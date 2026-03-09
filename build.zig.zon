@@ -1,0 +1,8 @@
+.{
+    .name = .zq,
+    .fingerprint = 0xb30bc2293a0bfa9e,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{"."},
+}
