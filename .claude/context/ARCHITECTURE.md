@@ -4,14 +4,11 @@
 Zig 0.15.2
 No extra dependencies
 
-## Decisions
-- D001: {decision}
-- D002: {decision}
+## Organization
 
-## Constraints
-- {constraint}
-- {constraint}
+Per module public interface.
+src/[module]/INTERFACE.md
 
-## Conventions
-- {convention}
-- {convention}
+
+LLM Manifest
+.claude/context/MANIFEST.md

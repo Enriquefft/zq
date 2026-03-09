@@ -1,0 +1,75 @@
+const std = @import("std");
+const err_mod = @import("error");
+const types = @import("types");
+const compiler = @import("src/compiler.zig");
+const vm = @import("src/vm.zig");
+
+pub const ZqError = err_mod.ZqError;
+pub const Tape    = types.Tape;
+pub const Value   = types.Value;
+
+// Re-export ResultIterator as part of the public surface.
+pub const ResultIterator = vm.ResultIterator;
+
+/// Compilation options. All fields have safe defaults.
+pub const Opts = struct {
+    /// When true, two specific conditions yield null instead of TypeError:
+    ///   1. Missing key on an object (.foo where "foo" is absent).
+    ///   2. Field access on a null value (.foo.bar where .foo is null).
+    ///
+    /// All other type mismatches remain TypeError regardless:
+    ///   key on array/number/bool, .[] on non-array, .[n] on non-array.
+    ///
+    /// Default: false (strict mode).
+    allow_null_propagation: bool = false,
+};
+
+/// Immutable compiled filter. Thread-safe for concurrent execute() calls.
+/// Owns its instruction bytecode and string-intern buffer.
+pub const CompiledQuery = struct {
+    allocator:    std.mem.Allocator,
+    instructions: []types.Instruction,
+    string_buf:   []u8,
+    opts:         Opts,
+
+    /// Compile `src` into bytecode.
+    ///
+    /// The allocator is stored internally and used by deinit().
+    /// Returns QuerySyntaxError for malformed filters; OutOfMemory if buffers
+    /// cannot be allocated.
+    pub fn compile(
+        src:       []const u8,
+        opts:      Opts,
+        allocator: std.mem.Allocator,
+    ) (ZqError || error{OutOfMemory})!CompiledQuery {
+        const compiled = try compiler.compile(src, allocator);
+        return CompiledQuery{
+            .allocator    = allocator,
+            .instructions = compiled.instructions,
+            .string_buf   = compiled.string_buf,
+            .opts         = opts,
+        };
+    }
+
+    /// Free bytecode and string-intern buffer.
+    pub fn deinit(q: *CompiledQuery) void {
+        q.allocator.free(q.instructions);
+        q.allocator.free(q.string_buf);
+    }
+
+    /// Bind `tape` to this query and allocate an iterator eval stack.
+    /// `tape` and `q` must both outlive the returned ResultIterator.
+    /// No execution occurs until the first next() call.
+    pub fn execute(
+        q:         *const CompiledQuery,
+        tape:      Tape,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}!ResultIterator {
+        return ResultIterator.init(
+            q.instructions,
+            q.opts.allow_null_propagation,
+            tape,
+            allocator,
+        );
+    }
+};

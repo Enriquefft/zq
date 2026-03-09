@@ -1,3 +1,12 @@
+// !! GENERATED FILE â do not edit by hand.
+// !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
+//
+// One test per jq test case.  Strategy:
+//   QuerySyntaxError â SkipZigTest   (filter not yet implemented)
+//   Any other error  â test FAILS    (real compatibility gap)
+//   Wrong output     â assertion FAILS
+//   %%FAIL tests     â expectCompileError()
+
 const std = @import("std");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
@@ -35,7 +44,7 @@ fn skipTapeEntry(tape: *const Tape, idx: u32) u32 {
     };
 }
 
-// ââ Value â compact JSON ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ââ Value â compact JSON (jq-compatible escaping) âââââââââââââââââââââââââââââ
 
 fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
     switch (val) {
@@ -95,19 +104,22 @@ fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
     }
 }
 
-/// jq-compatible escaping: all control chars as \uXXXX, non-ASCII as \uXXXX.
+/// jq-compatible escaping:
+///   - Control chars (0x00-0x1F)  â \uXXXX
+///   - Non-ASCII Unicode            â \uXXXX (surrogate pairs for > U+FFFF)
+///   - Printable ASCII (â  " or \) â literal
 fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
         const byte = s[i];
         if (byte < 0x80) {
             switch (byte) {
-                '"'              => try buf.appendSlice(alloc, "\\\""),
-                '\\'             => try buf.appendSlice(alloc, "\\\\"),
+                '"'          => try buf.appendSlice(alloc, "\\\""),
+                '\\'         => try buf.appendSlice(alloc, "\\\\"),
                 0x20, 0x21,
                 0x23...0x5B,
-                0x5D...0x7E     => try buf.append(alloc, byte),
-                else            => {
+                0x5D...0x7E => try buf.append(alloc, byte),
+                else        => {
                     var tmp: [6]u8 = undefined;
                     const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch unreachable;
                     try buf.appendSlice(alloc, seq);
@@ -147,8 +159,10 @@ fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     }
 }
 
-// ââ Core run helper âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ââ Core run helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
+/// Parse input JSON, compile filter, execute, collect serialized results.
+/// Returns an owned slice of owned compact-JSON strings.
 fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     var p = try Parser.init(alloc);
     defer p.deinit();
@@ -180,6 +194,7 @@ fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     return result_list.toOwnedSlice(alloc);
 }
 
+/// Verify that compiling `filter` returns QuerySyntaxError (%%FAIL tests).
 fn expectCompileError(filter: []const u8) !void {
     var q = CompiledQuery.compile(filter, .{}, alloc) catch |e| {
         if (e == error.QuerySyntaxError) return;
