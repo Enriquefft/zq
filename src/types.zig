@@ -103,11 +103,62 @@ pub const Instruction = struct {
         pipe,
         /// Identity: no-op pass-through (`.`).
         identity,
+        /// Push literal boolean. operand.bool = value.
+        push_bool,
+        /// Push literal integer. operand.int = value.
+        push_int,
+        /// Push literal float. operand.float = value.
+        push_float,
+        /// Add: pop 2 values, push sum.
+        add,
+        /// Subtract: pop 2 values, push difference.
+        sub,
+        /// Multiply: pop 2 values, push product.
+        mul,
+        /// Divide: pop 2 values, push quotient.
+        div,
+        /// Modulo: pop 2 values, push remainder.
+        mod,
+        /// Equal: pop 2 values, push boolean.
+        eq,
+        /// Not equal: pop 2 values, push boolean.
+        ne,
+        /// Less than: pop 2 values, push boolean.
+        lt,
+        /// Less than or equal: pop 2 values, push boolean.
+        le,
+        /// Greater than: pop 2 values, push boolean.
+        gt,
+        /// Greater than or equal: pop 2 values, push boolean.
+        ge,
+        /// Logical and: pop 2 values, push boolean (short-circuit).
+        and_op,
+        /// Logical or: pop 2 values, push boolean (short-circuit).
+        or_op,
+        /// Logical not: pop 1 value, push boolean.
+        not,
+
+        // Variable operations
+        /// Capture top of stack into variable. operand.index = variable id.
+        capture_variable,
+        /// Load variable value onto stack. operand.index = variable id.
+        load_variable,
+        /// Pop variable from scope. operand.index = variable id.
+        pop_variable,
+
+        // Function operations
+        /// Define function at compile time. operand.index = function id.
+        def_function,
+        /// Call function by name. operand.index = function id.
+        call_function,
     };
 
     pub const Operand = union {
         string: []const u8,
         index: u32,
+        bool: bool,
+        int: i64,
+        float: f64,
         none: void,
     };
 };
