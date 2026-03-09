@@ -2,2160 +2,7145 @@ const std = @import("std");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
 const types = @import("types");
-const err = @import("error");
+const err_mod = @import("error");
 
 const Parser = parser_mod.Parser;
 const CompiledQuery = query_mod.CompiledQuery;
 const Value = types.Value;
+const Tape = types.Tape;
 const alloc = std.testing.allocator;
 
-fn parseInput(input: []const u8) !types.Tape {
-    var p = try Parser.init(alloc);
-    defer p.deinit();
-    const result = try p.feed(input, true);
-    return switch (result) {
-        .done => |tape| tape,
-        .need_more => error.UnexpectedNeedMore,
+// ââ Tape helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+fn entryToValue(tape: *const Tape, idx: u32) Value {
+    const entry = tape.entries[idx];
+    return switch (entry.tag) {
+        .null_val     => .null_val,
+        .true_val     => .{ .bool_val = true },
+        .false_val    => .{ .bool_val = false },
+        .int          => .{ .int    = entry.payload.int },
+        .float        => .{ .float  = entry.payload.float },
+        .string       => .{ .string = tape.getString(entry.payload.string) },
+        .array_start  => .{ .array  = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
+        .object_start => .{ .object = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
+        else          => unreachable,
     };
 }
 
-fn collectResults(query: *const CompiledQuery, tape: types.Tape) ![]Value {
-    var it = try query.execute(tape, alloc);
+fn skipTapeEntry(tape: *const Tape, idx: u32) u32 {
+    const entry = tape.entries[idx];
+    return switch (entry.tag) {
+        .array_start, .object_start => entry.payload.skip,
+        else => idx + 1,
+    };
+}
+
+// ââ Value â compact JSON ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
+    switch (val) {
+        .null_val  => try buf.appendSlice(alloc, "null"),
+        .bool_val  => |b| try buf.appendSlice(alloc, if (b) "true" else "false"),
+        .int       => |n| {
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+            try buf.appendSlice(alloc, s);
+        },
+        .float     => |f| {
+            if (std.math.isNan(f) or std.math.isInf(f)) {
+                try buf.appendSlice(alloc, "null");
+            } else {
+                var tmp: [64]u8 = undefined;
+                const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            }
+        },
+        .string    => |s| {
+            try buf.append(alloc, '"');
+            try writeEscaped(buf, s);
+            try buf.append(alloc, '"');
+        },
+        .array     => |span| {
+            try buf.append(alloc, '[');
+            const tape = span.tape;
+            var idx = span.start + 1;
+            var first = true;
+            while (idx < span.end - 1) {
+                if (!first) try buf.append(alloc, ',');
+                first = false;
+                try serializeValue(buf, entryToValue(tape, idx));
+                idx = skipTapeEntry(tape, idx);
+            }
+            try buf.append(alloc, ']');
+        },
+        .object    => |span| {
+            try buf.append(alloc, '{');
+            const tape = span.tape;
+            var idx = span.start + 1;
+            var first = true;
+            while (idx < span.end - 1) {
+                const key_ref = tape.entries[idx].payload.string;
+                const key_str = tape.getString(key_ref);
+                if (!first) try buf.append(alloc, ',');
+                first = false;
+                try buf.append(alloc, '"');
+                try writeEscaped(buf, key_str);
+                try buf.appendSlice(alloc, "\":");
+                idx += 1;
+                try serializeValue(buf, entryToValue(tape, idx));
+                idx = skipTapeEntry(tape, idx);
+            }
+            try buf.append(alloc, '}');
+        },
+    }
+}
+
+/// jq-compatible escaping: all control chars as \uXXXX, non-ASCII as \uXXXX.
+fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const byte = s[i];
+        if (byte < 0x80) {
+            switch (byte) {
+                '"'              => try buf.appendSlice(alloc, "\\\""),
+                '\\'             => try buf.appendSlice(alloc, "\\\\"),
+                0x20, 0x21,
+                0x23...0x5B,
+                0x5D...0x7E     => try buf.append(alloc, byte),
+                else            => {
+                    var tmp: [6]u8 = undefined;
+                    const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{byte}) catch unreachable;
+                    try buf.appendSlice(alloc, seq);
+                },
+            }
+            i += 1;
+        } else {
+            const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                try buf.appendSlice(alloc, "\\ufffd");
+                i += 1;
+                continue;
+            };
+            if (i + seq_len > s.len) {
+                try buf.appendSlice(alloc, "\\ufffd");
+                i += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
+                try buf.appendSlice(alloc, "\\ufffd");
+                i += seq_len;
+                continue;
+            };
+            if (cp <= 0xFFFF) {
+                var tmp: [6]u8 = undefined;
+                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{cp}) catch unreachable;
+                try buf.appendSlice(alloc, seq);
+            } else {
+                const adjusted = cp - 0x10000;
+                const high: u32 = 0xD800 + (adjusted >> 10);
+                const low:  u32 = 0xDC00 + (adjusted & 0x3FF);
+                var tmp: [12]u8 = undefined;
+                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}\\u{x:0>4}", .{ high, low }) catch unreachable;
+                try buf.appendSlice(alloc, seq);
+            }
+            i += seq_len;
+        }
+    }
+}
+
+// ââ Core run helper âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
+    var p = try Parser.init(alloc);
+    defer p.deinit();
+
+    const tape = switch (try p.feed(input_json, true)) {
+        .done      => |t| t,
+        .need_more => return error.ParseIncomplete,
+    };
+
+    var q = try CompiledQuery.compile(filter, .{}, alloc);
+    defer q.deinit();
+
+    var it = try q.execute(tape, alloc);
     defer it.deinit();
-    var results = std.ArrayList(Value).init(alloc);
-    while (try it.next()) |v| try results.append(v);
-    return results.toOwnedSlice();
+
+    var result_list = std.ArrayList([]const u8){};
+    errdefer {
+        for (result_list.items) |s| alloc.free(s);
+        result_list.deinit(alloc);
+    }
+
+    while (try it.next()) |val| {
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(alloc);
+        try serializeValue(&buf, val);
+        try result_list.append(alloc, try buf.toOwnedSlice(alloc));
+    }
+
+    return result_list.toOwnedSlice(alloc);
+}
+
+fn expectCompileError(filter: []const u8) !void {
+    var q = CompiledQuery.compile(filter, .{}, alloc) catch |e| {
+        if (e == error.QuerySyntaxError) return;
+        return e;
+    };
+    q.deinit();
+    return error.ExpectedCompileError;
 }
 
 test "jq:L8 true" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "true",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
 test "jq:L12 false" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "false",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
 test "jq:L16 null" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "null",
+        "42",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
 test "jq:L20 1" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "1",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
 test "jq:L25 -1" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "-1",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("-1", results[0]);
 }
 
-test "jq:L31 __" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L31 {}" {
+    const results = runFilter(
+        "{}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{}", results[0]);
 }
 
-test "jq:L35 __" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L35 []" {
+    const results = runFilter(
+        "[]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
 }
 
-test "jq:L39 _x_-1___x_-.___x_-._abs_" {
-    return error.SkipZigTest;
+test "jq:L39 {x:-1},{x:-.},{x:-.|abs}" {
+    const results = runFilter(
+        "{x:-1},{x:-.},{x:-.|abs}",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("{\"x\":-1}", results[0]);
+    try std.testing.expectEqualStrings("{\"x\":-1}", results[1]);
+    try std.testing.expectEqualStrings("{\"x\":1}", results[2]);
 }
 
 test "jq:L48 ." {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".",
+        "﻿\"byte order mark\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"byte order mark\"", results[0]);
 }
 
 test "jq:L54 _Aa_r_n_t_b_f_u03bc_" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "\"Aa\\r\\n\\t\\b\\f\\u03bc\"",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
 test "jq:L58 ." {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".",
+        "\"Aa\\r\\n\\t\\b\\f\\u03bc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
-test "jq:L62 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L62 _u_vw_" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("\"u\\vw\"");
 }
 
-test "jq:L68 _inter___pol_ _ _ation___" {
-    return error.SkipZigTest;
+test "jq:L68 _inter_(_pol_ + _ation_)_" {
+    const results = runFilter(
+        "\"inter\\(\"pol\" + \"ation\")\"",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"interpolation\"", results[0]);
 }
 
-test "jq:L72 _text__json___1_.___csv__tsv___html___uri_.__urid___sh___..." {
-    return error.SkipZigTest;
+test "jq:L72 @text,@json,([1,.]|@csv,@tsv),@html,(@uri|.,@urid),@sh,(@..." {
+    const results = runFilter(
+        "@text,@json,([1,.]|@csv,@tsv),@html,(@uri|.,@urid),@sh,(@base64|.,@base64d)",
+        "\"!()<>&'\\\"\\t\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 10), results.len);
+    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[0]);
+    try std.testing.expectEqualStrings("\"\\\"!()<>&'\\\\\\\"\\\\t\\\"\"", results[1]);
+    try std.testing.expectEqualStrings("\"1,\\\"!()<>&'\\\"\\\"\\t\\\"\"", results[2]);
+    try std.testing.expectEqualStrings("\"1\\t!()<>&'\\\"\\\\t\"", results[3]);
+    try std.testing.expectEqualStrings("\"!()&lt;&gt;&amp;&apos;&quot;\\t\"", results[4]);
+    try std.testing.expectEqualStrings("\"%21%28%29%3C%3E%26%27%22%09\"", results[5]);
+    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[6]);
+    try std.testing.expectEqualStrings("\"'!()<>&'\\\\''\\\"\\t'\"", results[7]);
+    try std.testing.expectEqualStrings("\"ISgpPD4mJyIJ\"", results[8]);
+    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[9]);
 }
 
-test "jq:L86 _base64" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L86 @base64" {
+    const results = runFilter(
+        "@base64",
+        "\"foóbar\\n\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Zm/Ds2Jhcgo=\"", results[0]);
 }
 
-test "jq:L90 _base64d" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L90 @base64d" {
+    const results = runFilter(
+        "@base64d",
+        "\"Zm/Ds2Jhcgo=\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"foóbar\\n\"", results[0]);
 }
 
-test "jq:L94 _uri" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L94 @uri" {
+    const results = runFilter(
+        "@uri",
+        "\"\\u03bc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"%CE%BC\"", results[0]);
 }
 
-test "jq:L98 _urid" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L98 @urid" {
+    const results = runFilter(
+        "@urid",
+        "\"%CE%BC\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"\\u03bc\"", results[0]);
 }
 
-test "jq:L102 _html __b___.___b__" {
-    return error.SkipZigTest;
+test "jq:L102 @html _<b>_(.)</b>_" {
+    const results = runFilter(
+        "@html \"<b>\\(.)</b>\"",
+        "\"<script>hax</script>\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"<b>&lt;script&gt;hax&lt;/script&gt;</b>\"", results[0]);
 }
 
-test "jq:L106 _.___tojson_fromjson_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L106 [.[]|tojson|fromjson]" {
+    const results = runFilter(
+        "[.[]|tojson|fromjson]",
+        "[\"foo\", 1, [\"a\", 1, \"b\", 2, {\"foo\":\"bar\"}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"foo\",1,[\"a\",1,\"b\",2,{\"foo\":\"bar\"}]]", results[0]);
 }
 
-test "jq:L114 _a_ 1_" {
-    return error.SkipZigTest;
+test "jq:L114 {a: 1}" {
+    const results = runFilter(
+        "{a: 1}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":1}", results[0]);
 }
 
-test "jq:L118 _a_b__.d__.a_e_.b_" {
-    return error.SkipZigTest;
+test "jq:L118 {a,b,(.d):.a,e:.b}" {
+    const results = runFilter(
+        "{a,b,(.d):.a,e:.b}",
+        "{\"a\":1, \"b\":2, \"c\":3, \"d\":\"c\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"c\":1, \"e\":2}", results[0]);
 }
 
-test "jq:L122 __a__b__a___1_1___" {
-    return error.SkipZigTest;
+test "jq:L122 {_a_,b,_a$_(1+1)_}" {
+    const results = runFilter(
+        "{\"a\",b,\"a$\\(1+1)\"}",
+        "{\"a\":1, \"b\":2, \"c\":3, \"a$2\":4}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"a$2\":4}", results[0]);
 }
 
-test "jq:L126 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L126 {(0):1}" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("{(0):1}");
 }
 
-test "jq:L132 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L132 {1+2:3}" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("{1+2:3}");
 }
 
-test "jq:L138 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L138 {non_const:., (0):1}" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("{non_const:., (0):1}");
 }
 
 test "jq:L148 .foo" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".foo",
+        "{\"foo\": 42, \"bar\": 43}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("42", results[0]);
 }
 
-test "jq:L152 .foo _ .bar" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L152 .foo | .bar" {
+    const results = runFilter(
+        ".foo | .bar",
+        "{\"foo\": {\"bar\": 42}, \"bar\": \"badvalue\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("42", results[0]);
 }
 
 test "jq:L156 .foo.bar" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".foo.bar",
+        "{\"foo\": {\"bar\": 42}, \"bar\": \"badvalue\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("42", results[0]);
 }
 
 test "jq:L160 .foo_bar" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".foo_bar",
+        "{\"foo_bar\": 2}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
-test "jq:L164 .__foo__.bar" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L164 .[_foo_].bar" {
+    const results = runFilter(
+        ".[\"foo\"].bar",
+        "{\"foo\": {\"bar\": 42}, \"bar\": \"badvalue\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("42", results[0]);
 }
 
 test "jq:L168 ._foo_._bar_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L172 .e0_ .E1_ .E-1_ .E_1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L179 _.___.foo__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L183 _.___.foo_.bar__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L187 _.._" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L191 _.___.____" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L195 _.___._1_3___" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L200 map_try .a__ catch ._ try .a.__ catch ._ .a____ .a.____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L205 try __OK__ _.__ _ error__ catch __KO__ ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L213 try _.foo_-1_ _ 0_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L217 try _.foo_-2_ _ 0_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L221 ._-1_ _ 5" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L225 ._-2_ _ 5" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L229 try _._999999999_ _ 0_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L237 .__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L243 1_1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L248 1_." {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L253 _._" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L257 __2__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L261 ____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L265 _.___" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L269 __._1____._._____2_3___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L273 ___5_5_____._.___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L277 _x_ _1_2____x_3_ _ .x" {
-    return error.SkipZigTest;
-}
-
-test "jq:L283 _._-4_-3_-2_-1_0_1_2_3__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L287 _range_0_10__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L291 _range_0_1_3_4__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L295 _range_0_10_3__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L299 _range_0_10_-1__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L303 _range_0_-5_-1__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L307 _range_0_1_4_5_1_2__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L311 _while_._100_ ._2__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L315 __label _here _ .__ _ if ._1 then break _here else . end_..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L319 __label _here _ .__ _ if ._1 then break _here else . end_..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L323 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L329 _.____._1__until_._0_ _ 1_ _._0_ - 1_ ._1_ _ ._0____._1__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L333 _label _out _ foreach .__ as _item __3_ null__ if ._0_ _ ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L337 _foreach range_5_ as _item _0_ _item__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L341 _foreach .__ as __i_ _j_ _0_ . _ _i - _j__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L345 _foreach .__ as _a__a_ _0_ . _ _a_ -.__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L349 _-foreach -.__ as _x _0_ . _ _x__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L353 _foreach .__ _ .__ as _i _0_ . _ _i__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L357 _foreach .__ as _x _0_ . _ _x_ as _x _ _x_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L361 _limit_3_ .____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L365 _limit_0_ error__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L369 _limit_1_ 1_ error__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L373 try limit_-1_ error_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L377 _skip_3_ .____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L381 _skip_0_2_3_4_ .____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L385 _skip_3_ .____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L389 try skip_-1_ error_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L393 nth_1_ 0_1_error__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L397 _first_range_.___ last_range_.___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L401 _first_range_.___ last_range_.___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L405 _nth_0_5_9_10_15_ range_.___ try nth_-1_ range_.__ catch ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L410 first_1_error__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L420 _limit_5_7_ range_9___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L425 _nth_5_7_ range_9_0_-1___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L430 _range_0_1_2_4_3_2_2_3__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L435 _range_3_5__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L440 __index__________ rindex___________ indices__________" {
-    return error.SkipZigTest;
-}
-
-test "jq:L445 join_________" {
-    return error.SkipZigTest;
-}
-
-test "jq:L450 _.___join__a___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L455 flatten_3_2_1_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L466 _._3_2__ ._-5_4__ .__-2__ ._-2___ ._3_3__1___ ._10___" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L470 _._3_2__ ._-5_4__ .__-2__ ._-2___ ._3_3__1___ ._10___" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L474 del_._2_4__._0__._-2___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L478 ._2_4_ _ ____ __a___b___ __a___b___c___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L490 reduce range_65540_65536_-1_ as _i ____ .__i_ _ _i__._655..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L498 1 as _x _ 2 as _y _ __x__y__x_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L502 _1_2_3___ as _x _ __4_5_6_7___x__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L508 42 as _x _ . _ . _ . _ 432 _ _x _ 1" {
-    return error.SkipZigTest;
-}
-
-test "jq:L512 1 _ 2 as _x _ -_x" {
-    return error.SkipZigTest;
-}
-
-test "jq:L516 _x_ as _x _ _a___y_ as _y _ _x______y" {
-    return error.SkipZigTest;
-}
-
-test "jq:L520 1 as _x _ __x__x__x as _x _ _x_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L524 _1_ _c_3_ d_4__ as __a_ _c__b_ b__c__ _ _a_ _b_ _c" {
-    return error.SkipZigTest;
-}
-
-test "jq:L530 . as _as_ _kw_ _str__ _str_ __e___x___p___ _exp_ _ __kw_ ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L534 .__ as __a_ _b_ _ __b_ _a_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L539 . as _i _ . as __i_ _ _i" {
-    return error.SkipZigTest;
-}
-
-test "jq:L543 . as __i_ _ . as _i _ _i" {
-    return error.SkipZigTest;
-}
-
-test "jq:L547 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L553 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L559 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L565 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L577 1_1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L581 1_1" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".\"foo\".\"bar\"",
+        "{\"foo\": {\"bar\": 20}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("20", results[0]);
+}
+
+test "jq:L172 .e0, .E1, .E-1, .E+1" {
+    const results = runFilter(
+        ".e0, .E1, .E-1, .E+1",
+        "{\"e0\": 1, \"E1\": 2, \"E\": 3}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("2", results[1]);
+    try std.testing.expectEqualStrings("2", results[2]);
+    try std.testing.expectEqualStrings("4", results[3]);
+}
+
+test "jq:L179 [.[]|.foo?]" {
+    const results = runFilter(
+        "[.[]|.foo?]",
+        "[1,[2],{\"foo\":3,\"bar\":4},{},{\"foo\":5}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[3,null,5]", results[0]);
+}
+
+test "jq:L183 [.[]|.foo?.bar?]" {
+    const results = runFilter(
+        "[.[]|.foo?.bar?]",
+        "[1,[2],[],{\"foo\":3},{\"foo\":{\"bar\":4}},{}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4,null]", results[0]);
+}
+
+test "jq:L187 [..]" {
+    const results = runFilter(
+        "[..]",
+        "[1,[[2]],{ \"a\":[1]}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1,[[2]],{\"a\":[1]}],1,[[2]],[2],2,{\"a\":[1]},[1],1]", results[0]);
+}
+
+test "jq:L191 [.[]|.[]?]" {
+    const results = runFilter(
+        "[.[]|.[]?]",
+        "[1,null,[],[1,[2,[[3]]]],[{}],[{\"a\":[1,[2]]}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,[2,[[3]]],{},{\"a\":[1,[2]]}]", results[0]);
+}
+
+test "jq:L195 [.[]|.[1:3]?]" {
+    const results = runFilter(
+        "[.[]|.[1:3]?]",
+        "[1,null,true,false,\"abcdef\",{},{\"a\":1,\"b\":2},[],[1,2,3,4,5],[1,2]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,\"bc\",[],[2,3],[2]]", results[0]);
+}
+
+test "jq:L200 map(try .a[] catch ., try .a.[] catch ., .a[]?, .a.[]?)" {
+    const results = runFilter(
+        "map(try .a[] catch ., try .a.[] catch ., .a[]?, .a.[]?)",
+        "[{\"a\": [1,2]}, {\"a\": 123}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,1,2,1,2,1,2,\"Cannot iterate over number (123)\",\"Cannot iterate over number (123)\"]", results[0]);
+}
+
+test "jq:L205 try [_OK_, (.[] | error)] catch [_KO_, .]" {
+    const results = runFilter(
+        "try [\"OK\", (.[] | error)] catch [\"KO\", .]",
+        "{\"a\":[\"b\"],\"c\":[\"d\"]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"KO\",[\"b\"]]", results[0]);
+}
+
+test "jq:L213 try (.foo[-1] = 0) catch ." {
+    const results = runFilter(
+        "try (.foo[-1] = 0) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Out of bounds negative array index\"", results[0]);
+}
+
+test "jq:L217 try (.foo[-2] = 0) catch ." {
+    const results = runFilter(
+        "try (.foo[-2] = 0) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Out of bounds negative array index\"", results[0]);
+}
+
+test "jq:L221 .[-1] = 5" {
+    const results = runFilter(
+        ".[-1] = 5",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,5]", results[0]);
+}
+
+test "jq:L225 .[-2] = 5" {
+    const results = runFilter(
+        ".[-2] = 5",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,5,2]", results[0]);
+}
+
+test "jq:L229 try (.[999999999] = 0) catch ." {
+    const results = runFilter(
+        "try (.[999999999] = 0) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Array index too large\"", results[0]);
+}
+
+test "jq:L237 .[]" {
+    const results = runFilter(
+        ".[]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("2", results[1]);
+    try std.testing.expectEqualStrings("3", results[2]);
+}
+
+test "jq:L243 1,1" {
+    const results = runFilter(
+        "1,1",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("1", results[1]);
+}
+
+test "jq:L248 1,." {
+    const results = runFilter(
+        "1,.",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("[]", results[1]);
+}
+
+test "jq:L253 [.]" {
+    const results = runFilter(
+        "[.]",
+        "[2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[2]]", results[0]);
+}
+
+test "jq:L257 [[2]]" {
+    const results = runFilter(
+        "[[2]]",
+        "[3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[2]]", results[0]);
+}
+
+test "jq:L261 [{}]" {
+    const results = runFilter(
+        "[{}]",
+        "[2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{}]", results[0]);
+}
+
+test "jq:L265 [.[]]" {
+    const results = runFilter(
+        "[.[]]",
+        "[\"a\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\"]", results[0]);
+}
+
+test "jq:L269 [(.,1),((.,.[]),(2,3))]" {
+    const results = runFilter(
+        "[(.,1),((.,.[]),(2,3))]",
+        "[\"a\",\"b\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\",\"b\"],1,[\"a\",\"b\"],\"a\",\"b\",2,3]", results[0]);
+}
+
+test "jq:L273 [([5,5][]),.,.[]]" {
+    const results = runFilter(
+        "[([5,5][]),.,.[]]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[5,5,[1,2,3],1,2,3]", results[0]);
+}
+
+test "jq:L277 {x: (1,2)},{x:3} | .x" {
+    const results = runFilter(
+        "{x: (1,2)},{x:3} | .x",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("2", results[1]);
+    try std.testing.expectEqualStrings("3", results[2]);
+}
+
+test "jq:L283 [.[-4,-3,-2,-1,0,1,2,3]]" {
+    const results = runFilter(
+        "[.[-4,-3,-2,-1,0,1,2,3]]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,1,2,3,1,2,3,null]", results[0]);
+}
+
+test "jq:L287 [range(0;10)]" {
+    const results = runFilter(
+        "[range(0;10)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3,4,5,6,7,8,9]", results[0]);
+}
+
+test "jq:L291 [range(0,1;3,4)]" {
+    const results = runFilter(
+        "[range(0,1;3,4)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2, 0,1,2,3, 1,2, 1,2,3]", results[0]);
+}
+
+test "jq:L295 [range(0;10;3)]" {
+    const results = runFilter(
+        "[range(0;10;3)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,3,6,9]", results[0]);
+}
+
+test "jq:L299 [range(0;10;-1)]" {
+    const results = runFilter(
+        "[range(0;10;-1)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L303 [range(0;-5;-1)]" {
+    const results = runFilter(
+        "[range(0;-5;-1)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,-1,-2,-3,-4]", results[0]);
+}
+
+test "jq:L307 [range(0,1;4,5;1,2)]" {
+    const results = runFilter(
+        "[range(0,1;4,5;1,2)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3,0,2, 0,1,2,3,4,0,2,4, 1,2,3,1,3, 1,2,3,4,1,3]", results[0]);
+}
+
+test "jq:L311 [while(.<100; .*2)]" {
+    const results = runFilter(
+        "[while(.<100; .*2)]",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,4,8,16,32,64]", results[0]);
+}
+
+test "jq:L315 [(label $here | .[] | if .>1 then break $here else . end)..." {
+    const results = runFilter(
+        "[(label $here | .[] | if .>1 then break $here else . end), \"hi!\"]",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,\"hi!\"]", results[0]);
+}
+
+test "jq:L319 [(label $here | .[] | if .>1 then break $here else . end)..." {
+    const results = runFilter(
+        "[(label $here | .[] | if .>1 then break $here else . end), \"hi!\"]",
+        "[0,2,1]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,\"hi!\"]", results[0]);
+}
+
+test "jq:L323 . as $foo | break $foo" {
+    // %%FAIL: filter should not compile
+    try expectCompileError(". as $foo | break $foo");
+}
+
+test "jq:L329 [.[]|[.,1]|until(.[0] < 1; [.[0] - 1, .[1] * .[0]])|.[1]]" {
+    const results = runFilter(
+        "[.[]|[.,1]|until(.[0] < 1; [.[0] - 1, .[1] * .[0]])|.[1]]",
+        "[1,2,3,4,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,6,24,120]", results[0]);
+}
+
+test "jq:L333 [label $out | foreach .[] as $item ([3, null]; if .[0] < ..." {
+    const results = runFilter(
+        "[label $out | foreach .[] as $item ([3, null]; if .[0] < 1 then break $out else [.[0] -1, $item] end; .[1])]",
+        "[11,22,33,44,55,66,77,88,99]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[11,22,33]", results[0]);
+}
+
+test "jq:L337 [foreach range(5) as $item (0; $item)]" {
+    const results = runFilter(
+        "[foreach range(5) as $item (0; $item)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3,4]", results[0]);
+}
+
+test "jq:L341 [foreach .[] as [$i, $j] (0; . + $i - $j)]" {
+    const results = runFilter(
+        "[foreach .[] as [$i, $j] (0; . + $i - $j)]",
+        "[[2,1], [5,3], [6,4]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,3,5]", results[0]);
+}
+
+test "jq:L345 [foreach .[] as {a:$a} (0; . + $a; -.)]" {
+    const results = runFilter(
+        "[foreach .[] as {a:$a} (0; . + $a; -.)]",
+        "[{\"a\":1}, {\"b\":2}, {\"a\":3, \"b\":4}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[-1, -1, -4]", results[0]);
+}
+
+test "jq:L349 [-foreach -.[] as $x (0; . + $x)]" {
+    const results = runFilter(
+        "[-foreach -.[] as $x (0; . + $x)]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,3,6]", results[0]);
+}
+
+test "jq:L353 [foreach .[] / .[] as $i (0; . + $i)]" {
+    const results = runFilter(
+        "[foreach .[] / .[] as $i (0; . + $i)]",
+        "[1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,3,3.5,4.5]", results[0]);
+}
+
+test "jq:L357 [foreach .[] as $x (0; . + $x) as $x | $x]" {
+    const results = runFilter(
+        "[foreach .[] as $x (0; . + $x) as $x | $x]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,3,6]", results[0]);
+}
+
+test "jq:L361 [limit(3; .[])]" {
+    const results = runFilter(
+        "[limit(3; .[])]",
+        "[11,22,33,44,55,66,77,88,99]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[11,22,33]", results[0]);
+}
+
+test "jq:L365 [limit(0; error)]" {
+    const results = runFilter(
+        "[limit(0; error)]",
+        "\"badness\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L369 [limit(1; 1, error)]" {
+    const results = runFilter(
+        "[limit(1; 1, error)]",
+        "\"badness\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1]", results[0]);
+}
+
+test "jq:L373 try limit(-1; error) catch ." {
+    const results = runFilter(
+        "try limit(-1; error) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"limit doesn't support negative count\"", results[0]);
+}
+
+test "jq:L377 [skip(3; .[])]" {
+    const results = runFilter(
+        "[skip(3; .[])]",
+        "[1,2,3,4,5,6,7,8,9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4,5,6,7,8,9]", results[0]);
+}
+
+test "jq:L381 [skip(0,2,3,4; .[])]" {
+    const results = runFilter(
+        "[skip(0,2,3,4; .[])]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3,3]", results[0]);
+}
+
+test "jq:L385 [skip(3; .[])]" {
+    const results = runFilter(
+        "[skip(3; .[])]",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L389 try skip(-1; error) catch ." {
+    const results = runFilter(
+        "try skip(-1; error) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"skip doesn't support negative count\"", results[0]);
+}
+
+test "jq:L393 nth(1; 0,1,error(_foo_))" {
+    const results = runFilter(
+        "nth(1; 0,1,error(\"foo\"))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+}
+
+test "jq:L397 [first(range(.)), last(range(.))]" {
+    const results = runFilter(
+        "[first(range(.)), last(range(.))]",
+        "10",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,9]", results[0]);
+}
+
+test "jq:L401 [first(range(.)), last(range(.))]" {
+    const results = runFilter(
+        "[first(range(.)), last(range(.))]",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L405 [nth(0,5,9,10,15; range(.)), try nth(-1; range(.)) catch .]" {
+    const results = runFilter(
+        "[nth(0,5,9,10,15; range(.)), try nth(-1; range(.)) catch .]",
+        "10",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,5,9,\"nth doesn't support negative indices\"]", results[0]);
+}
+
+test "jq:L410 first(1,error(_foo_))" {
+    const results = runFilter(
+        "first(1,error(\"foo\"))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+}
+
+test "jq:L420 [limit(5,7; range(9))]" {
+    const results = runFilter(
+        "[limit(5,7; range(9))]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3,4,0,1,2,3,4,5,6]", results[0]);
+}
+
+test "jq:L425 [nth(5,7; range(9;0;-1))]" {
+    const results = runFilter(
+        "[nth(5,7; range(9;0;-1))]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4,2]", results[0]);
+}
+
+test "jq:L430 [range(0,1,2;4,3,2;2,3)]" {
+    const results = runFilter(
+        "[range(0,1,2;4,3,2;2,3)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,2,0,3,0,2,0,0,0,1,3,1,1,1,1,1,2,2,2,2]", results[0]);
+}
+
+test "jq:L435 [range(3,5)]" {
+    const results = runFilter(
+        "[range(3,5)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,0,1,2,3,4]", results[0]);
+}
+
+test "jq:L440 [(index(_,_,_|_), rindex(_,_,_|_)), indices(_,_,_|_)]" {
+    const results = runFilter(
+        "[(index(\",\",\"|\"), rindex(\",\",\"|\")), indices(\",\",\"|\")]",
+        "\"a,b|c,d,e||f,g,h,|,|,i,j\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,3,22,19,[1,5,7,12,14,16,18,20,22],[3,9,10,17,19]]", results[0]);
+}
+
+test "jq:L445 join(_,_,_/_)" {
+    const results = runFilter(
+        "join(\",\",\"/\")",
+        "[\"a\",\"b\",\"c\",\"d\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"a,b,c,d\"", results[0]);
+    try std.testing.expectEqualStrings("\"a/b/c/d\"", results[1]);
+}
+
+test "jq:L450 [.[]|join(_a_)]" {
+    const results = runFilter(
+        "[.[]|join(\"a\")]",
+        "[[],[\"\"],[\"\",\"\"],[\"\",\"\",\"\"]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"\",\"\",\"a\",\"aa\"]", results[0]);
+}
+
+test "jq:L455 flatten(3,2,1)" {
+    const results = runFilter(
+        "flatten(3,2,1)",
+        "[0, [1], [[2]], [[[3]]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,[3]]", results[1]);
+    try std.testing.expectEqualStrings("[0,1,[2],[[3]]]", results[2]);
+}
+
+test "jq:L466 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
+    const results = runFilter(
+        "[.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]",
+        "[0,1,2,3,4,5,6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[], [2,3], [0,1,2,3,4], [5,6], [], []]", results[0]);
+}
+
+test "jq:L470 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
+    const results = runFilter(
+        "[.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]",
+        "\"abcdefghi\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"\",\"\",\"abcdefg\",\"hi\",\"\",\"\"]", results[0]);
+}
+
+test "jq:L474 del(.[2:4],.[0],.[-2:])" {
+    const results = runFilter(
+        "del(.[2:4],.[0],.[-2:])",
+        "[0,1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,4,5]", results[0]);
+}
+
+test "jq:L478 .[2:4] = ([], [_a_,_b_], [_a_,_b_,_c_])" {
+    const results = runFilter(
+        ".[2:4] = ([], [\"a\",\"b\"], [\"a\",\"b\",\"c\"])",
+        "[0,1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[0,1,4,5,6,7]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,\"a\",\"b\",4,5,6,7]", results[1]);
+    try std.testing.expectEqualStrings("[0,1,\"a\",\"b\",\"c\",4,5,6,7]", results[2]);
+}
+
+test "jq:L490 reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[655..." {
+    const results = runFilter(
+        "reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[65536:]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,65537,65538,65539,65540]", results[0]);
+}
+
+test "jq:L498 1 as $x | 2 as $y | [$x,$y,$x]" {
+    const results = runFilter(
+        "1 as $x | 2 as $y | [$x,$y,$x]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,1]", results[0]);
+}
+
+test "jq:L502 [1,2,3][] as $x | [[4,5,6,7][$x]]" {
+    const results = runFilter(
+        "[1,2,3][] as $x | [[4,5,6,7][$x]]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[5]", results[0]);
+    try std.testing.expectEqualStrings("[6]", results[1]);
+    try std.testing.expectEqualStrings("[7]", results[2]);
+}
+
+test "jq:L508 42 as $x | . | . | . + 432 | $x + 1" {
+    const results = runFilter(
+        "42 as $x | . | . | . + 432 | $x + 1",
+        "34324",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("43", results[0]);
+}
+
+test "jq:L512 1 + 2 as $x | -$x" {
+    const results = runFilter(
+        "1 + 2 as $x | -$x",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("-3", results[0]);
+}
+
+test "jq:L516 _x_ as $x | _a_+_y_ as $y | $x+_,_+$y" {
+    const results = runFilter(
+        "\"x\" as $x | \"a\"+\"y\" as $y | $x+\",\"+$y",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"x,ay\"", results[0]);
+}
+
+test "jq:L520 1 as $x | [$x,$x,$x as $x | $x]" {
+    const results = runFilter(
+        "1 as $x | [$x,$x,$x as $x | $x]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,1,1]", results[0]);
+}
+
+test "jq:L524 [1, {c:3, d:4}] as [$a, {c:$b, b:$c}] | $a, $b, $c" {
+    const results = runFilter(
+        "[1, {c:3, d:4}] as [$a, {c:$b, b:$c}] | $a, $b, $c",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("3", results[1]);
+    try std.testing.expectEqualStrings("null", results[2]);
+}
+
+test "jq:L530 . as {as: $kw, _str_: $str, (_e_+_x_+_p_): $exp} | [$kw, ..." {
+    const results = runFilter(
+        ". as {as: $kw, \"str\": $str, (\"e\"+\"x\"+\"p\"): $exp} | [$kw, $str, $exp]",
+        "{\"as\": 1, \"str\": 2, \"exp\": 3}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1, 2, 3]", results[0]);
+}
+
+test "jq:L534 .[] as [$a, $b] | [$b, $a]" {
+    const results = runFilter(
+        ".[] as [$a, $b] | [$b, $a]",
+        "[[1], [1, 2, 3]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("[null, 1]", results[0]);
+    try std.testing.expectEqualStrings("[2, 1]", results[1]);
+}
+
+test "jq:L539 . as $i | . as [$i] | $i" {
+    const results = runFilter(
+        ". as $i | . as [$i] | $i",
+        "[0]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("0", results[0]);
+}
+
+test "jq:L543 . as [$i] | . as $i | $i" {
+    const results = runFilter(
+        ". as [$i] | . as $i | $i",
+        "[0]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0]", results[0]);
+}
+
+test "jq:L547 . as [] | null" {
+    // %%FAIL: filter should not compile
+    try expectCompileError(". as [] | null");
+}
+
+test "jq:L553 . as {} | null" {
+    // %%FAIL: filter should not compile
+    try expectCompileError(". as {} | null");
+}
+
+test "jq:L559 . as $foo | [$foo, $bar]" {
+    // %%FAIL: filter should not compile
+    try expectCompileError(". as $foo | [$foo, $bar]");
+}
+
+test "jq:L565 . as {(true):$foo} | $foo" {
+    // %%FAIL: filter should not compile
+    try expectCompileError(". as {(true):$foo} | $foo");
+}
+
+test "jq:L577 1+1" {
+    const results = runFilter(
+        "1+1",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
+}
+
+test "jq:L581 1+1" {
+    const results = runFilter(
+        "1+1",
+        "\"wtasdf\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2.0", results[0]);
 }
 
 test "jq:L585 2-1" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "2-1",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
-test "jq:L589 2-_-1_" {
-    return error.SkipZigTest;
+test "jq:L589 2-(-1)" {
+    const results = runFilter(
+        "2-(-1)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("3", results[0]);
 }
 
-test "jq:L593 1e_0_0.001e3" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L593 1e+0+0.001e3" {
+    const results = runFilter(
+        "1e+0+0.001e3",
+        "\"I wonder what this will be?\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("20e-1", results[0]);
 }
 
-test "jq:L597 ._4" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L597 .+4" {
+    const results = runFilter(
+        ".+4",
+        "15",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("19.0", results[0]);
 }
 
-test "jq:L601 ._null" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L601 .+null" {
+    const results = runFilter(
+        ".+null",
+        "{\"a\":42}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":42}", results[0]);
 }
 
-test "jq:L605 null_." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L605 null+." {
+    const results = runFilter(
+        "null+.",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
-test "jq:L609 .a_.b" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L609 .a+.b" {
+    const results = runFilter(
+        ".a+.b",
+        "{\"a\":42}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("42", results[0]);
 }
 
-test "jq:L613 _1_2_3_ _ _._" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L613 [1,2,3] + [.]" {
+    const results = runFilter(
+        "[1,2,3] + [.]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3,null]", results[0]);
 }
 
-test "jq:L617 __a__1_ _ __b__2_ _ __c__3_" {
-    return error.SkipZigTest;
+test "jq:L617 {_a_:1} + {_b_:2} + {_c_:3}" {
+    const results = runFilter(
+        "{\"a\":1} + {\"b\":2} + {\"c\":3}",
+        "\"asdfasdf\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"c\":3}", results[0]);
 }
 
-test "jq:L621 _asdf_ _ _jkl__ _ . _ . _ ." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L621 _asdf_ + _jkl;_ + . + . + ." {
+    const results = runFilter(
+        "\"asdf\" + \"jkl;\" + . + . + .",
+        "\"some string\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"asdfjkl;some stringsome stringsome string\"", results[0]);
 }
 
-test "jq:L625 __u0000_u0020_u0000_ _ ." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L625 __u0000_u0020_u0000_ + ." {
+    const results = runFilter(
+        "\"\\u0000\\u0020\\u0000\" + .",
+        "\"\\u0000\\u0020\\u0000\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"\\u0000 \\u0000\\u0000 \\u0000\"", results[0]);
 }
 
 test "jq:L629 42 - ." {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "42 - .",
+        "11",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("31", results[0]);
 }
 
-test "jq:L633 _1_2_3_4_1_ - _._3_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L633 [1,2,3,4,1] - [.,3]" {
+    const results = runFilter(
+        "[1,2,3,4,1] - [.,3]",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2,4]", results[0]);
 }
 
-test "jq:L637 _-1 as _x _ 1__x_" {
-    return error.SkipZigTest;
+test "jq:L637 [-1 as $x | 1,$x]" {
+    const results = runFilter(
+        "[-1 as $x | 1,$x]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,-1]", results[0]);
 }
 
-test "jq:L641 _10 _ 20_ 20 _ ._" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L641 [10 * 20, 20 / .]" {
+    const results = runFilter(
+        "[10 * 20, 20 / .]",
+        "4",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[200, 5]", results[0]);
 }
 
-test "jq:L645 1 _ 2 _ 2 _ 10 _ 2" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L645 1 + 2 * 2 + 10 / 2" {
+    const results = runFilter(
+        "1 + 2 * 2 + 10 / 2",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("10", results[0]);
 }
 
-test "jq:L649 _16 _ 4 _ 2_ 16 _ 4 _ 2_ 16 - 4 - 2_ 16 - 4 _ 2_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L649 [16 / 4 / 2, 16 / 4 * 2, 16 - 4 - 2, 16 - 4 + 2]" {
+    const results = runFilter(
+        "[16 / 4 / 2, 16 / 4 * 2, 16 - 4 - 2, 16 - 4 + 2]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2, 8, 10, 14]", results[0]);
 }
 
-test "jq:L653 1e-19 _ 1e-20 - 5e-21" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L653 1e-19 + 1e-20 - 5e-21" {
+    const results = runFilter(
+        "1e-19 + 1e-20 - 5e-21",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1.05e-19", results[0]);
 }
 
-test "jq:L657 1 _ 1e-17" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L657 1 / 1e-17" {
+    const results = runFilter(
+        "1 / 1e-17",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1e+17", results[0]);
 }
 
-test "jq:L661 9E999999999_ 9999999999E999999990_ 1E-999999999_ 0.000000..." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L661 9E999999999, 9999999999E999999990, 1E-999999999, 0.000000..." {
+    const results = runFilter(
+        "9E999999999, 9999999999E999999990, 1E-999999999, 0.000000001E-999999990",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("9E+999999999", results[0]);
+    try std.testing.expectEqualStrings("9.999999999E+999999999", results[1]);
+    try std.testing.expectEqualStrings("1E-999999999", results[2]);
+    try std.testing.expectEqualStrings("1E-999999999", results[3]);
 }
 
-test "jq:L668 5E500000000 _ 5E-5000000000_ 10000E500000000 _ 10000E-500..." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L668 5E500000000 > 5E-5000000000, 10000E500000000 > 10000E-500..." {
+    const results = runFilter(
+        "5E500000000 > 5E-5000000000, 10000E500000000 > 10000E-5000000000",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+    try std.testing.expectEqualStrings("true", results[1]);
 }
 
-test "jq:L674 _1e999999999_ 10e999999999_ _ _1e-1147483646_ 0.1e-114748..." {
-    return error.SkipZigTest;
+test "jq:L674 (1e999999999, 10e999999999) > (1e-1147483646, 0.1e-114748..." {
+    const results = runFilter(
+        "(1e999999999, 10e999999999) > (1e-1147483646, 0.1e-1147483646)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+    try std.testing.expectEqualStrings("true", results[1]);
+    try std.testing.expectEqualStrings("true", results[2]);
+    try std.testing.expectEqualStrings("true", results[3]);
 }
 
-test "jq:L681 25 _ 7" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L681 25 % 7" {
+    const results = runFilter(
+        "25 % 7",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("4", results[0]);
 }
 
-test "jq:L685 49732 _ 472" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L685 49732 % 472" {
+    const results = runFilter(
+        "49732 % 472",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("172", results[0]);
 }
 
-test "jq:L689 __infinite_ -infinite_ _ _1_ -1_ infinite__" {
-    return error.SkipZigTest;
+test "jq:L689 [(infinite, -infinite) % (1, -1, infinite)]" {
+    const results = runFilter(
+        "[(infinite, -infinite) % (1, -1, infinite)]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,0,0,0,0,-1]", results[0]);
 }
 
-test "jq:L693 _nan _ 1_ 1 _ nan _ isnan_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L693 [nan % 1, 1 % nan | isnan]" {
+    const results = runFilter(
+        "[nan % 1, 1 % nan | isnan]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,true]", results[0]);
 }
 
-test "jq:L697 1 _ tonumber _ __10_ _ tonumber_" {
-    return error.SkipZigTest;
+test "jq:L697 1 + tonumber + (_10_ | tonumber)" {
+    const results = runFilter(
+        "1 + tonumber + (\"10\" | tonumber)",
+        "4",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("15", results[0]);
 }
 
-test "jq:L701 _123_u0000456_ _ try tonumber catch ." {
-    return error.SkipZigTest;
+test "jq:L701 _123_u0000456_ | try tonumber catch ." {
+    const results = runFilter(
+        "\"123\\u0000456\" | try tonumber catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"123\\\\u0000456\\\") cannot be parsed as a number\"", results[0]);
 }
 
-test "jq:L705 map_toboolean_" {
-    return error.SkipZigTest;
+test "jq:L705 map(toboolean)" {
+    const results = runFilter(
+        "map(toboolean)",
+        "[\"false\",\"true\",false,true]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false,true,false,true]", results[0]);
 }
 
-test "jq:L709 .__ _ try toboolean catch ." {
-    return error.SkipZigTest;
+test "jq:L709 .[] | try toboolean catch ." {
+    const results = runFilter(
+        ".[] | try toboolean catch .",
+        "[null,0,\"tru\",\"truee\",\"fals\",\"falsee\",[],{}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 8), results.len);
+    try std.testing.expectEqualStrings("\"null (null) cannot be parsed as a boolean\"", results[0]);
+    try std.testing.expectEqualStrings("\"number (0) cannot be parsed as a boolean\"", results[1]);
+    try std.testing.expectEqualStrings("\"string (\\\"tru\\\") cannot be parsed as a boolean\"", results[2]);
+    try std.testing.expectEqualStrings("\"string (\\\"truee\\\") cannot be parsed as a boolean\"", results[3]);
+    try std.testing.expectEqualStrings("\"string (\\\"fals\\\") cannot be parsed as a boolean\"", results[4]);
+    try std.testing.expectEqualStrings("\"string (\\\"falsee\\\") cannot be parsed as a boolean\"", results[5]);
+    try std.testing.expectEqualStrings("\"array ([]) cannot be parsed as a boolean\"", results[6]);
+    try std.testing.expectEqualStrings("\"object ({}) cannot be parsed as a boolean\"", results[7]);
 }
 
-test "jq:L720 _true_u0000x__ _false_u0000_ _ try toboolean catch ." {
-    return error.SkipZigTest;
+test "jq:L720 _true_u0000x_, _false_u0000_ | try toboolean catch ." {
+    const results = runFilter(
+        "\"true\\u0000x\", \"false\\u0000\" | try toboolean catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"true\\\\u0000x\\\") cannot be parsed as a boolean\"", results[0]);
+    try std.testing.expectEqualStrings("\"string (\\\"false\\\\u0000\\\") cannot be parsed as a boolean\"", results[1]);
 }
 
-test "jq:L725 ___a__42__.object_10_.num_false_true_null__b___1_4__ _ ._..." {
-    return error.SkipZigTest;
+test "jq:L725 [{_a_:42},.object,10,.num,false,true,null,_b_,[1,4]] | .[..." {
+    const results = runFilter(
+        "[{\"a\":42},.object,10,.num,false,true,null,\"b\",[1,4]] | .[] as $x | [$x == .[]]",
+        "{\"object\": {\"a\":42}, \"num\":10.0}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 9), results.len);
+    try std.testing.expectEqualStrings("[true,  true,  false, false, false, false, false, false, false]", results[0]);
+    try std.testing.expectEqualStrings("[true,  true,  false, false, false, false, false, false, false]", results[1]);
+    try std.testing.expectEqualStrings("[false, false, true,  true,  false, false, false, false, false]", results[2]);
+    try std.testing.expectEqualStrings("[false, false, true,  true,  false, false, false, false, false]", results[3]);
+    try std.testing.expectEqualStrings("[false, false, false, false, true,  false, false, false, false]", results[4]);
+    try std.testing.expectEqualStrings("[false, false, false, false, false, true,  false, false, false]", results[5]);
+    try std.testing.expectEqualStrings("[false, false, false, false, false, false, true,  false, false]", results[6]);
+    try std.testing.expectEqualStrings("[false, false, false, false, false, false, false, true,  false]", results[7]);
+    try std.testing.expectEqualStrings("[false, false, false, false, false, false, false, false, true ]", results[8]);
 }
 
-test "jq:L737 _.__ _ length_" {
-    return error.SkipZigTest;
+test "jq:L737 [.[] | length]" {
+    const results = runFilter(
+        "[.[] | length]",
+        "[[], {}, [1,2], {\"a\":42}, \"asdf\", \"\\u03bc\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, 0, 2, 1, 4, 1]", results[0]);
 }
 
 test "jq:L741 utf8bytelength" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "utf8bytelength",
+        "\"asdf\\u03bc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("6", results[0]);
 }
 
-test "jq:L745 _.__ _ try utf8bytelength catch ._" {
-    return error.SkipZigTest;
+test "jq:L745 [.[] | try utf8bytelength catch .]" {
+    const results = runFilter(
+        "[.[] | try utf8bytelength catch .]",
+        "[[], {}, [1,2], 55, true, false]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"array ([]) only strings have UTF-8 byte length\",\"object ({}) only strings have UTF-8 byte length\",\"array ([1,2]) only strings have UTF-8 byte length\",\"number (55) only strings have UTF-8 byte length\",\"boolean (true) only strings have UTF-8 byte length\",\"boolean (false) only strings have UTF-8 byte length\"]", results[0]);
 }
 
-test "jq:L750 map_keys_" {
-    return error.SkipZigTest;
+test "jq:L750 map(keys)" {
+    const results = runFilter(
+        "map(keys)",
+        "[{}, {\"abcd\":1,\"abc\":2,\"abcde\":3}, {\"x\":1, \"z\": 3, \"y\":2}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[], [\"abc\",\"abcd\",\"abcde\"], [\"x\",\"y\",\"z\"]]", results[0]);
 }
 
-test "jq:L754 _1_2_empty_3_empty_4_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L754 [1,2,empty,3,empty,4]" {
+    const results = runFilter(
+        "[1,2,empty,3,empty,4]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3,4]", results[0]);
 }
 
-test "jq:L758 map_add_" {
-    return error.SkipZigTest;
+test "jq:L758 map(add)" {
+    const results = runFilter(
+        "map(add)",
+        "[[], [1,2,3], [\"a\",\"b\",\"c\"], [[3],[4,5],[6]], [{\"a\":1}, {\"b\":2}, {\"a\":3}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null, 6, \"abc\", [3,4,5,6], {\"a\":3, \"b\": 2}]", results[0]);
 }
 
-test "jq:L762 map_values_._1_" {
-    return error.SkipZigTest;
+test "jq:L762 map_values(.+1)" {
+    const results = runFilter(
+        "map_values(.+1)",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
 }
 
-test "jq:L766 _add_null__ add_range_range_10____ add_empty__ add_10_ran..." {
-    return error.SkipZigTest;
+test "jq:L766 [add(null), add(range(range(10))), add(empty), add(10,ran..." {
+    const results = runFilter(
+        "[add(null), add(range(range(10))), add(empty), add(10,range(10))]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,120,null,55]", results[0]);
 }
 
-test "jq:L771 .sum _ add_.arr___" {
-    return error.SkipZigTest;
+test "jq:L771 .sum = add(.arr[])" {
+    const results = runFilter(
+        ".sum = add(.arr[])",
+        "{\"arr\":[]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"arr\":[],\"sum\":null}", results[0]);
 }
 
-test "jq:L775 add___.____1__ _ keys" {
-    return error.SkipZigTest;
+test "jq:L775 add({(.[]):1}) | keys" {
+    const results = runFilter(
+        "add({(.[]):1}) | keys",
+        "[\"a\",\"a\",\"b\",\"a\",\"d\",\"b\",\"d\",\"a\",\"d\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\",\"b\",\"d\"]", results[0]);
 }
 
-test "jq:L784 def f_ . _ 1_ def g_ def g_ . _ 100_ f _ g _ f_ _f _ g__ g" {
-    return error.SkipZigTest;
+test "jq:L784 def f: . + 1; def g: def g: . + 100; f | g | f; (f | g), g" {
+    const results = runFilter(
+        "def f: . + 1; def g: def g: . + 100; f | g | f; (f | g), g",
+        "3.0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("106.0", results[0]);
+    try std.testing.expectEqualStrings("105.0", results[1]);
 }
 
-test "jq:L789 def f_ _1000_2000__ f" {
-    return error.SkipZigTest;
+test "jq:L789 def f: (1000,2000); f" {
+    const results = runFilter(
+        "def f: (1000,2000); f",
+        "123412345",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("1000", results[0]);
+    try std.testing.expectEqualStrings("2000", results[1]);
 }
 
-test "jq:L794 def f_a_b_c_d_e_f__ _a_1_b_c_d_e_f__ f_._0__._1__._0__._0..." {
-    return error.SkipZigTest;
+test "jq:L794 def f(a;b;c;d;e;f): [a+1,b,c,d,e,f]; f(.[0];.[1];.[0];.[0..." {
+    const results = runFilter(
+        "def f(a;b;c;d;e;f): [a+1,b,c,d,e,f]; f(.[0];.[1];.[0];.[0];.[0];.[0])",
+        "[1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2,2,1,1,1,1]", results[0]);
 }
 
-test "jq:L798 def f_ 1_ def g_ f_ def f_ 2_ def g_ 3_ f_ def f_ g_ f_ g..." {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L798 def f: 1; def g: f, def f: 2; def g: 3; f, def f: g; f, g..." {
+    const results = runFilter(
+        "def f: 1; def g: f, def f: 2; def g: 3; f, def f: g; f, g; def f: 4; [f, def f: g; def g: 5; f, g]+[f,g]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4,1,2,3,3,5,4,1,2,3,3]", results[0]);
 }
 
-test "jq:L803 def a_ 0_ . _ a" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L803 def a: 0; . | a" {
+    const results = runFilter(
+        "def a: 0; . | a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("0", results[0]);
 }
 
-test "jq:L808 def f_a_b_c_d_e_f_g_h_i_j__ _j_i_h_g_f_e_d_c_b_a__ f_._0_..." {
-    return error.SkipZigTest;
+test "jq:L808 def f(a;b;c;d;e;f;g;h;i;j): [j,i,h,g,f,e,d,c,b,a]; f(.[0]..." {
+    const results = runFilter(
+        "def f(a;b;c;d;e;f;g;h;i;j): [j,i,h,g,f,e,d,c,b,a]; f(.[0];.[1];.[2];.[3];.[4];.[5];.[6];.[7];.[8];.[9])",
+        "[0,1,2,3,4,5,6,7,8,9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[9,8,7,6,5,4,3,2,1,0]", results[0]);
 }
 
-test "jq:L812 __1_2_ _ _4_5__" {
-    return error.SkipZigTest;
+test "jq:L812 ([1,2] + [4,5])" {
+    const results = runFilter(
+        "([1,2] + [4,5])",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,4,5]", results[0]);
 }
 
 test "jq:L816 true" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L820 null_1_null" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L826 _1_2_3_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L830 _.___floor_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L834 _.___sqrt_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L838 _add _ length_ as _m _ map__. - _m_ as _d _ _d _ _d_ _ ad..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L847 atan _ 4 _ 1000000_floor _ 1000000" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L851 __3.141592 _ 2_ _ _range_0_20_ _ 20__cos _ 1000000_floor ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L855 __3.141592 _ 2_ _ _range_0_20_ _ 20__sin _ 1000000_floor ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L860 def f_x__ x _ x_ f__.__ . _ _42__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L868 def f_ ._1_ def g_ f_ def f_ ._100_ def f_a__a_._11_ __g_..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L873 def id_x__x_ 2000 as _x _ def f_x__1 as _x _ id___x_ x_ x..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L878 def x_a_b__ a as _a _ b as _b _ _a _ _b_ def y__a__b__ _a..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L884 __20_10__1_0_ as _x _ def f_ _100_200_ as _y _ def g_ __x..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L889 def fac_ if . __ 1 then 1 else . _ _. - 1 _ fac_ end_ _._..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L899 reduce .__ as _x _0_ . _ _x_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L903 reduce .__ as __i_ _j__j__ _0_ . _ _i - _j_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L907 reduce __1_2_10__ _3_4_10____ as __i__j_ _0_ . _ _i _ _j_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L911 _-reduce -.__ as _x _0_ . _ _x__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L915 _reduce .__ _ .__ as _i _0_ . _ _i__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L919 reduce .__ as _x _0_ . _ _x_ as _x _ _x" {
-    return error.SkipZigTest;
-}
-
-test "jq:L924 reduce . as _n _._ ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L929 . as __a_ b_ __c_ __d___ _ __a_ _c_ _d_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L933 . as __a_ _b___c_ _d___ __a_ _b_ _c_ _d_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L938 .__ _ . as __a_ b_ __c_ __d___ ___ __a_ __b__ _e_ ___ _f ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L945 .__ _ . as _a__a_ ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L949 .__ as _a__a_ ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L953 __3___4___5__6___ _ . as _a__a_ ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L957 __3___4___5__6_ _ .__ as _a__a_ ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L961 .__ _ . as _a__a_ ___ _a__a_ ___ _a _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L968 .__ as _a__a_ ___ _a__a_ ___ _a _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L975 __3___4___5__6___ _ . as _a__a_ ___ _a__a_ ___ _a _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L982 __3___4___5__6_ _ .__ as _a__a_ ___ _a__a_ ___ _a _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L989 .__ _ . as _a__a_ ___ _a ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L996 .__ as _a__a_ ___ _a ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1003 __3___4___5__6___ _ . as _a__a_ ___ _a ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1010 __3___4___5__6_ _ .__ as _a__a_ ___ _a ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1017 .__ _ . as _a ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1024 .__ as _a ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1031 __3___4___5__6___ _ . as _a ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1038 __3___4___5__6_ _ .__ as _a ___ _a__a_ ___ _a__a_ _ _a" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1045 . as _dot_any__dot___not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1049 . as _dot_any__dot___not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1053 . as _dot_all__dot___._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1057 . as _dot_all__dot___._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1062 any_true_ error_ ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1066 all_false_ error_ ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1070 any_not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1074 all_not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1078 any_not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1082 all_not_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1086 _any_all_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1090 _any_all_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1094 _any_all_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1098 _any_all_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1102 _any_all_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1110 path_.foo_0_1__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1115 path_.__ _ select_._3__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1119 path_._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1123 try path_.a _ map_select_.b __ 0___ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1127 try path_.a _ map_select_.b __ 0__ _ ._0__ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1131 try path_.a _ map_select_.b __ 0__ _ .c_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1135 try path_.a _ map_select_.b __ 0__ _ .___ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1139 path_.a_path_.b__0___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1143 _paths_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1147 __foo__1_ as _p _ getpath__p__ setpath__p_ 20__ delpaths_..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1153 map_getpath__2____ map_setpath__2__ 42___ map_delpaths___..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1159 map_delpaths___0__foo_____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1163 __foo__1_ as _p _ getpath__p__ setpath__p_ 20__ delpaths_..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1169 delpaths___-200___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1173 try delpaths_0_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1177 del_.__ del_empty__ del__.foo_.bar_.baz_ _ ._2_3_0___ del..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1184 del_._1__ ._-6__ ._2__ ._-3_9__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1188 del_._nan__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1192 del_._nan_nan__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1197 setpath__-1__ 1_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1201 pick_.a.b.c_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1205 pick_first_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1209 pick_first_first_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1214 try pick_last_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1221 .message _ _goodbye_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1225 .foo _ .bar" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1229 .foo __ ._1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1233 .__ __ 2_ .__ __ 2_ .__ -_ 2_ .__ __ 2_ .__ __2" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1241 _.__ _ 7_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1245 .foo __ .foo" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1249 ._0_.a __ __old__._ _new___._1__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1253 def inc_x__ x __ ._1_ inc_.__.a_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1258 .__ _ try _getpath___a__0__b___ __ 5_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1270 _.__ _ select_. __ 2__ __ empty" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1274 .__ __ select_. _ 2 __ 0_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1278 .foo_1_4_2_3_ __ empty" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1282 ._2__3_ _ 1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1286 .foo_2_.bar _ 1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1290 try __map_select_.a __ 1____.b_ _ 10_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1294 try __map_select_.a __ 1____.a_ __ ._1_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1298 def x_ ._1_2__ x_10" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1302 try _def x_ reverse_ x_10_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1306 .__ _ 1" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1314 _.__ _ if .foo then _yep_ else _nope_ end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1318 _.__ _ if .baz then _strange_ elif .foo then _yep_ else _..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1322 _if 1_null_2 then 3 else 4 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1326 _if empty then 3 else 4 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1330 _if 1 then 3_4 else 5 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1334 _if null then 3 else 5_6 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1338 _if true then 3 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1342 _if false then 3 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1346 _if false then 3 else . end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1350 _if false then 3 elif false then 4 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1354 _if false then 3 elif false then 4 else . end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1358 _-if true then 1 else 2 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1362 _x_ if true then 1 else 2 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1366 if true then _._ else . end __" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1370 _.__ _ _.foo__ __ .bar__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1374 .__ ___ ._0_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1378 .__ _ _._0_ and ._1__ ._0_ or ._1__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1385 _.__ _ not_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1390 _10 _ 0_ 10 _ 10_ 10 _ 20_ 10 _ 0_ 10 _ 10_ 10 _ 20_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1394 _10 __ 0_ 10 __ 10_ 10 __ 20_ 10 __ 0_ 10 __ 10_ 10 __ 20_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1399 _ 10 __ 10_ 10 __ 10_ 10 __ 11_ 10 __ 11_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1403 __hello_ __ _hello__ _hello_ __ _hello__ _hello_ __ _worl..." {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1407 __1_2_3_ __ _1_2_3__ _1_2_3_ __ _1_2_3__ _1_2_3_ __ _4_5_..." {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1411 ___foo__42_ __ __foo__42____foo__42_ __ __foo__42__ __foo..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1416 ___foo___1_2___bar__18___world___ __ __foo___1_2___bar__1..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1421 ___foo_ _ contains__foo____ __foobar_ _ contains__foo____..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1426 _contains_____ contains___u0000___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1430 _contains_____ contains__a___ contains__ab___ contains__c..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1434 _contains__cd___ contains__b_u0000___ contains__ab_u0000___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1438 _contains__b_u0000c___ contains__b_u0000cd___ contains__b..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1442 _contains______ contains___u0000____ contains___u0000what___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1448 _.___try if . __ 0 then error__foo__ elif . __ 1 then .a ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1452 _.____.a_ .a___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1456 __.____.a_.a____" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1460 _if error then 1 else 2 end__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1464 try error_0_ __ 1" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1468 1_ try error_2__ 3" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1473 1 _ try 2 catch 3 _ 4" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1477 _-try ._" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1481 try -._ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1485 _x_ try 1_ y_ try error catch 2_ z_ if true then 3 end_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1489 _x_ 1 _ 2_ y_ false or true_ z_ null __ 3_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1493 .__ _ try error catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1499 try error_______loc_____ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1504 _.___startswith__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1508 _.___endswith__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1512 _.__ _ split___ ___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1516 split____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1520 _.___ltrimstr__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1524 _.___rtrimstr__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1528 _.___trimstr__foo___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1532 _.___ltrimstr_____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1536 _.___rtrimstr_____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1540 _.___trimstr_____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1544 __index______ rindex_______ indices______" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1548 _ index__aba___ rindex__aba___ indices__aba__ _" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1554 map_trim__ map_ltrim__ map_rtrim_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1560 trim_ ltrim_ rtrim" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1566 try trim catch ._ try ltrim catch ._ try rtrim catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1572 indices_1_" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1576 indices__1_2__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1580 indices__1_2__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1584 indices___ __" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1588 index_____" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1592 .__rindex__x___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1596 indices__o__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1600 indices__o__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1604 _.___split______" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1608 _.___split___ ___" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1612 _.__ _ 3_" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1616 _.__ _ _abc__" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1620 _. _ _nan_-nan__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1624 . _ 100000 _ _.__10__._-10___" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1628 . _ 1000000000" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1632 try _. _ 1000000000_ catch ." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1636 _.__ _ ____" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1640 _.__ _ __ __" {
-    return error.SkipZigTest; // TODO: implement
-}
-
-test "jq:L1644 map_._1_ as _needle _ ._0_ _ contains__needle__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1648 map_._1_ as _needle _ ._0_ _ contains__needle__" {
-    return error.SkipZigTest;
-}
-
-test "jq:L1652 ___foo_ 12_ bar_13_ _ contains__foo_ 12____ __foo_ 12_ _ ..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1656 _foo_ _baz_ 12_ blap_ _bar_ 13___ bar_ 14_ _ contains__ba..." {
-    return error.SkipZigTest;
-}
-
-test "jq:L1660 _foo_ _baz_ 12_ blap_ _bar_ 13___ bar_ 14_ _ contains__ba..." {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "true",
+        "[1]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L820 null,1,null" {
+    const results = runFilter(
+        "null,1,null",
+        "\"hello\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
+    try std.testing.expectEqualStrings("1", results[1]);
+    try std.testing.expectEqualStrings("null", results[2]);
+}
+
+test "jq:L826 [1,2,3]" {
+    const results = runFilter(
+        "[1,2,3]",
+        "[5,6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+}
+
+test "jq:L830 [.[]|floor]" {
+    const results = runFilter(
+        "[.[]|floor]",
+        "[-1.1,1.1,1.9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[-2, 1, 1]", results[0]);
+}
+
+test "jq:L834 [.[]|sqrt]" {
+    const results = runFilter(
+        "[.[]|sqrt]",
+        "[4,9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2,3]", results[0]);
+}
+
+test "jq:L838 (add / length) as $m | map((. - $m) as $d | $d * $d) | ad..." {
+    const results = runFilter(
+        "(add / length) as $m | map((. - $m) as $d | $d * $d) | add / length | sqrt",
+        "[2,4,4,4,5,5,7,9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
+}
+
+test "jq:L847 atan * 4 * 1000000|floor / 1000000" {
+    const results = runFilter(
+        "atan * 4 * 1000000|floor / 1000000",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("3.141592", results[0]);
+}
+
+test "jq:L851 [(3.141592 / 2) * (range(0;20) / 20)|cos * 1000000|floor ..." {
+    const results = runFilter(
+        "[(3.141592 / 2) * (range(0;20) / 20)|cos * 1000000|floor / 1000000]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,0.996917,0.987688,0.972369,0.951056,0.923879,0.891006,0.85264,0.809017,0.760406,0.707106,0.649448,0.587785,0.522498,0.45399,0.382683,0.309017,0.233445,0.156434,0.078459]", results[0]);
+}
+
+test "jq:L855 [(3.141592 / 2) * (range(0;20) / 20)|sin * 1000000|floor ..." {
+    const results = runFilter(
+        "[(3.141592 / 2) * (range(0;20) / 20)|sin * 1000000|floor / 1000000]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,0.078459,0.156434,0.233445,0.309016,0.382683,0.45399,0.522498,0.587785,0.649447,0.707106,0.760405,0.809016,0.85264,0.891006,0.923879,0.951056,0.972369,0.987688,0.996917]", results[0]);
+}
+
+test "jq:L860 def f(x): x | x; f([.], . + [42])" {
+    const results = runFilter(
+        "def f(x): x | x; f([.], . + [42])",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[[[1,2,3]]]", results[0]);
+    try std.testing.expectEqualStrings("[[1,2,3],42]", results[1]);
+    try std.testing.expectEqualStrings("[[1,2,3,42]]", results[2]);
+    try std.testing.expectEqualStrings("[1,2,3,42,42]", results[3]);
+}
+
+test "jq:L868 def f: .+1; def g: f; def f: .+100; def f(a):a+.+11; [(g|..." {
+    const results = runFilter(
+        "def f: .+1; def g: f; def f: .+100; def f(a):a+.+11; [(g|f(20)), f]",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[33,101]", results[0]);
+}
+
+test "jq:L873 def id(x):x; 2000 as $x | def f(x):1 as $x | id([$x, x, x..." {
+    const results = runFilter(
+        "def id(x):x; 2000 as $x | def f(x):1 as $x | id([$x, x, x]); def g(x): 100 as $x | f($x,$x+x); g($x)",
+        "\"more testing\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,100,2100.0,100,2100.0]", results[0]);
+}
+
+test "jq:L878 def x(a;b): a as $a | b as $b | $a + $b; def y($a;$b): $a..." {
+    const results = runFilter(
+        "def x(a;b): a as $a | b as $b | $a + $b; def y($a;$b): $a + $b; def check(a;b): [x(a;b)] == [y(a;b)]; check(.[];.[]*2)",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L884 [[20,10][1,0] as $x | def f: (100,200) as $y | def g: [$x..." {
+    const results = runFilter(
+        "[[20,10][1,0] as $x | def f: (100,200) as $y | def g: [$x + $y, .]; . + $x | g; f[0] | [f][0][1] | f]",
+        "999999999",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[110.0, 130.0], [210.0, 130.0], [110.0, 230.0], [210.0, 230.0], [120.0, 160.0], [220.0, 160.0], [120.0, 260.0], [220.0, 260.0]]", results[0]);
+}
+
+test "jq:L889 def fac: if . == 1 then 1 else . * (. - 1 | fac) end; [.[..." {
+    const results = runFilter(
+        "def fac: if . == 1 then 1 else . * (. - 1 | fac) end; [.[] | fac]",
+        "[1,2,3,4]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,6,24]", results[0]);
+}
+
+test "jq:L899 reduce .[] as $x (0; . + $x)" {
+    const results = runFilter(
+        "reduce .[] as $x (0; . + $x)",
+        "[1,2,4]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("7", results[0]);
+}
+
+test "jq:L903 reduce .[] as [$i, {j:$j}] (0; . + $i - $j)" {
+    const results = runFilter(
+        "reduce .[] as [$i, {j:$j}] (0; . + $i - $j)",
+        "[[2,{\"j\":1}], [5,{\"j\":3}], [6,{\"j\":4}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("5", results[0]);
+}
+
+test "jq:L907 reduce [[1,2,10], [3,4,10]][] as [$i,$j] (0; . + $i * $j)" {
+    const results = runFilter(
+        "reduce [[1,2,10], [3,4,10]][] as [$i,$j] (0; . + $i * $j)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("14", results[0]);
+}
+
+test "jq:L911 [-reduce -.[] as $x (0; . + $x)]" {
+    const results = runFilter(
+        "[-reduce -.[] as $x (0; . + $x)]",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[6]", results[0]);
+}
+
+test "jq:L915 [reduce .[] / .[] as $i (0; . + $i)]" {
+    const results = runFilter(
+        "[reduce .[] / .[] as $i (0; . + $i)]",
+        "[1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4.5]", results[0]);
+}
+
+test "jq:L919 reduce .[] as $x (0; . + $x) as $x | $x" {
+    const results = runFilter(
+        "reduce .[] as $x (0; . + $x) as $x | $x",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("6", results[0]);
+}
+
+test "jq:L924 reduce . as $n (.; .)" {
+    const results = runFilter(
+        "reduce . as $n (.; .)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
+}
+
+test "jq:L929 . as {$a, b: [$c, {$d}]} | [$a, $c, $d]" {
+    const results = runFilter(
+        ". as {$a, b: [$c, {$d}]} | [$a, $c, $d]",
+        "{\"a\":1, \"b\":[2,{\"d\":3}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+}
+
+test "jq:L933 . as {$a, $b:[$c, $d]}| [$a, $b, $c, $d]" {
+    const results = runFilter(
+        ". as {$a, $b:[$c, $d]}| [$a, $b, $c, $d]",
+        "{\"a\":1, \"b\":[2,{\"d\":3}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,[2,{\"d\":3}],2,{\"d\":3}]", results[0]);
+}
+
+test "jq:L938 .[] | . as {$a, b: [$c, {$d}]} ?// [$a, {$b}, $e] ?// $f ..." {
+    const results = runFilter(
+        ".[] | . as {$a, b: [$c, {$d}]} ?// [$a, {$b}, $e] ?// $f | [$a, $b, $c, $d, $e, $f]",
+        "[{\"a\":1, \"b\":[2,{\"d\":3}]}, [4, {\"b\":5, \"c\":6}, 7, 8, 9], \"foo\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[1, null, 2, 3, null, null]", results[0]);
+    try std.testing.expectEqualStrings("[4, 5, null, null, 7, null]", results[1]);
+    try std.testing.expectEqualStrings("[null, null, null, null, null, \"foo\"]", results[2]);
+}
+
+test "jq:L945 .[] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:L949 .[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:L953 [[3],[4],[5],6][] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6][] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:L957 [[3],[4],[5],6] | .[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6] | .[] as {a:$a} ?// {a:$a} ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:L961 .[] | . as {a:$a} ?// {a:$a} ?// $a | $a" {
+    const results = runFilter(
+        ".[] | . as {a:$a} ?// {a:$a} ?// $a | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L968 .[] as {a:$a} ?// {a:$a} ?// $a | $a" {
+    const results = runFilter(
+        ".[] as {a:$a} ?// {a:$a} ?// $a | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L975 [[3],[4],[5],6][] | . as {a:$a} ?// {a:$a} ?// $a | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6][] | . as {a:$a} ?// {a:$a} ?// $a | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L982 [[3],[4],[5],6] | .[] as {a:$a} ?// {a:$a} ?// $a | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6] | .[] as {a:$a} ?// {a:$a} ?// $a | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L989 .[] | . as {a:$a} ?// $a ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] | . as {a:$a} ?// $a ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L996 .[] as {a:$a} ?// $a ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] as {a:$a} ?// $a ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1003 [[3],[4],[5],6][] | . as {a:$a} ?// $a ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6][] | . as {a:$a} ?// $a ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1010 [[3],[4],[5],6] | .[] as {a:$a} ?// $a ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6] | .[] as {a:$a} ?// $a ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1017 .[] | . as $a ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] | . as $a ?// {a:$a} ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1024 .[] as $a ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        ".[] as $a ?// {a:$a} ?// {a:$a} | $a",
+        "[[3],[4],[5],6]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1031 [[3],[4],[5],6][] | . as $a ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6][] | . as $a ?// {a:$a} ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1038 [[3],[4],[5],6] | .[] as $a ?// {a:$a} ?// {a:$a} | $a" {
+    const results = runFilter(
+        "[[3],[4],[5],6] | .[] as $a ?// {a:$a} ?// {a:$a} | $a",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+    try std.testing.expectEqualStrings("[4]", results[1]);
+    try std.testing.expectEqualStrings("[5]", results[2]);
+    try std.testing.expectEqualStrings("6", results[3]);
+}
+
+test "jq:L1045 . as $dot|any($dot[];not)" {
+    const results = runFilter(
+        ". as $dot|any($dot[];not)",
+        "[1,2,3,4,true,false,1,2,3,4,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1049 . as $dot|any($dot[];not)" {
+    const results = runFilter(
+        ". as $dot|any($dot[];not)",
+        "[1,2,3,4,true]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+}
+
+test "jq:L1053 . as $dot|all($dot[];.)" {
+    const results = runFilter(
+        ". as $dot|all($dot[];.)",
+        "[1,2,3,4,true,false,1,2,3,4,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+}
+
+test "jq:L1057 . as $dot|all($dot[];.)" {
+    const results = runFilter(
+        ". as $dot|all($dot[];.)",
+        "[1,2,3,4,true]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1062 any(true, error; .)" {
+    const results = runFilter(
+        "any(true, error; .)",
+        "\"badness\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1066 all(false, error; .)" {
+    const results = runFilter(
+        "all(false, error; .)",
+        "\"badness\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+}
+
+test "jq:L1070 any(not)" {
+    const results = runFilter(
+        "any(not)",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+}
+
+test "jq:L1074 all(not)" {
+    const results = runFilter(
+        "all(not)",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1078 any(not)" {
+    const results = runFilter(
+        "any(not)",
+        "[false]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1082 all(not)" {
+    const results = runFilter(
+        "all(not)",
+        "[false]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1086 [any,all]" {
+    const results = runFilter(
+        "[any,all]",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false,true]", results[0]);
+}
+
+test "jq:L1090 [any,all]" {
+    const results = runFilter(
+        "[any,all]",
+        "[true]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,true]", results[0]);
+}
+
+test "jq:L1094 [any,all]" {
+    const results = runFilter(
+        "[any,all]",
+        "[false]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false,false]", results[0]);
+}
+
+test "jq:L1098 [any,all]" {
+    const results = runFilter(
+        "[any,all]",
+        "[true,false]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false]", results[0]);
+}
+
+test "jq:L1102 [any,all]" {
+    const results = runFilter(
+        "[any,all]",
+        "[null,null,true]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false]", results[0]);
+}
+
+test "jq:L1110 path(.foo[0,1])" {
+    const results = runFilter(
+        "path(.foo[0,1])",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("[\"foo\", 0]", results[0]);
+    try std.testing.expectEqualStrings("[\"foo\", 1]", results[1]);
+}
+
+test "jq:L1115 path(.[] | select(.>3))" {
+    const results = runFilter(
+        "path(.[] | select(.>3))",
+        "[1,5,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1]", results[0]);
+}
+
+test "jq:L1119 path(.)" {
+    const results = runFilter(
+        "path(.)",
+        "42",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L1123 try path(.a | map(select(.b == 0))) catch ." {
+    const results = runFilter(
+        "try path(.a | map(select(.b == 0))) catch .",
+        "{\"a\":[{\"b\":0}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression with result [{\\\"b\\\":0}]\"", results[0]);
+}
+
+test "jq:L1127 try path(.a | map(select(.b == 0)) | .[0]) catch ." {
+    const results = runFilter(
+        "try path(.a | map(select(.b == 0)) | .[0]) catch .",
+        "{\"a\":[{\"b\":0}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression near attempt to access element 0 of [{\\\"b\\\":0}]\"", results[0]);
+}
+
+test "jq:L1131 try path(.a | map(select(.b == 0)) | .c) catch ." {
+    const results = runFilter(
+        "try path(.a | map(select(.b == 0)) | .c) catch .",
+        "{\"a\":[{\"b\":0}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression near attempt to access element \\\"c\\\" of [{\\\"b\\\":0}]\"", results[0]);
+}
+
+test "jq:L1135 try path(.a | map(select(.b == 0)) | .[]) catch ." {
+    const results = runFilter(
+        "try path(.a | map(select(.b == 0)) | .[]) catch .",
+        "{\"a\":[{\"b\":0}]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression near attempt to iterate through [{\\\"b\\\":0}]\"", results[0]);
+}
+
+test "jq:L1139 path(.a[path(.b)[0]])" {
+    const results = runFilter(
+        "path(.a[path(.b)[0]])",
+        "{\"a\":{\"b\":0}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\",\"b\"]", results[0]);
+}
+
+test "jq:L1143 [paths]" {
+    const results = runFilter(
+        "[paths]",
+        "[1,[[],{\"a\":2}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[0],[1],[1,0],[1,1],[1,1,\"a\"]]", results[0]);
+}
+
+test "jq:L1147 [_foo_,1] as $p | getpath($p), setpath($p; 20), delpaths(..." {
+    const results = runFilter(
+        "[\"foo\",1] as $p | getpath($p), setpath($p; 20), delpaths([$p])",
+        "{\"bar\": 42, \"foo\": [\"a\", \"b\", \"c\", \"d\"]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("\"b\"", results[0]);
+    try std.testing.expectEqualStrings("{\"bar\": 42, \"foo\": [\"a\", 20, \"c\", \"d\"]}", results[1]);
+    try std.testing.expectEqualStrings("{\"bar\": 42, \"foo\": [\"a\", \"c\", \"d\"]}", results[2]);
+}
+
+test "jq:L1153 map(getpath([2])), map(setpath([2]; 42)), map(delpaths([[..." {
+    const results = runFilter(
+        "map(getpath([2])), map(setpath([2]; 42)), map(delpaths([[2]]))",
+        "[[0], [0,1], [0,1,2]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[null, null, 2]", results[0]);
+    try std.testing.expectEqualStrings("[[0,null,42], [0,1,42], [0,1,42]]", results[1]);
+    try std.testing.expectEqualStrings("[[0], [0,1], [0,1]]", results[2]);
+}
+
+test "jq:L1159 map(delpaths([[0,_foo_]]))" {
+    const results = runFilter(
+        "map(delpaths([[0,\"foo\"]]))",
+        "[[{\"foo\":2, \"x\":1}], [{\"bar\":2}]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[{\"x\":1}], [{\"bar\":2}]]", results[0]);
+}
+
+test "jq:L1163 [_foo_,1] as $p | getpath($p), setpath($p; 20), delpaths(..." {
+    const results = runFilter(
+        "[\"foo\",1] as $p | getpath($p), setpath($p; 20), delpaths([$p])",
+        "{\"bar\":false}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
+    try std.testing.expectEqualStrings("{\"bar\":false, \"foo\": [null, 20]}", results[1]);
+    try std.testing.expectEqualStrings("{\"bar\":false}", results[2]);
+}
+
+test "jq:L1169 delpaths([[-200]])" {
+    const results = runFilter(
+        "delpaths([[-200]])",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+}
+
+test "jq:L1173 try delpaths(0) catch ." {
+    const results = runFilter(
+        "try delpaths(0) catch .",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Paths must be specified as an array\"", results[0]);
+}
+
+test "jq:L1177 del(.), del(empty), del((.foo,.bar,.baz) | .[2,3,0]), del..." {
+    const results = runFilter(
+        "del(.), del(empty), del((.foo,.bar,.baz) | .[2,3,0]), del(.foo[0], .bar[0], .foo, .baz.bar[0].x)",
+        "{\"foo\": [0,1,2,3,4], \"bar\": [0,1]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
+    try std.testing.expectEqualStrings("{\"foo\": [0,1,2,3,4], \"bar\": [0,1]}", results[1]);
+    try std.testing.expectEqualStrings("{\"foo\": [1,4], \"bar\": [1]}", results[2]);
+    try std.testing.expectEqualStrings("{\"bar\": [1]}", results[3]);
+}
+
+test "jq:L1184 del(.[1], .[-6], .[2], .[-3:9])" {
+    const results = runFilter(
+        "del(.[1], .[-6], .[2], .[-3:9])",
+        "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, 3, 5, 6, 9]", results[0]);
+}
+
+test "jq:L1188 del(.[nan])" {
+    const results = runFilter(
+        "del(.[nan])",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+}
+
+test "jq:L1192 del(.[nan,nan])" {
+    const results = runFilter(
+        "del(.[nan,nan])",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+}
+
+test "jq:L1197 setpath([-1]; 1)" {
+    const results = runFilter(
+        "setpath([-1]; 1)",
+        "[0]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1]", results[0]);
+}
+
+test "jq:L1201 pick(.a.b.c)" {
+    const results = runFilter(
+        "pick(.a.b.c)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":{\"b\":{\"c\":null}}}", results[0]);
+}
+
+test "jq:L1205 pick(first)" {
+    const results = runFilter(
+        "pick(first)",
+        "[1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1]", results[0]);
+}
+
+test "jq:L1209 pick(first|first)" {
+    const results = runFilter(
+        "pick(first|first)",
+        "[[10,20],30]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[10]]", results[0]);
+}
+
+test "jq:L1214 try pick(last) catch ." {
+    const results = runFilter(
+        "try pick(last) catch .",
+        "[1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Out of bounds negative array index\"", results[0]);
+}
+
+test "jq:L1221 .message = _goodbye_" {
+    const results = runFilter(
+        ".message = \"goodbye\"",
+        "{\"message\": \"hello\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"message\": \"goodbye\"}", results[0]);
+}
+
+test "jq:L1225 .foo = .bar" {
+    const results = runFilter(
+        ".foo = .bar",
+        "{\"bar\":42}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\":42, \"bar\":42}", results[0]);
+}
+
+test "jq:L1229 .foo |= .+1" {
+    const results = runFilter(
+        ".foo |= .+1",
+        "{\"foo\": 42}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\": 43}", results[0]);
+}
+
+test "jq:L1233 .[] += 2, .[] *= 2, .[] -= 2, .[] /= 2, .[] %=2" {
+    const results = runFilter(
+        ".[] += 2, .[] *= 2, .[] -= 2, .[] /= 2, .[] %=2",
+        "[1,3,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("[3,5,7]", results[0]);
+    try std.testing.expectEqualStrings("[2,6,10]", results[1]);
+    try std.testing.expectEqualStrings("[-1,1,3]", results[2]);
+    try std.testing.expectEqualStrings("[0.5, 1.5, 2.5]", results[3]);
+    try std.testing.expectEqualStrings("[1,1,1]", results[4]);
+}
+
+test "jq:L1241 [.[] % 7]" {
+    const results = runFilter(
+        "[.[] % 7]",
+        "[-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,0]", results[0]);
+}
+
+test "jq:L1245 .foo += .foo" {
+    const results = runFilter(
+        ".foo += .foo",
+        "{\"foo\":2}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\":4}", results[0]);
+}
+
+test "jq:L1249 .[0].a |= {_old_:., _new_:(.+1)}" {
+    const results = runFilter(
+        ".[0].a |= {\"old\":., \"new\":(.+1)}",
+        "[{\"a\":1,\"b\":2}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{\"a\":{\"old\":1, \"new\":2},\"b\":2}]", results[0]);
+}
+
+test "jq:L1253 def inc(x): x |= .+1; inc(.[].a)" {
+    const results = runFilter(
+        "def inc(x): x |= .+1; inc(.[].a)",
+        "[{\"a\":1,\"b\":2},{\"a\":2,\"b\":4},{\"a\":7,\"b\":8}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{\"a\":2,\"b\":2},{\"a\":3,\"b\":4},{\"a\":8,\"b\":8}]", results[0]);
+}
+
+test "jq:L1258 .[] | try (getpath([_a_,0,_b_]) |= 5) catch ." {
+    const results = runFilter(
+        ".[] | try (getpath([\"a\",0,\"b\"]) |= 5) catch .",
+        "[null,{\"b\":0},{\"a\":0},{\"a\":null},{\"a\":[0,1]},{\"a\":{\"b\":1}},{\"a\":[{}]},{\"a\":[{\"c\":3}]}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 8), results.len);
+    try std.testing.expectEqualStrings("{\"a\":[{\"b\":5}]}", results[0]);
+    try std.testing.expectEqualStrings("{\"b\":0,\"a\":[{\"b\":5}]}", results[1]);
+    try std.testing.expectEqualStrings("\"Cannot index number with number (0)\"", results[2]);
+    try std.testing.expectEqualStrings("{\"a\":[{\"b\":5}]}", results[3]);
+    try std.testing.expectEqualStrings("\"Cannot index number with string (\\\"b\\\")\"", results[4]);
+    try std.testing.expectEqualStrings("\"Cannot index object with number (0)\"", results[5]);
+    try std.testing.expectEqualStrings("{\"a\":[{\"b\":5}]}", results[6]);
+    try std.testing.expectEqualStrings("{\"a\":[{\"c\":3,\"b\":5}]}", results[7]);
+}
+
+test "jq:L1270 (.[] | select(. >= 2)) |= empty" {
+    const results = runFilter(
+        "(.[] | select(. >= 2)) |= empty",
+        "[1,5,3,0,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,0]", results[0]);
+}
+
+test "jq:L1274 .[] |= select(. % 2 == 0)" {
+    const results = runFilter(
+        ".[] |= select(. % 2 == 0)",
+        "[0,1,2,3,4,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,2,4]", results[0]);
+}
+
+test "jq:L1278 .foo[1,4,2,3] |= empty" {
+    const results = runFilter(
+        ".foo[1,4,2,3] |= empty",
+        "{\"foo\":[0,1,2,3,4,5]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\":[0,5]}", results[0]);
+}
+
+test "jq:L1282 .[2][3] = 1" {
+    const results = runFilter(
+        ".[2][3] = 1",
+        "[4]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[4, null, [null, null, null, 1]]", results[0]);
+}
+
+test "jq:L1286 .foo[2].bar = 1" {
+    const results = runFilter(
+        ".foo[2].bar = 1",
+        "{\"foo\":[11], \"bar\":42}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\":[11,null,{\"bar\":1}], \"bar\":42}", results[0]);
+}
+
+test "jq:L1290 try ((map(select(.a == 1))[].b) = 10) catch ." {
+    const results = runFilter(
+        "try ((map(select(.a == 1))[].b) = 10) catch .",
+        "[{\"a\":0},{\"a\":1}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression near attempt to iterate through [{\\\"a\\\":1}]\"", results[0]);
+}
+
+test "jq:L1294 try ((map(select(.a == 1))[].a) |= .+1) catch ." {
+    const results = runFilter(
+        "try ((map(select(.a == 1))[].a) |= .+1) catch .",
+        "[{\"a\":0},{\"a\":1}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression near attempt to iterate through [{\\\"a\\\":1}]\"", results[0]);
+}
+
+test "jq:L1298 def x: .[1,2]; x=10" {
+    const results = runFilter(
+        "def x: .[1,2]; x=10",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,10,10]", results[0]);
+}
+
+test "jq:L1302 try (def x: reverse; x=10) catch ." {
+    const results = runFilter(
+        "try (def x: reverse; x=10) catch .",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid path expression with result [2,1,0]\"", results[0]);
+}
+
+test "jq:L1306 .[] = 1" {
+    const results = runFilter(
+        ".[] = 1",
+        "[1,null,Infinity,-Infinity,NaN,-NaN]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,1,1,1,1,1]", results[0]);
+}
+
+test "jq:L1314 [.[] | if .foo then _yep_ else _nope_ end]" {
+    const results = runFilter(
+        "[.[] | if .foo then \"yep\" else \"nope\" end]",
+        "[{\"foo\":0},{\"foo\":1},{\"foo\":[]},{\"foo\":true},{\"foo\":false},{\"foo\":null},{\"foo\":\"foo\"},{}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"yep\",\"yep\",\"yep\",\"yep\",\"nope\",\"nope\",\"yep\",\"nope\"]", results[0]);
+}
+
+test "jq:L1318 [.[] | if .baz then _strange_ elif .foo then _yep_ else _..." {
+    const results = runFilter(
+        "[.[] | if .baz then \"strange\" elif .foo then \"yep\" else \"nope\" end]",
+        "[{\"foo\":0},{\"foo\":1},{\"foo\":[]},{\"foo\":true},{\"foo\":false},{\"foo\":null},{\"foo\":\"foo\"},{}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"yep\",\"yep\",\"yep\",\"yep\",\"nope\",\"nope\",\"yep\",\"nope\"]", results[0]);
+}
+
+test "jq:L1322 [if 1,null,2 then 3 else 4 end]" {
+    const results = runFilter(
+        "[if 1,null,2 then 3 else 4 end]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[3,4,3]", results[0]);
+}
+
+test "jq:L1326 [if empty then 3 else 4 end]" {
+    const results = runFilter(
+        "[if empty then 3 else 4 end]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L1330 [if 1 then 3,4 else 5 end]" {
+    const results = runFilter(
+        "[if 1 then 3,4 else 5 end]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[3,4]", results[0]);
+}
+
+test "jq:L1334 [if null then 3 else 5,6 end]" {
+    const results = runFilter(
+        "[if null then 3 else 5,6 end]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[5,6]", results[0]);
+}
+
+test "jq:L1338 [if true then 3 end]" {
+    const results = runFilter(
+        "[if true then 3 end]",
+        "7",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[3]", results[0]);
+}
+
+test "jq:L1342 [if false then 3 end]" {
+    const results = runFilter(
+        "[if false then 3 end]",
+        "7",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[7]", results[0]);
+}
+
+test "jq:L1346 [if false then 3 else . end]" {
+    const results = runFilter(
+        "[if false then 3 else . end]",
+        "7",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[7]", results[0]);
+}
+
+test "jq:L1350 [if false then 3 elif false then 4 end]" {
+    const results = runFilter(
+        "[if false then 3 elif false then 4 end]",
+        "7",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[7]", results[0]);
+}
+
+test "jq:L1354 [if false then 3 elif false then 4 else . end]" {
+    const results = runFilter(
+        "[if false then 3 elif false then 4 else . end]",
+        "7",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[7]", results[0]);
+}
+
+test "jq:L1358 [-if true then 1 else 2 end]" {
+    const results = runFilter(
+        "[-if true then 1 else 2 end]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[-1]", results[0]);
+}
+
+test "jq:L1362 {x: if true then 1 else 2 end}" {
+    const results = runFilter(
+        "{x: if true then 1 else 2 end}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"x\":1}", results[0]);
+}
+
+test "jq:L1366 if true then [.] else . end []" {
+    const results = runFilter(
+        "if true then [.] else . end []",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
+}
+
+test "jq:L1370 [.[] | [.foo[] // .bar]]" {
+    const results = runFilter(
+        "[.[] | [.foo[] // .bar]]",
+        "[{\"foo\":[1,2], \"bar\": 42}, {\"foo\":[1], \"bar\": null}, {\"foo\":[null,false,3], \"bar\": 18}, {\"foo\":[], \"bar\":42}, {\"foo\": [null,false,null], \"bar\": 41}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1,2], [1], [3], [42], [41]]", results[0]);
+}
+
+test "jq:L1374 .[] //= .[0]" {
+    const results = runFilter(
+        ".[] //= .[0]",
+        "[\"hello\",true,false,[false],null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"hello\",true,\"hello\",[false],\"hello\"]", results[0]);
+}
+
+test "jq:L1378 .[] | [.[0] and .[1], .[0] or .[1]]" {
+    const results = runFilter(
+        ".[] | [.[0] and .[1], .[0] or .[1]]",
+        "[[true,[]], [false,1], [42,null], [null,false]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[true,true]", results[0]);
+    try std.testing.expectEqualStrings("[false,true]", results[1]);
+    try std.testing.expectEqualStrings("[false,true]", results[2]);
+    try std.testing.expectEqualStrings("[false,false]", results[3]);
+}
+
+test "jq:L1385 [.[] | not]" {
+    const results = runFilter(
+        "[.[] | not]",
+        "[1,0,false,null,true,\"hello\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false,false,true,true,false,false]", results[0]);
+}
+
+test "jq:L1390 [10 > 0, 10 > 10, 10 > 20, 10 < 0, 10 < 10, 10 < 20]" {
+    const results = runFilter(
+        "[10 > 0, 10 > 10, 10 > 20, 10 < 0, 10 < 10, 10 < 20]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false,false,false,false,true]", results[0]);
+}
+
+test "jq:L1394 [10 >= 0, 10 >= 10, 10 >= 20, 10 <= 0, 10 <= 10, 10 <= 20]" {
+    const results = runFilter(
+        "[10 >= 0, 10 >= 10, 10 >= 20, 10 <= 0, 10 <= 10, 10 <= 20]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,true,false,false,true,true]", results[0]);
+}
+
+test "jq:L1399 [ 10 == 10, 10 != 10, 10 != 11, 10 == 11]" {
+    const results = runFilter(
+        "[ 10 == 10, 10 != 10, 10 != 11, 10 == 11]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false,true,false]", results[0]);
+}
+
+test "jq:L1403 [_hello_ == _hello_, _hello_ != _hello_, _hello_ == _worl..." {
+    const results = runFilter(
+        "[\"hello\" == \"hello\", \"hello\" != \"hello\", \"hello\" == \"world\", \"hello\" != \"world\" ]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false,false,true]", results[0]);
+}
+
+test "jq:L1407 [[1,2,3] == [1,2,3], [1,2,3] != [1,2,3], [1,2,3] == [4,5,..." {
+    const results = runFilter(
+        "[[1,2,3] == [1,2,3], [1,2,3] != [1,2,3], [1,2,3] == [4,5,6], [1,2,3] != [4,5,6]]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false,false,true]", results[0]);
+}
+
+test "jq:L1411 [{_foo_:42} == {_foo_:42},{_foo_:42} != {_foo_:42}, {_foo..." {
+    const results = runFilter(
+        "[{\"foo\":42} == {\"foo\":42},{\"foo\":42} != {\"foo\":42}, {\"foo\":42} != {\"bar\":42}, {\"foo\":42} == {\"bar\":42}]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false,true,false]", results[0]);
+}
+
+test "jq:L1416 [{_foo_:[1,2,{_bar_:18},_world_]} == {_foo_:[1,2,{_bar_:1..." {
+    const results = runFilter(
+        "[{\"foo\":[1,2,{\"bar\":18},\"world\"]} == {\"foo\":[1,2,{\"bar\":18},\"world\"]},{\"foo\":[1,2,{\"bar\":18},\"world\"]} == {\"foo\":[1,2,{\"bar\":19},\"world\"]}]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false]", results[0]);
+}
+
+test "jq:L1421 [(_foo_ | contains(_foo_)), (_foobar_ | contains(_foo_)),..." {
+    const results = runFilter(
+        "[(\"foo\" | contains(\"foo\")), (\"foobar\" | contains(\"foo\")), (\"foo\" | contains(\"foobar\"))]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, false]", results[0]);
+}
+
+test "jq:L1426 [contains(__), contains(__u0000_)]" {
+    const results = runFilter(
+        "[contains(\"\"), contains(\"\\u0000\")]",
+        "\"\\u0000\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true]", results[0]);
+}
+
+test "jq:L1430 [contains(__), contains(_a_), contains(_ab_), contains(_c..." {
+    const results = runFilter(
+        "[contains(\"\"), contains(\"a\"), contains(\"ab\"), contains(\"c\"), contains(\"d\")]",
+        "\"ab\\u0000cd\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, true, true, true]", results[0]);
+}
+
+test "jq:L1434 [contains(_cd_), contains(_b_u0000_), contains(_ab_u0000_)]" {
+    const results = runFilter(
+        "[contains(\"cd\"), contains(\"b\\u0000\"), contains(\"ab\\u0000\")]",
+        "\"ab\\u0000cd\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, true]", results[0]);
+}
+
+test "jq:L1438 [contains(_b_u0000c_), contains(_b_u0000cd_), contains(_b..." {
+    const results = runFilter(
+        "[contains(\"b\\u0000c\"), contains(\"b\\u0000cd\"), contains(\"b\\u0000cd\")]",
+        "\"ab\\u0000cd\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, true]", results[0]);
+}
+
+test "jq:L1442 [contains(_@_), contains(__u0000@_), contains(__u0000what_)]" {
+    const results = runFilter(
+        "[contains(\"@\"), contains(\"\\u0000@\"), contains(\"\\u0000what\")]",
+        "\"ab\\u0000cd\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false, false, false]", results[0]);
+}
+
+test "jq:L1448 [.[]|try if . == 0 then error(_foo_) elif . == 1 then .a ..." {
+    const results = runFilter(
+        "[.[]|try if . == 0 then error(\"foo\") elif . == 1 then .a elif . == 2 then empty else . end catch .]",
+        "[0,1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"foo\",\"Cannot index number with string (\\\"a\\\")\",3]", results[0]);
+}
+
+test "jq:L1452 [.[]|(.a, .a)?]" {
+    const results = runFilter(
+        "[.[]|(.a, .a)?]",
+        "[null,true,{\"a\":1}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,null,1,1]", results[0]);
+}
+
+test "jq:L1456 [[.[]|[.a,.a]]?]" {
+    const results = runFilter(
+        "[[.[]|[.a,.a]]?]",
+        "[null,true,{\"a\":1}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L1460 [if error then 1 else 2 end?]" {
+    const results = runFilter(
+        "[if error then 1 else 2 end?]",
+        "\"foo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L1464 try error(0) // 1" {
+    const results = runFilter(
+        "try error(0) // 1",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+}
+
+test "jq:L1468 1, try error(2), 3" {
+    const results = runFilter(
+        "1, try error(2), 3",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("3", results[1]);
+}
+
+test "jq:L1473 1 + try 2 catch 3 + 4" {
+    const results = runFilter(
+        "1 + try 2 catch 3 + 4",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("7", results[0]);
+}
+
+test "jq:L1477 [-try .]" {
+    const results = runFilter(
+        "[-try .]",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[-1]", results[0]);
+}
+
+test "jq:L1481 try -.? catch ." {
+    const results = runFilter(
+        "try -.? catch .",
+        "\"foo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"foo\\\") cannot be negated\"", results[0]);
+}
+
+test "jq:L1485 {x: try 1, y: try error catch 2, z: if true then 3 end}" {
+    const results = runFilter(
+        "{x: try 1, y: try error catch 2, z: if true then 3 end}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"x\":1,\"y\":2,\"z\":3}", results[0]);
+}
+
+test "jq:L1489 {x: 1 + 2, y: false or true, z: null // 3}" {
+    const results = runFilter(
+        "{x: 1 + 2, y: false or true, z: null // 3}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"x\":3,\"y\":true,\"z\":3}", results[0]);
+}
+
+test "jq:L1493 .[] | try error catch ." {
+    const results = runFilter(
+        ".[] | try error catch .",
+        "[1,null,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("null", results[1]);
+    try std.testing.expectEqualStrings("2", results[2]);
+}
+
+test "jq:L1499 try error(__($__loc__)_) catch ." {
+    const results = runFilter(
+        "try error(\"\\($__loc__)\") catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"{\\\"file\\\":\\\"<top-level>\\\",\\\"line\\\":1}\"", results[0]);
+}
+
+test "jq:L1504 [.[]|startswith(_foo_)]" {
+    const results = runFilter(
+        "[.[]|startswith(\"foo\")]",
+        "[\"fo\", \"foo\", \"barfoo\", \"foobar\", \"barfoob\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false, true, false, true, false]", results[0]);
+}
+
+test "jq:L1508 [.[]|endswith(_foo_)]" {
+    const results = runFilter(
+        "[.[]|endswith(\"foo\")]",
+        "[\"fo\", \"foo\", \"barfoo\", \"foobar\", \"barfoob\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false, true, true, false, false]", results[0]);
+}
+
+test "jq:L1512 [.[] | split(_, _)]" {
+    const results = runFilter(
+        "[.[] | split(\", \")]",
+        "[\"a,b, c, d, e,f\",\", a,b, c, d, e,f, \"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a,b\",\"c\",\"d\",\"e,f\"],[\"\",\"a,b\",\"c\",\"d\",\"e,f\",\"\"]]", results[0]);
+}
+
+test "jq:L1516 split(__)" {
+    const results = runFilter(
+        "split(\"\")",
+        "\"abc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\"]", results[0]);
+}
+
+test "jq:L1520 [.[]|ltrimstr(_foo_)]" {
+    const results = runFilter(
+        "[.[]|ltrimstr(\"foo\")]",
+        "[\"fo\", \"foo\", \"barfoo\", \"foobar\", \"afoo\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"fo\",\"\",\"barfoo\",\"bar\",\"afoo\"]", results[0]);
+}
+
+test "jq:L1524 [.[]|rtrimstr(_foo_)]" {
+    const results = runFilter(
+        "[.[]|rtrimstr(\"foo\")]",
+        "[\"fo\", \"foo\", \"barfoo\", \"foobar\", \"foob\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"fo\",\"\",\"bar\",\"foobar\",\"foob\"]", results[0]);
+}
+
+test "jq:L1528 [.[]|trimstr(_foo_)]" {
+    const results = runFilter(
+        "[.[]|trimstr(\"foo\")]",
+        "[\"fo\", \"foo\", \"barfoo\", \"foobarfoo\", \"foob\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"fo\",\"\",\"bar\",\"bar\",\"b\"]", results[0]);
+}
+
+test "jq:L1532 [.[]|ltrimstr(__)]" {
+    const results = runFilter(
+        "[.[]|ltrimstr(\"\")]",
+        "[\"a\", \"xx\", \"\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\", \"xx\", \"\"]", results[0]);
+}
+
+test "jq:L1536 [.[]|rtrimstr(__)]" {
+    const results = runFilter(
+        "[.[]|rtrimstr(\"\")]",
+        "[\"a\", \"xx\", \"\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\", \"xx\", \"\"]", results[0]);
+}
+
+test "jq:L1540 [.[]|trimstr(__)]" {
+    const results = runFilter(
+        "[.[]|trimstr(\"\")]",
+        "[\"a\", \"xx\", \"\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\", \"xx\", \"\"]", results[0]);
+}
+
+test "jq:L1544 [(index(_,_), rindex(_,_)), indices(_,_)]" {
+    const results = runFilter(
+        "[(index(\",\"), rindex(\",\")), indices(\",\")]",
+        "\"a,bc,def,ghij,klmno\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,13,[1,4,8,13]]", results[0]);
+}
+
+test "jq:L1548 [ index(_aba_), rindex(_aba_), indices(_aba_) ]" {
+    const results = runFilter(
+        "[ index(\"aba\"), rindex(\"aba\"), indices(\"aba\") ]",
+        "\"xababababax\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,7,[1,3,5,7]]", results[0]);
+}
+
+test "jq:L1554 map(trim), map(ltrim), map(rtrim)" {
+    const results = runFilter(
+        "map(trim), map(ltrim), map(rtrim)",
+        "[\" \\n\\t\\r\\f\\u000b\", \"\",\"  \", \"a\", \" a \", \"abc\", \"  abc  \", \"  abc\", \"abc  \"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("[\"\", \"\", \"\", \"a\", \"a\", \"abc\", \"abc\", \"abc\", \"abc\"]", results[0]);
+    try std.testing.expectEqualStrings("[\"\", \"\", \"\", \"a\", \"a \", \"abc\", \"abc  \", \"abc\", \"abc  \"]", results[1]);
+    try std.testing.expectEqualStrings("[\"\", \"\", \"\", \"a\", \" a\", \"abc\", \"  abc\", \"  abc\", \"abc\"]", results[2]);
+}
+
+test "jq:L1560 trim, ltrim, rtrim" {
+    const results = runFilter(
+        "trim, ltrim, rtrim",
+        "\"\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000abc\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("\"abc\"", results[0]);
+    try std.testing.expectEqualStrings("\"abc\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\"", results[1]);
+    try std.testing.expectEqualStrings("\"\\u0009\\u000A\\u000B\\u000C\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000abc\"", results[2]);
+}
+
+test "jq:L1566 try trim catch ., try ltrim catch ., try rtrim catch ." {
+    const results = runFilter(
+        "try trim catch ., try ltrim catch ., try rtrim catch .",
+        "123",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("\"trim input must be a string\"", results[0]);
+    try std.testing.expectEqualStrings("\"trim input must be a string\"", results[1]);
+    try std.testing.expectEqualStrings("\"trim input must be a string\"", results[2]);
+}
+
+test "jq:L1572 indices(1)" {
+    const results = runFilter(
+        "indices(1)",
+        "[0,1,1,2,3,4,1,5]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,6]", results[0]);
+}
+
+test "jq:L1576 indices([1,2])" {
+    const results = runFilter(
+        "indices([1,2])",
+        "[0,1,2,3,1,4,2,5,1,2,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,8]", results[0]);
+}
+
+test "jq:L1580 indices([1,2])" {
+    const results = runFilter(
+        "indices([1,2])",
+        "[1]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:L1584 indices(_, _)" {
+    const results = runFilter(
+        "indices(\", \")",
+        "\"a,b, cd,e, fgh, ijkl\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[3,9,14]", results[0]);
+}
+
+test "jq:L1588 index(_!_)" {
+    const results = runFilter(
+        "index(\"!\")",
+        "\"здравствуй мир!\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("14", results[0]);
+}
+
+test "jq:L1592 .[:rindex(_x_)]" {
+    const results = runFilter(
+        ".[:rindex(\"x\")]",
+        "\"正xyz\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"正\"", results[0]);
+}
+
+test "jq:L1596 indices(_o_)" {
+    const results = runFilter(
+        "indices(\"o\")",
+        "\"🇬🇧oo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2,3]", results[0]);
+}
+
+test "jq:L1600 indices(_o_)" {
+    const results = runFilter(
+        "indices(\"o\")",
+        "\"ƒoo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2]", results[0]);
+}
+
+test "jq:L1604 [.[]|split(_,_)]" {
+    const results = runFilter(
+        "[.[]|split(\",\")]",
+        "[\"a, bc, def, ghij, jklmn, a,b, c,d, e,f\", \"a,b,c,d, e,f,g,h\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\",\" bc\",\" def\",\" ghij\",\" jklmn\",\" a\",\"b\",\" c\",\"d\",\" e\",\"f\"],[\"a\",\"b\",\"c\",\"d\",\" e\",\"f\",\"g\",\"h\"]]", results[0]);
+}
+
+test "jq:L1608 [.[]|split(_, _)]" {
+    const results = runFilter(
+        "[.[]|split(\", \")]",
+        "[\"a, bc, def, ghij, jklmn, a,b, c,d, e,f\", \"a,b,c,d, e,f,g,h\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\",\"bc\",\"def\",\"ghij\",\"jklmn\",\"a,b\",\"c,d\",\"e,f\"],[\"a,b,c,d\",\"e,f,g,h\"]]", results[0]);
+}
+
+test "jq:L1612 [.[] * 3]" {
+    const results = runFilter(
+        "[.[] * 3]",
+        "[\"a\", \"ab\", \"abc\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"aaa\", \"ababab\", \"abcabcabc\"]", results[0]);
+}
+
+test "jq:L1616 [.[] * _abc_]" {
+    const results = runFilter(
+        "[.[] * \"abc\"]",
+        "[-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 3.7, 10.0]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,null,\"\",\"\",\"abc\",\"abc\",\"abcabcabc\",\"abcabcabcabcabcabcabcabcabcabc\"]", results[0]);
+}
+
+test "jq:L1620 [. * (nan,-nan)]" {
+    const results = runFilter(
+        "[. * (nan,-nan)]",
+        "\"abc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,null]", results[0]);
+}
+
+test "jq:L1624 . * 100000 | [.[:10],.[-10:]]" {
+    const results = runFilter(
+        ". * 100000 | [.[:10],.[-10:]]",
+        "\"abc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"abcabcabca\",\"cabcabcabc\"]", results[0]);
+}
+
+test "jq:L1628 . * 1000000000" {
+    const results = runFilter(
+        ". * 1000000000",
+        "\"\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"\"", results[0]);
+}
+
+test "jq:L1632 try (. * 1000000000) catch ." {
+    const results = runFilter(
+        "try (. * 1000000000) catch .",
+        "\"abc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Repeat string result too long\"", results[0]);
+}
+
+test "jq:L1636 [.[] / _,_]" {
+    const results = runFilter(
+        "[.[] / \",\"]",
+        "[\"a, bc, def, ghij, jklmn, a,b, c,d, e,f\", \"a,b,c,d, e,f,g,h\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\",\" bc\",\" def\",\" ghij\",\" jklmn\",\" a\",\"b\",\" c\",\"d\",\" e\",\"f\"],[\"a\",\"b\",\"c\",\"d\",\" e\",\"f\",\"g\",\"h\"]]", results[0]);
+}
+
+test "jq:L1640 [.[] / _, _]" {
+    const results = runFilter(
+        "[.[] / \", \"]",
+        "[\"a, bc, def, ghij, jklmn, a,b, c,d, e,f\", \"a,b,c,d, e,f,g,h\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\",\"bc\",\"def\",\"ghij\",\"jklmn\",\"a,b\",\"c,d\",\"e,f\"],[\"a,b,c,d\",\"e,f,g,h\"]]", results[0]);
+}
+
+test "jq:L1644 map(.[1] as $needle | .[0] | contains($needle))" {
+    const results = runFilter(
+        "map(.[1] as $needle | .[0] | contains($needle))",
+        "[[[],[]], [[1,2,3], [1,2]], [[1,2,3], [3,1]], [[1,2,3], [4]], [[1,2,3], [1,4]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, true, false, false]", results[0]);
+}
+
+test "jq:L1648 map(.[1] as $needle | .[0] | contains($needle))" {
+    const results = runFilter(
+        "map(.[1] as $needle | .[0] | contains($needle))",
+        "[[[\"foobar\", \"foobaz\"], [\"baz\", \"bar\"]], [[\"foobar\", \"foobaz\"], [\"foo\"]], [[\"foobar\", \"foobaz\"], [\"blap\"]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, false]", results[0]);
+}
+
+test "jq:L1652 [({foo: 12, bar:13} | contains({foo: 12})), ({foo: 12} | ..." {
+    const results = runFilter(
+        "[({foo: 12, bar:13} | contains({foo: 12})), ({foo: 12} | contains({})), ({foo: 12, bar:13} | contains({baz:14}))]",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, false]", results[0]);
+}
+
+test "jq:L1656 {foo: {baz: 12, blap: {bar: 13}}, bar: 14} | contains({ba..." {
+    const results = runFilter(
+        "{foo: {baz: 12, blap: {bar: 13}}, bar: 14} | contains({bar: 14, foo: {blap: {}}})",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+}
+
+test "jq:L1660 {foo: {baz: 12, blap: {bar: 13}}, bar: 14} | contains({ba..." {
+    const results = runFilter(
+        "{foo: {baz: 12, blap: {bar: 13}}, bar: 14} | contains({bar: 14, foo: {blap: {bar: 14}}})",
+        "{}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
 test "jq:L1664 sort" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "sort",
+        "[42,[2,5,3,11],10,{\"a\":42,\"b\":2},{\"a\":42},true,2,[2,6],\"hello\",null,[2,5,6],{\"a\":[],\"b\":1},\"abc\",\"ab\",[3,10],{},false,\"abcd\",null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,null,false,true,2,10,42,\"ab\",\"abc\",\"abcd\",\"hello\",[2,5,3,11],[2,5,6],[2,6],[3,10],{},{\"a\":42},{\"a\":42,\"b\":2},{\"a\":[],\"b\":1}]", results[0]);
 }
 
-test "jq:L1668 _sort_by_.b_ _ sort_by_.a___ sort_by_.a_ .b__ sort_by_.b_..." {
-    return error.SkipZigTest;
+test "jq:L1668 (sort_by(.b) | sort_by(.a)), sort_by(.a, .b), sort_by(.b,..." {
+    const results = runFilter(
+        "(sort_by(.b) | sort_by(.a)), sort_by(.a, .b), sort_by(.b, .c), group_by(.b), group_by(.a + .b - .c == 2)",
+        "[{\"a\": 1, \"b\": 4, \"c\": 14}, {\"a\": 4, \"b\": 1, \"c\": 3}, {\"a\": 1, \"b\": 4, \"c\": 3}, {\"a\": 0, \"b\": 2, \"c\": 43}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("[{\"a\": 0, \"b\": 2, \"c\": 43}, {\"a\": 1, \"b\": 4, \"c\": 14}, {\"a\": 1, \"b\": 4, \"c\": 3}, {\"a\": 4, \"b\": 1, \"c\": 3}]", results[0]);
+    try std.testing.expectEqualStrings("[{\"a\": 0, \"b\": 2, \"c\": 43}, {\"a\": 1, \"b\": 4, \"c\": 14}, {\"a\": 1, \"b\": 4, \"c\": 3}, {\"a\": 4, \"b\": 1, \"c\": 3}]", results[1]);
+    try std.testing.expectEqualStrings("[{\"a\": 4, \"b\": 1, \"c\": 3}, {\"a\": 0, \"b\": 2, \"c\": 43}, {\"a\": 1, \"b\": 4, \"c\": 3}, {\"a\": 1, \"b\": 4, \"c\": 14}]", results[2]);
+    try std.testing.expectEqualStrings("[[{\"a\": 4, \"b\": 1, \"c\": 3}], [{\"a\": 0, \"b\": 2, \"c\": 43}], [{\"a\": 1, \"b\": 4, \"c\": 14}, {\"a\": 1, \"b\": 4, \"c\": 3}]]", results[3]);
+    try std.testing.expectEqualStrings("[[{\"a\": 1, \"b\": 4, \"c\": 14}, {\"a\": 0, \"b\": 2, \"c\": 43}], [{\"a\": 4, \"b\": 1, \"c\": 3}, {\"a\": 1, \"b\": 4, \"c\": 3}]]", results[4]);
 }
 
 test "jq:L1676 unique" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "unique",
+        "[1,2,5,3,5,3,1,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3,5]", results[0]);
 }
 
 test "jq:L1680 unique" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "unique",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
 }
 
-test "jq:L1684 _min_ max_ min_by_._1___ max_by_._1___ min_by_._2___ max_..." {
-    return error.SkipZigTest;
+test "jq:L1684 [min, max, min_by(.[1]), max_by(.[1]), min_by(.[2]), max_..." {
+    const results = runFilter(
+        "[min, max, min_by(.[1]), max_by(.[1]), min_by(.[2]), max_by(.[2])]",
+        "[[4,2,\"a\"],[3,1,\"a\"],[2,4,\"a\"],[1,3,\"a\"]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1,3,\"a\"],[4,2,\"a\"],[3,1,\"a\"],[2,4,\"a\"],[4,2,\"a\"],[1,3,\"a\"]]", results[0]);
 }
 
-test "jq:L1688 _min_max_min_by_.__max_by_.__" {
-    return error.SkipZigTest;
+test "jq:L1688 [min,max,min_by(.),max_by(.)]" {
+    const results = runFilter(
+        "[min,max,min_by(.),max_by(.)]",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null,null,null,null]", results[0]);
 }
 
-test "jq:L1692 .foo_.baz_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1692 .foo[.baz]" {
+    const results = runFilter(
+        ".foo[.baz]",
+        "{\"foo\":{\"bar\":4},\"baz\":\"bar\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("4", results[0]);
 }
 
-test "jq:L1696 .__ _ .error _ _no_ it_s OK_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1696 .[] | .error = _no, it's OK_" {
+    const results = runFilter(
+        ".[] | .error = \"no, it's OK\"",
+        "[{\"error\":true}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"error\": \"no, it's OK\"}", results[0]);
 }
 
-test "jq:L1700 __a_1__ _ .__ _ .a_999" {
-    return error.SkipZigTest;
+test "jq:L1700 [{a:1}] | .[] | .a=999" {
+    const results = runFilter(
+        "[{a:1}] | .[] | .a=999",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\": 999}", results[0]);
 }
 
 test "jq:L1704 to_entries" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "to_entries",
+        "{\"a\": 1, \"b\": 2}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{\"key\":\"a\", \"value\":1}, {\"key\":\"b\", \"value\":2}]", results[0]);
 }
 
 test "jq:L1708 from_entries" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "from_entries",
+        "[{\"key\":\"a\", \"value\":1}, {\"Key\":\"b\", \"Value\":2}, {\"name\":\"c\", \"value\":3}, {\"Name\":\"d\", \"Value\":4}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\": 1, \"b\": 2, \"c\": 3, \"d\": 4}", results[0]);
 }
 
-test "jq:L1712 with_entries_.key __ _KEY__ _ ._" {
-    return error.SkipZigTest;
+test "jq:L1712 with_entries(.key |= _KEY__ + .)" {
+    const results = runFilter(
+        "with_entries(.key |= \"KEY_\" + .)",
+        "{\"a\": 1, \"b\": 2}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"KEY_a\": 1, \"KEY_b\": 2}", results[0]);
 }
 
-test "jq:L1716 map_has__foo___" {
-    return error.SkipZigTest;
+test "jq:L1716 map(has(_foo_))" {
+    const results = runFilter(
+        "map(has(\"foo\"))",
+        "[{\"foo\": 42}, {}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, false]", results[0]);
 }
 
-test "jq:L1720 map_has_2__" {
-    return error.SkipZigTest;
+test "jq:L1720 map(has(2))" {
+    const results = runFilter(
+        "map(has(2))",
+        "[[0,1], [\"a\",\"b\",\"c\"]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false, true]", results[0]);
 }
 
-test "jq:L1724 has_nan_" {
-    return error.SkipZigTest;
+test "jq:L1724 has(nan)" {
+    const results = runFilter(
+        "has(nan)",
+        "[0,1,2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
 test "jq:L1728 keys" {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "keys",
+        "[42,3,35]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2]", results[0]);
 }
 
-test "jq:L1732 ___._" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1732 [][.]" {
+    const results = runFilter(
+        "[][.]",
+        "1000000000000000000",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
-test "jq:L1736 map__1_2__0_.__" {
-    return error.SkipZigTest;
+test "jq:L1736 map([1,2][0:.])" {
+    const results = runFilter(
+        "map([1,2][0:.])",
+        "[-1, 1, 2, 3, 1000000000000000000]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1], [1], [1,2], [1,2], [1,2]]", results[0]);
 }
 
-test "jq:L1742 __k__ __a__ 1_ _b__ 2__ _ ." {
-    return error.SkipZigTest;
+test "jq:L1742 {_k_: {_a_: 1, _b_: 2}} * ." {
+    const results = runFilter(
+        "{\"k\": {\"a\": 1, \"b\": 2}} * .",
+        "{\"k\": {\"a\": 0,\"c\": 3}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}}", results[0]);
 }
 
-test "jq:L1746 __k__ __a__ 1_ _b__ 2__ _hello__ __x__ 1__ _ ." {
-    return error.SkipZigTest;
+test "jq:L1746 {_k_: {_a_: 1, _b_: 2}, _hello_: {_x_: 1}} * ." {
+    const results = runFilter(
+        "{\"k\": {\"a\": 1, \"b\": 2}, \"hello\": {\"x\": 1}} * .",
+        "{\"k\": {\"a\": 0,\"c\": 3}, \"hello\": 1}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}, \"hello\": 1}", results[0]);
 }
 
-test "jq:L1750 __k__ __a__ 1_ _b__ 2__ _hello__ 1_ _ ." {
-    return error.SkipZigTest;
+test "jq:L1750 {_k_: {_a_: 1, _b_: 2}, _hello_: 1} * ." {
+    const results = runFilter(
+        "{\"k\": {\"a\": 1, \"b\": 2}, \"hello\": 1} * .",
+        "{\"k\": {\"a\": 0,\"c\": 3}, \"hello\": {\"x\": 1}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}, \"hello\": {\"x\": 1}}", results[0]);
 }
 
-test "jq:L1754 __a__ __b__ 1__ _c__ __d__ 2__ _e__ 5_ _ ." {
-    return error.SkipZigTest;
+test "jq:L1754 {_a_: {_b_: 1}, _c_: {_d_: 2}, _e_: 5} * ." {
+    const results = runFilter(
+        "{\"a\": {\"b\": 1}, \"c\": {\"d\": 2}, \"e\": 5} * .",
+        "{\"a\": {\"b\": 2}, \"c\": {\"d\": 3, \"f\": 9}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\": {\"b\": 2}, \"c\": {\"d\": 3, \"f\": 9}, \"e\": 5}", results[0]);
 }
 
-test "jq:L1758 _.___arrays_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1758 [.[]|arrays]" {
+    const results = runFilter(
+        "[.[]|arrays]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[],[3,[]]]", results[0]);
 }
 
-test "jq:L1762 _.___objects_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1762 [.[]|objects]" {
+    const results = runFilter(
+        "[.[]|objects]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{}]", results[0]);
 }
 
-test "jq:L1766 _.___iterables_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1766 [.[]|iterables]" {
+    const results = runFilter(
+        "[.[]|iterables]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[],[3,[]],{}]", results[0]);
 }
 
-test "jq:L1770 _.___scalars_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1770 [.[]|scalars]" {
+    const results = runFilter(
+        "[.[]|scalars]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,\"foo\",true,false,null]", results[0]);
 }
 
-test "jq:L1774 _.___values_" {
-    return error.SkipZigTest;
+test "jq:L1774 [.[]|values]" {
+    const results = runFilter(
+        "[.[]|values]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,\"foo\",[],[3,[]],{},true,false]", results[0]);
 }
 
-test "jq:L1778 _.___booleans_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1778 [.[]|booleans]" {
+    const results = runFilter(
+        "[.[]|booleans]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true,false]", results[0]);
 }
 
-test "jq:L1782 _.___nulls_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1782 [.[]|nulls]" {
+    const results = runFilter(
+        "[.[]|nulls]",
+        "[1,2,\"foo\",[],[3,[]],{},true,false,null]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[null]", results[0]);
 }
 
 test "jq:L1786 flatten" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "flatten",
+        "[0, [1], [[2]], [[[3]]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, 1, 2, 3]", results[0]);
 }
 
-test "jq:L1790 flatten_0_" {
-    return error.SkipZigTest;
+test "jq:L1790 flatten(0)" {
+    const results = runFilter(
+        "flatten(0)",
+        "[0, [1], [[2]], [[[3]]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, [1], [[2]], [[[3]]]]", results[0]);
 }
 
-test "jq:L1794 flatten_2_" {
-    return error.SkipZigTest;
+test "jq:L1794 flatten(2)" {
+    const results = runFilter(
+        "flatten(2)",
+        "[0, [1], [[2]], [[[3]]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, 1, 2, [3]]", results[0]);
 }
 
-test "jq:L1798 flatten_2_" {
-    return error.SkipZigTest;
+test "jq:L1798 flatten(2)" {
+    const results = runFilter(
+        "flatten(2)",
+        "[0, [1, [2]], [1, [[3], 2]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0, 1, 2, 1, [3], 2]", results[0]);
 }
 
-test "jq:L1802 try flatten_-1_ catch ." {
-    return error.SkipZigTest;
+test "jq:L1802 try flatten(-1) catch ." {
+    const results = runFilter(
+        "try flatten(-1) catch .",
+        "[0, [1], [[2]], [[[3]]]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"flatten depth must not be negative\"", results[0]);
 }
 
 test "jq:L1806 transpose" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "transpose",
+        "[[1], [2,3]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1,2],[null,3]]", results[0]);
 }
 
 test "jq:L1810 transpose" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "transpose",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
 }
 
 test "jq:L1814 ascii_upcase" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "ascii_upcase",
+        "\"useful but not for é\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"USEFUL BUT NOT FOR é\"", results[0]);
 }
 
-test "jq:L1818 bsearch_0_1_2_3_4_" {
-    return error.SkipZigTest;
+test "jq:L1818 bsearch(0,1,2,3,4)" {
+    const results = runFilter(
+        "bsearch(0,1,2,3,4)",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("-1", results[0]);
+    try std.testing.expectEqualStrings("0", results[1]);
+    try std.testing.expectEqualStrings("1", results[2]);
+    try std.testing.expectEqualStrings("2", results[3]);
+    try std.testing.expectEqualStrings("-4", results[4]);
 }
 
-test "jq:L1826 bsearch__x_1__" {
-    return error.SkipZigTest;
+test "jq:L1826 bsearch({x:1})" {
+    const results = runFilter(
+        "bsearch({x:1})",
+        "[{ \"x\": 0 },{ \"x\": 1 },{ \"x\": 2 }]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
-test "jq:L1830 try __OK__ bsearch_0__ catch __KO__._" {
-    return error.SkipZigTest;
+test "jq:L1830 try [_OK_, bsearch(0)] catch [_KO_,.]" {
+    const results = runFilter(
+        "try [\"OK\", bsearch(0)] catch [\"KO\",.]",
+        "\"aa\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"KO\",\"string (\\\"aa\\\") cannot be searched from\"]", results[0]);
 }
 
-test "jq:L1834 strftime___Y-_m-_dT_H__M__SZ__" {
-    return error.SkipZigTest;
+test "jq:L1834 strftime(_%Y-%m-%dT%H:%M:%SZ_)" {
+    const results = runFilter(
+        "strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "[2015,2,5,23,51,47,4,63]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"2015-03-05T23:51:47Z\"", results[0]);
 }
 
-test "jq:L1838 strftime___A_ _B _d_ _Y__" {
-    return error.SkipZigTest;
+test "jq:L1838 strftime(_%A, %B %d, %Y_)" {
+    const results = runFilter(
+        "strftime(\"%A, %B %d, %Y\")",
+        "1435677542.822351",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Tuesday, June 30, 2015\"", results[0]);
 }
 
-test "jq:L1842 strftime___Y-_m-_dT_H__M__SZ__" {
-    return error.SkipZigTest;
+test "jq:L1842 strftime(_%Y-%m-%dT%H:%M:%SZ_)" {
+    const results = runFilter(
+        "strftime(\"%Y-%m-%dT%H:%M:%SZ\")",
+        "[2024,2,15]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"2024-03-15T00:00:00Z\"", results[0]);
 }
 
 test "jq:L1846 mktime" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "mktime",
+        "[2024,8,21]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1726876800", results[0]);
 }
 
 test "jq:L1850 gmtime" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "gmtime",
+        "1425599507",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2015,2,5,23,51,47,4,63]", results[0]);
 }
 
-test "jq:L1854 gmtime_5_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1854 gmtime[5]" {
+    const results = runFilter(
+        "gmtime[5]",
+        "1425599507.25",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("47.25", results[0]);
 }
 
-test "jq:L1859 try strftime___Y-_m-_dT_H__M__SZ__ catch ." {
-    return error.SkipZigTest;
+test "jq:L1859 try strftime(_%Y-%m-%dT%H:%M:%SZ_) catch ." {
+    const results = runFilter(
+        "try strftime(\"%Y-%m-%dT%H:%M:%SZ\") catch .",
+        "[\"a\",1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"strftime/1 requires parsed datetime inputs\"", results[0]);
 }
 
-test "jq:L1863 try strflocaltime___Y-_m-_dT_H__M__SZ__ catch ." {
-    return error.SkipZigTest;
+test "jq:L1863 try strflocaltime(_%Y-%m-%dT%H:%M:%SZ_) catch ." {
+    const results = runFilter(
+        "try strflocaltime(\"%Y-%m-%dT%H:%M:%SZ\") catch .",
+        "[\"a\",1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"strflocaltime/1 requires parsed datetime inputs\"", results[0]);
 }
 
 test "jq:L1867 try mktime catch ." {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "try mktime catch .",
+        "[\"a\",1,2,3,4,5,6,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"mktime requires parsed datetime inputs\"", results[0]);
 }
 
-test "jq:L1872 try __OK__ strftime_____ catch __KO__ ._" {
-    return error.SkipZigTest;
+test "jq:L1872 try [_OK_, strftime([])] catch [_KO_, .]" {
+    const results = runFilter(
+        "try [\"OK\", strftime([])] catch [\"KO\", .]",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"KO\",\"strftime/1 requires a string format\"]", results[0]);
 }
 
-test "jq:L1876 try __OK__ strflocaltime_____ catch __KO__ ._" {
-    return error.SkipZigTest;
+test "jq:L1876 try [_OK_, strflocaltime({})] catch [_KO_, .]" {
+    const results = runFilter(
+        "try [\"OK\", strflocaltime({})] catch [\"KO\", .]",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"KO\",\"strflocaltime/1 requires a string format\"]", results[0]);
 }
 
-test "jq:L1880 _strptime___Y-_m-_dT_H__M__SZ____._mktime__" {
-    return error.SkipZigTest;
+test "jq:L1880 [strptime(_%Y-%m-%dT%H:%M:%SZ_)|(.,mktime)]" {
+    const results = runFilter(
+        "[strptime(\"%Y-%m-%dT%H:%M:%SZ\")|(.,mktime)]",
+        "\"2015-03-05T23:51:47Z\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[2015,2,5,23,51,47,4,63],1425599507]", results[0]);
 }
 
-test "jq:L1886 last_range_365 _ 67____1970-03-01T01_02_03Z__strptime___Y..." {
-    return error.SkipZigTest;
+test "jq:L1886 last(range(365 * 67)|(_1970-03-01T01:02:03Z_|strptime(_%Y..." {
+    const results = runFilter(
+        "last(range(365 * 67)|(\"1970-03-01T01:02:03Z\"|strptime(\"%Y-%m-%dT%H:%M:%SZ\")|mktime) + (86400 * .)|strftime(\"%Y-%m-%dT%H:%M:%SZ\")|strptime(\"%Y-%m-%dT%H:%M:%SZ\"))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2037,1,11,1,2,3,3,41]", results[0]);
 }
 
-test "jq:L1891 import _a_ as foo_ import _b_ as bar_ def fooa_ foo__a_ _..." {
-    return error.SkipZigTest;
+test "jq:L1891 import _a_ as foo; import _b_ as bar; def fooa: foo::a; [..." {
+    const results = runFilter(
+        "import \"a\" as foo; import \"b\" as bar; def fooa: foo::a; [fooa, bar::a, bar::b, foo::a]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\",\"a\"]", results[0]);
 }
 
-test "jq:L1895 import _c_ as foo_ _foo__a_ foo__c_" {
-    return error.SkipZigTest;
+test "jq:L1895 import _c_ as foo; [foo::a, foo::c]" {
+    const results = runFilter(
+        "import \"c\" as foo; [foo::a, foo::c]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,\"acmehbah\"]", results[0]);
 }
 
-test "jq:L1899 include _c__ _a_ c_" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1899 include _c_; [a, c]" {
+    const results = runFilter(
+        "include \"c\"; [a, c]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,\"acmehbah\"]", results[0]);
 }
 
-test "jq:L1903 import _data_ as _e_ import _data_ as _d_ __d__.this__e__..." {
-    return error.SkipZigTest;
+test "jq:L1903 import _data_ as $e; import _data_ as $d; [$d[].this,$e[]..." {
+    const results = runFilter(
+        "import \"data\" as $e; import \"data\" as $d; [$d[].this,$e[].that,$d::d[].this,$e::e[].that]|join(\";\")",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"is a test;is too;is a test;is too\"", results[0]);
 }
 
-test "jq:L1908 import _data_ as _a_ import _data_ as _b_ def f_ __a_ _b__ f" {
-    return error.SkipZigTest;
+test "jq:L1908 import _data_ as $a; import _data_ as $b; def f: {$a, $b}; f" {
+    const results = runFilter(
+        "import \"data\" as $a; import \"data\" as $b; def f: {$a, $b}; f",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":[{\"this\":\"is a test\",\"that\":\"is too\"}],\"b\":[{\"this\":\"is a test\",\"that\":\"is too\"}]}", results[0]);
 }
 
-test "jq:L1912 include _shadow1__ e" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1912 include _shadow1_; e" {
+    const results = runFilter(
+        "include \"shadow1\"; e",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
-test "jq:L1916 include _shadow1__ include _shadow2__ e" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1916 include _shadow1_; include _shadow2_; e" {
+    const results = runFilter(
+        "include \"shadow1\"; include \"shadow2\"; e",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("3", results[0]);
 }
 
-test "jq:L1920 import _shadow1_ as f_ import _shadow2_ as f_ import _sha..." {
-    return error.SkipZigTest;
+test "jq:L1920 import _shadow1_ as f; import _shadow2_ as f; import _sha..." {
+    const results = runFilter(
+        "import \"shadow1\" as f; import \"shadow2\" as f; import \"shadow1\" as e; [e::e, f::e]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[2,3]", results[0]);
 }
 
-test "jq:L1924 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1924 module (.+1); 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("module (.+1); 0");
 }
 
-test "jq:L1930 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1930 module []; 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("module []; 0");
 }
 
-test "jq:L1936 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1936 include _a_ (.+1); 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("include \"a\" (.+1); 0");
 }
 
-test "jq:L1942 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1942 include _a_ []; 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("include \"a\" []; 0");
 }
 
-test "jq:L1948 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1948 include __ _; 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("include \"\\ \"; 0");
 }
 
-test "jq:L1954 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1954 include __(a)_; 0" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("include \"\\(a)\"; 0");
 }
 
 test "jq:L1960 modulemeta" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "modulemeta",
+        "\"c\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"whatever\":null,\"deps\":[{\"as\":\"foo\",\"is_data\":false,\"relpath\":\"a\"},{\"search\":\"./\",\"as\":\"d\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./\",\"as\":\"d2\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./../lib/jq\",\"as\":\"e\",\"is_data\":false,\"relpath\":\"e\"},{\"search\":\"./../lib/jq\",\"as\":\"f\",\"is_data\":false,\"relpath\":\"f\"},{\"as\":\"d\",\"is_data\":true,\"relpath\":\"data\"}],\"defs\":[\"a/0\",\"c/0\"]}", results[0]);
 }
 
-test "jq:L1964 modulemeta _ .deps _ length" {
-    return error.SkipZigTest;
+test "jq:L1964 modulemeta | .deps | length" {
+    const results = runFilter(
+        "modulemeta | .deps | length",
+        "\"c\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("6", results[0]);
 }
 
-test "jq:L1968 modulemeta _ .defs _ length" {
-    return error.SkipZigTest;
+test "jq:L1968 modulemeta | .defs | length" {
+    const results = runFilter(
+        "modulemeta | .defs | length",
+        "\"c\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
-test "jq:L1972 __FAIL IGNORE MSG" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1972 import _syntaxerror_ as e; ." {
+    // %%FAIL: filter should not compile
+    try expectCompileError("import \"syntaxerror\" as e; .");
 }
 
-test "jq:L1978 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L1978 %::wat" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("%::wat");
 }
 
-test "jq:L1984 import _test_bind_order_ as check_ check__check" {
-    return error.SkipZigTest;
+test "jq:L1984 import _test_bind_order_ as check; check::check" {
+    const results = runFilter(
+        "import \"test_bind_order\" as check; check::check",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
 test "jq:L1988 try -. catch ." {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "try -. catch .",
+        "\"very-long-long-long-long-string\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"very-long-long-long-long...\\\") cannot be negated\"", results[0]);
 }
 
-test "jq:L1992 try _.-._ catch ." {
-    return error.SkipZigTest;
+test "jq:L1992 try (.-.) catch ." {
+    const results = runFilter(
+        "try (.-.) catch .",
+        "\"very-long-long-long-long-string\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"very-long-long-long-long...\\\") and string (\\\"very-long-long-long-long...\\\") cannot be subtracted\"", results[0]);
 }
 
-test "jq:L1996 _x_ _ range_0_ 12_ 2_ _ ___ _ 8 _ try -. catch ." {
-    return error.SkipZigTest;
+test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
+    const results = runFilter(
+        "\"x\" * range(0; 12; 2) + \"☆\" * 8 | try -. catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 6), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[0]);
+    try std.testing.expectEqualStrings("\"string (\\\"xx☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[1]);
+    try std.testing.expectEqualStrings("\"string (\\\"xxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[2]);
+    try std.testing.expectEqualStrings("\"string (\\\"xxxxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[3]);
+    try std.testing.expectEqualStrings("\"string (\\\"xxxxxxxx☆☆☆☆☆...\\\") cannot be negated\"", results[4]);
+    try std.testing.expectEqualStrings("\"string (\\\"xxxxxxxxxx☆☆☆☆...\\\") cannot be negated\"", results[5]);
 }
 
-test "jq:L2005 try _. _ _x__ catch . __ if have_decnum then _number _123..." {
-    return error.SkipZigTest;
+test "jq:L2005 try (. + _x_) catch . == if have_decnum then _number (123..." {
+    const results = runFilter(
+        "try (. + \"x\") catch . == if have_decnum then \"number (12345678901234567890123456...) and string (\\\"x\\\") cannot be added\" else \"number (12345678901234568000000000...) and string (\\\"x\\\") cannot be added\" end",
+        "123456789012345678901234567890",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2009 join_____" {
-    return error.SkipZigTest;
+test "jq:L2009 join(_,_)" {
+    const results = runFilter(
+        "join(\",\")",
+        "[\"1\",2,true,false,3.4]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"1,2,true,false,3.4\"", results[0]);
 }
 
-test "jq:L2013 .__ _ join_____" {
-    return error.SkipZigTest;
+test "jq:L2013 .[] | join(_,_)" {
+    const results = runFilter(
+        ".[] | join(\",\")",
+        "[[], [null], [null,null], [null,null,null]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("\"\"", results[0]);
+    try std.testing.expectEqualStrings("\"\"", results[1]);
+    try std.testing.expectEqualStrings("\",\"", results[2]);
+    try std.testing.expectEqualStrings("\",,\"", results[3]);
 }
 
-test "jq:L2020 .__ _ join_____" {
-    return error.SkipZigTest;
+test "jq:L2020 .[] | join(_,_)" {
+    const results = runFilter(
+        ".[] | join(\",\")",
+        "[[\"a\",null], [null,\"a\"]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"a,\"", results[0]);
+    try std.testing.expectEqualStrings("\",a\"", results[1]);
 }
 
-test "jq:L2025 try join_____ catch ." {
-    return error.SkipZigTest;
+test "jq:L2025 try join(_,_) catch ." {
+    const results = runFilter(
+        "try join(\",\") catch .",
+        "[\"1\",\"2\",{\"a\":{\"b\":{\"c\":33}}}]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"1,2,\\\") and object ({\\\"a\\\":{\\\"b\\\":{\\\"c\\\":33}}}) cannot be added\"", results[0]);
 }
 
-test "jq:L2029 try join_____ catch ." {
-    return error.SkipZigTest;
+test "jq:L2029 try join(_,_) catch ." {
+    const results = runFilter(
+        "try join(\",\") catch .",
+        "[\"1\",\"2\",[3,4,5]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"string (\\\"1,2,\\\") and array ([3,4,5]) cannot be added\"", results[0]);
 }
 
-test "jq:L2033 _if_0_and_1_or_2_then_3_else_4_elif_5_end_6_as_7_def_8_re..." {
-    return error.SkipZigTest;
+test "jq:L2033 {if:0,and:1,or:2,then:3,else:4,elif:5,end:6,as:7,def:8,re..." {
+    const results = runFilter(
+        "{if:0,and:1,or:2,then:3,else:4,elif:5,end:6,as:7,def:8,reduce:9,foreach:10,try:11,catch:12,label:13,import:14,include:15,module:16}",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"if\":0,\"and\":1,\"or\":2,\"then\":3,\"else\":4,\"elif\":5,\"end\":6,\"as\":7,\"def\":8,\"reduce\":9,\"foreach\":10,\"try\":11,\"catch\":12,\"label\":13,\"import\":14,\"include\":15,\"module\":16}", results[0]);
 }
 
-test "jq:L2037 try _1_._ catch ." {
-    return error.SkipZigTest;
+test "jq:L2037 try (1/.) catch ." {
+    const results = runFilter(
+        "try (1/.) catch .",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
-test "jq:L2041 try _1_0_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2041 try (1/0) catch ." {
+    const results = runFilter(
+        "try (1/0) catch .",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
-test "jq:L2045 try _0_0_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2045 try (0/0) catch ." {
+    const results = runFilter(
+        "try (0/0) catch .",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"number (0) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
-test "jq:L2049 try _1_._ catch ." {
-    return error.SkipZigTest;
+test "jq:L2049 try (1%.) catch ." {
+    const results = runFilter(
+        "try (1%.) catch .",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
 }
 
-test "jq:L2053 try _1_0_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2053 try (1%0) catch ." {
+    const results = runFilter(
+        "try (1%0) catch .",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
 }
 
-test "jq:L2058 _range_-52_52_1__ as _powers _ __powers___pow_2_.__log2_r..." {
-    return error.SkipZigTest;
+test "jq:L2058 [range(-52;52;1)] as $powers | [$powers[]|pow(2;.)|log2|r..." {
+    const results = runFilter(
+        "[range(-52;52;1)] as $powers | [$powers[]|pow(2;.)|log2|round] == $powers",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2062 _range_-99_2_99_2_1__ as _orig _ __orig___pow_2_.__log2_ ..." {
-    return error.SkipZigTest;
+test "jq:L2062 [range(-99/2;99/2;1)] as $orig | [$orig[]|pow(2;.)|log2] ..." {
+    const results = runFilter(
+        "[range(-99/2;99/2;1)] as $orig | [$orig[]|pow(2;.)|log2] as $back | ($orig|keys)[]|. as $k | (($orig|.[$k])-($back|.[$k]))|if . < 0 then . * -1 else . end|select(.>.00005)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
 }
 
-test "jq:L2065 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2065 {" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("{");
 }
 
-test "jq:L2071 __FAIL" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2071 }" {
+    // %%FAIL: filter should not compile
+    try expectCompileError("}");
 }
 
-test "jq:L2077 _.____ _ 0__" {
-    return error.SkipZigTest;
+test "jq:L2077 (.[{}] = 0)?" {
+    const results = runFilter(
+        "(.[{}] = 0)?",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
 }
 
-test "jq:L2080 INDEX_range_5___._ _foo__.____ ._0__" {
-    return error.SkipZigTest;
+test "jq:L2080 INDEX(range(5)|[., _foo_(.)_]; .[0])" {
+    const results = runFilter(
+        "INDEX(range(5)|[., \"foo\\(.)\"]; .[0])",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"0\":[0,\"foo0\"],\"1\":[1,\"foo1\"],\"2\":[2,\"foo2\"],\"3\":[3,\"foo3\"],\"4\":[4,\"foo4\"]}", results[0]);
 }
 
-test "jq:L2084 JOIN___0___0__abc____1___1__bcd____2___2__def____3___3__e..." {
-    return error.SkipZigTest;
+test "jq:L2084 JOIN({_0_:[0,_abc_],_1_:[1,_bcd_],_2_:[2,_def_],_3_:[3,_e..." {
+    const results = runFilter(
+        "JOIN({\"0\":[0,\"abc\"],\"1\":[1,\"bcd\"],\"2\":[2,\"def\"],\"3\":[3,\"efg\"],\"4\":[4,\"fgh\"]}; .[0]|tostring)",
+        "[[5,\"foo\"],[3,\"bar\"],[1,\"foobar\"]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[[5,\"foo\"],null],[[3,\"bar\"],[3,\"efg\"]],[[1,\"foobar\"],[1,\"bcd\"]]]", results[0]);
 }
 
-test "jq:L2088 range_5_10__IN_range_10__" {
-    return error.SkipZigTest;
+test "jq:L2088 range(5;10)|IN(range(10))" {
+    const results = runFilter(
+        "range(5;10)|IN(range(10))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+    try std.testing.expectEqualStrings("true", results[1]);
+    try std.testing.expectEqualStrings("true", results[2]);
+    try std.testing.expectEqualStrings("true", results[3]);
+    try std.testing.expectEqualStrings("true", results[4]);
 }
 
-test "jq:L2096 range_5_13__IN_range_0_10_3__" {
-    return error.SkipZigTest;
+test "jq:L2096 range(5;13)|IN(range(0;10;3))" {
+    const results = runFilter(
+        "range(5;13)|IN(range(0;10;3))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 8), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+    try std.testing.expectEqualStrings("true", results[1]);
+    try std.testing.expectEqualStrings("false", results[2]);
+    try std.testing.expectEqualStrings("false", results[3]);
+    try std.testing.expectEqualStrings("true", results[4]);
+    try std.testing.expectEqualStrings("false", results[5]);
+    try std.testing.expectEqualStrings("false", results[6]);
+    try std.testing.expectEqualStrings("false", results[7]);
 }
 
-test "jq:L2107 range_10_12__IN_range_10__" {
-    return error.SkipZigTest;
+test "jq:L2107 range(10;12)|IN(range(10))" {
+    const results = runFilter(
+        "range(10;12)|IN(range(10))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
+    try std.testing.expectEqualStrings("false", results[1]);
 }
 
-test "jq:L2112 IN_range_10_20__ range_10__" {
-    return error.SkipZigTest;
+test "jq:L2112 IN(range(10;20); range(10))" {
+    const results = runFilter(
+        "IN(range(10;20); range(10))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
-test "jq:L2116 IN_range_5_20__ range_10__" {
-    return error.SkipZigTest;
+test "jq:L2116 IN(range(5;20); range(10))" {
+    const results = runFilter(
+        "IN(range(5;20); range(10))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2121 _.a as _x _ .b_ _ _b_" {
-    return error.SkipZigTest;
+test "jq:L2121 (.a as $x | .b) = _b_" {
+    const results = runFilter(
+        "(.a as $x | .b) = \"b\"",
+        "{\"a\":null,\"b\":null}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":null,\"b\":\"b\"}", results[0]);
 }
 
-test "jq:L2126 _.. _ select_type __ _object_ and has__b__ and _.b _ type..." {
-    return error.SkipZigTest;
+test "jq:L2126 (.. | select(type == _object_ and has(_b_) and (.b | type..." {
+    const results = runFilter(
+        "(.. | select(type == \"object\" and has(\"b\") and (.b | type) == \"array\")|.b) |= .[0]",
+        "{\"a\": {\"b\": [1, {\"b\": 3}]}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\": {\"b\": 1}}", results[0]);
 }
 
-test "jq:L2130 isempty_empty_" {
-    return error.SkipZigTest;
+test "jq:L2130 isempty(empty)" {
+    const results = runFilter(
+        "isempty(empty)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2134 isempty_range_3__" {
-    return error.SkipZigTest;
+test "jq:L2134 isempty(range(3))" {
+    const results = runFilter(
+        "isempty(range(3))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
-test "jq:L2138 isempty_1_error__foo___" {
-    return error.SkipZigTest;
+test "jq:L2138 isempty(1,error(_foo_))" {
+    const results = runFilter(
+        "isempty(1,error(\"foo\"))",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
-test "jq:L2143 index____" {
-    return error.SkipZigTest;
+test "jq:L2143 index(__)" {
+    const results = runFilter(
+        "index(\"\")",
+        "\"\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
-test "jq:L2148 builtins_length _ 10" {
-    return error.SkipZigTest;
+test "jq:L2148 builtins|length > 10" {
+    const results = runFilter(
+        "builtins|length > 10",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2152 _-1__IN_builtins__ _ ____._1__" {
-    return error.SkipZigTest;
+test "jq:L2152 _-1_|IN(builtins[] / _/_|.[1])" {
+    const results = runFilter(
+        "\"-1\"|IN(builtins[] / \"/\"|.[1])",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
-test "jq:L2156 all_builtins__ _ ____ ._1__tonumber __ 0_" {
-    return error.SkipZigTest;
+test "jq:L2156 all(builtins[] / _/_; .[1]|tonumber >= 0)" {
+    const results = runFilter(
+        "all(builtins[] / \"/\"; .[1]|tonumber >= 0)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2160 builtins_any_.__1_ __ ____" {
-    return error.SkipZigTest;
+test "jq:L2160 builtins|any(.[:1] == ___)" {
+    const results = runFilter(
+        "builtins|any(.[:1] == \"_\")",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("false", results[0]);
 }
 
-test "jq:L2181 map_. __ 1_" {
-    return error.SkipZigTest;
+test "jq:L2181 map(. == 1)" {
+    const results = runFilter(
+        "map(. == 1)",
+        "[1, 1.0, 1.000, 100e-2, 1e+0, 0.0001e4]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true, true, true, true, true, true]", results[0]);
 }
 
-test "jq:L2187 ._0_ _ tostring _ . __ if have_decnum then _1391186036643..." {
-    return error.SkipZigTest;
+test "jq:L2187 .[0] | tostring | . == if have_decnum then _1391186036643..." {
+    const results = runFilter(
+        ".[0] | tostring | . == if have_decnum then \"13911860366432393\" else \"13911860366432392\" end",
+        "[13911860366432393]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2191 .x _ tojson _ . __ if have_decnum then _13911860366432393..." {
-    return error.SkipZigTest;
+test "jq:L2191 .x | tojson | . == if have_decnum then _13911860366432393..." {
+    const results = runFilter(
+        ".x | tojson | . == if have_decnum then \"13911860366432393\" else \"13911860366432392\" end",
+        "{\"x\":13911860366432393}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2195 _13911860366432393 __ 13911860366432392_ _ . __ if have_d..." {
-    return error.SkipZigTest;
+test "jq:L2195 (13911860366432393 == 13911860366432392) | . == if have_d..." {
+    const results = runFilter(
+        "(13911860366432393 == 13911860366432392) | . == if have_decnum then false else true end",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
 test "jq:L2202 . - 10" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ". - 10",
+        "13911860366432393",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("13911860366432382", results[0]);
 }
 
-test "jq:L2206 ._0_ - 10" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2206 .[0] - 10" {
+    const results = runFilter(
+        ".[0] - 10",
+        "[13911860366432393]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("13911860366432382", results[0]);
 }
 
 test "jq:L2210 .x - 10" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        ".x - 10",
+        "{\"x\":13911860366432393}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("13911860366432382", results[0]);
 }
 
-test "jq:L2215 -. _ tojson __ if have_decnum then _-13911860366432393_ e..." {
-    return error.SkipZigTest;
+test "jq:L2215 -. | tojson == if have_decnum then _-13911860366432393_ e..." {
+    const results = runFilter(
+        "-. | tojson == if have_decnum then \"-13911860366432393\" else \"-13911860366432392\" end",
+        "13911860366432393",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2219 -. _ tojson __ if have_decnum then _0.1234567890123456789..." {
-    return error.SkipZigTest;
+test "jq:L2219 -. | tojson == if have_decnum then _0.1234567890123456789..." {
+    const results = runFilter(
+        "-. | tojson == if have_decnum then \"0.12345678901234567890123456789\" else \"0.12345678901234568\" end",
+        "-0.12345678901234567890123456789",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2223 _1E_1000_-1E_1000 _ tojson_ __ if have_decnum then __1E_1..." {
-    return error.SkipZigTest;
+test "jq:L2223 [1E+1000,-1E+1000 | tojson] == if have_decnum then [_1E+1..." {
+    const results = runFilter(
+        "[1E+1000,-1E+1000 | tojson] == if have_decnum then [\"1E+1000\",\"-1E+1000\"] else [\"1.7976931348623157e+308\",\"-1.7976931348623157e+308\"] end",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2227 . __ try . catch ." {
-    return error.SkipZigTest;
+test "jq:L2227 . |= try . catch ." {
+    const results = runFilter(
+        ". |= try . catch .",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
-test "jq:L2232 .__ as _n _ _n_0 _ _._ tostring_ . __ _n_" {
-    return error.SkipZigTest;
+test "jq:L2232 .[] as $n | $n+0 | [., tostring, . == $n]" {
+    const results = runFilter(
+        ".[] as $n | $n+0 | [., tostring, . == $n]",
+        "[-9007199254740993, -9007199254740992, 9007199254740992, 9007199254740993, 13911860366432393]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 5), results.len);
+    try std.testing.expectEqualStrings("[-9007199254740992,\"-9007199254740992\",true]", results[0]);
+    try std.testing.expectEqualStrings("[-9007199254740992,\"-9007199254740992\",true]", results[1]);
+    try std.testing.expectEqualStrings("[9007199254740992,\"9007199254740992\",true]", results[2]);
+    try std.testing.expectEqualStrings("[9007199254740992,\"9007199254740992\",true]", results[3]);
+    try std.testing.expectEqualStrings("[13911860366432392,\"13911860366432392\",true]", results[4]);
 }
 
 test "jq:L2241 abs" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "abs",
+        "\"abc\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"abc\"", results[0]);
 }
 
-test "jq:L2245 map_abs_" {
-    return error.SkipZigTest;
+test "jq:L2245 map(abs)" {
+    const results = runFilter(
+        "map(abs)",
+        "[-0, 0, -10, -1.1]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,0,10,1.1]", results[0]);
 }
 
-test "jq:L2249 map_fabs_" {
-    return error.SkipZigTest;
+test "jq:L2249 map(fabs)" {
+    const results = runFilter(
+        "map(fabs)",
+        "[-0, 0, -10, -1.1]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,0,10,1.1]", results[0]);
 }
 
-test "jq:L2253 map_abs __ length_ _ unique" {
-    return error.SkipZigTest;
+test "jq:L2253 map(abs == length) | unique" {
+    const results = runFilter(
+        "map(abs == length) | unique",
+        "[-10, -1.1, -1e-1, 1000000000000000002]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[true]", results[0]);
 }
 
-test "jq:L2258 map_abs_" {
-    return error.SkipZigTest;
+test "jq:L2258 map(abs)" {
+    const results = runFilter(
+        "map(abs)",
+        "[0.1,1000000000000000002]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1e-1, 1000000000000000002]", results[0]);
 }
 
-test "jq:L2262 _1E_1000_-1E_1000 _ abs _ tojson_ _ unique __ if have_dec..." {
-    return error.SkipZigTest;
+test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {
+    const results = runFilter(
+        "[1E+1000,-1E+1000 | abs | tojson] | unique == if have_decnum then [\"1E+1000\"] else [\"1.7976931348623157e+308\"] end",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2266 _1E_1000_-1E_1000 _ length _ tojson_ _ unique __ if have_..." {
-    return error.SkipZigTest;
+test "jq:L2266 [1E+1000,-1E+1000 | length | tojson] | unique == if have_..." {
+    const results = runFilter(
+        "[1E+1000,-1E+1000 | length | tojson] | unique == if have_decnum then [\"1E+1000\"] else [\"1.7976931348623157e+308\"] end",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2272 123 as _label _ _label" {
-    return error.SkipZigTest;
+test "jq:L2272 123 as $label | $label" {
+    const results = runFilter(
+        "123 as $label | $label",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("123", results[0]);
 }
 
-test "jq:L2276 _ label _if _ range_10_ _ ._ _select_. __ 5_ _ break _if_ _" {
-    return error.SkipZigTest;
+test "jq:L2276 [ label $if | range(10) | ., (select(. == 5) | break $if) ]" {
+    const results = runFilter(
+        "[ label $if | range(10) | ., (select(. == 5) | break $if) ]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,1,2,3,4,5]", results[0]);
 }
 
-test "jq:L2280 reduce .__ as _then _4 as _else _ _else_ . as _elif _ . _..." {
-    return error.SkipZigTest;
+test "jq:L2280 reduce .[] as $then (4 as $else | $else; . as $elif | . +..." {
+    const results = runFilter(
+        "reduce .[] as $then (4 as $else | $else; . as $elif | . + $then * $elif)",
+        "[1,2,3]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("96", results[0]);
 }
 
-test "jq:L2284 1 as _foreach _ 2 as _and _ 3 as _or _ _ _foreach_ _and_ ..." {
-    return error.SkipZigTest;
+test "jq:L2284 1 as $foreach | 2 as $and | 3 as $or | { $foreach, $and, ..." {
+    const results = runFilter(
+        "1 as $foreach | 2 as $and | 3 as $or | { $foreach, $and, $or, a }",
+        "{\"a\":4,\"b\":5}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foreach\":1,\"and\":2,\"or\":3,\"a\":4}", results[0]);
 }
 
-test "jq:L2288 _ foreach .__ as _try _1 as _catch _ _catch - 1_ . _ _try..." {
-    return error.SkipZigTest;
+test "jq:L2288 [ foreach .[] as $try (1 as $catch | $catch - 1; . + $try..." {
+    const results = runFilter(
+        "[ foreach .[] as $try (1 as $catch | $catch - 1; . + $try; .) ]",
+        "[10,9,8,7]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[10,19,27,34]", results[0]);
 }
 
-test "jq:L2295 _ a_ ___loc___ c _" {
-    return error.SkipZigTest;
+test "jq:L2295 { a, $__loc__, c }" {
+    const results = runFilter(
+        "{ a, $__loc__, c }",
+        "{\"a\":[1,2,3],\"b\":\"foo\",\"c\":{\"hi\":\"hey\"}}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":[1,2,3],\"__loc__\":{\"file\":\"<top-level>\",\"line\":1},\"c\":{\"hi\":\"hey\"}}", results[0]);
 }
 
-test "jq:L2299 1 as _x _ _2_ as _y _ _3_ as _z _ _ _x_ as_ _y_ 4_ __z__ ..." {
-    return error.SkipZigTest;
+test "jq:L2299 1 as $x | _2_ as $y | _3_ as $z | { $x, as, $y: 4, ($z): ..." {
+    const results = runFilter(
+        "1 as $x | \"2\" as $y | \"3\" as $z | { $x, as, $y: 4, ($z): 5, if: 6, foo: 7 }",
+        "{\"as\":8}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"x\":1,\"as\":8,\"2\":4,\"3\":5,\"if\":6,\"foo\":7}", results[0]);
 }
 
-test "jq:L2306 fromjson _ isnan" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2306 fromjson | isnan" {
+    const results = runFilter(
+        "fromjson | isnan",
+        "\"nan\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2310 tojson _ fromjson" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2310 tojson | fromjson" {
+    const results = runFilter(
+        "tojson | fromjson",
+        "{\"a\":nan}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":null}", results[0]);
 }
 
-test "jq:L2315 .__ _ try _fromjson _ isnan_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2315 .[] | try (fromjson | isnan) catch ." {
+    const results = runFilter(
+        ".[] | try (fromjson | isnan) catch .",
+        "[\"NaN\",\"-NaN\",\"NaN1\",\"NaN10\",\"NaN100\",\"NaN1000\",\"NaN10000\",\"NaN100000\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 8), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
+    try std.testing.expectEqualStrings("true", results[1]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 4 (while parsing 'NaN1')\"", results[2]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 5 (while parsing 'NaN10')\"", results[3]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 6 (while parsing 'NaN100')\"", results[4]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 7 (while parsing 'NaN1000')\"", results[5]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 8 (while parsing 'NaN10000')\"", results[6]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 9 (while parsing 'NaN100000')\"", results[7]);
 }
 
 test "jq:L2328 try input catch ." {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "try input catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"break\"", results[0]);
 }
 
 test "jq:L2332 debug" {
-    return error.SkipZigTest; // TODO: implement
+    const results = runFilter(
+        "debug",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
-test "jq:L2337 _foo_ _ try __try . catch _caught too much__ _ error_ cat..." {
-    return error.SkipZigTest;
+test "jq:L2337 _foo_ | try ((try . catch _caught too much_) | error) cat..." {
+    const results = runFilter(
+        "\"foo\" | try ((try . catch \"caught too much\") | error) catch \"caught just right\"",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"caught just right\"", results[0]);
 }
 
-test "jq:L2341 .____try _if .___hi_ then . else error end_ catch empty_ ..." {
-    return error.SkipZigTest;
+test "jq:L2341 .[]|(try (if .==_hi_ then . else error end) catch empty) ..." {
+    const results = runFilter(
+        ".[]|(try (if .==\"hi\" then . else error end) catch empty) | \"\\(.) there!\"",
+        "[\"hi\",\"ho\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"hi there!\"", results[0]);
 }
 
-test "jq:L2345 try ___hi___ho___.____try . catch _if .___ho_ then _BROKE..." {
-    return error.SkipZigTest;
+test "jq:L2345 try ([_hi_,_ho_]|.[]|(try . catch (if .==_ho_ then _BROKE..." {
+    const results = runFilter(
+        "try ([\"hi\",\"ho\"]|.[]|(try . catch (if .==\"ho\" then \"BROKEN\"|error else empty end)) | if .==\"ho\" then error else \"\\(.) there!\" end) catch \"caught outside \\(.)\"",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"hi there!\"", results[0]);
+    try std.testing.expectEqualStrings("\"caught outside ho\"", results[1]);
 }
 
-test "jq:L2350 .____try . catch _if .___ho_ then _BROKEN__error else emp..." {
-    return error.SkipZigTest;
+test "jq:L2350 .[]|(try . catch (if .==_ho_ then _BROKEN_|error else emp..." {
+    const results = runFilter(
+        ".[]|(try . catch (if .==\"ho\" then \"BROKEN\"|error else empty end)) | if .==\"ho\" then error else \"\\(.) there!\" end",
+        "[\"hi\",\"ho\"]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"hi there!\"", results[0]);
 }
 
-test "jq:L2354 try _try error catch _inner catch __.___ catch _outer cat..." {
-    return error.SkipZigTest;
+test "jq:L2354 try (try error catch _inner catch _(.)_) catch _outer cat..." {
+    const results = runFilter(
+        "try (try error catch \"inner catch \\(.)\") catch \"outer catch \\(.)\"",
+        "\"foo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"inner catch foo\"", results[0]);
 }
 
-test "jq:L2358 try __try error catch _inner catch __.____error_ catch _o..." {
-    return error.SkipZigTest;
+test "jq:L2358 try ((try error catch _inner catch _(.)_)|error) catch _o..." {
+    const results = runFilter(
+        "try ((try error catch \"inner catch \\(.)\")|error) catch \"outer catch \\(.)\"",
+        "\"foo\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"outer catch inner catch foo\"", results[0]);
 }
 
-test "jq:L2363 first_.__.__" {
-    return error.SkipZigTest;
+test "jq:L2363 first(.?,.?)" {
+    const results = runFilter(
+        "first(.?,.?)",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
-test "jq:L2368 _foo_ _bar__ _ .foo __ ._" {
-    return error.SkipZigTest;
+test "jq:L2368 {foo: _bar_} | .foo |= .?" {
+    const results = runFilter(
+        "{foo: \"bar\"} | .foo |= .?",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"foo\": \"bar\"}", results[0]);
 }
 
-test "jq:L2373 . __ try 2" {
-    return error.SkipZigTest;
+test "jq:L2373 . |= try 2" {
+    const results = runFilter(
+        ". |= try 2",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
-test "jq:L2377 . __ try 2 catch 3" {
-    return error.SkipZigTest;
+test "jq:L2377 . |= try 2 catch 3" {
+    const results = runFilter(
+        ". |= try 2 catch 3",
+        "1",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
-test "jq:L2381 .__ __ try tonumber" {
-    return error.SkipZigTest;
+test "jq:L2381 .[] |= try tonumber" {
+    const results = runFilter(
+        ".[] |= try tonumber",
+        "[\"1\", \"2a\", \"3\", \" 4\", \"5 \", \"6.7\", \".89\", \"-876\", \"+5.43\", 21]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1, 3, 6.7, 0.89, -876, 5.43, 21]", results[0]);
 }
 
-test "jq:L2386 any_keys___tostring__true_" {
-    return error.SkipZigTest;
+test "jq:L2386 any(keys[]|tostring?;true)" {
+    const results = runFilter(
+        "any(keys[]|tostring?;true)",
+        "{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2394 implode_explode" {
-    return error.SkipZigTest; // TODO: implement
+test "jq:L2394 implode|explode" {
+    const results = runFilter(
+        "implode|explode",
+        "[-1,0,1,2,3,1114111,1114112,55295,55296,57343,57344,1.1,1.9]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[65533,0,1,2,3,1114111,65533,55295,65533,65533,57344,1,1]", results[0]);
 }
 
-test "jq:L2398 map_try implode catch ._" {
-    return error.SkipZigTest;
+test "jq:L2398 map(try implode catch .)" {
+    const results = runFilter(
+        "map(try implode catch .)",
+        "[123,[\"a\"],[nan]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"implode input must be an array\",\"string (\\\"a\\\") can't be imploded, unicode codepoint needs to be numeric\",\"number (null) can't be imploded, unicode codepoint needs to be numeric\"]", results[0]);
 }
 
-test "jq:L2402 try 0_implode_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2402 try 0[implode] catch ." {
+    const results = runFilter(
+        "try 0[implode] catch .",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Cannot index number with string (\\\"\\\")\"", results[0]);
 }
 
-test "jq:L2407 walk_._" {
-    return error.SkipZigTest;
+test "jq:L2407 walk(.)" {
+    const results = runFilter(
+        "walk(.)",
+        "{\"x\":0}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"x\":0}", results[0]);
 }
 
-test "jq:L2411 walk_1_" {
-    return error.SkipZigTest;
+test "jq:L2411 walk(1)" {
+    const results = runFilter(
+        "walk(1)",
+        "{\"x\":0}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
 }
 
-test "jq:L2416 _walk_._1__" {
-    return error.SkipZigTest;
+test "jq:L2416 [walk(.,1)]" {
+    const results = runFilter(
+        "[walk(.,1)]",
+        "{\"x\":0}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{\"x\":0},1]", results[0]);
 }
 
-test "jq:L2421 walk_select_IN____ ___ _ not__" {
-    return error.SkipZigTest;
+test "jq:L2421 walk(select(IN({}, []) | not))" {
+    const results = runFilter(
+        "walk(select(IN({}, []) | not))",
+        "{\"a\":1,\"b\":[]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("{\"a\":1}", results[0]);
 }
 
-test "jq:L2426 _range_10__ _ ._1.2_3.5_" {
-    return error.SkipZigTest;
+test "jq:L2426 [range(10)] | .[1.2:3.5]" {
+    const results = runFilter(
+        "[range(10)] | .[1.2:3.5]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
 }
 
-test "jq:L2430 _range_10__ _ ._1.5_3.5_" {
-    return error.SkipZigTest;
+test "jq:L2430 [range(10)] | .[1.5:3.5]" {
+    const results = runFilter(
+        "[range(10)] | .[1.5:3.5]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
 }
 
-test "jq:L2434 _range_10__ _ ._1.7_3.5_" {
-    return error.SkipZigTest;
+test "jq:L2434 [range(10)] | .[1.7:3.5]" {
+    const results = runFilter(
+        "[range(10)] | .[1.7:3.5]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
 }
 
-test "jq:L2438 _range_10__ _ ._1.7_4294967295_" {
-    return error.SkipZigTest;
+test "jq:L2438 [range(10)] | .[1.7:4294967295]" {
+    const results = runFilter(
+        "[range(10)] | .[1.7:4294967295]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2,3,4,5,6,7,8,9]", results[0]);
 }
 
-test "jq:L2442 _range_10__ _ ._1.7_-4294967296_" {
-    return error.SkipZigTest;
+test "jq:L2442 [range(10)] | .[1.7:-4294967296]" {
+    const results = runFilter(
+        "[range(10)] | .[1.7:-4294967296]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
 }
 
-test "jq:L2446 __range_10__ _ ._1.1_1.5_1.7__" {
-    return error.SkipZigTest;
+test "jq:L2446 [[range(10)] | .[1.1,1.5,1.7]]" {
+    const results = runFilter(
+        "[[range(10)] | .[1.1,1.5,1.7]]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,1,1]", results[0]);
 }
 
-test "jq:L2450 _range_5__ _ ._1.1_ _ 5" {
-    return error.SkipZigTest;
+test "jq:L2450 [range(5)] | .[1.1] = 5" {
+    const results = runFilter(
+        "[range(5)] | .[1.1] = 5",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,5,2,3,4]", results[0]);
 }
 
-test "jq:L2454 _range_3__ _ ._nan_1_" {
-    return error.SkipZigTest;
+test "jq:L2454 [range(3)] | .[nan:1]" {
+    const results = runFilter(
+        "[range(3)] | .[nan:1]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0]", results[0]);
 }
 
-test "jq:L2458 _range_3__ _ ._1_nan_" {
-    return error.SkipZigTest;
+test "jq:L2458 [range(3)] | .[1:nan]" {
+    const results = runFilter(
+        "[range(3)] | .[1:nan]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[1,2]", results[0]);
 }
 
-test "jq:L2462 _range_3__ _ ._nan_" {
-    return error.SkipZigTest;
+test "jq:L2462 [range(3)] | .[nan]" {
+    const results = runFilter(
+        "[range(3)] | .[nan]",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("null", results[0]);
 }
 
-test "jq:L2466 try __range_3__ _ ._nan_ _ 9_ catch ." {
-    return error.SkipZigTest;
+test "jq:L2466 try ([range(3)] | .[nan] = 9) catch ." {
+    const results = runFilter(
+        "try ([range(3)] | .[nan] = 9) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Cannot set array element at NaN index\"", results[0]);
 }
 
-test "jq:L2470 try __foobar_ _ ._1.5_3.5_ _ _xyz__ catch ." {
-    return error.SkipZigTest;
+test "jq:L2470 try (_foobar_ | .[1.5:3.5] = _xyz_) catch ." {
+    const results = runFilter(
+        "try (\"foobar\" | .[1.5:3.5] = \"xyz\") catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Cannot update string slices\"", results[0]);
 }
 
-test "jq:L2474 try __range_10__ _ ._1.5_3.5_ _ __xyz___ catch ." {
-    return error.SkipZigTest;
+test "jq:L2474 try ([range(10)] | .[1.5:3.5] = [_xyz_]) catch ." {
+    const results = runFilter(
+        "try ([range(10)] | .[1.5:3.5] = [\"xyz\"]) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,\"xyz\",4,5,6,7,8,9]", results[0]);
 }
 
-test "jq:L2478 try __foobar_ _ ._1.5__ catch ." {
-    return error.SkipZigTest;
+test "jq:L2478 try (_foobar_ | .[1.5]) catch ." {
+    const results = runFilter(
+        "try (\"foobar\" | .[1.5]) catch .",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Cannot index string with number (1.5)\"", results[0]);
 }
 
-test "jq:L2485 try __ok__ setpath__1__ 1__ catch __ko__ ._" {
-    return error.SkipZigTest;
+test "jq:L2485 try [_ok_, setpath([1]; 1)] catch [_ko_, .]" {
+    const results = runFilter(
+        "try [\"ok\", setpath([1]; 1)] catch [\"ko\", .]",
+        "{\"hi\":\"hello\"}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"ko\",\"Cannot index object with number (1)\"]", results[0]);
 }
 
 test "jq:L2489 try fromjson catch ." {
-    return error.SkipZigTest;
+    const results = runFilter(
+        "try fromjson catch .",
+        "\"{'a': 123}\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"Invalid string literal; expected \\\", but got ' at line 1, column 5 (while parsing '{'a': 123}')\"", results[0]);
 }
 
-test "jq:L2495 try ltrimstr_1_ catch _x__ try rtrimstr_1_ catch _x_ _ _ok_" {
-    return error.SkipZigTest;
+test "jq:L2495 try ltrimstr(1) catch _x_, try rtrimstr(1) catch _x_ | _ok_" {
+    const results = runFilter(
+        "try ltrimstr(1) catch \"x\", try rtrimstr(1) catch \"x\" | \"ok\"",
+        "\"hi\"",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"ok\"", results[0]);
+    try std.testing.expectEqualStrings("\"ok\"", results[1]);
 }
 
-test "jq:L2500 try ltrimstr__x__ catch _x__ try rtrimstr__x__ catch _x_ ..." {
-    return error.SkipZigTest;
+test "jq:L2500 try ltrimstr(_x_) catch _x_, try rtrimstr(_x_) catch _x_ ..." {
+    const results = runFilter(
+        "try ltrimstr(\"x\") catch \"x\", try rtrimstr(\"x\") catch \"x\" | \"ok\"",
+        "{\"hey\":[]}",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"ok\"", results[0]);
+    try std.testing.expectEqualStrings("\"ok\"", results[1]);
 }
 
-test "jq:L2507 .__ as __x_ _y_ _ try __ok__ __x _ ltrimstr__y___ catch _..." {
-    return error.SkipZigTest;
+test "jq:L2507 .[] as [$x, $y] | try [_ok_, ($x | ltrimstr($y))] catch [..." {
+    const results = runFilter(
+        ".[] as [$x, $y] | try [\"ok\", ($x | ltrimstr($y))] catch [\"ko\", .]",
+        "[[\"hi\",1],[1,\"hi\"],[\"hi\",\"hi\"],[1,1]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[\"ko\",\"startswith() requires string inputs\"]", results[0]);
+    try std.testing.expectEqualStrings("[\"ko\",\"startswith() requires string inputs\"]", results[1]);
+    try std.testing.expectEqualStrings("[\"ok\",\"\"]", results[2]);
+    try std.testing.expectEqualStrings("[\"ko\",\"startswith() requires string inputs\"]", results[3]);
 }
 
-test "jq:L2514 .__ as __x_ _y_ _ try __ok__ __x _ rtrimstr__y___ catch _..." {
-    return error.SkipZigTest;
+test "jq:L2514 .[] as [$x, $y] | try [_ok_, ($x | rtrimstr($y))] catch [..." {
+    const results = runFilter(
+        ".[] as [$x, $y] | try [\"ok\", ($x | rtrimstr($y))] catch [\"ko\", .]",
+        "[[\"hi\",1],[1,\"hi\"],[\"hi\",\"hi\"],[1,1]]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("[\"ko\",\"endswith() requires string inputs\"]", results[0]);
+    try std.testing.expectEqualStrings("[\"ko\",\"endswith() requires string inputs\"]", results[1]);
+    try std.testing.expectEqualStrings("[\"ok\",\"\"]", results[2]);
+    try std.testing.expectEqualStrings("[\"ko\",\"endswith() requires string inputs\"]", results[3]);
 }
 
-test "jq:L2524 try __OK__ setpath___1___ 1__ catch __KO__ ._" {
-    return error.SkipZigTest;
+test "jq:L2524 try [_OK_, setpath([[1]]; 1)] catch [_KO_, .]" {
+    const results = runFilter(
+        "try [\"OK\", setpath([[1]]; 1)] catch [\"KO\", .]",
+        "[]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"KO\",\"Cannot update field at array index of array\"]", results[0]);
 }
 
-test "jq:L2529 foreach .__ as _x _0_ 1_ . _ _x_" {
-    return error.SkipZigTest;
+test "jq:L2529 foreach .[] as $x (0, 1; . + $x)" {
+    const results = runFilter(
+        "foreach .[] as $x (0, 1; . + $x)",
+        "[1, 2]",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 4), results.len);
+    try std.testing.expectEqualStrings("1", results[0]);
+    try std.testing.expectEqualStrings("3", results[1]);
+    try std.testing.expectEqualStrings("2", results[2]);
+    try std.testing.expectEqualStrings("4", results[3]);
 }
 
-test "jq:L2539 strflocaltime___ _ ._ _uri_" {
-    return error.SkipZigTest;
+test "jq:L2539 strflocaltime(__ | ., @uri)" {
+    const results = runFilter(
+        "strflocaltime(\"\" | ., @uri)",
+        "0",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("\"\"", results[0]);
+    try std.testing.expectEqualStrings("\"\"", results[1]);
 }
 
-test "jq:L2549 reduce range_9999_ as __ _____.__ _ tojson _ fromjson _ f..." {
-    return error.SkipZigTest;
+test "jq:L2549 reduce range(9999) as $_ ([];[.]) | tojson | fromjson | f..." {
+    const results = runFilter(
+        "reduce range(9999) as $_ ([];[.]) | tojson | fromjson | flatten",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
 }
 
-test "jq:L2554 reduce range_10000_ as __ _____.__ _ tojson _ try _fromjs..." {
-    return error.SkipZigTest;
+test "jq:L2554 reduce range(10000) as $_ ([];[.]) | tojson | try (fromjs..." {
+    const results = runFilter(
+        "reduce range(10000) as $_ ([];[.]) | tojson | try (fromjson) catch . | (contains(\"<skipped: too deep>\") | not) and contains(\"Exceeds depth limit for parsing\")",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
-test "jq:L2559 reduce range_10001_ as __ _____.__ _ tojson _ contains___..." {
-    return error.SkipZigTest;
+test "jq:L2559 reduce range(10001) as $_ ([];[.]) | tojson | contains(_<..." {
+    const results = runFilter(
+        "reduce range(10001) as $_ ([];[.]) | tojson | contains(\"<skipped: too deep>\")",
+        "null",
+    ) catch |e| switch (e) {
+        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented
+        else => return e, // real failure: wrong type, bad input, etc.
+    };
+    defer { for (results) |s| alloc.free(s); alloc.free(results); }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("true", results[0]);
 }
 
