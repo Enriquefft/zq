@@ -1,6 +1,70 @@
 const std = @import("std");
 const err = @import("error");
 
+// ── ZqError / kindFromZqError ─────────────────────────────────────────────────
+
+test "ZqError: all variants are distinct Zig errors" {
+    // Each variant must be returnable and matchable — validates the error set.
+    const variants = [_]err.ZqError{
+        error.UnexpectedToken,
+        error.UnexpectedEof,
+        error.InvalidUtf8,
+        error.InvalidNumber,
+        error.UnterminatedString,
+        error.DepthLimitExceeded,
+        error.IoError,
+        error.QuerySyntaxError,
+        error.TypeError,
+        error.IndexOutOfBounds,
+    };
+    for (variants) |v| {
+        // Catching a ZqError and re-returning it must round-trip without loss.
+        const caught: err.ZqError = v;
+        try std.testing.expectEqual(v, caught);
+    }
+}
+
+test "kindFromZqError: maps every ZqError to its ErrorKind" {
+    const cases = [_]struct { ze: err.ZqError, ek: err.ErrorKind }{
+        .{ .ze = error.UnexpectedToken,   .ek = .unexpected_token },
+        .{ .ze = error.UnexpectedEof,     .ek = .unexpected_eof },
+        .{ .ze = error.InvalidUtf8,       .ek = .invalid_utf8 },
+        .{ .ze = error.InvalidNumber,     .ek = .invalid_number },
+        .{ .ze = error.UnterminatedString,  .ek = .unterminated_string },
+        .{ .ze = error.DepthLimitExceeded,  .ek = .depth_limit_exceeded },
+        .{ .ze = error.IoError,            .ek = .io_error },
+        .{ .ze = error.QuerySyntaxError,   .ek = .query_syntax_error },
+        .{ .ze = error.TypeError,          .ek = .type_error },
+        .{ .ze = error.IndexOutOfBounds,   .ek = .index_out_of_bounds },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.ek, err.kindFromZqError(c.ze));
+    }
+}
+
+test "ZqError: propagates through error union (try/catch pattern)" {
+    // Simulate the canonical zq module usage: propagate ZqError!T, then enrich.
+    const source = "bad input";
+    const failing_offset: u64 = 0;
+
+    const result: err.ZqError!u64 = error.UnexpectedToken;
+    const display_err: err.Error = result catch |e| blk: {
+        const table = try err.buildLineTable(source, std.testing.allocator);
+        defer err.deinit(table, std.testing.allocator);
+        const pos = err.resolve(table, failing_offset);
+        break :blk err.raise(err.kindFromZqError(e), .{
+            .line    = pos.line,
+            .col     = pos.col,
+            .snippet = source[0..3],
+        });
+    };
+
+    try std.testing.expectEqual(err.ErrorKind.unexpected_token, display_err.kind);
+    try std.testing.expectEqual(@as(u64, 1), display_err.ctx.line);
+    try std.testing.expectEqual(@as(u64, 1), display_err.ctx.col);
+    try std.testing.expectEqualStrings("bad", display_err.ctx.snippet);
+}
+
 // ── raise ─────────────────────────────────────────────────────────────────────
 
 test "raise: assembles error without allocation" {
@@ -20,6 +84,10 @@ test "raise: all ErrorKind variants round-trip" {
         .invalid_number,
         .unterminated_string,
         .depth_limit_exceeded,
+        .io_error,
+        .query_syntax_error,
+        .type_error,
+        .index_out_of_bounds,
     };
     const ctx = err.Context{ .line = 1, .col = 1, .snippet = "" };
     for (kinds) |k| {
