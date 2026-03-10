@@ -513,7 +513,7 @@ fn printErr(msg: []const u8) void {
 }
 
 fn printErrByte(b: u8) void {
-    std.fs.File.stderr().writer().writeByte(b) catch {};
+    std.fs.File.stderr().writeAll(&[1]u8{b}) catch {};
 }
 
 fn printZqErr(e: anyerror) void {

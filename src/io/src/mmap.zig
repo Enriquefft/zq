@@ -1,6 +1,30 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Windows file-mapping APIs are not wrapped in std.os.windows — declare them directly.
+const win32 = struct {
+    extern "kernel32" fn CreateFileMappingW(
+        hFile: std.os.windows.HANDLE,
+        lpFileMappingAttributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+        flProtect: std.os.windows.DWORD,
+        dwMaximumSizeHigh: std.os.windows.DWORD,
+        dwMaximumSizeLow: std.os.windows.DWORD,
+        lpName: ?std.os.windows.LPCWSTR,
+    ) callconv(.winapi) ?std.os.windows.HANDLE;
+
+    extern "kernel32" fn MapViewOfFile(
+        hFileMappingObject: std.os.windows.HANDLE,
+        dwDesiredAccess: std.os.windows.DWORD,
+        dwFileOffsetHigh: std.os.windows.DWORD,
+        dwFileOffsetLow: std.os.windows.DWORD,
+        dwNumberOfBytesToMap: usize,
+    ) callconv(.winapi) ?std.os.windows.LPVOID;
+
+    extern "kernel32" fn UnmapViewOfFile(
+        lpBaseAddress: std.os.windows.LPCVOID,
+    ) callconv(.winapi) std.os.windows.BOOL;
+};
+
 /// Cross-platform memory-mapped read-only file region.
 ///
 /// On POSIX targets uses mmap(2)/munmap(2).
@@ -12,7 +36,7 @@ pub const MappedFile = struct {
     pub fn init(file: std.fs.File, size: usize) !MappedFile {
         if (builtin.os.tag == .windows) {
             const FILE_MAP_READ: std.os.windows.DWORD = 0x0004;
-            const mapping = std.os.windows.CreateFileMappingW(
+            const mapping = win32.CreateFileMappingW(
                 file.handle,
                 null,
                 std.os.windows.PAGE_READONLY,
@@ -21,7 +45,7 @@ pub const MappedFile = struct {
                 null,
             ) orelse return error.IoError;
             errdefer std.os.windows.CloseHandle(mapping);
-            const ptr = std.os.windows.MapViewOfFile(
+            const ptr = win32.MapViewOfFile(
                 mapping,
                 FILE_MAP_READ,
                 0,
@@ -47,7 +71,7 @@ pub const MappedFile = struct {
 
     pub fn deinit(self: *MappedFile) void {
         if (builtin.os.tag == .windows) {
-            _ = std.os.windows.UnmapViewOfFile(@ptrCast(self.data.ptr));
+            _ = win32.UnmapViewOfFile(@ptrCast(self.data.ptr));
             std.os.windows.CloseHandle(self._win_mapping);
         } else {
             std.posix.munmap(@alignCast(@constCast(self.data)));
