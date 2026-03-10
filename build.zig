@@ -70,10 +70,13 @@ pub fn build(b: *std.Build) void {
     c_abi_module.addImport("parser", parser_module);
 
     // ── Executable ─────────────────────────────────────────────────────────────
+    const is_release = optimize != .Debug;
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (is_release) true else null,
     });
     exe_mod.addImport("error", error_module);
     exe_mod.addImport("types", types_module);
