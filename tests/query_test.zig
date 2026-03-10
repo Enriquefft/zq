@@ -1235,3 +1235,586 @@ test ".['key']: syntax error on unterminated string" {
         CompiledQuery.compile(".[\"unterminated]", .{}, alloc),
     );
 }
+
+// ── Alternative operator (//) ─────────────────────────────────────────────────
+
+test "alternative: null // literal returns literal" {
+    // null input → . // 42 → 42
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // 42");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+}
+
+test "alternative: false // literal returns literal" {
+    // false input → . // 99 → 99
+    const entries = [_]Entry{.{ .tag = .false_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // 99");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+}
+
+test "alternative: truthy value passes through" {
+    // integer 7 → . // 99 → 7 (7 is truthy)
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // 99");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "alternative: 0 is truthy (jq semantics)" {
+    // 0 is truthy in jq — only false and null are falsy
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // 42");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+}
+
+test "alternative: .foo // literal when key is null" {
+    // {"foo": null}  →  .foo // "default"  → "default"
+    const sb = "foodefault";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo // \"default\"");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("default", vals[0].string);
+}
+
+test "alternative: .foo // literal when key is present and truthy" {
+    // {"foo": 5}  →  .foo // 99  → 5
+    const sb = "foo";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .int, .payload = .{ .int = 5 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo // 99");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+}
+
+test "alternative: .foo // .bar when foo is null, bar is used with original input" {
+    // {"foo": null, "bar": 42}  →  .foo // .bar  → 42
+    const sb = "foobar";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const bar_ref = StringRef{ .offset = 3, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = bar_ref } },
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo // .bar");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+}
+
+test "alternative: missing key falls back to right side" {
+    // {"bar": 77}  →  .foo // .bar  → 77  (foo is absent, alt_null_depth enables null propagation)
+    const sb = "foobar";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const bar_ref = StringRef{ .offset = 3, .len = 3 };
+    _ = foo_ref; // foo is absent from the tape object
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = bar_ref } },
+        .{ .tag = .int, .payload = .{ .int = 77 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo // .bar");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 77), vals[0].int);
+}
+
+test "alternative: chained a // b // c, first truthy" {
+    // integer 1 → . // 2 // 3 → 1
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 1 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // 2 // 3");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+}
+
+test "alternative: chained a // b // c, first two null" {
+    // null → . // null // 99 → 99
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(". // null // 99");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+}
+
+test "alternative: in pipe context" {
+    // {"x": null}  →  .x // 0  → 0
+    const sb = "x";
+    const x_ref = StringRef{ .offset = 0, .len = 1 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = x_ref } },
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(". | .x // 0");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+}
+
+// ── Try-catch ────────────────────────────────────────────────────────────────
+
+test "try: no error - yields value" {
+    const sb = "foo";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("try .foo");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+}
+
+test "try: missing key - yields nothing" {
+    const sb = "bar";
+    const bar_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = bar_ref } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("try .foo");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "try: type error - yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 5 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try .foo");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "try-catch: missing key uses catch handler" {
+    const sb = "bar";
+    const bar_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = bar_ref } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("try .foo catch \"fallback\"");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("fallback", vals[0].string);
+}
+
+test "try-catch: catch receives error name string" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 5 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try .foo catch .");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("TypeError", vals[0].string);
+}
+
+test "try-catch: no error - yields try body, skips catch" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try . catch \"err\"");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "try: index out of bounds - yields nothing" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 3 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("try .[5]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "try-catch: index out of bounds uses catch handler" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 3 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("try .[5] catch -1");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+}
+
+test "try: iterate non-array - yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 3 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try .[]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "try: nested - inner catch fires, outer not needed" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try (try .foo catch \"inner\") catch \"outer\"");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("inner", vals[0].string);
+}
+
+test "try: division by zero - yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try (1 / 0)");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "try-catch: modulo by zero uses catch" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try (1 % 0) catch \"div0\"");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("div0", vals[0].string);
+}
+
+// ── Optional operator (?) ─────────────────────────────────────────────────────
+
+test "optional: .foo? on object with key returns value" {
+    const sb = "foo";
+    const ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = ref } },
+        .{ .tag = .int, .payload = .{ .int = 7 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "optional: .foo? on non-object suppresses error, yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 42 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(".foo?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "optional: .[]? on array yields all elements" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile(".[]?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 2), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+}
+
+test "optional: .[]? on non-array suppresses error, yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 5 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(".[]?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "optional: .[] | .foo? skips non-object elements, yields rest" {
+    // [{"foo": 1}, 42, {"foo": 3}]
+    const sb = "foo";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 12 } },
+        // {"foo": 1}
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        // 42
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        // {"foo": 3}
+        .{ .tag = .object_start, .payload = .{ .skip = 10 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        // string element
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".[] | .foo?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 2), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 3), vals[1].int);
+}
+
+test "optional: .foo.bar? suppresses error from either step" {
+    // input: {"foo": 42}  — .foo is 42 (int), .bar would error on int
+    const sb = "foo";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo.bar?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "optional: .foo?.bar leaves .bar outside the try" {
+    // input: {"foo": {"bar": 9}}
+    const sb = "foobar";
+    const foo_ref = StringRef{ .offset = 0, .len = 3 };
+    const bar_ref = StringRef{ .offset = 3, .len = 3 };
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } },
+        .{ .tag = .key, .payload = .{ .string = foo_ref } },
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key, .payload = .{ .string = bar_ref } },
+        .{ .tag = .int, .payload = .{ .int = 9 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".foo?.bar");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 9), vals[0].int);
+}
+
+test "optional: .[0]? on array returns first element" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 3 } },
+        .{ .tag = .int, .payload = .{ .int = 5 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile(".[0]?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+}
+
+test "optional: .[0]? on non-array suppresses error, yields nothing" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile(".[0]?");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}

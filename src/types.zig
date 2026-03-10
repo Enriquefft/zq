@@ -251,6 +251,23 @@ pub const Instruction = struct {
         /// Finalize collection: pop the collect frame and push the assembled array
         /// onto the value stack.
         array_collect_end,
+
+        // Alternative operator (//) — null coalescing
+        /// Begin alternative evaluation: push current to if_stack; increment alt_null_depth
+        /// so that field accesses on the left side propagate null instead of TypeError.
+        alt_start,
+        /// End of left side: decrement alt_null_depth. Pop TOS (or use current).
+        /// If truthy: pop one entry from if_stack, push val back, jump to operand.index.
+        /// If falsy: discard val, continue — restore_input fires next to pop if_stack.
+        alt_check,
+
+        // Try-catch error handling
+        /// Begin a try block. operand.index = catch handler IP (0 = no catch;
+        /// suppress error silently and terminate this output path).
+        try_begin,
+        /// End of try body (no error occurred). Pop TryFrame.
+        /// operand.index = IP after catch handler (0 = no handler, just ip+1).
+        try_end,
     };
 
     pub const Operand = union {

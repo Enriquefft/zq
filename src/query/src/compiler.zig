@@ -175,6 +175,45 @@ fn lookupFunction(ctx: *Ctx, name_ref: StrRef) ?u32 {
     return null;
 }
 
+// ── Instruction insertion ─────────────────────────────────────────────────────
+//
+// Retroactively inserts a raw instruction at `pos`, shifting all later
+// instructions right by one slot.  Fixes up every jump-target operand and every
+// function-table body-range index whose value is ≥ pos so that they still
+// address the same (now shifted) instructions.
+
+fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!void {
+    // Grow the buffer by one slot (appended dummy is overwritten below).
+    try ctx.raw.append(ctx.alloc, .{ .op = .identity, .operand = .{ .none = {} } });
+    // Shift items at [pos..len-2] one slot to the right.
+    var i = ctx.raw.items.len - 1;
+    while (i > pos) : (i -= 1) {
+        ctx.raw.items[i] = ctx.raw.items[i - 1];
+    }
+    ctx.raw.items[pos] = instr;
+    // Fix up jump targets whose value is at or past the insertion point.
+    const p = @as(u32, @intCast(pos));
+    for (ctx.raw.items) |*r| {
+        switch (r.op) {
+            .jump, .jump_if_false, .array_collect_start, .alt_check => {
+                if (r.operand.index >= p) r.operand.index += 1;
+            },
+            // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
+            // fix up non-zero indices.
+            .try_begin, .try_end => {
+                if (r.operand.index > 0 and r.operand.index >= p) r.operand.index += 1;
+            },
+            else => {},
+        }
+    }
+    // Fix up function-table body ranges.
+    for (ctx.function_table.items) |*func| {
+        if (func.body_start_raw >= p) func.body_start_raw += 1;
+        if (func.body_end_raw >= p) func.body_end_raw += 1;
+        if (func.def_func_raw_ip >= p) func.def_func_raw_ip += 1;
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutOfMemory})!Compiled {
@@ -256,13 +295,54 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    try parseLogical(ctx);
+    try parseAlternative(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .pipe) break;
         _ = try ctx.lex.next();
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+        try parseAlternative(ctx);
+    }
+}
+
+/// parseAlternative: `//` (alternative operator / null coalescing).
+/// Precedence: lower than `or`/`and`, higher than `|`.
+///
+/// For `a // b` emits:
+///   alt_start             ← push current to if_stack; enable implicit null propagation
+///   <a>
+///   alt_check → after_b   ← decrement null-prop depth; if truthy keep value and jump;
+///                           if falsy discard and fall through to restore_input
+///   restore_input         ← restore original input for right-side evaluation
+///   <b>
+///   after_b:
+///
+/// For chained `a // b // c` a second alt_start is inserted at chain_start on the
+/// second iteration, wrapping the entire left subtree.
+fn parseAlternative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const chain_start: usize = ctx.raw.items.len;
+    try parseLogical(ctx);
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .double_slash) break;
+        _ = try ctx.lex.next();
+
+        // Insert alt_start before the entire left subtree.
+        // insertRawInstr fixes all existing jump targets ≥ chain_start.
+        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .alt_start, .operand = .{ .none = {} } });
+
+        // Emit alt_check with a placeholder target (backpatched after parsing right).
+        const check_pos = ctx.raw.items.len;
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .alt_check, .operand = .{ .index = 0 } });
+
+        // restore_input fires only on the falsy path so the right expr sees the saved input.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+        // Parse the right expression.
         try parseLogical(ctx);
+
+        // Backpatch alt_check to jump here (one past the right expr).
+        ctx.raw.items[check_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
     }
 }
 
@@ -416,6 +496,13 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         .false_kw => {
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_bool, .operand = .{ .bool = false } });
         },
+        .string_lit => {
+            const raw_str = t.slice(ctx.src);
+            // Strip surrounding double-quotes to get the bare content bytes.
+            const content = raw_str[1 .. raw_str.len - 1];
+            const ref = try internStr(&ctx.intern, ctx.alloc, content);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
+        },
         .int_lit => {
             const n = std.fmt.parseInt(i64, t.slice(ctx.src), 10) catch return error.QuerySyntaxError;
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = n } });
@@ -429,6 +516,12 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             const peek = try ctx.lex.peek();
             const ident_name = t.slice(ctx.src);
 
+            // `null` is a soft keyword: emit push_null when used as a standalone value.
+            if (std.mem.eql(u8, ident_name, "null")) {
+                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_null, .operand = .{ .none = {} } });
+                return;
+            }
+
             // Built-in functions: map, select, reduce, etc.
             // These are handled specially in jq
             if (peek.tag == .lparen or isBuiltinFunction(ident_name)) {
@@ -437,8 +530,9 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             } else {
                 // Field access
                 const ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+                const start = ctx.raw.items.len;
                 try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
-                try parseSuffixes(ctx);
+                try parseSuffixes(ctx, start);
             }
         },
         .dot => {
@@ -447,13 +541,15 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 .ident => {
                     _ = try ctx.lex.next();
                     const ref = try internStr(&ctx.intern, ctx.alloc, after.slice(ctx.src));
+                    const start = ctx.raw.items.len;
                     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
-                    try parseSuffixes(ctx);
+                    try parseSuffixes(ctx, start);
                 },
                 .lbracket => {
                     _ = try ctx.lex.next();
+                    const start = ctx.raw.items.len;
                     try parseBracket(ctx);
-                    try parseSuffixes(ctx);
+                    try parseSuffixes(ctx, start);
                 },
                 else => {
                     // Bare dot — identity.
@@ -478,11 +574,68 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             // Conditional: if COND then THEN [elif COND then THEN]* [else ELSE] end
             try parseIfBody(ctx);
         },
+        .try_kw => {
+            // try EXPR [catch EXPR]
+            try parseTryCatch(ctx);
+        },
         .lbracket => {
             // Array construction: [expr] — collect all outputs of expr into an array.
             try parseArrayConstruct(ctx);
         },
         else => return error.QuerySyntaxError,
+    }
+}
+
+/// Parse a `try EXPR [catch EXPR]` expression (the `try` keyword has already been
+/// consumed by parsePrimary).
+///
+/// jq semantics:
+///   - `try EXPR`            — evaluate EXPR; if error, suppress (produce no output).
+///   - `try EXPR catch HDLR` — evaluate EXPR; if error, evaluate HDLR with the error
+///                             message (a string) as its input.
+///
+/// Both EXPR and HDLR are parsed at the "primary" level so that `try .foo | .bar`
+/// correctly parses as `(try .foo) | .bar`, matching jq's term-level precedence.
+///
+/// Emits for `try EXPR` (no catch):
+///   try_begin(catch_ip=0)    ← 0 = suppress on error
+///   <EXPR>
+///   try_end(after_ip=0)      ← 0 = no handler to skip; ip+1
+///
+/// Emits for `try EXPR catch HDLR`:
+///   try_begin(catch_ip=N)    ← N = first instruction of HDLR
+///   <EXPR>
+///   try_end(after_ip=M)      ← M = first instruction past HDLR
+///   N: <HDLR>                ← handler receives error string as `current`
+///   M: (next instruction)
+fn parseTryCatch(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Emit try_begin with placeholder catch_ip (backpatched if catch is present).
+    const try_begin_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .try_begin, .operand = .{ .index = 0 } });
+
+    // Parse the try body at primary level so that `|` is left to the outer pipe.
+    try parsePrimary(ctx);
+
+    const t = try ctx.lex.peek();
+    if (t.tag == .catch_kw) {
+        _ = try ctx.lex.next(); // consume 'catch'
+
+        // Emit try_end with placeholder after_ip (backpatched after parsing handler).
+        const try_end_pos = ctx.raw.items.len;
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .try_end, .operand = .{ .index = 0 } });
+
+        // Backpatch try_begin to point at the first instruction of the handler.
+        const catch_ip: u32 = @intCast(ctx.raw.items.len);
+        ctx.raw.items[try_begin_pos].operand = .{ .index = catch_ip };
+
+        // Parse the catch handler at primary level.
+        try parsePrimary(ctx);
+
+        // Backpatch try_end to jump past the handler.
+        ctx.raw.items[try_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    } else {
+        // No catch: try_end with sentinel 0 means "no jump, ip+1".
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .try_end, .operand = .{ .index = 0 } });
     }
 }
 
@@ -794,7 +947,20 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// Consume any chain of `.ident`, `[...]`, or `$var` suffixes following a primary expression.
-fn parseSuffixes(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+/// Parse zero or more postfix suffixes (.field, [index], .[key], ?) after a
+/// primary expression. `start_pos` is the raw-instruction index of the first
+/// instruction emitted for the preceding primary expression; it is the insertion
+/// point used when `?` retroactively wraps the preceding segment in try/end.
+///
+/// `?` applies to the segment since the last `?` (or since `start_pos`):
+///   .foo.bar?   → try_begin, load_key "foo", load_key "bar", try_end
+///   .foo?.bar   → try_begin, load_key "foo", try_end, load_key "bar"
+///   .foo?.bar?  → try_begin, load_key "foo", try_end, try_begin, load_key "bar", try_end
+fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!void {
+    // segment_start: raw-instruction index where the current try-scope began.
+    // Resets to ctx.raw.items.len after each `?` so the next `?` only wraps
+    // what came after the previous one.
+    var segment_start: usize = start_pos;
     while (true) {
         const t = try ctx.lex.peek();
         switch (t.tag) {
@@ -822,6 +988,16 @@ fn parseSuffixes(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             .lbracket => {
                 _ = try ctx.lex.next();
                 try parseBracket(ctx);
+            },
+            .question => {
+                _ = try ctx.lex.next();
+                // Retroactively wrap the preceding segment in try_begin / try_end
+                // (no catch handler — errors are suppressed silently).
+                // insertRawInstr shifts all existing jump targets past segment_start.
+                try insertRawInstr(ctx, segment_start, RawInstr{ .op = .try_begin, .operand = .{ .index = 0 } });
+                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .try_end, .operand = .{ .index = 0 } });
+                // The next `?` (if any) only wraps what comes after this try_end.
+                segment_start = ctx.raw.items.len;
             },
             else => break,
         }
@@ -1009,6 +1185,12 @@ fn fuse(
                 // Array construction: remap end_ip raw → fused index.
                 .array_collect_start => .{ .index = index_map.items[r.operand.index] },
                 .array_collect_end => .{ .none = {} },
+                // Alternative operator: remap jump target raw → fused index.
+                .alt_start => .{ .none = {} },
+                .alt_check => .{ .index = index_map.items[r.operand.index] },
+                // Try-catch: remap non-zero index operands (0 = sentinel, no jump).
+                .try_begin => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
+                .try_end => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
             },
         };
     }

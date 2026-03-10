@@ -64,6 +64,16 @@ pub const Token = struct {
 
         // String literal
         string_lit, // "..."
+
+        // Alternative operator
+        double_slash, // //
+
+        // Try-catch keywords
+        try_kw,   // try
+        catch_kw, // catch
+
+        // Optional operator
+        question, // ?
     };
 
     pub fn slice(tok: Token, src: []const u8) []const u8 {
@@ -143,6 +153,10 @@ pub const Lexer = struct {
             },
             '/' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '/') {
+                    l.pos += 1;
+                    return .{ .tag = .double_slash, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .slash, .offset = start, .len = 1 };
             },
             '%' => {
@@ -196,6 +210,10 @@ pub const Lexer = struct {
             '$' => {
                 l.pos += 1;
                 return .{ .tag = .dollar, .offset = start, .len = 1 };
+            },
+            '?' => {
+                l.pos += 1;
+                return .{ .tag = .question, .offset = start, .len = 1 };
             },
             '"' => {
                 l.pos += 1; // skip opening quote
@@ -283,6 +301,10 @@ pub const Lexer = struct {
             .else_kw
         else if (std.mem.eql(u8, slice, "end"))
             .end_kw
+        else if (std.mem.eql(u8, slice, "try"))
+            .try_kw
+        else if (std.mem.eql(u8, slice, "catch"))
+            .catch_kw
         else
             .ident;
 

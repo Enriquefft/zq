@@ -75,8 +75,8 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 | Feature | Scope | What it unlocks |
 |---------|-------|-----------------|
-| [ ] **Alternative operator** (`//`) | Compiler + VM | Null coalescing. `(.foo // "default")` |
-| [ ] **Try/catch** (`try expr catch expr`) | Compiler + VM | Error recovery. The LLM streaming use case. |
+| [x] **Alternative operator** (`//`) | Compiler + VM | Null coalescing. `(.foo // "default")` |
+| [x] **Try/catch** (`try expr catch expr`) | Compiler + VM | Error recovery. The LLM streaming use case. |
 | [ ] **Optional operator** (`expr?`) | Compiler + VM | Suppress errors on missing keys. `.foo?` |
 | [ ] **Slicing** (`.[2:4]`, `.[2:]`, `.[:4]`) | Compiler + VM | Array and string slicing |
 | [ ] **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. `.foo \|= . + 1` |
