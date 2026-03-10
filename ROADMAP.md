@@ -38,27 +38,6 @@ Performance:        11.6x jq on 15M-line JSONL (parallel)
 
 **Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete, all module tests green.
 
-### What the query VM supports today
-
-```
-.           .foo        .foo.bar.baz
-.[0]        .[]         .foo | .bar
-.foo | .[] | .[0]
-
-+  -  *  /  %          (arithmetic, object/array/string merge)
-==  !=  <  >  <=  >=   (comparisons)
-and  or  not            (boolean logic)
-
-expr as $x | ...        (variable binding)
-a, b                    (comma — multiple outputs)
-{a: .b, c: .d}          (object construction, shorthand {a}, computed {(.k): .v})
-"hello \(.name)"        (string interpolation)
-..                      (recursive descent)
-def f(args): body;      (user-defined functions, including recursion)
-```
-
-That is approximately **25-30% of jq's language surface**.
-
 ---
 
 ## v0.1.0 — Useful
