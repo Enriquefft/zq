@@ -73,7 +73,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}
-          path: zq-*.${{ matrix.ext }}
+          path: ${{ steps.meta.outputs.name }}.${{ matrix.ext }}
           retention-days: 1
 
   release:
