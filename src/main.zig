@@ -3,6 +3,7 @@ const io_mod = @import("io");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
 const output_mod = @import("output");
+const pool_mod = @import("pool");
 const types = @import("types");
 
 const EXIT_OK = 0;
@@ -98,6 +99,7 @@ pub fn main() !u8 {
     const format = config.format;
 
     var last_was_false_or_null = false;
+    var had_parse_errors = false;
 
     if (config.null_input) {
         last_was_false_or_null = processNullInput(&cq, &writer, format, allocator) catch |e| {
@@ -108,7 +110,7 @@ pub fn main() !u8 {
     } else if (config.files.len == 0) {
         // Read from stdin.
         const stdin_fd = std.posix.STDIN_FILENO;
-        last_was_false_or_null = processSource(stdin_fd, &cq, &writer, format, allocator) catch |e| {
+        last_was_false_or_null = processSource(stdin_fd, &cq, &writer, format, allocator, &had_parse_errors) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -123,7 +125,7 @@ pub fn main() !u8 {
             };
             defer std.posix.close(fd);
 
-            last_was_false_or_null = processSource(fd, &cq, &writer, format, allocator) catch |e| {
+            last_was_false_or_null = processFile(fd, &cq, &writer, format, allocator) catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 return EXIT_SYSTEM;
@@ -136,24 +138,32 @@ pub fn main() !u8 {
         return EXIT_SYSTEM;
     };
 
+    if (had_parse_errors) return EXIT_SYSTEM;
     if (config.exit_status and last_was_false_or_null) {
         return EXIT_FALSE;
     }
     return EXIT_OK;
 }
 
+/// Process a streaming source (stdin, pipe) single-threaded with a persistent
+/// iterator that is reset() per JSONL record — zero allocations after the first.
 fn processSource(
     fd: std.posix.fd_t,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
     allocator: std.mem.Allocator,
+    had_errors: *bool,
 ) !bool {
     var src = try io_mod.Source.init(fd, allocator);
     defer src.deinit();
 
     var parser = try parser_mod.Parser.init(allocator);
     defer parser.deinit();
+
+    // Persistent iterator: allocated once, reset() per JSONL record.
+    var opt_it: ?query_mod.ResultIterator = null;
+    defer if (opt_it) |*it| it.deinit();
 
     var last_was_false_or_null = false;
 
@@ -167,10 +177,15 @@ fn processSource(
         if (view.bytes.len == 0 and view.is_eof) {
             // If parser has pending state, finalize with empty eof feed.
             if (fed_any) {
-                const result = try parser.feed("", true);
+                const result = parser.feed("", true) catch |e| {
+                    printErr("zq: ");
+                    printZqErr(e);
+                    had_errors.* = true;
+                    break;
+                };
                 switch (result) {
-                    .done => |tape| {
-                        _ = try executeAndWrite(cq, tape, writer, format, allocator);
+                    .done => |d| {
+                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, allocator);
                     },
                     .need_more => {},
                 }
@@ -184,20 +199,65 @@ fn processSource(
         }
 
         fed_any = true;
-        const result = try parser.feed(view.bytes, view.is_eof);
-        src.consume(view.bytes.len);
+        const result = parser.feed(view.bytes, view.is_eof) catch |e| {
+            // Parse error: report, skip to next record boundary (\n), and continue.
+            printErr("zq: ");
+            printZqErr(e);
+            had_errors.* = true;
+            // Skip past the next newline to re-sync on the next JSONL record.
+            const skip = std.mem.indexOfScalar(u8, view.bytes, '\n') orelse view.bytes.len - 1;
+            src.consume(skip + 1);
+            parser.reset();
+            fed_any = false;
+            if (view.is_eof and skip + 1 >= view.bytes.len) break;
+            continue;
+        };
 
         switch (result) {
-            .done => |tape| {
-                last_was_false_or_null = try executeAndWrite(cq, tape, writer, format, allocator);
+            .done => |d| {
+                src.consume(d.consumed);
+                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, allocator);
                 parser.reset();
                 fed_any = false;
             },
             .need_more => {
+                src.consume(view.bytes.len);
                 if (view.is_eof) break;
                 _ = try src.refill();
             },
         }
+    }
+
+    return last_was_false_or_null;
+}
+
+/// Process a regular file in parallel using the worker Pool.
+/// Uses all available CPU cores. Results are delivered in submission order.
+fn processFile(
+    fd: std.posix.fd_t,
+    cq: *const query_mod.CompiledQuery,
+    writer: *output_mod.Writer,
+    format: types.Format,
+    allocator: std.mem.Allocator,
+) !bool {
+    const n_threads = std.Thread.getCpuCount() catch 4;
+    var pool = try pool_mod.Pool.init(n_threads, allocator);
+    defer pool.deinit();
+
+    try pool.submit_file(fd, cq);
+
+    var last_was_false_or_null = false;
+    while (try pool.collect()) |result| {
+        const val = result.value;
+        try writer.write_value(val, format);
+        if (format == .pretty or format == .compact) {
+            try writer.write_value(.{ .string = "\n" }, .raw);
+        }
+        last_was_false_or_null = switch (val) {
+            .null_val => true,
+            .bool_val => |b| !b,
+            else => false,
+        };
     }
 
     return last_was_false_or_null;
@@ -209,38 +269,45 @@ fn processNullInput(
     format: types.Format,
     allocator: std.mem.Allocator,
 ) !bool {
-    // Parse "null" as input.
     var parser = try parser_mod.Parser.init(allocator);
     defer parser.deinit();
 
     const result = try parser.feed("null", true);
     const tape = switch (result) {
-        .done => |t| t,
+        .done => |d| d.tape,
         .need_more => return false,
     };
 
-    return try executeAndWrite(cq, tape, writer, format, allocator);
+    var opt_it: ?query_mod.ResultIterator = null;
+    defer if (opt_it) |*it| it.deinit();
+    return try writeRecord(cq, tape, &opt_it, writer, format, allocator);
 }
 
-fn executeAndWrite(
+/// Execute the query against `tape` and write all output values.
+/// On the first call, `opt_it.*` is null and the iterator is allocated.
+/// On subsequent calls, the existing iterator is reset() to the new tape —
+/// zero allocations after the first record.
+fn writeRecord(
     cq: *const query_mod.CompiledQuery,
     tape: parser_mod.Tape,
+    opt_it: *?query_mod.ResultIterator,
     writer: *output_mod.Writer,
     format: types.Format,
     allocator: std.mem.Allocator,
 ) !bool {
-    var iter = try cq.execute(tape, allocator);
-    defer iter.deinit();
+    if (opt_it.*) |*it| {
+        it.reset(tape);
+    } else {
+        opt_it.* = try cq.execute(tape, allocator);
+    }
+    const it = &opt_it.*.?;
 
     var last_was_false_or_null = false;
-
-    while (try iter.next()) |val| {
+    while (try it.next()) |val| {
         try writer.write_value(val, format);
-        // For non-join mode, write newline after each value in pretty/compact mode.
         if (format == .pretty or format == .compact) {
             try writer.write_value(.{ .string = "\n" }, .raw);
         }
-
         last_was_false_or_null = switch (val) {
             .null_val => true,
             .bool_val => |b| !b,

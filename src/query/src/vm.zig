@@ -35,6 +35,12 @@ const StackValue = union(enum) {
 pub const ResultIterator = struct {
     tape: Tape,
     instructions: []const Instruction,
+    /// Function definitions table.
+    function_table: []const types.FunctionDef,
+    /// Compiled string buffer for string literals.
+    string_buf: []const u8,
+    /// Original input value, preserved for object construction.
+    input_value: Value,
     opts_allow_null: bool,
     ip: u32,
     current: Value,
@@ -44,6 +50,12 @@ pub const ResultIterator = struct {
     value_stack: std.ArrayList(StackValue),
     /// Variable storage for variable capture and reference.
     variable_store: std.ArrayList(?StackValue),
+    /// Mutable runtime tape for constructing objects/arrays at query time.
+    runtime_tape: types.RuntimeTape,
+    /// Persistent Tape view of runtime_tape for value references.
+    runtime_tape_view: types.Tape,
+    /// Object construction state.
+    object_construct: std.ArrayList(ObjectField),
     alloc: std.mem.Allocator,
     done: bool,
     /// Defers initial tapeEntryToValue(&self.tape, 0) until after any struct move.
@@ -51,6 +63,8 @@ pub const ResultIterator = struct {
 
     pub fn init(
         instructions: []const Instruction,
+        function_table: []const types.FunctionDef,
+        string_buf: []const u8,
         opts_allow_null: bool,
         tape: Tape,
         allocator: std.mem.Allocator,
@@ -72,15 +86,36 @@ pub const ResultIterator = struct {
         variable_store.items.len = 0;
         try variable_store.appendNTimes(allocator, null, max_value_stack);
 
+        // Initialize object construction state
+        var object_construct = std.ArrayList(ObjectField){};
+        errdefer object_construct.deinit(allocator);
+        try object_construct.ensureTotalCapacity(allocator, 128);
+
+        // Initialize runtime tape
+        var runtime_tape = try types.RuntimeTape.init(allocator);
+        errdefer runtime_tape.deinit(allocator);
+
+        // Initialize runtime tape view
+        const runtime_tape_view = types.Tape{
+            .entries = runtime_tape.entries.items,
+            .string_buf = runtime_tape.string_buf.items,
+        };
+
         return ResultIterator{
             .tape = tape,
             .instructions = instructions,
+            .function_table = function_table,
+            .string_buf = string_buf,
+            .input_value = undefined, // Will be set on first next() call
             .opts_allow_null = opts_allow_null,
             .ip = 0,
             .current = undefined,
             .stack = stack,
             .value_stack = value_stack,
             .variable_store = variable_store,
+            .runtime_tape = runtime_tape,
+            .runtime_tape_view = runtime_tape_view,
+            .object_construct = object_construct,
             .alloc = allocator,
             .done = false,
             .initialized = false,
@@ -92,6 +127,35 @@ pub const ResultIterator = struct {
         it.stack.deinit(it.alloc);
         it.value_stack.deinit(it.alloc);
         it.variable_store.deinit(it.alloc);
+        it.object_construct.deinit(it.alloc);
+        it.runtime_tape.deinit(it.alloc);
+    }
+
+    /// Rebind this iterator to a new tape from the same query.
+    /// All internal buffers retain their capacity — zero allocations.
+    /// The iterator returns to the initial state, ready for a new next() loop.
+    ///
+    /// Must be called only when the previous run is complete: either next()
+    /// returned null or an error, or the caller has decided to abandon it.
+    /// Must NOT be called after deinit().
+    pub fn reset(it: *ResultIterator, tape: Tape) void {
+        it.tape = tape;
+        it.ip = 0;
+        it.done = false;
+        it.initialized = false;
+        it.stack.clearRetainingCapacity();
+        it.value_stack.clearRetainingCapacity();
+        // Restore variable slots to their initial null state without reallocating.
+        // capacity >= max_value_stack is guaranteed by init()'s ensureTotalCapacity.
+        it.variable_store.items.len = max_value_stack;
+        @memset(it.variable_store.items, null);
+        it.object_construct.clearRetainingCapacity();
+        it.runtime_tape.entries.clearRetainingCapacity();
+        it.runtime_tape.string_buf.clearRetainingCapacity();
+        it.runtime_tape_view = types.Tape{
+            .entries = it.runtime_tape.entries.items,
+            .string_buf = it.runtime_tape.string_buf.items,
+        };
     }
 
     // ── Value stack operations ──────────────────────────────────────────────────
@@ -141,6 +205,8 @@ pub const ResultIterator = struct {
                 return null;
             }
             it.current = tapeEntryToValue(&it.tape, 0);
+            // Store input value for object construction to reference
+            it.input_value = it.current;
         }
 
         return it.step();
@@ -177,9 +243,13 @@ pub const ResultIterator = struct {
                 },
 
                 .load_key => {
-                    it.current = try lookupKeyInValue(
+                    const result = try lookupKeyInValue(
                         &it.tape, it.opts_allow_null, it.current, instr.operand.string,
                     );
+                    it.current = result;
+                    // Push result to value stack so arithmetic operations can use it
+                    const result_sv = try valueToStackValue(result);
+                    it.pushValue(result_sv);
                     it.ip += 1;
                 },
 
@@ -207,6 +277,70 @@ pub const ResultIterator = struct {
 
                 .push_float => {
                     it.pushValue(.{ .float = instr.operand.float });
+                    it.ip += 1;
+                },
+
+                .push_null => {
+                    it.pushValue(.null_val);
+                    it.ip += 1;
+                },
+
+                .push_string => {
+                    const str_ref = instr.operand.str_ref;
+                    // Get string from compiled string buffer
+                    const str = it.string_buf[str_ref.offset..][0..str_ref.len];
+                    it.pushValue(.{ .tape_value = .{ .string = str } });
+                    it.ip += 1;
+                },
+
+                .push_current => {
+                    it.pushValue(try valueToStackValue(it.current));
+                    it.ip += 1;
+                },
+
+                // Object construction operations
+                .object_construct_start => {
+                    it.object_construct.clearRetainingCapacity();
+                    // Snapshot input so each field's value expression starts from it.
+                    it.current = it.input_value;
+                    it.ip += 1;
+                },
+
+                .object_key => {
+                    // Get value from stack if available, otherwise use current
+                    // We check for 2 items on stack (key + value) vs 1 item (just key)
+                    const value = if (it.value_stack.items.len > 1)
+                        try it.popValue()
+                    else
+                        try valueToStackValue(it.current);
+
+                    const key_val = try it.popValue();
+
+                    // Extract key string - only support string keys for now
+                    const key = switch (key_val) {
+                        .tape_value => |tv| switch (tv) {
+                            .string => |s| s,
+                            else => return error.TypeError,
+                        },
+                        else => return error.TypeError, // Only strings can be object keys
+                    };
+
+                    // Use appendAssumeCapacity since we pre-allocated
+                    it.object_construct.appendAssumeCapacity(ObjectField{
+                        .key = key,
+                        .value = value,
+                    });
+
+                    // Restore current to the filter input so the next field's
+                    // value expression is evaluated against the same context.
+                    it.current = it.input_value;
+                    it.ip += 1;
+                },
+
+                .object_construct_end => {
+                    // Construct object and push to stack
+                    const obj = try it.constructObjectFromFields();
+                    it.pushValue(obj);
                     it.ip += 1;
                 },
 
@@ -378,6 +512,181 @@ pub const ResultIterator = struct {
         const left_f = try toFloat(left);
         const right_f = try toFloat(right);
         return .{ .float = left_f - right_f };
+    }
+
+    // ── Object construction operations ─────────────────────────────────────────────────
+
+    const ObjectField = struct {
+        key: []const u8,
+        value: StackValue,
+    };
+
+    fn constructObjectFromFields(it: *ResultIterator) ZqError!StackValue {
+        // Clear runtime tape for new object construction
+        it.runtime_tape.entries.clearRetainingCapacity();
+        it.runtime_tape.string_buf.clearRetainingCapacity();
+
+        // Append object_start entry
+        const obj_start_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 }, // Will update after object_end
+        });
+
+        // Append key-value pairs
+        for (it.object_construct.items) |field| {
+            // Intern key string
+            const key_ref = try it.runtime_tape.internString(it.alloc, field.key);
+            // Append key entry
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .key,
+                .payload = .{ .string = key_ref },
+            });
+            // Append value entry
+            try it.stackValueToRuntimeTapeEntry(field.value);
+        }
+
+        // Append object_end entry
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+
+        // Update object_start skip pointer to point past object_end
+        it.runtime_tape.entries.items[obj_start_idx].payload.skip = obj_end_idx + 1;
+
+        // Update runtime_tape_view to point to current runtime_tape state
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+
+        // Create tape view and construct object value
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape_view,
+            .start = obj_start_idx,
+            .end = obj_end_idx + 1,
+        } } };
+    }
+
+    /// Convert a StackValue to a runtime tape entry.
+    /// Appends the entry(s) to the runtime tape.
+    fn stackValueToRuntimeTapeEntry(it: *ResultIterator, val: StackValue) ZqError!void {
+        switch (val) {
+            .null_val => {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .null_val,
+                    .payload = .{ .none = {} },
+                });
+            },
+            .bool_val => |b| {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = if (b) .true_val else .false_val,
+                    .payload = .{ .none = {} },
+                });
+            },
+            .int => |i| {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = i },
+                });
+            },
+            .float => |f| {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .float,
+                    .payload = .{ .float = f },
+                });
+            },
+            .tape_value => |tv| switch (tv) {
+                .string => |s| {
+                    // Intern the string
+                    const str_ref = try it.runtime_tape.internString(it.alloc, s);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .string,
+                        .payload = .{ .string = str_ref },
+                    });
+                },
+                .object => |span| {
+                    // Copy entire object from original tape to runtime tape
+                    try it.copyTapeSpanToRuntimeTape(span);
+                },
+                .array => |span| {
+                    // Copy entire array from original tape to runtime tape
+                    try it.copyTapeSpanToRuntimeTape(span);
+                },
+                .null_val => {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .null_val,
+                        .payload = .{ .none = {} },
+                    });
+                },
+                .bool_val => |b| {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = if (b) .true_val else .false_val,
+                        .payload = .{ .none = {} },
+                    });
+                },
+                .int => |i| {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .int,
+                        .payload = .{ .int = i },
+                    });
+                },
+                .float => |f| {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .float,
+                        .payload = .{ .float = f },
+                    });
+                },
+            },
+        }
+    }
+
+    /// Copy a tape span (object or array) from the original tape to the runtime tape.
+    /// Preserves the structure and string references.
+    fn copyTapeSpanToRuntimeTape(it: *ResultIterator, span: types.Value.TapeSpan) ZqError!void {
+        var pos = span.start;
+
+        // Copy all entries in the span
+        while (pos < span.end) {
+            const entry = span.tape.entries[pos];
+
+            switch (entry.tag) {
+                .object_start, .array_start => {
+                    // For container start, we need to copy the container recursively
+                    // and track the skip pointer
+                    const container_start_idx = try it.runtime_tape.appendEntry(it.alloc, entry);
+                    const container_end_idx = entry.payload.skip;
+                    // Recursively copy container content (excluding end marker)
+                    // Check if there's content to copy (empty container case)
+                    if (container_end_idx > pos + 1) {
+                        const nested_span = types.Value.TapeSpan{
+                            .tape = span.tape,
+                            .start = pos + 1,
+                            .end = container_end_idx - 1,  // Exclude end marker from recursive copy
+                        };
+                        try it.copyTapeSpanToRuntimeTape(nested_span);
+                    }
+
+                    // Append end marker
+                    const new_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = if (entry.tag == .object_start) .object_end else .array_end,
+                        .payload = .{ .none = {} },
+                    });
+
+                    // Update skip pointer to point past the new end
+                    it.runtime_tape.entries.items[container_start_idx].payload.skip = new_end_idx + 1;
+
+                    // Skip to after the container in the source tape
+                    pos = container_end_idx + 1;
+                },
+                .key => {
+                    // Skip key entries when copying values (not constructing objects)
+                    pos = skipEntry(span.tape.*, pos);
+                },
+                else => {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, entry);
+                    pos += 1;
+                },
+            }
+        }
     }
 
     fn doMul(it: *ResultIterator) ZqError!StackValue {

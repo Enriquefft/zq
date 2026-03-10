@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("parser", parser_module);
     exe_mod.addImport("query", query_module);
     exe_mod.addImport("output", output_module);
+    exe_mod.addImport("pool", pool_module);
 
     const exe = b.addExecutable(.{
         .name = "zq",

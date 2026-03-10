@@ -9,7 +9,9 @@ pub const Tape = types.Tape;
 pub const FeedResult = union(enum) {
     /// A complete top-level JSON value was parsed.
     /// `tape` is non-owning; valid until next `reset()` or `deinit()`.
-    done: Tape,
+    /// `consumed` is how many bytes of the input chunk were used (≤ input.len).
+    /// Caller must pass the unconsumed remainder back on the next feed() call.
+    done: struct { tape: Tape, consumed: usize },
     /// Valid so far but incomplete; call `feed()` again with the next chunk.
     need_more,
 };
@@ -155,8 +157,11 @@ pub const Parser = struct {
         input: []const u8,
         is_eof: bool,
     ) (ZqError || error{OutOfMemory})!FeedResult {
-        for (input) |byte| {
+        for (input, 0..) |byte, i| {
             try p.processByte(byte);
+            if (p.state == .top_done) {
+                return .{ .done = .{ .tape = p.makeTape(), .consumed = i + 1 } };
+            }
         }
         if (is_eof) return p.processEof();
         return .need_more;
@@ -518,7 +523,9 @@ pub const Parser = struct {
             .want_colon => return error.UnexpectedEof,
 
             .want_value => {
-                if (p.stack.items.len == 0) return error.UnexpectedEof;
+                // Top-level with no value started: trailing whitespace after
+                // the last record.  Not an error — signal no value produced.
+                if (p.stack.items.len == 0) return .need_more;
                 const top = p.stack.items[p.stack.items.len - 1];
                 // After ':' in an object — value is mandatory.
                 if (top.kind == .object) return error.UnexpectedEof;
@@ -550,7 +557,7 @@ pub const Parser = struct {
 
             .top_done => {},
         }
-        return FeedResult{ .done = p.makeTape() };
+        return FeedResult{ .done = .{ .tape = p.makeTape(), .consumed = 0 } };
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

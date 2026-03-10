@@ -77,16 +77,28 @@ pub const ResultIterator = struct {
     /// Idempotent and infallible. Safe to call after any error from next().
     pub fn deinit(it: *ResultIterator) void;
 
+    /// Rebind this iterator to a new tape from the same query.
+    /// All internal buffers retain their capacity — zero allocations.
+    /// The iterator returns to the initial state, ready for a new next() loop.
+    ///
+    /// Use this to reuse the same iterator across multiple records (e.g. JSONL),
+    /// avoiding the 6 heap allocations that execute() + deinit() would incur
+    /// per record. This mirrors the Parser.reset() contract.
+    ///
+    /// Must be called only when the previous run is complete (next() returned
+    /// null or an error) or abandoned. Must NOT be called after deinit().
+    pub fn reset(it: *ResultIterator, tape: Tape) void;
+
     /// Advance the VM and return the next output value.
     ///
     /// Returns:
     ///   .{value}          — a non-owning view into the Tape passed to execute().
     ///                       Valid until the Tape is freed; not invalidated by next().
-    ///   null              — iteration complete; no more values. Call deinit().
+    ///   null              — iteration complete; no more values. Call deinit() or reset().
     ///   TypeError         — operation applied to the wrong JSON type (always fatal).
     ///   IndexOutOfBounds  — array index beyond array length (always fatal).
     ///
-    /// After any error the iterator is spent; call deinit() and discard it.
+    /// After any error the iterator is spent; call deinit() or reset() before reuse.
     pub fn next(it: *ResultIterator) ZqError!?Value;
 };
 ```
@@ -99,6 +111,7 @@ pub const ResultIterator = struct {
 | `CompiledQuery.deinit`   | `*CompiledQuery → void`                                                 | Free bytecode buffer and string-intern table.                        |
 | `CompiledQuery.execute`  | `*const CompiledQuery, Tape, Allocator → OOM!ResultIterator`            | Allocate eval stack. No execution yet.                               |
 | `ResultIterator.deinit`  | `*ResultIterator → void`                                                | Free the eval stack. Idempotent.                                     |
+| `ResultIterator.reset`   | `*ResultIterator, Tape → void`                                          | Rebind to a new tape; zero allocations. Reuse across JSONL records.  |
 | `ResultIterator.next`    | `*ResultIterator → ZqError!?Value`                                      | Step the VM; yield next output value, null when done, or an error.  |
 
 ### Errors
@@ -130,8 +143,11 @@ pub const ResultIterator = struct {
   shared by `snippet` (error), `SliceView` (io), and `Tape` itself.
 - **Eval stack depth limit is 512.** Matches the parser's structural depth limit.
   `DepthLimitExceeded` is returned if nesting exceeds this during execution.
-- **Iterator is single-use.** After `next()` returns `null` or any error, the iterator is
-  spent. Call `deinit()` and discard.
+- **Iterator is single-use per binding.** After `next()` returns `null` or any error for a
+  given tape, the iterator is spent for that binding. Either call `deinit()` to free all
+  resources, or call `reset(new_tape)` to rebind to a new tape with the same query. After
+  `reset()`, the iterator starts fresh as if `execute()` had been called again, but without
+  any heap allocation. This pattern (init once, reset per record) is identical to `Parser`.
 - **Fuse pass is an implementation detail.** `.a | .b` compiles internally to a single
   `OP_LOAD_PATH "a.b"` instruction (`types.Instruction.Op.load_path`). Callers observe no
   difference; the `Instruction` type in `types.zig` documents this as a possible opcode.

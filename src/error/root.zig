@@ -23,6 +23,8 @@ pub const ZqError = error{
     TypeError,
     /// Array index beyond array length at runtime.
     IndexOutOfBounds,
+    /// Memory allocation failed during operation.
+    OutOfMemory,
 };
 
 /// All error conditions zq can produce. Mirrors ZqError 1:1.
@@ -42,6 +44,8 @@ pub const ErrorKind = enum {
     type_error,
     /// Array index beyond array length at runtime.
     index_out_of_bounds,
+    /// Memory allocation failed during operation.
+    out_of_memory,
 };
 
 /// Rich diagnostic context attached to every user-facing error.
@@ -75,6 +79,7 @@ pub fn kindFromZqError(e: ZqError) ErrorKind {
         error.QuerySyntaxError  => .query_syntax_error,
         error.TypeError         => .type_error,
         error.IndexOutOfBounds  => .index_out_of_bounds,
+        error.OutOfMemory      => .out_of_memory,
     };
 }
 

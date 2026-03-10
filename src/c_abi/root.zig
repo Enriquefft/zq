@@ -255,7 +255,7 @@ pub export fn zq_execute(
     };
 
     const tape = switch (feed_result) {
-        .done => |t| t,
+        .done => |d| d.tape,
         // is_eof = true means feed() must return .done or an error, never
         // .need_more.  Treat it as a parse error defensively.
         .need_more => return ERR_PARSE,

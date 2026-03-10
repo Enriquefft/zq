@@ -23,6 +23,9 @@
             zig
             zls
             hyperfine
+            jq
+            jaq
+            yq
           ];
         };
 

@@ -27,10 +27,11 @@ pub const Opts = struct {
 /// Immutable compiled filter. Thread-safe for concurrent execute() calls.
 /// Owns its instruction bytecode and string-intern buffer.
 pub const CompiledQuery = struct {
-    allocator:    std.mem.Allocator,
-    instructions: []types.Instruction,
-    string_buf:   []u8,
-    opts:         Opts,
+    allocator:     std.mem.Allocator,
+    instructions:  []types.Instruction,
+    function_table: []const types.FunctionDef,
+    string_buf:    []u8,
+    opts:          Opts,
 
     /// Compile `src` into bytecode.
     ///
@@ -44,10 +45,11 @@ pub const CompiledQuery = struct {
     ) (ZqError || error{OutOfMemory})!CompiledQuery {
         const compiled = try compiler.compile(src, allocator);
         return CompiledQuery{
-            .allocator    = allocator,
-            .instructions = compiled.instructions,
-            .string_buf   = compiled.string_buf,
-            .opts         = opts,
+            .allocator      = allocator,
+            .instructions   = compiled.instructions,
+            .function_table = compiled.function_table,
+            .string_buf     = compiled.string_buf,
+            .opts           = opts,
         };
     }
 
@@ -67,6 +69,8 @@ pub const CompiledQuery = struct {
     ) error{OutOfMemory}!ResultIterator {
         return ResultIterator.init(
             q.instructions,
+            q.function_table,
+            q.string_buf,
             q.opts.allow_null_propagation,
             tape,
             allocator,

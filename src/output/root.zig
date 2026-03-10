@@ -326,7 +326,13 @@ fn formatFloat(buf: *[64]u8, f: f64) []const u8 {
     if (std.math.isNan(f) or std.math.isInf(f)) {
         return "null";
     }
-    // Use Zig's default float formatter. It emits the shortest round-trip form.
+    // Check if the float is actually an integer
+    if (f == @trunc(f)) {
+        // Integer-valued float - format as integer (no decimal point)
+        const s = std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(f))}) catch unreachable;
+        return s;
+    }
+    // Non-integer float - format with decimal part
     const s = std.fmt.bufPrint(buf, "{d}", .{f}) catch unreachable;
     return s;
 }

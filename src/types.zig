@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// Core data types shared across all zq modules.
 ///
 /// These are the "contracts" that connect Parser → Query → Output:
@@ -81,6 +83,65 @@ pub const Value = union(enum) {
     };
 };
 
+// ─── Runtime Tape ─────────────────────────────────────────────────────────────
+/// Mutable tape for constructing objects/arrays at query time.
+/// Used by VM to build objects from {k: v} syntax.
+
+pub const RuntimeTape = struct {
+    entries: std.ArrayList(Tape.Entry),
+    string_buf: std.ArrayList(u8),
+
+    pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!RuntimeTape {
+        var rt_tape: RuntimeTape = .{
+            .entries = std.ArrayList(Tape.Entry){},
+            .string_buf = std.ArrayList(u8){},
+        };
+        // Pre-allocate capacity for typical object construction
+        try rt_tape.entries.ensureTotalCapacity(allocator, 256);
+        try rt_tape.string_buf.ensureTotalCapacity(allocator, 4096);
+        return rt_tape;
+    }
+
+    pub fn deinit(self: *RuntimeTape, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+        self.string_buf.deinit(allocator);
+    }
+
+    /// Intern a string and return its reference.
+    pub fn internString(self: *RuntimeTape, allocator: std.mem.Allocator, s: []const u8) error{OutOfMemory}!Tape.StringRef {
+        const offset = @as(u32, @intCast(self.string_buf.items.len));
+        try self.string_buf.appendSlice(allocator, s);
+        return Tape.StringRef{
+            .offset = offset,
+            .len = @as(u32, @intCast(s.len)),
+        };
+    }
+
+    /// Append an entry and return its index.
+    pub fn appendEntry(self: *RuntimeTape, allocator: std.mem.Allocator, entry: Tape.Entry) error{OutOfMemory}!u32 {
+        const idx = @as(u32, @intCast(self.entries.items.len));
+        try self.entries.append(allocator, entry);
+        return idx;
+    }
+
+    /// Get immutable view of this runtime tape as a regular Tape.
+    pub fn asTape(self: *const RuntimeTape) Tape {
+        return .{
+            .entries = self.entries.items,
+            .string_buf = self.string_buf.items,
+        };
+    }
+};
+
+// ─── Function Definition ─────────────────────────────────────────────────────
+
+/// Function definition stored in compiled query.
+pub const FunctionDef = struct {
+    body_ip: u32,
+    body_end: u32,
+    param_count: u8,
+};
+
 // ─── Instruction ─────────────────────────────────────────────────────────────
 // Bytecode emitted by Query.compile(), executed against a Tape.
 
@@ -151,10 +212,27 @@ pub const Instruction = struct {
         def_function,
         /// Call function by name. operand.index = function id.
         call_function,
+
+        // Object construction operations
+        /// Begin object construction frame.
+        object_construct_start,
+        /// Add key-value pair to current object.
+        object_key,
+        /// Complete object construction, push to stack.
+        object_construct_end,
+
+        // Literal values
+        /// Push null value to stack.
+        push_null,
+        /// Push string value to stack. operand.string = string value.
+        push_string,
+        /// Push current value to stack.
+        push_current,
     };
 
     pub const Operand = union {
         string: []const u8,
+        str_ref: Tape.StringRef,
         index: u32,
         bool: bool,
         int: i64,

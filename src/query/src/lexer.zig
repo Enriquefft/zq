@@ -36,11 +36,14 @@ pub const Token = struct {
         // Parentheses
         lparen,    // (
         rparen,    // )
+        lbrace,    // {
+        rbrace,    // }
 
         // Variable/function syntax
         dollar,    // $
         colon,     // :
         semicolon,  // ;
+        comma,     // ,
 
         // Keywords
         and_kw,    // and
@@ -50,6 +53,7 @@ pub const Token = struct {
         false_kw,  // false
         def_kw,    // def
         as_kw,     // as
+        reduce_kw, // reduce
     };
 
     pub fn slice(tok: Token, src: []const u8) []const u8 {
@@ -87,6 +91,8 @@ pub const Lexer = struct {
             ']' => { l.pos += 1; return .{ .tag = .rbracket,  .offset = start, .len = 1 }; },
             '(' => { l.pos += 1; return .{ .tag = .lparen,    .offset = start, .len = 1 }; },
             ')' => { l.pos += 1; return .{ .tag = .rparen,    .offset = start, .len = 1 }; },
+            '{' => { l.pos += 1; return .{ .tag = .lbrace,    .offset = start, .len = 1 }; },
+            '}' => { l.pos += 1; return .{ .tag = .rbrace,    .offset = start, .len = 1 }; },
             '+' => { l.pos += 1; return .{ .tag = .plus,      .offset = start, .len = 1 }; },
             '-' => {
                 l.pos += 1;
@@ -131,6 +137,7 @@ pub const Lexer = struct {
             },
             ':' => { l.pos += 1; return .{ .tag = .colon,     .offset = start, .len = 1 }; },
             ';' => { l.pos += 1; return .{ .tag = .semicolon,  .offset = start, .len = 1 }; },
+            ',' => { l.pos += 1; return .{ .tag = .comma,     .offset = start, .len = 1 }; },
             '$' => { l.pos += 1; return .{ .tag = .dollar,    .offset = start, .len = 1 }; },
             'a'...'z', 'A'...'Z', '_' => {
                 l.pos += 1;
@@ -193,6 +200,8 @@ pub const Lexer = struct {
             .def_kw
         else if (std.mem.eql(u8, slice, "as"))
             .as_kw
+        else if (std.mem.eql(u8, slice, "reduce"))
+            .reduce_kw
         else
             .ident;
 

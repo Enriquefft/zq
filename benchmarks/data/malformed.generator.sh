@@ -1,0 +1,106 @@
+#!/bin/bash
+# Generate malformed test dataset for fault tolerance benchmark
+# 90 valid lines, 5 incomplete (truncated), 5 with syntax errors
+
+cat > malformed.jsonl << 'EOF'
+{"valid": 1, "timestamp": "2024-01-01T00:00:00Z"}
+{"valid": 2, "timestamp": "2024-01-01T00:01:00Z"}
+{"valid": 3, "timestamp": "2024-01-01T00:02:00Z"}
+{"valid": 4, "timestamp": "2024-01-01T00:03:00Z"}
+{"valid": 5, "timestamp": "2024-01-01T00:04:00Z"}
+{"valid": 6, "timestamp": "2024-01-01T00:05:00Z"}
+{"valid": 7, "timestamp": "2024-01-01T00:06:00Z"}
+{"valid": 8, "timestamp": "2024-01-01T00:07:00Z"}
+{"valid": 9, "timestamp": "2024-01-01T00:08:00Z"}
+{"valid": 10, "timestamp": "2024-01-01T00:09:00Z"}
+{"valid": 11, "timestamp": "2024-01-01T00:10:00Z"}
+{"valid": 12, "timestamp": "2024-01-01T00:11:00Z"}
+{"valid": 13, "timestamp": "2024-01-01T00:12:00Z"}
+{"valid": 14, "timestamp": "2024-01-01T00:13:00Z"}
+{"valid": 15, "timestamp": "2024-01-01T00:14:00Z"}
+{"valid": 16, "timestamp": "2024-01-01T00:15:00Z"}
+{"valid": 17, "timestamp": "2024-01-01T00:16:00Z"}
+{"valid": 18, "timestamp": "2024-01-01T00:17:00Z"}
+{"valid": 19, "timestamp": "2024-01-01T00:18:00Z"}
+{"valid": 20, "timestamp": "2024-01-01T00:19:00Z"}
+{"valid": 21, "timestamp": "2024-01-01T00:20:00Z"}
+{"valid": 22, "timestamp": "2024-01-01T00:21:00Z"}
+{"valid": 23, "timestamp": "2024-01-01T00:22:00Z"}
+{"valid": 24, "timestamp": "2024-01-01T00:23:00Z"}
+{"valid": 25, "timestamp": "2024-01-01T00:24:00Z"}
+{"valid": 26, "timestamp": "2024-01-01T00:25:00Z"}
+{"valid": 27, "timestamp": "2024-01-01T00:26:00Z"}
+{"valid": 28, "timestamp": "2024-01-01T00:27:00Z"}
+{"valid": 29, "timestamp": "2024-01-01T00:28:00Z"}
+{"valid": 30, "timestamp": "2024-01-01T00:29:00Z"}
+{"valid": 31, "timestamp": "2024-01-01T00:30:00Z"}
+{"valid": 32, "timestamp": "2024-01-01T00:31:00Z"}
+{"valid": 33, "timestamp": "2024-01-01T00:32:00Z"}
+{"valid": 34, "timestamp": "2024-01-01T00:33:00Z"}
+{"valid": 35, "timestamp": "2024-01-01T00:34:00Z"}
+{"valid": 36, "timestamp": "2024-01-01T00:35:00Z"}
+{"valid": 37, "timestamp": "2024-01-01T00:36:00Z"}
+{"valid": 38, "timestamp": "2024-01-01T00:37:00Z"}
+{"valid": 39, "timestamp": "2024-01-01T00:38:00Z"}
+{"valid": 40, "timestamp": "2024-01-01T00:39:00Z"}
+{"valid": 41, "timestamp": "2024-01-01T00:40:00Z"}
+{"valid": 42, "timestamp": "2024-01-01T00:41:00Z"}
+{"valid": 43, "timestamp": "2024-01-01T00:42:00Z"}
+{"valid": 44, "timestamp": "2024-01-01T00:43:00Z"}
+{"valid": 45, "timestamp": "2024-01-01T00:44:00Z"}
+{"valid": 46, "timestamp": "2024-01-01T00:45:00Z"}
+{"valid": 47, "timestamp": "2024-01-01T00:46:00Z"}
+{"valid": 48, "timestamp": "2024-01-01T00:47:00Z"}
+{"valid": 49, "timestamp": "2024-01-01T00:48:00Z"}
+{"valid": 50, "timestamp": "2024-01-01T00:49:00Z"}
+{"valid": 51, "timestamp": "2024-01-01T00:50:00Z"}
+{"valid": 52, "timestamp": "2024-01-01T00:51:00Z"}
+{"valid": 53, "timestamp": "2024-01-01T00:52:00Z"}
+{"valid": 54, "timestamp": "2024-01-01T00:53:00Z"}
+{"valid": 55, "timestamp": "2024-01-01T00:54:00Z"}
+{"valid": 56, "timestamp": "2024-01-01T00:55:00Z"}
+{"valid": 57, "timestamp": "2024-01-01T00:56:00Z"}
+{"valid": 58, "timestamp": "2024-01-01T00:57:00Z"}
+{"valid": 59, "timestamp": "2024-01-01T00:58:00Z"}
+{"valid": 60, "timestamp": "2024-01-01T00:59:00Z"}
+{"valid": 61, "timestamp": "2024-01-01T01:00:00Z"}
+{"valid": 62, "timestamp": "2024-01-01T01:01:00Z"}
+{"valid": 63, "timestamp": "2024-01-01T01:02:00Z"}
+{"valid": 64, "timestamp": "2024-01-01T01:03:00Z"}
+{"valid": 65, "timestamp": "2024-01-01T01:04:00Z"}
+{"valid": 66, "timestamp": "2024-01-01T01:05:00Z"}
+{"valid": 67, "timestamp": "2024-01-01T01:06:00Z"}
+{"valid": 68, "timestamp": "2024-01-01T01:07:00Z"}
+{"valid": 69, "timestamp": "2024-01-01T01:08:00Z"}
+{"valid": 70, "timestamp": "2024-01-01T01:09:00Z"}
+{"valid": 71, "timestamp": "2024-01-01T01:10:00Z"}
+{"valid": 72, "timestamp": "2024-01-01T01:11:00Z"}
+{"valid": 73, "timestamp": "2024-01-01T01:12:00Z"}
+{"valid": 74, "timestamp": "2024-01-01T01:13:00Z"}
+{"valid": 75, "timestamp": "2024-01-01T01:14:00Z"}
+{"valid": 76, "timestamp": "2024-01-01T01:15:00Z"}
+{"valid": 77, "timestamp": "2024-01-01T01:16:00Z"}
+{"valid": 78, "timestamp": "2024-01-01T01:17:00Z"}
+{"valid": 79, "timestamp": "2024-01-01T01:18:00Z"}
+{"valid": 80, "timestamp": "2024-01-01T01:19:00Z"}
+{"valid": 81, "timestamp": "2024-01-01T01:20:00Z"}
+{"valid": 82, "timestamp": "2024-01-01T01:21:00Z"}
+{"valid": 83, "timestamp": "2024-01-01T01:22:00Z"}
+{"valid": 84, "timestamp": "2024-01-01T01:23:00Z"}
+{"valid": 85, "timestamp": "2024-01-01T01:24:00Z"}
+{"valid": 86, "timestamp": "2024-01-01T01:25:00Z"}
+{"valid": 87, "timestamp": "2024-01-01T01:26:00Z"}
+{"valid": 88, "timestamp": "2024-01-01T01:27:00Z"}
+{"valid": 89, "timestamp": "2024-01-01T01:28:00Z"}
+{"valid": 90, "timestamp": "2024-01-01T01:29:00Z"}
+{"incomplete": 1, "truncated":
+{"incomplete": 2, "truncated":
+{"incomplete": 3, "truncated":
+{"incomplete": 4, "truncated":
+{"incomplete": 5, "truncated":
+{"broken": missing_quote}
+{"broken": "unclosed_bracket": [1, 2, 3}
+{"broken": {"key": value_without_quotes}}
+{"broken": {"key": "value", "extra_comma": true,}}
+{"broken": {"nested": {"deeply": {"unclosed": true}}}
+EOF

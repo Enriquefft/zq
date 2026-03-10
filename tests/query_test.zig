@@ -577,3 +577,90 @@ test "boolean and float values round-trip through identity" {
         try std.testing.expectApproxEqAbs(@as(f64, 3.14), vals[0].float, 1e-9);
     }
 }
+
+// ── ResultIterator.reset() ────────────────────────────────────────────────────
+
+test "reset: iterator reuses buffers across two integer tapes" {
+    var q = try compile(".");
+    defer q.deinit();
+
+    const entries_a = [_]Entry{.{ .tag = .int, .payload = .{ .int = 100 } }};
+    const tape_a = tape(&entries_a, "");
+
+    const entries_b = [_]Entry{.{ .tag = .int, .payload = .{ .int = 200 } }};
+    const tape_b = tape(&entries_b, "");
+
+    // First run via execute().
+    var it = try q.execute(tape_a, alloc);
+    defer it.deinit();
+    const v1 = (try it.next()).?;
+    try std.testing.expectEqual(@as(i64, 100), v1.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+
+    // Reset to a new tape — must produce correct values with zero new allocations.
+    it.reset(tape_b);
+    const v2 = (try it.next()).?;
+    try std.testing.expectEqual(@as(i64, 200), v2.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "reset: iterator reuses buffers across many records (JSONL simulation)" {
+    var q = try compile(".");
+    defer q.deinit();
+
+    // Simulate processing 1000 records with a single iterator.
+    var first = true;
+    var it: query.ResultIterator = undefined;
+    defer if (!first) it.deinit();
+
+    var i: i64 = 0;
+    while (i < 1000) : (i += 1) {
+        const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = i } }};
+        const t = tape(&entries, "");
+
+        if (first) {
+            it = try q.execute(t, alloc);
+            first = false;
+        } else {
+            it.reset(t);
+        }
+
+        const val = (try it.next()).?;
+        try std.testing.expectEqual(i, val.int);
+        try std.testing.expectEqual(@as(?Value, null), try it.next());
+    }
+}
+
+test "reset: iterator correctly re-evaluates field access on different objects" {
+    var q = try compile(".age");
+    defer q.deinit();
+
+    // Object 1: {"age": 30}
+    const sb1 = "age";
+    const entries_1 = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 3 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
+        .{ .tag = .int,          .payload = .{ .int = 30 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const tape_1 = tape(&entries_1, sb1);
+
+    // Object 2: {"age": 55}
+    const sb2 = "age";
+    const entries_2 = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 3 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
+        .{ .tag = .int,          .payload = .{ .int = 55 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const tape_2 = tape(&entries_2, sb2);
+
+    var it = try q.execute(tape_1, alloc);
+    defer it.deinit();
+    try std.testing.expectEqual(@as(i64, 30), (try it.next()).?.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+
+    it.reset(tape_2);
+    try std.testing.expectEqual(@as(i64, 55), (try it.next()).?.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}

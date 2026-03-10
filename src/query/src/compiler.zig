@@ -11,11 +11,13 @@ const Token = lx.Token;
 /// Caller owns both slices; free via deinit().
 pub const Compiled = struct {
     instructions: []Instruction,
+    function_table: []const types.FunctionDef,
     string_buf: []u8,
 
     pub fn deinit(c: *Compiled, alloc: std.mem.Allocator) void {
         alloc.free(c.instructions);
         alloc.free(c.string_buf);
+        // function_table is part of string_buf, no need to free separately
     }
 };
 
@@ -69,7 +71,9 @@ const FunctionEntry = struct {
     name: StrRef,
     param_count: u8,
     param_ids: []u32, // Variable IDs for parameters
-    body_ip: u32, // Will be set by the fuse pass
+    body_start_raw: u32, // Raw instruction index where function body starts
+    def_func_raw_ip: u32, // Raw instruction index where def_function will be emitted
+    body_end_raw: u32, // Raw instruction index where function body ends
     id: u32,
 
     fn deinit(self: *const FunctionEntry, alloc: std.mem.Allocator) void {
@@ -139,7 +143,7 @@ fn lookupVariable(ctx: *Ctx, name_ref: StrRef) ?u32 {
 // ── Function management ──────────────────────────────────────────────────
 
 /// Define a function in the function table
-fn defineFunction(ctx: *Ctx, name_ref: StrRef, param_ids: []u32, alloc: std.mem.Allocator) error{OutOfMemory}!u32 {
+fn defineFunctionWithBody(ctx: *Ctx, name_ref: StrRef, param_ids: []u32, body_start_raw: u32, body_end_raw: u32, def_func_raw_ip: u32, alloc: std.mem.Allocator) error{OutOfMemory}!u32 {
     const func_id = ctx.next_func_id;
     ctx.next_func_id += 1;
 
@@ -150,7 +154,9 @@ fn defineFunction(ctx: *Ctx, name_ref: StrRef, param_ids: []u32, alloc: std.mem.
         .name = name_ref,
         .param_count = @intCast(param_ids.len),
         .param_ids = param_copy,
-        .body_ip = 0, // Will be set during fuse pass
+        .body_start_raw = body_start_raw,
+        .def_func_raw_ip = def_func_raw_ip,
+        .body_end_raw = body_end_raw,
         .id = func_id,
     });
 
@@ -226,12 +232,26 @@ pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutO
         try ctx.raw.append(alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
     }
 
-    return fuse(ctx.raw.items, &ctx.intern, alloc);
+    return fuse(ctx.raw.items, &ctx.function_table, &ctx.intern, alloc);
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Parse function definitions at the top level before the main expression
+    // Function definitions in jq are: def name(params): body;
+    // They can appear multiple times before the main query
+    while (true) {
+        const peek = try ctx.lex.peek();
+        if (peek.tag == .def_kw) {
+            // Parse function definition
+            try parseFunctionDef(ctx);
+        } else {
+            // Not a function definition, start parsing the main expression
+            break;
+        }
+    }
+
     try parsePipe(ctx);
 }
 
@@ -369,6 +389,31 @@ fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     }
 }
 
+/// Check if an identifier is a built-in function name
+fn isBuiltinFunction(name: []const u8) bool {
+    // Common jq built-in functions
+    const builtins = [_][]const u8{
+        "map", "select", "reduce", "range", "foreach", "walk",
+        "keys", "values", "to_entries", "from_entries",
+        "add", "sub", "mul", "div", "mod",
+        "length", "utf8bytelength", "explode", "split", "join",
+        "min", "max", "any", "all", "first", "last", "nth",
+        "type", "has", "paths", "del", "setpath",
+        "with_entries", "limit", "sort", "sort_by", "group_by",
+        "unique", "unique_by", "map_values", "index", "rindex",
+        "inside", "startswith", "endswith", "contains", "test",
+        "match", "capture", "matches", "splitn", "inputs",
+        "env", "tonumber", "tostreams", "tostring",
+    };
+
+    for (builtins) |builtin| {
+        if (std.mem.eql(u8, name, builtin)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// parsePrimary: literals, identifiers (with .field, [index]), `(` expr `)`, `$var`, `def name:`, `func(...)`
 fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.next();
@@ -388,14 +433,18 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_float, .operand = .{ .float = f } });
         },
         .ident => {
-            // Check if this is a function call
+            // Check if this is a built-in function or function call
             const peek = try ctx.lex.peek();
-            if (peek.tag == .lparen) {
+            const ident_name = t.slice(ctx.src);
+
+            // Built-in functions: map, select, reduce, etc.
+            // These are handled specially in jq
+            if (peek.tag == .lparen or isBuiltinFunction(ident_name)) {
                 // Function call
                 try parseFunctionCall(ctx, t);
             } else {
                 // Field access
-                const ref = try internStr(&ctx.intern, ctx.alloc, t.slice(ctx.src));
+                const ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
                 try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
                 try parseSuffixes(ctx);
             }
@@ -429,9 +478,9 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             // Variable reference: $var
             try parseVariableReference(ctx);
         },
-        .def_kw => {
-            // Function definition
-            try parseFunctionDef(ctx);
+        .lbrace => {
+            // Object literal
+            try parseObjectLiteral(ctx);
         },
         else => return error.QuerySyntaxError,
     }
@@ -502,11 +551,16 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try param_ids.append(ctx.alloc, param_id);
     }
 
+    // Track where function body starts
+    const body_start = @as(u32, @intCast(ctx.raw.items.len));
+
     // Parse function body
     try parseLogical(ctx);
 
-    // Define the function
-    const func_id = try defineFunction(ctx, name_ref, param_ids.items, ctx.alloc);
+    // Define the function with body_start (position of def_function, will be resolved later)
+    const def_func_pos = @as(u32, @intCast(ctx.raw.items.len));
+    const body_end = @as(u32, @intCast(ctx.raw.items.len + 1)); // Position after def_function
+    const func_id = try defineFunctionWithBody(ctx, name_ref, param_ids.items, body_start, body_end, def_func_pos, ctx.alloc);
 
     // Emit def_function instruction (will be resolved at compile time)
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .def_function, .operand = .{ .index = func_id } });
@@ -518,47 +572,116 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     popScope(ctx, ctx.alloc);
 }
 
-/// Parse a function call: func(arg1; arg2; ...)
+/// Parse a function call: func(arg1; arg2; ...) or builtin(expr)
 fn parseFunctionCall(ctx: *Ctx, name_tok: Token) (ZqError || error{OutOfMemory})!void {
-    const name_ref = try internStr(&ctx.intern, ctx.alloc, name_tok.slice(ctx.src));
-    const func_id = lookupFunction(ctx, name_ref) orelse return error.QuerySyntaxError;
-    const func = &ctx.function_table.items[func_id];
+    const ident_name = name_tok.slice(ctx.src);
 
-    // Consume opening paren
-    _ = try ctx.lex.next();
+    // Check if this is a built-in function
+    if (isBuiltinFunction(ident_name)) {
+        // Built-in function: consume opening paren
+        _ = try ctx.lex.next();
 
-    // Parse arguments
-    var arg_count: usize = 0;
+        // Parse the expression for built-in function
+        // Built-in functions like map take a single expression in parentheses
+        // For simplicity, we'll just emit iterate for map
+        try parseLogical(ctx);
+
+        // Expect closing paren
+        const rparen = try ctx.lex.next();
+        if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+        // For now, map just iterates - proper implementation needed
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+    } else {
+        // User-defined function
+        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+        const func_id = lookupFunction(ctx, name_ref) orelse return error.QuerySyntaxError;
+
+        // Consume opening paren
+        _ = try ctx.lex.next();
+
+        // Parse arguments
+        var arg_count: usize = 0;
+        while (true) {
+            const next_tok = try ctx.lex.peek();
+            if (next_tok.tag == .rparen) {
+                _ = try ctx.lex.next();
+                break;
+            }
+
+            // Parse argument expression
+            try parseLogical(ctx);
+            arg_count += 1;
+
+            // Check for more arguments or end of list
+            const sep_tok = try ctx.lex.peek();
+            if (sep_tok.tag == .semicolon) {
+                _ = try ctx.lex.next();
+            } else if (sep_tok.tag != .rparen) {
+                return error.QuerySyntaxError;
+            }
+        }
+
+        // Emit call_function instruction
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .call_function, .operand = .{ .index = func_id } });
+    }
+}
+
+/// Parse an object literal: {key1: value1, key2: value2, ...}
+fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .object_construct_start, .operand = .{ .none = {} } });
+
     while (true) {
-        const next_tok = try ctx.lex.peek();
-        if (next_tok.tag == .rparen) {
+        const peek = try ctx.lex.peek();
+        if (peek.tag == .rbrace) {
             _ = try ctx.lex.next();
             break;
         }
 
-        // Parse argument expression
-        try parseLogical(ctx);
-        arg_count += 1;
+        // Parse key (literal or dynamic)
+        try parseObjectKey(ctx);
 
-        // Check for more arguments or end of list
-        const sep_tok = try ctx.lex.peek();
-        if (sep_tok.tag == .semicolon) {
+        // Parse colon
+        const colon = try ctx.lex.next();
+        if (colon.tag != .colon) return error.QuerySyntaxError;
+
+        // Parse value expression
+        // The VM's object_key handler will get the value from stack or current
+        try parseLogical(ctx);
+
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .object_key, .operand = .{ .none = {} } });
+
+        // Check for comma
+        const comma = try ctx.lex.peek();
+        if (comma.tag == .comma) {
             _ = try ctx.lex.next();
-        } else if (sep_tok.tag != .rparen) {
-            return error.QuerySyntaxError;
         }
     }
 
-    // Check argument count matches parameter count
-    if (arg_count != func.param_count) {
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .object_construct_end, .operand = .{ .none = {} } });
+}
+
+/// Parse an object key: ident or string literal, or parenthesized expression for dynamic keys
+fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const peek = try ctx.lex.peek();
+
+    if (peek.tag == .lparen) {
+        // Dynamic key: {(.expr): value}
+        _ = try ctx.lex.next();
+        try parseLogical(ctx); // Evaluate key expression
+
+        const rparen = try ctx.lex.next();
+        if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
+               peek.tag == .true_kw or peek.tag == .false_kw) {
+        // Literal key - push as string value for object construction
+        const key = try ctx.lex.next();
+        const ref = try internStr(&ctx.intern, ctx.alloc, key.slice(ctx.src));
+        // Push string value directly to stack for object construction
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
+    } else {
         return error.QuerySyntaxError;
     }
-
-    // Emit call_function instruction
-    // Note: For simplicity, we'll use inline expansion approach
-    // where function bodies are substituted at compile time
-    // For now, just emit a placeholder
-    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .call_function, .operand = .{ .index = func_id } });
 }
 
 /// Consume any chain of `.ident`, `[...]`, or `$var` suffixes following a primary expression.
@@ -652,14 +775,23 @@ fn internPath(
 
 fn fuse(
     raw: []const RawInstr,
+    function_table: *std.ArrayList(FunctionEntry),
     intern: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
 ) error{OutOfMemory}!Compiled {
     var fused = std.ArrayList(RawInstr){};
     defer fused.deinit(alloc);
 
+    // Track mapping from raw instruction index to fused instruction index
+    var index_map = std.ArrayList(u32){};
+    defer index_map.deinit(alloc);
+    try index_map.ensureTotalCapacity(alloc, raw.len);
+
     var i: usize = 0;
     while (i < raw.len) {
+        // Record mapping for current raw instruction
+        index_map.appendAssumeCapacity(@intCast(fused.items.len));
+
         if (raw[i].op == .load_key) {
             var keys = std.ArrayList(StrRef){};
             defer keys.deinit(alloc);
@@ -700,17 +832,54 @@ fn fuse(
             .op = r.op,
             .operand = switch (r.op) {
                 .load_key, .load_path => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
+                .push_string => .{ .str_ref = .{
+                    .offset = r.operand.str_ref.offset,
+                    .len = r.operand.str_ref.len,
+                } },
                 .load_index, .capture_variable, .load_variable, .pop_variable, .def_function, .call_function => .{ .index = r.operand.index },
                 .push_bool => .{ .bool = r.operand.bool },
                 .push_int => .{ .int = r.operand.int },
                 .push_float => .{ .float = r.operand.float },
-                .identity, .iterate, .pipe, .output,
-                .add, .sub, .mul, .div, .mod,
-                .eq, .ne, .lt, .le, .gt, .ge,
-                .and_op, .or_op, .not => .{ .none = {} },
+                .push_null => .{ .none = {} },
+                .push_current => .{ .none = {} },
+                .identity => .{ .none = {} },
+                .iterate => .{ .none = {} },
+                .pipe => .{ .none = {} },
+                .output => .{ .none = {} },
+                .add => .{ .none = {} },
+                .sub => .{ .none = {} },
+                .mul => .{ .none = {} },
+                .div => .{ .none = {} },
+                .mod => .{ .none = {} },
+                .eq => .{ .none = {} },
+                .ne => .{ .none = {} },
+                .lt => .{ .none = {} },
+                .le => .{ .none = {} },
+                .gt => .{ .none = {} },
+                .ge => .{ .none = {} },
+                .and_op => .{ .none = {} },
+                .or_op => .{ .none = {} },
+                .not => .{ .none = {} },
+                .object_construct_start => .{ .none = {} },
+                .object_key => .{ .none = {} },
+                .object_construct_end => .{ .none = {} },
             },
         };
     }
 
-    return Compiled{ .instructions = instructions, .string_buf = string_buf };
+    // Create function table for VM
+    const function_defs = try alloc.alloc(types.FunctionDef, function_table.items.len);
+    for (function_table.items, function_defs) |func, *def| {
+        // Map raw instruction indices to fused instruction indices
+        const fused_body_start = index_map.items[func.body_start_raw];
+        const fused_body_end = index_map.items[func.body_end_raw];
+
+        def.* = types.FunctionDef{
+            .body_ip = fused_body_start,
+            .body_end = fused_body_end,
+            .param_count = func.param_count,
+        };
+    }
+
+    return Compiled{ .instructions = instructions, .function_table = function_defs, .string_buf = string_buf };
 }
