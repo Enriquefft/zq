@@ -168,7 +168,7 @@ fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     defer p.deinit();
 
     const tape = switch (try p.feed(input_json, true)) {
-        .done      => |t| t,
+        .done      => |d| d.tape,
         .need_more => return error.ParseIncomplete,
     };
 

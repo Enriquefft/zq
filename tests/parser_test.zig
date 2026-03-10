@@ -12,7 +12,7 @@ const Tape = parser.Tape;
 fn parseAll(p: *Parser, input: []const u8) !Tape {
     const result = try p.feed(input, true);
     switch (result) {
-        .done => |tape| return tape,
+        .done => |d| return d.tape,
         .need_more => return error.UnexpectedNeedMore,
     }
 }
@@ -272,7 +272,8 @@ test "streaming: need_more then done" {
     try std.testing.expectEqual(FeedResult.need_more, r1);
     const r2 = try p.feed("1}", true);
     switch (r2) {
-        .done => |tape| {
+        .done => |d| {
+            const tape = d.tape;
             try std.testing.expectEqual(@as(usize, 4), tape.entries.len);
             try std.testing.expectEqual(@as(i64, 1), tape.entries[2].payload.int);
         },
@@ -286,7 +287,7 @@ test "streaming: number split across chunks" {
     _ = try p.feed("12", false);
     const r = try p.feed("34", true);
     switch (r) {
-        .done => |tape| try std.testing.expectEqual(@as(i64, 1234), tape.entries[0].payload.int),
+        .done => |d| try std.testing.expectEqual(@as(i64, 1234), d.tape.entries[0].payload.int),
         .need_more => return error.UnexpectedNeedMore,
     }
 }
@@ -297,7 +298,8 @@ test "streaming: string split across chunks" {
     _ = try p.feed("\"hel", false);
     const r = try p.feed("lo\"", true);
     switch (r) {
-        .done => |tape| {
+        .done => |d| {
+            const tape = d.tape;
             const s = tape.getString(tape.entries[0].payload.string);
             try std.testing.expectEqualStrings("hello", s);
         },
@@ -394,10 +396,11 @@ test "error: unterminated string with escape" {
     try expectError(&p, "\"abc\\", error.UnterminatedString);
 }
 
-test "error: unexpected eof — empty input" {
+test "empty input at EOF returns need_more (streaming compatibility)" {
     var p = try Parser.init(std.testing.allocator);
     defer p.deinit();
-    try expectError(&p, "", error.UnexpectedEof);
+    const result = try p.feed("", true);
+    try std.testing.expectEqual(FeedResult.need_more, result);
 }
 
 test "error: unexpected eof — after colon" {
