@@ -25,7 +25,7 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-10)
 
-**Last updated:** Commit 8fa914a (Tests: fix parser API migration)
+**Last updated:** Commit 590666f
 
 ```
 Binary size:        203 KB (ReleaseFast, stripped)
@@ -36,36 +36,7 @@ Compat tests:       42/533 passing (8%)
 Performance:        11.6x jq on 15M-line JSONL (parallel)
 ```
 
----
-
-## Current State (v0.0.1 — 2026-03-10)
-
-### Infrastructure
-
-| Metric | Status |
-|--------|--------|
-| Binary size (ReleaseFast) | **203 KB** (was 3.0 MB with debug info; now auto-stripped) |
-| compat tests migrated | **533/533** (100% of jq test suite imported) |
-| compat tests passing | **42/533** (8%, real compatibility gaps) |
-| compat tests skipped | **450/533** (85%, QuerySyntaxError — unimplemented features) |
-| compat tests failing | **41/533** (7%, bugs to fix) |
-| Module tests passing | **249/249** unit tests (all green) |
-| Total test count | **291 passing, 450 skipped, 41 failing** |
-
-### What exists
-
-| Layer | Status |
-|-------|--------|
-| `error` | ZqError set, LineTable, lazy line/col resolution. 19 tests. |
-| `types` | Tape, Value, Instruction, Format. |
-| `io` | mmap + ring buffer behind unified Source. 6 tests. |
-| `parser` | Streaming state machine, auto-close truncated containers, 512 depth limit. **58 tests all green.** FeedResult now includes consumed byte count. |
-| `query` | Lexer, compiler (recursive descent + fuse pass), VM with value stack. Arithmetic, comparisons, boolean, variables, closures, object construction, string interpolation, recursive descent, user-defined functions. 42/533 compat tests passing. |
-| `output` | Buffered Writer, pretty/compact/raw/jsonl, JSON escaping. 56 tests. |
-| `pool` | mmap chunk-based file mode + stream pipeline. Chunk-level Sequencer (N_CHUNKS ops), arena-per-chunk, multi-value cursor. **11.6x faster than jq, 7.9x faster than jaq** on 15M-record JSONL. 21 tests. |
-| `c_abi` | zq_compile/zq_execute/zq_get_result/zq_free. 37 tests. |
-| `main.zig` | CLI with arg parsing. File parallelism auto-enabled (pool). |
-| **Total** | **249 module tests green + 533 compat tests** (42 pass, 450 skip, 41 fail) |
+**Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete, all module tests green.
 
 ### What the query VM supports today
 
