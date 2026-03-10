@@ -1818,3 +1818,355 @@ test "optional: .[0]? on non-array suppresses error, yields nothing" {
 
     try std.testing.expectEqual(@as(usize, 0), vals.len);
 }
+
+// ── Slicing ───────────────────────────────────────────────────────────────────
+// Helper: build a flat integer array tape [v0, v1, ...].
+// entries must be: array_start(skip=n+2) + n int entries + array_end.
+
+test "slice: .[1:3] extracts elements at index 1 and 2" {
+    // [10, 20, 30, 40, 50] → .[1:3] = [20, 30]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 7 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .int, .payload = .{ .int = 40 } },
+        .{ .tag = .int, .payload = .{ .int = 50 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[1:3]");
+    defer q.deinit();
+    // Verify within iterator lifetime so runtime_tape is still valid.
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .array);
+    // array_start + int(20) + int(30) + array_end = 4 entries
+    try std.testing.expectEqual(@as(u32, 4), v.array.end - v.array.start);
+    try std.testing.expectEqual(@as(i64, 20), v.array.tape.entries[v.array.start + 1].payload.int);
+    try std.testing.expectEqual(@as(i64, 30), v.array.tape.entries[v.array.start + 2].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "slice: .[2:] extracts from index 2 to end" {
+    // [10, 20, 30, 40]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .int, .payload = .{ .int = 40 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[2:]");
+    defer q.deinit();
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // [30, 40]: array_start + 2 ints + array_end = 4 entries
+    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+}
+
+test "slice: .[:2] extracts first two elements" {
+    // [10, 20, 30] → .[:2] = [10, 20]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[:2]");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .array);
+    // [10, 20]: array_start + 2 ints + array_end = 4 entries
+    try std.testing.expectEqual(@as(u32, 4), v.array.end - v.array.start);
+    try std.testing.expectEqual(@as(i64, 10), v.array.tape.entries[v.array.start + 1].payload.int);
+    try std.testing.expectEqual(@as(i64, 20), v.array.tape.entries[v.array.start + 2].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "slice: .[-2:] extracts last two elements" {
+    // [10, 20, 30] → .[-2:] = [20, 30]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[-2:]");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .array);
+    // [20, 30]: array_start + 2 ints + array_end = 4 entries
+    try std.testing.expectEqual(@as(u32, 4), v.array.end - v.array.start);
+    try std.testing.expectEqual(@as(i64, 20), v.array.tape.entries[v.array.start + 1].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "slice: .[:-1] extracts all but last element" {
+    // [10, 20, 30]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[:-1]");
+    defer q.deinit();
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // [10, 20]: array_start + 2 ints + array_end = 4 entries
+    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+}
+
+test "slice: .[0:0] returns empty array" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[0:0]");
+    defer q.deinit();
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // empty: array_start + array_end = 2 entries
+    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+}
+
+test "slice: out-of-bounds indices are clamped, returns empty" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[100:200]");
+    defer q.deinit();
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+}
+
+test "slice: string slice extracts byte range" {
+    // "hello" → .[1:4] = "ell"
+    const sb = "hello";
+    const entries = [_]Entry{
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 0, .len = 5 } } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".[1:4]");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .string);
+    try std.testing.expectEqualStrings("ell", v.string);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "slice: TypeError on non-array non-string" {
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 42 } }};
+    const t = tape(&entries, "");
+    var q = try compile(".[1:2]");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+// ── Update assignment ─────────────────────────────────────────────────────────
+
+test "update |=: replace object field" {
+    // {"a": 1, "b": 2} | .a |= . + 10  →  {"a": 11, "b": 2}
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int,          .payload = .{ .int = 1 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int,          .payload = .{ .int = 2 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".a |= . + 10");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .object);
+    const span = v.object;
+    // entries: [obj_start, key"a", int/float 11, key"b", int 2, obj_end]
+    try std.testing.expectEqual(Tag.object_start, span.tape.entries[span.start].tag);
+    // "a" value at start+2: result of . + 10 (may be float)
+    const a_entry = span.tape.entries[span.start + 2];
+    try std.testing.expect(a_entry.tag == .float or a_entry.tag == .int);
+    if (a_entry.tag == .float) {
+        try std.testing.expectApproxEqAbs(@as(f64, 11.0), a_entry.payload.float, 0.001);
+    } else {
+        try std.testing.expectEqual(@as(i64, 11), a_entry.payload.int);
+    }
+    // "b" value at start+4: unchanged int 2
+    try std.testing.expectEqual(@as(i64, 2), span.tape.entries[span.start + 4].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "update +=: increment field" {
+    // {"n": 5} | .n += 3  →  {"n": 8}
+    const sb = "n";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int,          .payload = .{ .int = 5 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".n += 3");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .object);
+    const span = v.object;
+    try std.testing.expectEqual(Tag.object_start, span.tape.entries[span.start].tag);
+    // "n" value at start+2: 5 + 3 = 8 (may be float from add)
+    const n_entry = span.tape.entries[span.start + 2];
+    try std.testing.expect(n_entry.tag == .float or n_entry.tag == .int);
+    if (n_entry.tag == .float) {
+        try std.testing.expectApproxEqAbs(@as(f64, 8.0), n_entry.payload.float, 0.001);
+    } else {
+        try std.testing.expectEqual(@as(i64, 8), n_entry.payload.int);
+    }
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "update |=: replace array element" {
+    // [1,2,3] | .[1] |= . * 10  →  [1,20,3]
+    const entries = [_]Entry{
+        .{ .tag = .array_start,  .payload = .{ .skip = 5 } },
+        .{ .tag = .int,          .payload = .{ .int = 1 } },
+        .{ .tag = .int,          .payload = .{ .int = 2 } },
+        .{ .tag = .int,          .payload = .{ .int = 3 } },
+        .{ .tag = .array_end,    .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile(".[1] |= . * 10");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .array);
+    const span = v.array;
+    // entries: [arr_start, int 1, float/int 20, int 3, arr_end]
+    try std.testing.expectEqual(Tag.array_start, span.tape.entries[span.start].tag);
+    try std.testing.expectEqual(@as(i64, 1), span.tape.entries[span.start + 1].payload.int);
+    const mid = span.tape.entries[span.start + 2];
+    try std.testing.expect(mid.tag == .float or mid.tag == .int);
+    if (mid.tag == .float) {
+        try std.testing.expectApproxEqAbs(@as(f64, 20.0), mid.payload.float, 0.001);
+    } else {
+        try std.testing.expectEqual(@as(i64, 20), mid.payload.int);
+    }
+    try std.testing.expectEqual(@as(i64, 3), span.tape.entries[span.start + 3].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "update //=: uses default when field is null" {
+    // {"x": null} | .x //= 99  →  {"x": 99}
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .null_val,     .payload = .{ .none = {} } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".x //= 99");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .object);
+    const span = v.object;
+    // entries: [obj_start, key"x", int 99, obj_end]
+    try std.testing.expectEqual(Tag.object_start, span.tape.entries[span.start].tag);
+    try std.testing.expectEqual(@as(i64, 99), span.tape.entries[span.start + 2].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "update //=: keeps existing truthy value" {
+    // {"x": 42} | .x //= 99  →  {"x": 42}
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int,          .payload = .{ .int = 42 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".x //= 99");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .object);
+    const span = v.object;
+    try std.testing.expectEqual(@as(i64, 42), span.tape.entries[span.start + 2].payload.int);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "update |=: nested path .a.b" {
+    // {"a": {"b": 1}} | .a.b |= . + 100  →  {"a": {"b": 101}}
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int,          .payload = .{ .int = 1 } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(".a.b |= . + 100");
+    defer q.deinit();
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+    const v = (try it.next()).?;
+    try std.testing.expect(v == .object);
+    const outer = v.object;
+    try std.testing.expectEqual(Tag.object_start, outer.tape.entries[outer.start].tag);
+    // Inner object at outer.start+2
+    try std.testing.expectEqual(Tag.object_start, outer.tape.entries[outer.start + 2].tag);
+    // "b" value at outer.start+4: 1 + 100 = 101 (may be float)
+    const b_entry = outer.tape.entries[outer.start + 4];
+    try std.testing.expect(b_entry.tag == .float or b_entry.tag == .int);
+    if (b_entry.tag == .float) {
+        try std.testing.expectApproxEqAbs(@as(f64, 101.0), b_entry.payload.float, 0.001);
+    } else {
+        try std.testing.expectEqual(@as(i64, 101), b_entry.payload.int);
+    }
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}

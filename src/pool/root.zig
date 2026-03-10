@@ -3,9 +3,10 @@
 /// File mode
 /// ---------
 /// submit_file() mmap's the entire file and splits it into n_threads × CHUNK_FACTOR
-/// byte-range chunks aligned to newline boundaries.  Each worker dequeues one chunk,
-/// processes every record in it, and posts a single ChunkResult to the Sequencer.
-/// Total Sequencer operations: N_CHUNKS (≤ 64 for 16 threads), not 15M.
+/// byte-range chunks aligned to newline boundaries.  A dedicated feeder thread lazily
+/// pushes chunks to the worker queue one at a time, blocking when too many are in-flight.
+/// Workers dequeue one chunk, process every record in it, and post a ChunkResult to the
+/// Sequencer.  Total Sequencer operations: N_CHUNKS (≤ 64 for 16 threads), not 15M.
 ///
 /// Stream mode
 /// -----------
@@ -21,10 +22,24 @@
 /// In the hot path for scalar queries (int/float/bool/null), own_value() allocates
 /// nothing — the arena is touched only for strings and object/array tape copies.
 ///
+/// Backpressure (file mode)
+/// ------------------------
+/// An InFlightLimiter caps the number of simultaneously live ChunkResults to
+/// IN_FLIGHT_FACTOR × n_threads.  The feeder acquires a slot before pushing each
+/// chunk to the queue; collect() releases the slot after freeing the chunk's arena.
+/// Peak RSS ≈ IN_FLIGHT_FACTOR × chunk_size × n_threads, not the full file size.
+///
 /// Ordering
 /// --------
-/// The Sequencer holds a reorder buffer (HashMap<chunk_id → ChunkResult>) and
-/// delivers chunks in chunk_id order regardless of worker completion order.
+/// The Sequencer holds a fixed-size ring buffer (capacity = QUEUE_CAP + n_threads
+/// slots) indexed by chunk_id % capacity.  Workers write directly into their
+/// assigned slot; collect() reads the slot for next_chunk_id, clears it, then
+/// advances.  No HashMap, no dynamic allocation in the reorder hot path.
+///
+/// Capacity is sized to the maximum spread of simultaneously live chunk IDs for
+/// both modes (file: IN_FLIGHT_FACTOR×n_threads; stream: QUEUE_CAP+n_threads).
+/// The ring invariant — no two live chunks share a slot — is enforced by the
+/// InFlightLimiter (file) and JobQueue capacity (stream).
 /// collect() maintains a (rec_idx, val_idx) cursor so multi-value queries (e.g.
 /// `.[]`) deliver every output value before advancing to the next record.
 const std = @import("std");
@@ -196,27 +211,92 @@ const JobQueue = struct {
     }
 };
 
-// ── Sequencer — chunk-level reorder buffer ─────────────────────────────────────
+// ── InFlightLimiter — backpressure between feeder and collect() ───────────────
+//
+// Caps how many ChunkResults are simultaneously alive (either being processed by
+// a worker or sitting in the Sequencer awaiting collect()).  The feeder calls
+// acquire() before enqueuing each chunk; collect() calls release() after freeing
+// the chunk's arena.  This bounds peak RSS to IN_FLIGHT_FACTOR × chunk_size ×
+// n_threads instead of the full file size.
+
+const InFlightLimiter = struct {
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+    count: usize,
+    max: usize,
+    shutdown: bool,
+
+    fn init(max_slots: usize) InFlightLimiter {
+        return .{
+            .mutex = .{},
+            .cond = .{},
+            .count = 0,
+            .max = max_slots,
+            .shutdown = false,
+        };
+    }
+
+    /// Block until a slot is available, then claim it.
+    /// Returns false when the limiter has been shut down; the caller must not
+    /// process any more chunks.
+    fn acquire(self: *InFlightLimiter) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.count >= self.max and !self.shutdown) self.cond.wait(&self.mutex);
+        if (self.shutdown) return false;
+        self.count += 1;
+        return true;
+    }
+
+    /// Release one slot and wake a waiting producer.
+    fn release(self: *InFlightLimiter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count > 0) self.count -= 1;
+        self.cond.signal();
+    }
+
+    /// Broadcast shutdown so all blocked acquire() calls return false immediately.
+    fn signal_shutdown(self: *InFlightLimiter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.shutdown = true;
+        self.cond.broadcast();
+    }
+};
+
+// ── Sequencer — ring-buffer reorder buffer ────────────────────────────────────
 //
 // Workers post ChunkResults out-of-order.  The Sequencer delivers them in
-// chunk_id order.  With N_CHUNKS ≤ 64 the HashMap never exceeds 64 entries —
-// orders of magnitude cheaper than the previous per-record (15M-entry) approach.
+// chunk_id order using a fixed-size ring buffer indexed by chunk_id % capacity.
+//
+// Capacity = QUEUE_CAP + n_threads, which upper-bounds the spread of live chunk
+// IDs in both modes:
+//   • File mode:   IN_FLIGHT_FACTOR × n_threads (enforced by InFlightLimiter)
+//   • Stream mode: QUEUE_CAP + n_threads (jobs queued + jobs being processed)
+//
+// Because the spread is always < capacity, no two live chunks share the same
+// slot index.  post() is a direct array write; next_in_order() is a direct read.
+// Zero dynamic allocation after init.
 
 const Sequencer = struct {
     mutex: std.Thread.Mutex,
     available: std.Thread.Condition,
-    pending: std.AutoHashMap(u64, ChunkResult),
+    /// Pre-allocated ring of chunk-result slots, indexed by chunk_id % slots.len.
+    slots: []?ChunkResult,
     /// chunk_id that collect() expects next.
     next_chunk_id: u64,
     /// Total chunks submitted; null until all submissions are complete.
     total_chunks: ?u64,
     allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator) error{OutOfMemory}!Sequencer {
+    fn init(capacity: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Sequencer {
+        const slots = try allocator.alloc(?ChunkResult, capacity);
+        @memset(slots, null);
         return .{
             .mutex = .{},
             .available = .{},
-            .pending = std.AutoHashMap(u64, ChunkResult).init(allocator),
+            .slots = slots,
             .next_chunk_id = 0,
             .total_chunks = null,
             .allocator = allocator,
@@ -224,20 +304,24 @@ const Sequencer = struct {
     }
 
     fn deinit(s: *Sequencer) void {
-        // Free arenas for any chunks that were never consumed.
-        var it = s.pending.valueIterator();
-        while (it.next()) |cr| cr.arena.deinit();
-        s.pending.deinit();
+        // Free arenas for any chunks that were never consumed by collect().
+        for (s.slots) |*maybe| {
+            if (maybe.*) |*cr| cr.arena.deinit();
+        }
+        s.allocator.free(s.slots);
     }
 
+    /// Write a completed ChunkResult into its ring slot.
+    ///
+    /// Invariant: slot[chunk_id % capacity] is always null on entry.
+    /// Guaranteed by InFlightLimiter (file mode) and QUEUE_CAP (stream mode):
+    /// the number of simultaneously live chunks never exceeds `capacity`.
     fn post(s: *Sequencer, result: ChunkResult) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        s.pending.put(result.chunk_id, result) catch {
-            // OOM storing the result — free the arena immediately to avoid a leak.
-            var r = result;
-            r.arena.deinit();
-        };
+        const idx = result.chunk_id % s.slots.len;
+        std.debug.assert(s.slots[idx] == null);
+        s.slots[idx] = result;
         s.available.signal();
     }
 
@@ -257,11 +341,11 @@ const Sequencer = struct {
             if (s.total_chunks) |tot| {
                 if (s.next_chunk_id >= tot) return null;
             }
-            if (s.pending.getPtr(s.next_chunk_id)) |cr| {
-                const result = cr.*;
-                _ = s.pending.remove(s.next_chunk_id);
+            const idx = s.next_chunk_id % s.slots.len;
+            if (s.slots[idx]) |cr| {
+                s.slots[idx] = null;
                 s.next_chunk_id += 1;
-                return result;
+                return cr;
             }
             s.available.wait(&s.mutex);
         }
@@ -527,6 +611,82 @@ fn io_thread_fn(ctx: IoCtx) void {
     ctx.queue.signal_done();
 }
 
+// ── File feeder thread ────────────────────────────────────────────────────────
+//
+// Iterates the mmap lazily: computes chunk boundaries on demand, acquires an
+// in-flight slot from the limiter (blocking when max is reached), then enqueues
+// the chunk to the worker queue.  This is the sole mechanism controlling how
+// many arenas are simultaneously live for file-mode processing.
+
+const FileFeedCtx = struct {
+    data: []const u8,
+    n_chunks: usize,
+    query: *const query_mod.CompiledQuery,
+    queue: *JobQueue,
+    sequencer: *Sequencer,
+    limiter: *InFlightLimiter,
+    allocator: std.mem.Allocator,
+};
+
+fn file_feeder_fn(ctx: FileFeedCtx) void {
+    const data = ctx.data;
+    const file_size = data.len;
+    var chunk_start: usize = 0;
+    var chunk_id: u64 = 0;
+
+    for (0..ctx.n_chunks) |i| {
+        const ideal_end = if (i + 1 == ctx.n_chunks)
+            file_size
+        else
+            (i + 1) * file_size / ctx.n_chunks;
+
+        // Align to newline so no record is split across chunks.
+        const chunk_end: usize = if (ideal_end >= file_size)
+            file_size
+        else blk: {
+            var pos = ideal_end;
+            while (pos < file_size and data[pos] != '\n') pos += 1;
+            break :blk if (pos < file_size) pos + 1 else file_size;
+        };
+
+        const chunk = data[chunk_start..chunk_end];
+        chunk_start = chunk_end;
+
+        if (chunk.len == 0) continue;
+        if (!hasNonEmptyLine(chunk)) continue;
+
+        // Block until a slot is available.  Returns false on shutdown (deinit).
+        if (!ctx.limiter.acquire()) break;
+
+        ctx.queue.push(.{
+            .data = chunk,
+            .seq_base = chunk_id,
+            .chunk_id = chunk_id,
+            .query = ctx.query,
+            .owns_data = false,
+            .allocator = ctx.allocator,
+        });
+        chunk_id += 1;
+    }
+
+    // Always inform the Sequencer of the final total and stop workers,
+    // even when we exit early due to shutdown.
+    ctx.sequencer.set_total_chunks(chunk_id);
+    ctx.queue.signal_done();
+}
+
+/// Return true if `data` contains at least one non-blank line.
+fn hasNonEmptyLine(data: []const u8) bool {
+    var rem = data;
+    while (rem.len > 0) {
+        const nl = std.mem.indexOfScalar(u8, rem, '\n') orelse rem.len;
+        const line = std.mem.trimRight(u8, rem[0..nl], " \t\r");
+        if (line.len > 0) return true;
+        rem = if (nl < rem.len) rem[nl + 1 ..] else &.{};
+    }
+    return false;
+}
+
 // ── SharedCtx — heap-allocated, ref-counted pool state ────────────────────────
 //
 // Pool is returned by value from init(), so JobQueue and Sequencer cannot live
@@ -536,6 +696,9 @@ fn io_thread_fn(ctx: IoCtx) void {
 const SharedCtx = struct {
     queue: JobQueue,
     sequencer: Sequencer,
+    /// Backpressure limiter for file mode.  Feeder acquires before each chunk;
+    /// collect() releases after each arena free.
+    limiter: InFlightLimiter,
     allocator: std.mem.Allocator,
     /// Starts at 1 (for the Pool) + n_workers.  Each exiting thread decrements.
     /// The last to decrement frees SharedCtx.
@@ -561,13 +724,18 @@ fn release_shared(shared: *SharedCtx, allocator: std.mem.Allocator) void {
 
 // ── Pool ──────────────────────────────────────────────────────────────────────
 
-/// Queue capacity: CHUNK_FACTOR × max sensible thread count gives comfortable
-/// headroom so submit_file() rarely blocks while workers drain the queue.
+/// Stream-mode queue capacity.  The IO thread blocks on push() when full,
+/// providing natural backpressure for streaming workloads.
 const QUEUE_CAP: usize = 256;
 
 /// Chunks per thread — more chunks than threads allows the OS scheduler to
 /// balance load when records have uneven parse/query cost.
 const CHUNK_FACTOR: usize = 4;
+
+/// File-mode backpressure: max simultaneously-live ChunkResults per thread.
+/// With 2× n_threads slots, each worker can have one chunk being processed and
+/// one buffered in the Sequencer, keeping all cores busy while bounding RSS.
+const IN_FLIGHT_FACTOR: usize = 2;
 
 pub const Pool = struct {
     allocator: std.mem.Allocator,
@@ -593,12 +761,21 @@ pub const Pool = struct {
         var queue = try JobQueue.init(QUEUE_CAP, allocator);
         errdefer queue.deinit();
 
-        var sequencer = try Sequencer.init(allocator);
+        // Ring capacity must exceed the maximum spread of simultaneously live
+        // chunk IDs across both operating modes:
+        //   • File mode:   IN_FLIGHT_FACTOR × n_threads  (capped by InFlightLimiter)
+        //   • Stream mode: QUEUE_CAP + n_threads          (queue depth + workers)
+        // Taking the max covers both; the allocation is at most a few KB.
+        const n_eff = @max(1, n_threads);
+        const seq_capacity = @max(IN_FLIGHT_FACTOR * n_eff, QUEUE_CAP + n_eff);
+        var sequencer = try Sequencer.init(seq_capacity, allocator);
         errdefer sequencer.deinit();
 
+        const max_in_flight = IN_FLIGHT_FACTOR * @max(1, n_threads);
         shared.* = .{
             .queue = queue,
             .sequencer = sequencer,
+            .limiter = InFlightLimiter.init(max_in_flight),
             .allocator = allocator,
             .ref_count = std.atomic.Value(usize).init(1 + n_threads),
         };
@@ -632,6 +809,10 @@ pub const Pool = struct {
     }
 
     pub fn deinit(p: *Pool) void {
+        // Unblock the feeder if it is stalled on limiter.acquire(), then stop
+        // all workers.  Order matters: limiter shutdown first so the feeder can
+        // wake up and call queue.signal_done() (or we call it below if it doesn't).
+        p._shared.limiter.signal_shutdown();
         p._shared.queue.signal_done();
         if (p.io_thread) |t| t.join();
         // Join workers BEFORE unmapping — workers may still read mmap memory.
@@ -646,13 +827,12 @@ pub const Pool = struct {
 
     /// Submit a regular file for parallel processing.
     ///
-    /// The file is memory-mapped once.  The mapping is split into at most
-    /// n_threads × CHUNK_FACTOR byte-range chunks, each aligned to newline
-    /// boundaries so records are never split across workers.
-    ///
-    /// Only non-empty chunks (at least one non-blank line) are enqueued.
-    /// The Sequencer is told exactly how many chunks to expect so collect()
-    /// returns null as soon as all work is done.
+    /// The file is memory-mapped once.  A dedicated feeder thread lazily splits
+    /// the mapping into at most n_threads × CHUNK_FACTOR newline-aligned chunks
+    /// and enqueues them one at a time, blocking when IN_FLIGHT_FACTOR × n_threads
+    /// chunks are already in-flight.  collect() releases each slot when it frees a
+    /// chunk's arena, so peak RSS is proportional to the in-flight limit, not the
+    /// full file size.
     pub fn submit_file(
         p: *Pool,
         file: std.fs.File,
@@ -668,62 +848,41 @@ pub const Pool = struct {
         }
 
         p._mmap = io_mod.MappedFile.init(file, file_size) catch return error.IoError;
-        const data: []const u8 = p._mmap.?.data;
         const n_threads = @max(1, p.threads.len);
         const n_chunks = n_threads * CHUNK_FACTOR;
 
-        // chunk_id counts only non-empty chunks (those we actually enqueue).
-        var chunk_id: u64 = 0;
-        var total_records: u64 = 0;
-        var chunk_start: usize = 0;
+        const ctx_ptr = p.allocator.create(FileFeedCtx) catch {
+            // Unmap before returning so _mmap doesn't dangle.
+            p._mmap.?.deinit();
+            p._mmap = null;
+            p._shared.sequencer.set_total_chunks(0);
+            p._shared.queue.signal_done();
+            return error.IoError;
+        };
+        ctx_ptr.* = .{
+            .data = p._mmap.?.data,
+            .n_chunks = n_chunks,
+            .query = cq,
+            .queue = &p._shared.queue,
+            .sequencer = &p._shared.sequencer,
+            .limiter = &p._shared.limiter,
+            .allocator = p.allocator,
+        };
 
-        for (0..n_chunks) |i| {
-            const ideal_end = if (i + 1 == n_chunks)
-                file_size
-            else
-                (i + 1) * file_size / n_chunks;
-
-            // Advance to the next newline so no record is split.
-            const chunk_end: usize = if (ideal_end >= file_size)
-                file_size
-            else blk: {
-                var pos = ideal_end;
-                while (pos < file_size and data[pos] != '\n') pos += 1;
-                break :blk if (pos < file_size) pos + 1 else file_size;
-            };
-
-            const chunk = data[chunk_start..chunk_end];
-            chunk_start = chunk_end;
-            if (chunk.len == 0) continue;
-
-            // Count non-empty records for set_total_records bookkeeping (seq_base).
-            // This O(N) pass is cache-sequential and auto-vectorised in ReleaseFast.
-            var record_count: u64 = 0;
-            {
-                var rem = chunk;
-                while (rem.len > 0) {
-                    const nl = std.mem.indexOfScalar(u8, rem, '\n') orelse rem.len;
-                    const line = std.mem.trimRight(u8, rem[0..nl], " \t\r");
-                    if (line.len > 0) record_count += 1;
-                    rem = if (nl < rem.len) rem[nl + 1 ..] else &.{};
-                }
+        p.io_thread = std.Thread.spawn(.{}, struct {
+            fn run(c: *FileFeedCtx) void {
+                const alloc = c.allocator;
+                file_feeder_fn(c.*);
+                alloc.destroy(c);
             }
-            if (record_count == 0) continue;
-
-            p._shared.queue.push(.{
-                .data = chunk,
-                .seq_base = total_records,
-                .chunk_id = chunk_id,
-                .query = cq,
-                .owns_data = false,
-                .allocator = p.allocator,
-            });
-            total_records += record_count;
-            chunk_id += 1;
-        }
-
-        p._shared.sequencer.set_total_chunks(chunk_id);
-        p._shared.queue.signal_done();
+        }.run, .{ctx_ptr}) catch {
+            p.allocator.destroy(ctx_ptr);
+            p._mmap.?.deinit();
+            p._mmap = null;
+            p._shared.sequencer.set_total_chunks(0);
+            p._shared.queue.signal_done();
+            return error.IoError;
+        };
     }
 
     /// Submit a streaming source (stdin, pipe, …) for pipeline processing.
@@ -790,8 +949,11 @@ pub const Pool = struct {
             // Safety: the arena is freed HERE, at the start of this call.  The
             // caller is done with the value returned in the PREVIOUS call (the
             // contract states "valid until next collect() call").
+            // Release the in-flight slot so the file feeder can enqueue the next
+            // chunk.  No-op in stream mode (limiter.count stays 0).
             if (p._rec_idx >= p._delivering.?.records.len) {
                 p._delivering.?.arena.deinit();
+                p._shared.limiter.release();
                 p._delivering = null;
                 continue;
             }

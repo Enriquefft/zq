@@ -132,6 +132,17 @@ pub const RuntimeTape = struct {
     }
 };
 
+// ─── Slice Args ──────────────────────────────────────────────────────────────
+/// Operands for the `slice` instruction (.[from:to]).
+/// Uses i32 to keep @sizeOf(SliceArgs) = 12, within the 16-byte Operand union slot.
+/// Absent bound: has_from/has_to = false; the corresponding from/to field is 0 (ignored).
+pub const SliceArgs = extern struct {
+    from: i32 = 0,
+    to: i32 = 0,
+    has_from: bool = false,
+    has_to: bool = false,
+};
+
 // ─── Function Definition ─────────────────────────────────────────────────────
 
 /// Function definition stored in compiled query.
@@ -268,6 +279,28 @@ pub const Instruction = struct {
         /// End of try body (no error occurred). Pop TryFrame.
         /// operand.index = IP after catch handler (0 = no handler, just ip+1).
         try_end,
+
+        // Slicing
+        /// Extract a sub-array or sub-string. operand.slice_args = bounds.
+        /// Handles .[from:to], .[from:], .[:to], .[:] patterns.
+        /// Negative indices count from the end; bounds are clamped to [0, length].
+        slice,
+
+        // Update assignment (|=, +=, -=, *=, /=, %=, //=)
+        /// Navigate to object field for update: sets current to field value without
+        /// pushing to value_stack. operand.string = key name.
+        navigate_key,
+        /// Navigate to array element for update: sets current to element value without
+        /// pushing to value_stack. operand.index = element index.
+        navigate_index,
+        /// Update object field: pops new_val from value_stack (or uses current if empty),
+        /// pops base object from if_stack, reconstructs object with field replaced.
+        /// Pushes modified object to value_stack; sets current to it.
+        update_key,
+        /// Update array element: pops new_val from value_stack (or uses current if empty),
+        /// pops base array from if_stack, reconstructs array with element replaced.
+        /// Pushes modified array to value_stack; sets current to it.
+        update_index,
     };
 
     pub const Operand = union {
@@ -278,6 +311,7 @@ pub const Instruction = struct {
         int: i64,
         float: f64,
         none: void,
+        slice_args: SliceArgs,
     };
 };
 

@@ -46,6 +46,15 @@ const TryFrame = struct {
     saved_alt_null_depth: u32,
 };
 
+/// Resolve a slice bound (possibly negative) against collection length.
+/// Negative x wraps from end: x + len. Result is clamped to [0, len].
+fn resolveSliceBound(x: i32, len: i32) i32 {
+    const resolved = if (x < 0) len + x else x;
+    if (resolved < 0) return 0;
+    if (resolved > len) return len;
+    return resolved;
+}
+
 /// Map a ZqError to its display name for the catch handler's input value.
 /// Returns a string literal (static memory); no allocation required.
 fn errorToString(err: ZqError) []const u8 {
@@ -476,6 +485,42 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .slice => {
+                const result = try it.doSlice(instr.operand.slice_args);
+                it.current = try stackValueToValue(result);
+                it.pushValue(result);
+                it.ip += 1;
+                return null;
+            },
+
+            .navigate_key => {
+                it.current = try lookupKeyInValue(&it.tape, it.nullAllowed(), it.current, instr.operand.string);
+                it.ip += 1;
+                return null;
+            },
+
+            .navigate_index => {
+                it.current = try it.doLoadIndex(instr.operand.index);
+                it.ip += 1;
+                return null;
+            },
+
+            .update_key => {
+                const result = try it.doUpdateKey(instr.operand.string);
+                it.current = try stackValueToValue(result);
+                it.pushValue(result);
+                it.ip += 1;
+                return null;
+            },
+
+            .update_index => {
+                const result = try it.doUpdateIndex(instr.operand.index);
+                it.current = try stackValueToValue(result);
+                it.pushValue(result);
+                it.ip += 1;
+                return null;
+            },
+
             .iterate => {
                 try it.doIterate(it.ip + 1);
                 return null;
@@ -860,6 +905,190 @@ pub const ResultIterator = struct {
             .null_val => if (it.nullAllowed()) .null_val else error.TypeError,
             else => error.TypeError,
         };
+    }
+
+    fn doSlice(it: *ResultIterator, args: types.SliceArgs) ZqError!StackValue {
+        switch (it.current) {
+            .array => |span| {
+                // Count array length.
+                var len: i32 = 0;
+                {
+                    var pos = span.start + 1;
+                    const end = span.end - 1;
+                    while (pos < end) : (len += 1) pos = skipEntry(span.tape.*, pos);
+                }
+                const from = resolveSliceBound(if (args.has_from) args.from else 0, len);
+                const to_resolved = resolveSliceBound(if (args.has_to) args.to else len, len);
+                const actual_to: i32 = if (to_resolved < from) from else to_resolved;
+
+                const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                // Walk to the `from`-th element.
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var i: i32 = 0;
+                while (i < from and pos < end) : (i += 1) pos = skipEntry(span.tape.*, pos);
+
+                // Copy elements [from..actual_to).
+                while (i < actual_to and pos < end) : (i += 1) {
+                    const sv = try valueToStackValue(tapeEntryToValue(span.tape, pos));
+                    try it.stackValueToRuntimeTapeEntry(sv);
+                    pos = skipEntry(span.tape.*, pos);
+                }
+
+                const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_end,
+                    .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .array = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = arr_start,
+                    .end = arr_end_idx + 1,
+                } } };
+            },
+            .string => |s| {
+                const len: i32 = @intCast(s.len);
+                const from = resolveSliceBound(if (args.has_from) args.from else 0, len);
+                const to_resolved = resolveSliceBound(if (args.has_to) args.to else len, len);
+                const actual_from: usize = @intCast(from);
+                const actual_to: usize = @intCast(if (to_resolved < from) from else to_resolved);
+                const str_ref = try it.runtime_tape.internString(it.alloc, s[actual_from..actual_to]);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            .null_val => {
+                if (it.nullAllowed()) return .null_val;
+                return error.TypeError;
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn doUpdateKey(it: *ResultIterator, key: []const u8) ZqError!StackValue {
+        const new_val = if (it.value_stack.items.len > 0)
+            try it.popValue()
+        else
+            try valueToStackValue(it.current);
+
+        if (it.if_stack.items.len == 0) return error.TypeError;
+        const base = it.if_stack.pop().?;
+
+        switch (base) {
+            .object => |span| {
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start, .payload = .{ .skip = 0 },
+                });
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var found = false;
+                while (pos < end) {
+                    const key_entry = span.tape.entries[pos];
+                    const this_key = span.tape.getString(key_entry.payload.string);
+                    const val_pos = pos + 1;
+                    const new_key_ref = try it.runtime_tape.internString(it.alloc, this_key);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .key, .payload = .{ .string = new_key_ref },
+                    });
+                    if (std.mem.eql(u8, this_key, key)) {
+                        try it.stackValueToRuntimeTapeEntry(new_val);
+                        found = true;
+                    } else {
+                        const orig_val = tapeEntryToValue(span.tape, val_pos);
+                        try it.stackValueToRuntimeTapeEntry(try valueToStackValue(orig_val));
+                    }
+                    pos = skipEntry(span.tape.*, val_pos);
+                }
+                if (!found) {
+                    const new_key_ref = try it.runtime_tape.internString(it.alloc, key);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .key, .payload = .{ .string = new_key_ref },
+                    });
+                    try it.stackValueToRuntimeTapeEntry(new_val);
+                }
+                const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end, .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .object = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = obj_start,
+                    .end = obj_end_idx + 1,
+                } } };
+            },
+            .null_val => {
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start, .payload = .{ .skip = 0 },
+                });
+                const new_key_ref = try it.runtime_tape.internString(it.alloc, key);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .key, .payload = .{ .string = new_key_ref },
+                });
+                try it.stackValueToRuntimeTapeEntry(new_val);
+                const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end, .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .object = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = obj_start,
+                    .end = obj_end_idx + 1,
+                } } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn doUpdateIndex(it: *ResultIterator, idx: u32) ZqError!StackValue {
+        const new_val = if (it.value_stack.items.len > 0)
+            try it.popValue()
+        else
+            try valueToStackValue(it.current);
+
+        if (it.if_stack.items.len == 0) return error.TypeError;
+        const base = it.if_stack.pop().?;
+
+        switch (base) {
+            .array => |span| {
+                const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_start, .payload = .{ .skip = 0 },
+                });
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var i: u32 = 0;
+                while (pos < end) {
+                    if (i == idx) {
+                        try it.stackValueToRuntimeTapeEntry(new_val);
+                    } else {
+                        const orig_val = tapeEntryToValue(span.tape, pos);
+                        try it.stackValueToRuntimeTapeEntry(try valueToStackValue(orig_val));
+                    }
+                    pos = skipEntry(span.tape.*, pos);
+                    i += 1;
+                }
+                const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_end, .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .array = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = arr_start,
+                    .end = arr_end_idx + 1,
+                } } };
+            },
+            else => return error.TypeError,
+        }
     }
 
     fn doLoadPath(it: *ResultIterator, path: []const u8) ZqError!Value {

@@ -34,6 +34,7 @@ const RawOp = union {
     int: i64,
     float: f64,
     none: void,
+    slice_args: types.SliceArgs,
 };
 
 const RawInstr = struct {
@@ -79,6 +80,12 @@ const FunctionEntry = struct {
     fn deinit(self: *const FunctionEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.param_ids);
     }
+};
+
+const PathStep = struct {
+    kind: enum { key, index },
+    key: StrRef = .{ .offset = 0, .len = 0 },
+    index: u32 = 0,
 };
 
 // ── Scope management ─────────────────────────────────────────────────────
@@ -294,7 +301,172 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parsePipe(ctx);
 }
 
+/// Lookahead: returns true if the token stream starts with a path expression
+/// followed by an update-assignment operator (|=, +=, -=, *=, /=, %=, //=).
+/// Pure scan — no instructions emitted, lexer position restored via defer.
+fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
+    const saved_pos = ctx.lex.pos;
+    defer ctx.lex.pos = saved_pos;
+
+    const first = try ctx.lex.next();
+    if (first.tag != .dot) return false;
+
+    while (true) {
+        const t = try ctx.lex.peek();
+        switch (t.tag) {
+            .ident => {
+                _ = try ctx.lex.next();
+                const sep = try ctx.lex.peek();
+                if (sep.tag == .dot) _ = try ctx.lex.next();
+            },
+            .lbracket => {
+                _ = try ctx.lex.next();
+                const inner = try ctx.lex.next();
+                switch (inner.tag) {
+                    .int_lit, .string_lit => {
+                        const close = try ctx.lex.next();
+                        if (close.tag != .rbracket) return false;
+                        const sep = try ctx.lex.peek();
+                        if (sep.tag == .dot) _ = try ctx.lex.next();
+                    },
+                    else => return false,
+                }
+            },
+            .pipe_eq, .plus_eq, .minus_eq, .star_eq,
+            .slash_eq, .percent_eq, .double_slash_eq => return true,
+            else => return false,
+        }
+    }
+}
+
+/// Parse and emit an update-assignment expression.
+/// Called only when peekIsUpdateAssign() returned true.
+/// Handles: .path |= f, .path += rhs, .path -= rhs, etc.
+fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Consume the leading dot
+    _ = try ctx.lex.next();
+
+    // Collect path steps
+    var path_steps = std.ArrayList(PathStep){};
+    defer path_steps.deinit(ctx.alloc);
+
+    while (true) {
+        const t = try ctx.lex.peek();
+        switch (t.tag) {
+            .ident => {
+                _ = try ctx.lex.next();
+                const ref = try internStr(&ctx.intern, ctx.alloc, t.slice(ctx.src));
+                try path_steps.append(ctx.alloc, PathStep{ .kind = .key, .key = ref });
+                const sep = try ctx.lex.peek();
+                if (sep.tag == .dot) _ = try ctx.lex.next();
+            },
+            .lbracket => {
+                _ = try ctx.lex.next();
+                const inner = try ctx.lex.peek();
+                switch (inner.tag) {
+                    .int_lit => {
+                        const tok = try ctx.lex.next();
+                        const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+                        if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
+                        const close = try ctx.lex.next();
+                        if (close.tag != .rbracket) return error.QuerySyntaxError;
+                        try path_steps.append(ctx.alloc, PathStep{ .kind = .index, .index = @intCast(n) });
+                        const sep = try ctx.lex.peek();
+                        if (sep.tag == .dot) _ = try ctx.lex.next();
+                    },
+                    .string_lit => {
+                        const tok = try ctx.lex.next();
+                        const raw_str = tok.slice(ctx.src);
+                        const content = raw_str[1 .. raw_str.len - 1];
+                        const ref = try internStr(&ctx.intern, ctx.alloc, content);
+                        const close = try ctx.lex.next();
+                        if (close.tag != .rbracket) return error.QuerySyntaxError;
+                        try path_steps.append(ctx.alloc, PathStep{ .kind = .key, .key = ref });
+                        const sep = try ctx.lex.peek();
+                        if (sep.tag == .dot) _ = try ctx.lex.next();
+                    },
+                    else => return error.QuerySyntaxError,
+                }
+            },
+            .pipe_eq, .plus_eq, .minus_eq, .star_eq,
+            .slash_eq, .percent_eq, .double_slash_eq => break,
+            else => break,
+        }
+    }
+
+    // Emit navigation: for each path step, save_input then navigate_key/index
+    for (path_steps.items) |step| {
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+        switch (step.kind) {
+            .key => try ctx.raw.append(ctx.alloc, RawInstr{
+                .op = .navigate_key, .operand = .{ .str_ref = step.key },
+            }),
+            .index => try ctx.raw.append(ctx.alloc, RawInstr{
+                .op = .navigate_index, .operand = .{ .index = step.index },
+            }),
+        }
+    }
+
+    // Consume the assignment operator
+    const assign_tok = try ctx.lex.next();
+
+    // Parse RHS and emit arithmetic wrapper if needed
+    switch (assign_tok.tag) {
+        .pipe_eq => try parseAlternative(ctx),
+        .plus_eq => {
+            try parseAlternative(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .add, .operand = .{ .none = {} } });
+        },
+        .minus_eq => {
+            try parseAlternative(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .sub, .operand = .{ .none = {} } });
+        },
+        .star_eq => {
+            try parseAlternative(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .mul, .operand = .{ .none = {} } });
+        },
+        .slash_eq => {
+            try parseAlternative(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .div, .operand = .{ .none = {} } });
+        },
+        .percent_eq => {
+            try parseAlternative(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .mod, .operand = .{ .none = {} } });
+        },
+        .double_slash_eq => {
+            // .path //= rhs  →  .path |= (. // rhs)
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .alt_start, .operand = .{ .none = {} } });
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .identity, .operand = .{ .none = {} } });
+            const check_pos = ctx.raw.items.len;
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .alt_check, .operand = .{ .index = 0 } });
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+            try parseAlternative(ctx);
+            ctx.raw.items[check_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+        },
+        else => return error.QuerySyntaxError,
+    }
+
+    // Emit update instructions in REVERSE path order
+    var i = path_steps.items.len;
+    while (i > 0) {
+        i -= 1;
+        const step = path_steps.items[i];
+        switch (step.kind) {
+            .key => try ctx.raw.append(ctx.alloc, RawInstr{
+                .op = .update_key, .operand = .{ .str_ref = step.key },
+            }),
+            .index => try ctx.raw.append(ctx.alloc, RawInstr{
+                .op = .update_index, .operand = .{ .index = step.index },
+            }),
+        }
+    }
+}
+
 fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    if (try peekIsUpdateAssign(ctx)) {
+        try parseUpdateAssign(ctx);
+        return;
+    }
     try parseAlternative(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -1004,6 +1176,33 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
     }
 }
 
+/// Parse the tail of a slice expression after `:` has been consumed.
+/// `has_from` / `from` carry the already-parsed left bound (if any).
+/// Emits a single `slice` instruction and consumes the closing `]`.
+fn parseSliceTail(ctx: *Ctx, has_from: bool, from: i32) (ZqError || error{OutOfMemory})!void {
+    const peek = try ctx.lex.peek();
+    var has_to = false;
+    var to: i32 = 0;
+    if (peek.tag == .int_lit) {
+        has_to = true;
+        const tok = try ctx.lex.next();
+        const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
+        to = @intCast(n);
+    }
+    const close = try ctx.lex.next();
+    if (close.tag != .rbracket) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .slice,
+        .operand = .{ .slice_args = types.SliceArgs{
+            .from = from,
+            .to = to,
+            .has_from = has_from,
+            .has_to = has_to,
+        } },
+    });
+}
+
 /// Parse the body of `[...]` (the opening `[` has already been consumed).
 fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.peek();
@@ -1012,16 +1211,30 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             _ = try ctx.lex.next();
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
         },
+        .colon => {
+            // .[:n] or .[:] — slice with no left bound
+            _ = try ctx.lex.next(); // consume ':'
+            try parseSliceTail(ctx, false, 0);
+        },
         .int_lit => {
             const tok = try ctx.lex.next();
             const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
-            if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
-            const close = try ctx.lex.next();
-            if (close.tag != .rbracket) return error.QuerySyntaxError;
-            try ctx.raw.append(ctx.alloc, RawInstr{
-                .op = .load_index,
-                .operand = .{ .index = @intCast(n) },
-            });
+            const after = try ctx.lex.peek();
+            if (after.tag == .colon) {
+                // .[n:...] — slice with left bound (negative allowed)
+                _ = try ctx.lex.next(); // consume ':'
+                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
+                try parseSliceTail(ctx, true, @intCast(n));
+            } else {
+                // .[n] — index access (negative rejected)
+                if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
+                const close = try ctx.lex.next();
+                if (close.tag != .rbracket) return error.QuerySyntaxError;
+                try ctx.raw.append(ctx.alloc, RawInstr{
+                    .op = .load_index,
+                    .operand = .{ .index = @intCast(n) },
+                });
+            }
         },
         .string_lit => {
             const tok = try ctx.lex.next();
@@ -1191,6 +1404,9 @@ fn fuse(
                 // Try-catch: remap non-zero index operands (0 = sentinel, no jump).
                 .try_begin => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
                 .try_end => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
+                .slice => .{ .slice_args = r.operand.slice_args },
+                .navigate_key, .update_key => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
+                .navigate_index, .update_index => .{ .index = r.operand.index },
             },
         };
     }

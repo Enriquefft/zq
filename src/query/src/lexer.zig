@@ -74,6 +74,15 @@ pub const Token = struct {
 
         // Optional operator
         question, // ?
+
+        // Update-assignment operators
+        pipe_eq,         // |=
+        plus_eq,         // +=
+        minus_eq,        // -=
+        star_eq,         // *=
+        slash_eq,        // /=
+        percent_eq,      // %=
+        double_slash_eq, // //=
     };
 
     pub fn slice(tok: Token, src: []const u8) []const u8 {
@@ -111,6 +120,10 @@ pub const Lexer = struct {
             },
             '|' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .pipe_eq, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .pipe, .offset = start, .len = 1 };
             },
             '[' => {
@@ -139,28 +152,53 @@ pub const Lexer = struct {
             },
             '+' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .plus_eq, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .plus, .offset = start, .len = 1 };
             },
             '-' => {
                 l.pos += 1;
-                if (l.pos >= l.src.len or !std.ascii.isDigit(l.src[l.pos]))
-                    return .{ .tag = .minus, .offset = start, .len = 1 };
-                return l.scanNumberLiteral(start);
+                if (l.pos < l.src.len) {
+                    if (l.src[l.pos] == '=') {
+                        l.pos += 1;
+                        return .{ .tag = .minus_eq, .offset = start, .len = 2 };
+                    }
+                    if (std.ascii.isDigit(l.src[l.pos])) return l.scanNumberLiteral(start);
+                }
+                return .{ .tag = .minus, .offset = start, .len = 1 };
             },
             '*' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .star_eq, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .star, .offset = start, .len = 1 };
             },
             '/' => {
                 l.pos += 1;
                 if (l.pos < l.src.len and l.src[l.pos] == '/') {
                     l.pos += 1;
+                    if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                        l.pos += 1;
+                        return .{ .tag = .double_slash_eq, .offset = start, .len = 3 };
+                    }
                     return .{ .tag = .double_slash, .offset = start, .len = 2 };
+                }
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .slash_eq, .offset = start, .len = 2 };
                 }
                 return .{ .tag = .slash, .offset = start, .len = 1 };
             },
             '%' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .percent_eq, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .percent, .offset = start, .len = 1 };
             },
             '<' => {
