@@ -195,7 +195,7 @@ pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutO
         .next_var_id = 0,
         .next_func_id = 0,
     };
-    defer ctx.raw.deinit(alloc);   // always freed; fuse() copies what it needs
+    defer ctx.raw.deinit(alloc); // always freed; fuse() copies what it needs
     defer {
         // Cleanup function table (free param_ids for each function)
         for (ctx.function_table.items) |*func| {
@@ -393,17 +393,16 @@ fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 fn isBuiltinFunction(name: []const u8) bool {
     // Common jq built-in functions
     const builtins = [_][]const u8{
-        "map", "select", "reduce", "range", "foreach", "walk",
-        "keys", "values", "to_entries", "from_entries",
-        "add", "sub", "mul", "div", "mod",
-        "length", "utf8bytelength", "explode", "split", "join",
-        "min", "max", "any", "all", "first", "last", "nth",
-        "type", "has", "paths", "del", "setpath",
-        "with_entries", "limit", "sort", "sort_by", "group_by",
-        "unique", "unique_by", "map_values", "index", "rindex",
-        "inside", "startswith", "endswith", "contains", "test",
-        "match", "capture", "matches", "splitn", "inputs",
-        "env", "tonumber", "tostreams", "tostring",
+        "map",       "select",     "reduce",       "range",        "foreach",        "walk",
+        "keys",      "values",     "to_entries",   "from_entries", "add",            "sub",
+        "mul",       "div",        "mod",          "length",       "utf8bytelength", "explode",
+        "split",     "join",       "min",          "max",          "any",            "all",
+        "first",     "last",       "nth",          "type",         "has",            "paths",
+        "del",       "setpath",    "with_entries", "limit",        "sort",           "sort_by",
+        "group_by",  "unique",     "unique_by",    "map_values",   "index",          "rindex",
+        "inside",    "startswith", "endswith",     "contains",     "test",           "match",
+        "capture",   "matches",    "splitn",       "inputs",       "env",            "tonumber",
+        "tostreams", "tostring",
     };
 
     for (builtins) |builtin| {
@@ -673,7 +672,8 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const rparen = try ctx.lex.next();
         if (rparen.tag != .rparen) return error.QuerySyntaxError;
     } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
-               peek.tag == .true_kw or peek.tag == .false_kw) {
+        peek.tag == .true_kw or peek.tag == .false_kw)
+    {
         // Literal key - push as string value for object construction
         const key = try ctx.lex.next();
         const ref = try internStr(&ctx.intern, ctx.alloc, key.slice(ctx.src));

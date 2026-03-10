@@ -2,15 +2,15 @@ const std = @import("std");
 const query = @import("query");
 const types = @import("types");
 
-const CompiledQuery  = query.CompiledQuery;
-const Opts           = query.Opts;
-const Tape           = types.Tape;
-const Entry          = types.Tape.Entry;
-const Tag            = types.Tape.Tag;
-const Payload        = types.Tape.Payload;
-const StringRef      = types.Tape.StringRef;
-const Value          = types.Value;
-const alloc          = std.testing.allocator;
+const CompiledQuery = query.CompiledQuery;
+const Opts = query.Opts;
+const Tape = types.Tape;
+const Entry = types.Tape.Entry;
+const Tag = types.Tape.Tag;
+const Payload = types.Tape.Payload;
+const StringRef = types.Tape.StringRef;
+const Value = types.Value;
+const alloc = std.testing.allocator;
 
 // ── Tape construction helpers ─────────────────────────────────────────────────
 //
@@ -87,9 +87,9 @@ test ".foo: returns value for present key" {
     const ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = ref } },
-        .{ .tag = .int,          .payload = .{ .int = 99 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = ref } },
+        .{ .tag = .int, .payload = .{ .int = 99 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -108,9 +108,9 @@ test ".foo: missing key returns TypeError in strict mode" {
     const ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = ref } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = ref } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -128,9 +128,9 @@ test ".foo: missing key returns null with allow_null_propagation" {
     const ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = ref } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = ref } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -148,9 +148,9 @@ test ".foo: TypeError on non-object (array)" {
     // [1, 2] — array root
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .int,         .payload = .{ .int = 1 } },
-        .{ .tag = .int,         .payload = .{ .int = 2 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -177,12 +177,12 @@ test ".a.b: returns nested value" {
     const sb = "ab";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 7 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
         .{ .tag = .object_start, .payload = .{ .skip = 6 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 7 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 7 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -206,10 +206,10 @@ test ".[1]: returns element at index" {
     // [10, 20, 30]
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 5 } },
-        .{ .tag = .int,         .payload = .{ .int = 10 } },
-        .{ .tag = .int,         .payload = .{ .int = 20 } },
-        .{ .tag = .int,         .payload = .{ .int = 30 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -226,8 +226,8 @@ test ".[1]: returns element at index" {
 test ".[0]: returns first element" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 3 } },
-        .{ .tag = .int,         .payload = .{ .int = 5 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 5 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -244,8 +244,8 @@ test ".[0]: returns first element" {
 test ".[5]: IndexOutOfBounds on short array" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 3 } },
-        .{ .tag = .int,         .payload = .{ .int = 1 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -264,10 +264,10 @@ test ".[] on array: yields all elements" {
     // [1, 2, 3]
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 5 } },
-        .{ .tag = .int,         .payload = .{ .int = 1 } },
-        .{ .tag = .int,         .payload = .{ .int = 2 } },
-        .{ .tag = .int,         .payload = .{ .int = 3 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -286,7 +286,7 @@ test ".[] on array: yields all elements" {
 test ".[] on empty array: yields nothing" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 2 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -304,11 +304,11 @@ test ".[] on object: yields values only" {
     const sb = "xy";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 6 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 2 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -361,20 +361,20 @@ test ".[] | .name: yields name field from each element" {
     // "a"    = offset 4, len 1
     // "b"    = offset 5, len 1
     const name_ref = StringRef{ .offset = 0, .len = 4 };
-    const a_ref    = StringRef{ .offset = 4, .len = 1 };
-    const b_ref    = StringRef{ .offset = 5, .len = 1 };
+    const a_ref = StringRef{ .offset = 4, .len = 1 };
+    const b_ref = StringRef{ .offset = 5, .len = 1 };
 
     const entries = [_]Entry{
-        .{ .tag = .array_start,  .payload = .{ .skip = 10 } },
+        .{ .tag = .array_start, .payload = .{ .skip = 10 } },
         .{ .tag = .object_start, .payload = .{ .skip = 5 } },
-        .{ .tag = .key,          .payload = .{ .string = name_ref } },
-        .{ .tag = .string,       .payload = .{ .string = a_ref } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = name_ref } },
+        .{ .tag = .string, .payload = .{ .string = a_ref } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
         .{ .tag = .object_start, .payload = .{ .skip = 9 } },
-        .{ .tag = .key,          .payload = .{ .string = name_ref } },
-        .{ .tag = .string,       .payload = .{ .string = b_ref } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
-        .{ .tag = .array_end,    .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = name_ref } },
+        .{ .tag = .string, .payload = .{ .string = b_ref } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -405,13 +405,13 @@ test ".[] | .[]: flattens nested arrays" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 9 } },
         .{ .tag = .array_start, .payload = .{ .skip = 5 } },
-        .{ .tag = .int,         .payload = .{ .int = 1 } },
-        .{ .tag = .int,         .payload = .{ .int = 2 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
         .{ .tag = .array_start, .payload = .{ .skip = 8 } },
-        .{ .tag = .int,         .payload = .{ .int = 3 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -432,11 +432,11 @@ test ".[] | .[]: empty inner array produces no output for that element" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 7 } },
         .{ .tag = .array_start, .payload = .{ .skip = 3 } }, // []
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
         .{ .tag = .array_start, .payload = .{ .skip = 6 } }, // [1]
-        .{ .tag = .int,         .payload = .{ .int = 1 } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
-        .{ .tag = .array_end,   .payload = .{ .none = {} } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
 
@@ -457,9 +457,9 @@ test ".a.b: null propagation through null intermediate value" {
     const sb = "ab";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .null_val,     .payload = .{ .none = {} } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
 
@@ -639,9 +639,9 @@ test "reset: iterator correctly re-evaluates field access on different objects" 
     const sb1 = "age";
     const entries_1 = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 3 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
-        .{ .tag = .int,          .payload = .{ .int = 30 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const tape_1 = tape(&entries_1, sb1);
 
@@ -649,9 +649,9 @@ test "reset: iterator correctly re-evaluates field access on different objects" 
     const sb2 = "age";
     const entries_2 = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 3 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
-        .{ .tag = .int,          .payload = .{ .int = 55 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 3 } } },
+        .{ .tag = .int, .payload = .{ .int = 55 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const tape_2 = tape(&entries_2, sb2);
 

@@ -26,16 +26,16 @@ test "ZqError: all variants are distinct Zig errors" {
 
 test "kindFromZqError: maps every ZqError to its ErrorKind" {
     const cases = [_]struct { ze: err.ZqError, ek: err.ErrorKind }{
-        .{ .ze = error.UnexpectedToken,   .ek = .unexpected_token },
-        .{ .ze = error.UnexpectedEof,     .ek = .unexpected_eof },
-        .{ .ze = error.InvalidUtf8,       .ek = .invalid_utf8 },
-        .{ .ze = error.InvalidNumber,     .ek = .invalid_number },
-        .{ .ze = error.UnterminatedString,  .ek = .unterminated_string },
-        .{ .ze = error.DepthLimitExceeded,  .ek = .depth_limit_exceeded },
-        .{ .ze = error.IoError,            .ek = .io_error },
-        .{ .ze = error.QuerySyntaxError,   .ek = .query_syntax_error },
-        .{ .ze = error.TypeError,          .ek = .type_error },
-        .{ .ze = error.IndexOutOfBounds,   .ek = .index_out_of_bounds },
+        .{ .ze = error.UnexpectedToken, .ek = .unexpected_token },
+        .{ .ze = error.UnexpectedEof, .ek = .unexpected_eof },
+        .{ .ze = error.InvalidUtf8, .ek = .invalid_utf8 },
+        .{ .ze = error.InvalidNumber, .ek = .invalid_number },
+        .{ .ze = error.UnterminatedString, .ek = .unterminated_string },
+        .{ .ze = error.DepthLimitExceeded, .ek = .depth_limit_exceeded },
+        .{ .ze = error.IoError, .ek = .io_error },
+        .{ .ze = error.QuerySyntaxError, .ek = .query_syntax_error },
+        .{ .ze = error.TypeError, .ek = .type_error },
+        .{ .ze = error.IndexOutOfBounds, .ek = .index_out_of_bounds },
     };
     for (cases) |c| {
         try std.testing.expectEqual(c.ek, err.kindFromZqError(c.ze));
@@ -53,8 +53,8 @@ test "ZqError: propagates through error union (try/catch pattern)" {
         defer err.deinit(table, std.testing.allocator);
         const pos = err.resolve(table, failing_offset);
         break :blk err.raise(err.kindFromZqError(e), .{
-            .line    = pos.line,
-            .col     = pos.col,
+            .line = pos.line,
+            .col = pos.col,
             .snippet = source[0..3],
         });
     };

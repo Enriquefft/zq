@@ -32,14 +32,14 @@ const StackEntry = struct {
 };
 
 const NumSubState = enum(u8) {
-    neg,          // saw '-', expect digit
+    neg, // saw '-', expect digit
     leading_zero, // saw '0'
-    int,          // digits in integer part
-    frac_start,   // saw '.', expect at least one digit
-    frac,         // digits in fractional part
-    exp_sign,     // saw 'e'/'E'
-    exp_start,    // saw 'e[+-]', expect digit
-    exp,          // digits in exponent
+    int, // digits in integer part
+    frac_start, // saw '.', expect at least one digit
+    frac, // digits in fractional part
+    exp_sign, // saw 'e'/'E'
+    exp_start, // saw 'e[+-]', expect digit
+    exp, // digits in exponent
 };
 
 const KeywordKind = enum(u2) { kw_true, kw_false, kw_null };
@@ -171,16 +171,16 @@ pub const Parser = struct {
 
     fn processByte(p: *Parser, byte: u8) (ZqError || error{OutOfMemory})!void {
         switch (p.state) {
-            .want_value        => try p.onWantValue(byte),
-            .want_key          => try p.onWantKey(byte),
-            .want_colon        => try p.onWantColon(byte),
-            .after_value       => try p.onAfterValue(byte),
-            .in_string         => try p.onInString(byte),
-            .in_string_escape  => try p.onInStringEscape(byte),
+            .want_value => try p.onWantValue(byte),
+            .want_key => try p.onWantKey(byte),
+            .want_colon => try p.onWantColon(byte),
+            .after_value => try p.onAfterValue(byte),
+            .in_string => try p.onInString(byte),
+            .in_string_escape => try p.onInStringEscape(byte),
             .in_string_unicode => try p.onInStringUnicode(byte),
-            .in_number         => try p.onInNumber(byte),
-            .in_keyword        => try p.onInKeyword(byte),
-            .top_done          => try p.onTopDone(byte),
+            .in_number => try p.onInNumber(byte),
+            .in_keyword => try p.onInKeyword(byte),
+            .top_done => try p.onTopDone(byte),
         }
     }
 
@@ -363,8 +363,8 @@ pub const Parser = struct {
             0x00...0x1F => return error.InvalidUtf8, // control chars must be escaped
             '"' => try p.finalizeString(),
             '\\' => p.state = .in_string_escape,
-            0x80...0xBF => return error.InvalidUtf8,  // stray continuation byte
-            0xC0, 0xC1 => return error.InvalidUtf8,  // overlong 2-byte prefix
+            0x80...0xBF => return error.InvalidUtf8, // stray continuation byte
+            0xC0, 0xC1 => return error.InvalidUtf8, // overlong 2-byte prefix
             0xC2...0xDF => {
                 p.utf8_first = byte;
                 p.utf8_pending = 1;
@@ -390,15 +390,39 @@ pub const Parser = struct {
         if (p.unicode_surrogate != 0 and byte != 'u') return error.InvalidUtf8;
 
         switch (byte) {
-            '"'  => { try p.string_buf.append(p.allocator, '"');  p.state = .in_string; },
-            '\\' => { try p.string_buf.append(p.allocator, '\\'); p.state = .in_string; },
-            '/'  => { try p.string_buf.append(p.allocator, '/');  p.state = .in_string; },
-            'b'  => { try p.string_buf.append(p.allocator, 0x08); p.state = .in_string; },
-            'f'  => { try p.string_buf.append(p.allocator, 0x0C); p.state = .in_string; },
-            'n'  => { try p.string_buf.append(p.allocator, '\n'); p.state = .in_string; },
-            'r'  => { try p.string_buf.append(p.allocator, '\r'); p.state = .in_string; },
-            't'  => { try p.string_buf.append(p.allocator, '\t'); p.state = .in_string; },
-            'u'  => {
+            '"' => {
+                try p.string_buf.append(p.allocator, '"');
+                p.state = .in_string;
+            },
+            '\\' => {
+                try p.string_buf.append(p.allocator, '\\');
+                p.state = .in_string;
+            },
+            '/' => {
+                try p.string_buf.append(p.allocator, '/');
+                p.state = .in_string;
+            },
+            'b' => {
+                try p.string_buf.append(p.allocator, 0x08);
+                p.state = .in_string;
+            },
+            'f' => {
+                try p.string_buf.append(p.allocator, 0x0C);
+                p.state = .in_string;
+            },
+            'n' => {
+                try p.string_buf.append(p.allocator, '\n');
+                p.state = .in_string;
+            },
+            'r' => {
+                try p.string_buf.append(p.allocator, '\r');
+                p.state = .in_string;
+            },
+            't' => {
+                try p.string_buf.append(p.allocator, '\t');
+                p.state = .in_string;
+            },
+            'u' => {
                 p.unicode_count = 0;
                 p.unicode_accum = 0;
                 p.state = .in_string_unicode;
@@ -446,39 +470,76 @@ pub const Parser = struct {
     fn onInNumber(p: *Parser, byte: u8) (ZqError || error{OutOfMemory})!void {
         switch (p.num_sub) {
             .neg => switch (byte) {
-                '0' => { try p.numAppend(byte); p.num_sub = .leading_zero; },
-                '1'...'9' => { try p.numAppend(byte); p.num_sub = .int; },
+                '0' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .leading_zero;
+                },
+                '1'...'9' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .int;
+                },
                 else => return error.InvalidNumber,
             },
             .leading_zero => switch (byte) {
-                '.' => { try p.numAppend(byte); p.num_is_float = true; p.num_sub = .frac_start; },
-                'e', 'E' => { try p.numAppend(byte); p.num_is_float = true; p.num_sub = .exp_sign; },
+                '.' => {
+                    try p.numAppend(byte);
+                    p.num_is_float = true;
+                    p.num_sub = .frac_start;
+                },
+                'e', 'E' => {
+                    try p.numAppend(byte);
+                    p.num_is_float = true;
+                    p.num_sub = .exp_sign;
+                },
                 '0'...'9' => return error.InvalidNumber, // leading zeros forbidden
                 else => try p.terminateNumber(byte),
             },
             .int => switch (byte) {
                 '0'...'9' => try p.numAppend(byte),
-                '.' => { try p.numAppend(byte); p.num_is_float = true; p.num_sub = .frac_start; },
-                'e', 'E' => { try p.numAppend(byte); p.num_is_float = true; p.num_sub = .exp_sign; },
+                '.' => {
+                    try p.numAppend(byte);
+                    p.num_is_float = true;
+                    p.num_sub = .frac_start;
+                },
+                'e', 'E' => {
+                    try p.numAppend(byte);
+                    p.num_is_float = true;
+                    p.num_sub = .exp_sign;
+                },
                 else => try p.terminateNumber(byte),
             },
             .frac_start => switch (byte) {
-                '0'...'9' => { try p.numAppend(byte); p.num_sub = .frac; },
+                '0'...'9' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .frac;
+                },
                 else => return error.InvalidNumber,
             },
             .frac => switch (byte) {
                 '0'...'9' => try p.numAppend(byte),
-                'e', 'E' => { try p.numAppend(byte); p.num_sub = .exp_sign; },
+                'e', 'E' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .exp_sign;
+                },
                 '.' => return error.InvalidNumber, // second decimal point: 1.2.3
                 else => try p.terminateNumber(byte),
             },
             .exp_sign => switch (byte) {
-                '+', '-' => { try p.numAppend(byte); p.num_sub = .exp_start; },
-                '0'...'9' => { try p.numAppend(byte); p.num_sub = .exp; },
+                '+', '-' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .exp_start;
+                },
+                '0'...'9' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .exp;
+                },
                 else => return error.InvalidNumber,
             },
             .exp_start => switch (byte) {
-                '0'...'9' => { try p.numAppend(byte); p.num_sub = .exp; },
+                '0'...'9' => {
+                    try p.numAppend(byte);
+                    p.num_sub = .exp;
+                },
                 else => return error.InvalidNumber,
             },
             .exp => switch (byte) {
@@ -495,9 +556,9 @@ pub const Parser = struct {
 
         if (p.kw_pos == kw.len) {
             const tag: types.Tape.Tag = switch (p.kw_kind) {
-                .kw_true  => .true_val,
+                .kw_true => .true_val,
                 .kw_false => .false_val,
-                .kw_null  => .null_val,
+                .kw_null => .null_val,
             };
             try p.tape_buf.append(p.allocator, .{ .tag = tag, .payload = PAYLOAD_NONE });
             p.transitionAfterValue();
@@ -516,9 +577,7 @@ pub const Parser = struct {
 
     fn processEof(p: *Parser) (ZqError || error{OutOfMemory})!FeedResult {
         switch (p.state) {
-            .in_string,
-            .in_string_escape,
-            .in_string_unicode => return error.UnterminatedString,
+            .in_string, .in_string_escape, .in_string_unicode => return error.UnterminatedString,
 
             .want_colon => return error.UnexpectedEof,
 
@@ -616,7 +675,7 @@ pub const Parser = struct {
         p.tape_buf.items[entry.tape_idx].payload.skip = end_idx + 1;
         const end_tag: types.Tape.Tag = switch (entry.kind) {
             .object => .object_end,
-            .array  => .array_end,
+            .array => .array_end,
         };
         try p.tape_buf.append(p.allocator, .{ .tag = end_tag, .payload = PAYLOAD_NONE });
         p.transitionAfterValue();
@@ -635,16 +694,16 @@ pub const Parser = struct {
 
     fn makeTape(p: *const Parser) Tape {
         return Tape{
-            .entries    = p.tape_buf.items,
+            .entries = p.tape_buf.items,
             .string_buf = p.string_buf.items,
         };
     }
 
     fn keywordBytes(kind: KeywordKind) []const u8 {
         return switch (kind) {
-            .kw_true  => "true",
+            .kw_true => "true",
             .kw_false => "false",
-            .kw_null  => "null",
+            .kw_null => "null",
         };
     }
 };

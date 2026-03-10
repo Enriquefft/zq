@@ -115,7 +115,7 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | Item | Priority |
 |------|----------|
 | [x] jq compat test suite fully migrated (533 tests) | P0 |
-| [ ] CI: `zig build test` on every commit | P0 |
+| [x] CI: `zig build test` on every commit | P0 |
 | [ ] Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
 | [ ] Basic `--help` text matching jq's structure | P1 |
 | [ ] Error messages include filter position and input context | P2 |

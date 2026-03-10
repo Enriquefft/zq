@@ -4,7 +4,6 @@
 /// `zq_free`) are Zig `export fn` declarations and are callable directly from
 /// Zig test code without FFI overhead. All tests exercise the public C surface
 /// only — no internal `QueryHandle` fields are accessed.
-
 const std = @import("std");
 const c_abi = @import("c_abi");
 

@@ -86,7 +86,6 @@ pub const Value = union(enum) {
 // ─── Runtime Tape ─────────────────────────────────────────────────────────────
 /// Mutable tape for constructing objects/arrays at query time.
 /// Used by VM to build objects from {k: v} syntax.
-
 pub const RuntimeTape = struct {
     entries: std.ArrayList(Tape.Entry),
     string_buf: std.ArrayList(u8),

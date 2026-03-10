@@ -9,50 +9,50 @@ pub const Token = struct {
     len: u32,
 
     pub const Tag = enum {
-        dot,       // .
-        pipe,      // |
-        lbracket,  // [
-        rbracket,  // ]
-        ident,     // [a-zA-Z_][a-zA-Z0-9_]*
-        int_lit,   // -?[0-9]+
+        dot, // .
+        pipe, // |
+        lbracket, // [
+        rbracket, // ]
+        ident, // [a-zA-Z_][a-zA-Z0-9_]*
+        int_lit, // -?[0-9]+
         float_lit, // -?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?
         eof,
 
         // Arithmetic operators
-        plus,      // +
-        minus,     // -
-        star,      // *
-        slash,     // /
-        percent,   // %
+        plus, // +
+        minus, // -
+        star, // *
+        slash, // /
+        percent, // %
 
         // Comparison operators
-        eq,        // ==
-        ne,        // !=
-        lt,        // <
-        le,        // <=
-        gt,        // >
-        ge,        // >=
+        eq, // ==
+        ne, // !=
+        lt, // <
+        le, // <=
+        gt, // >
+        ge, // >=
 
         // Parentheses
-        lparen,    // (
-        rparen,    // )
-        lbrace,    // {
-        rbrace,    // }
+        lparen, // (
+        rparen, // )
+        lbrace, // {
+        rbrace, // }
 
         // Variable/function syntax
-        dollar,    // $
-        colon,     // :
-        semicolon,  // ;
-        comma,     // ,
+        dollar, // $
+        colon, // :
+        semicolon, // ;
+        comma, // ,
 
         // Keywords
-        and_kw,    // and
-        or_kw,     // or
-        not_kw,    // not
-        true_kw,   // true
-        false_kw,  // false
-        def_kw,    // def
-        as_kw,     // as
+        and_kw, // and
+        or_kw, // or
+        not_kw, // not
+        true_kw, // true
+        false_kw, // false
+        def_kw, // def
+        as_kw, // as
         reduce_kw, // reduce
     };
 
@@ -85,24 +85,60 @@ pub const Lexer = struct {
 
         const start: u32 = l.pos;
         switch (l.src[l.pos]) {
-            '.' => { l.pos += 1; return .{ .tag = .dot,       .offset = start, .len = 1 }; },
-            '|' => { l.pos += 1; return .{ .tag = .pipe,      .offset = start, .len = 1 }; },
-            '[' => { l.pos += 1; return .{ .tag = .lbracket,  .offset = start, .len = 1 }; },
-            ']' => { l.pos += 1; return .{ .tag = .rbracket,  .offset = start, .len = 1 }; },
-            '(' => { l.pos += 1; return .{ .tag = .lparen,    .offset = start, .len = 1 }; },
-            ')' => { l.pos += 1; return .{ .tag = .rparen,    .offset = start, .len = 1 }; },
-            '{' => { l.pos += 1; return .{ .tag = .lbrace,    .offset = start, .len = 1 }; },
-            '}' => { l.pos += 1; return .{ .tag = .rbrace,    .offset = start, .len = 1 }; },
-            '+' => { l.pos += 1; return .{ .tag = .plus,      .offset = start, .len = 1 }; },
+            '.' => {
+                l.pos += 1;
+                return .{ .tag = .dot, .offset = start, .len = 1 };
+            },
+            '|' => {
+                l.pos += 1;
+                return .{ .tag = .pipe, .offset = start, .len = 1 };
+            },
+            '[' => {
+                l.pos += 1;
+                return .{ .tag = .lbracket, .offset = start, .len = 1 };
+            },
+            ']' => {
+                l.pos += 1;
+                return .{ .tag = .rbracket, .offset = start, .len = 1 };
+            },
+            '(' => {
+                l.pos += 1;
+                return .{ .tag = .lparen, .offset = start, .len = 1 };
+            },
+            ')' => {
+                l.pos += 1;
+                return .{ .tag = .rparen, .offset = start, .len = 1 };
+            },
+            '{' => {
+                l.pos += 1;
+                return .{ .tag = .lbrace, .offset = start, .len = 1 };
+            },
+            '}' => {
+                l.pos += 1;
+                return .{ .tag = .rbrace, .offset = start, .len = 1 };
+            },
+            '+' => {
+                l.pos += 1;
+                return .{ .tag = .plus, .offset = start, .len = 1 };
+            },
             '-' => {
                 l.pos += 1;
                 if (l.pos >= l.src.len or !std.ascii.isDigit(l.src[l.pos]))
                     return .{ .tag = .minus, .offset = start, .len = 1 };
                 return l.scanNumberLiteral(start);
             },
-            '*' => { l.pos += 1; return .{ .tag = .star,      .offset = start, .len = 1 }; },
-            '/' => { l.pos += 1; return .{ .tag = .slash,     .offset = start, .len = 1 }; },
-            '%' => { l.pos += 1; return .{ .tag = .percent,   .offset = start, .len = 1 }; },
+            '*' => {
+                l.pos += 1;
+                return .{ .tag = .star, .offset = start, .len = 1 };
+            },
+            '/' => {
+                l.pos += 1;
+                return .{ .tag = .slash, .offset = start, .len = 1 };
+            },
+            '%' => {
+                l.pos += 1;
+                return .{ .tag = .percent, .offset = start, .len = 1 };
+            },
             '<' => {
                 l.pos += 1;
                 if (l.pos < l.src.len and l.src[l.pos] == '=') {
@@ -135,10 +171,22 @@ pub const Lexer = struct {
                 }
                 return error.QuerySyntaxError;
             },
-            ':' => { l.pos += 1; return .{ .tag = .colon,     .offset = start, .len = 1 }; },
-            ';' => { l.pos += 1; return .{ .tag = .semicolon,  .offset = start, .len = 1 }; },
-            ',' => { l.pos += 1; return .{ .tag = .comma,     .offset = start, .len = 1 }; },
-            '$' => { l.pos += 1; return .{ .tag = .dollar,    .offset = start, .len = 1 }; },
+            ':' => {
+                l.pos += 1;
+                return .{ .tag = .colon, .offset = start, .len = 1 };
+            },
+            ';' => {
+                l.pos += 1;
+                return .{ .tag = .semicolon, .offset = start, .len = 1 };
+            },
+            ',' => {
+                l.pos += 1;
+                return .{ .tag = .comma, .offset = start, .len = 1 };
+            },
+            '$' => {
+                l.pos += 1;
+                return .{ .tag = .dollar, .offset = start, .len = 1 };
+            },
             'a'...'z', 'A'...'Z', '_' => {
                 l.pos += 1;
                 while (l.pos < l.src.len and isIdentCont(l.src[l.pos])) l.pos += 1;

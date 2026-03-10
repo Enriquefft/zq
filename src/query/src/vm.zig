@@ -244,7 +244,10 @@ pub const ResultIterator = struct {
 
                 .load_key => {
                     const result = try lookupKeyInValue(
-                        &it.tape, it.opts_allow_null, it.current, instr.operand.string,
+                        &it.tape,
+                        it.opts_allow_null,
+                        it.current,
+                        instr.operand.string,
                     );
                     it.current = result;
                     // Push result to value stack so arithmetic operations can use it
@@ -451,7 +454,6 @@ pub const ResultIterator = struct {
                     it.ip += 1;
                 },
 
-
                 .def_function => {
                     // Function definitions are resolved at compile time
                     // No runtime action needed
@@ -470,7 +472,7 @@ pub const ResultIterator = struct {
 
     fn doLoadIndex(it: *ResultIterator, idx: u32) ZqError!Value {
         return switch (it.current) {
-            .array  => |span| lookupIndex(&it.tape, span, idx) orelse error.IndexOutOfBounds,
+            .array => |span| lookupIndex(&it.tape, span, idx) orelse error.IndexOutOfBounds,
             .null_val => if (it.opts_allow_null) .null_val else error.TypeError,
             else => error.TypeError,
         };
@@ -660,7 +662,7 @@ pub const ResultIterator = struct {
                         const nested_span = types.Value.TapeSpan{
                             .tape = span.tape,
                             .start = pos + 1,
-                            .end = container_end_idx - 1,  // Exclude end marker from recursive copy
+                            .end = container_end_idx - 1, // Exclude end marker from recursive copy
                         };
                         try it.copyTapeSpanToRuntimeTape(nested_span);
                     }
@@ -747,27 +749,51 @@ pub const ResultIterator = struct {
     // ── Comparison operations ─────────────────────────────────────────────────────
 
     fn doEq(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a == b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a == b;
+            }
+        }.op);
     }
 
     fn doNe(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a != b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a != b;
+            }
+        }.op);
     }
 
     fn doLt(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a < b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a < b;
+            }
+        }.op);
     }
 
     fn doLe(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a <= b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a <= b;
+            }
+        }.op);
     }
 
     fn doGt(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a > b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a > b;
+            }
+        }.op);
     }
 
     fn doGe(it: *ResultIterator) ZqError!bool {
-        return it.doCompareOp(struct { fn op(a: f64, b: f64) bool { return a >= b; } }.op);
+        return it.doCompareOp(struct {
+            fn op(a: f64, b: f64) bool {
+                return a >= b;
+            }
+        }.op);
     }
 
     fn doCompareOp(
@@ -859,15 +885,15 @@ pub const ResultIterator = struct {
         switch (it.current) {
             .array => |span| {
                 const first = span.start + 1;
-                const end   = span.end - 1; // position of array_end
+                const end = span.end - 1; // position of array_end
                 if (first >= end) {
                     // Empty array — skip past all instructions; produce no output.
                     it.ip = @intCast(it.instructions.len);
                     return;
                 }
                 it.stack.appendAssumeCapacity(IterFrame{
-                    .pos       = first,
-                    .end       = end,
+                    .pos = first,
+                    .end = end,
                     .is_object = false,
                     .resume_ip = resume_ip,
                 });
@@ -876,14 +902,14 @@ pub const ResultIterator = struct {
             },
             .object => |span| {
                 const first_key = span.start + 1;
-                const end       = span.end - 1; // position of object_end
+                const end = span.end - 1; // position of object_end
                 if (first_key >= end) {
                     it.ip = @intCast(it.instructions.len);
                     return;
                 }
                 it.stack.appendAssumeCapacity(IterFrame{
-                    .pos       = first_key,
-                    .end       = end,
+                    .pos = first_key,
+                    .end = end,
                     .is_object = true,
                     .resume_ip = resume_ip,
                 });
@@ -904,14 +930,14 @@ pub const ResultIterator = struct {
         const next_pos: u32 = if (frame.is_object)
             skipEntry(it.tape, frame.pos + 1) // step past value → next key
         else
-            skipEntry(it.tape, frame.pos);    // step past current value
+            skipEntry(it.tape, frame.pos); // step past current value
 
         if (next_pos >= frame.end) {
             _ = it.stack.pop();
             return false;
         }
 
-        frame.pos  = next_pos;
+        frame.pos = next_pos;
         it.current = if (frame.is_object)
             tapeEntryToValue(&it.tape, next_pos + 1) // value after key
         else
@@ -945,20 +971,19 @@ fn valueToStackValue(v: Value) ZqError!StackValue {
     };
 }
 
-
 // ── Tape helpers ──────────────────────────────────────────────────────────────
 
 fn tapeEntryToValue(tape: *const Tape, pos: u32) Value {
     const e = tape.entries[pos];
     return switch (e.tag) {
-        .null_val     => .null_val,
-        .true_val     => .{ .bool_val = true },
-        .false_val    => .{ .bool_val = false },
-        .int          => .{ .int    = e.payload.int },
-        .float        => .{ .float  = e.payload.float },
-        .string       => .{ .string = tape.getString(e.payload.string) },
+        .null_val => .null_val,
+        .true_val => .{ .bool_val = true },
+        .false_val => .{ .bool_val = false },
+        .int => .{ .int = e.payload.int },
+        .float => .{ .float = e.payload.float },
+        .string => .{ .string = tape.getString(e.payload.string) },
         .object_start => .{ .object = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
-        .array_start  => .{ .array  = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
+        .array_start => .{ .array = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
         // These tags are never returned as values.
         .key, .object_end, .array_end => unreachable,
     };
@@ -969,8 +994,8 @@ fn tapeEntryToValue(tape: *const Tape, pos: u32) Value {
 fn skipEntry(tape: Tape, pos: u32) u32 {
     return switch (tape.entries[pos].tag) {
         .object_start => tape.entries[pos].payload.skip,
-        .array_start  => tape.entries[pos].payload.skip,
-        else          => pos + 1,
+        .array_start => tape.entries[pos].payload.skip,
+        else => pos + 1,
     };
 }
 
@@ -981,10 +1006,10 @@ fn lookupKeyInValue(
     key: []const u8,
 ) ZqError!Value {
     return switch (val) {
-        .object   => |span| lookupKey(tape, span, key) orelse
+        .object => |span| lookupKey(tape, span, key) orelse
             (if (allow_null) .null_val else error.TypeError),
         .null_val => if (allow_null) .null_val else error.TypeError,
-        else      => error.TypeError,
+        else => error.TypeError,
     };
 }
 

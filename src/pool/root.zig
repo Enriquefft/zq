@@ -27,7 +27,6 @@
 /// delivers chunks in chunk_id order regardless of worker completion order.
 /// collect() maintains a (rec_idx, val_idx) cursor so multi-value queries (e.g.
 /// `.[]`) deliver every output value before advancing to the next record.
-
 const std = @import("std");
 const err_mod = @import("error");
 const io_mod = @import("io");

@@ -75,11 +75,11 @@ pub fn kindFromZqError(e: ZqError) ErrorKind {
         error.InvalidNumber => .invalid_number,
         error.UnterminatedString => .unterminated_string,
         error.DepthLimitExceeded => .depth_limit_exceeded,
-        error.IoError           => .io_error,
-        error.QuerySyntaxError  => .query_syntax_error,
-        error.TypeError         => .type_error,
-        error.IndexOutOfBounds  => .index_out_of_bounds,
-        error.OutOfMemory      => .out_of_memory,
+        error.IoError => .io_error,
+        error.QuerySyntaxError => .query_syntax_error,
+        error.TypeError => .type_error,
+        error.IndexOutOfBounds => .index_out_of_bounds,
+        error.OutOfMemory => .out_of_memory,
     };
 }
 

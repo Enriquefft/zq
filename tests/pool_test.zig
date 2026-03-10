@@ -5,7 +5,6 @@
 /// exercised via a pipe created with std.posix.pipe().
 ///
 /// Ordering invariant: collect() must always return results in submission order.
-
 const std = @import("std");
 const pool_mod = @import("pool");
 const query_mod = @import("query");

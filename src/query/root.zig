@@ -5,8 +5,8 @@ const compiler = @import("src/compiler.zig");
 const vm = @import("src/vm.zig");
 
 pub const ZqError = err_mod.ZqError;
-pub const Tape    = types.Tape;
-pub const Value   = types.Value;
+pub const Tape = types.Tape;
+pub const Value = types.Value;
 
 // Re-export ResultIterator as part of the public surface.
 pub const ResultIterator = vm.ResultIterator;
@@ -27,11 +27,11 @@ pub const Opts = struct {
 /// Immutable compiled filter. Thread-safe for concurrent execute() calls.
 /// Owns its instruction bytecode and string-intern buffer.
 pub const CompiledQuery = struct {
-    allocator:     std.mem.Allocator,
-    instructions:  []types.Instruction,
+    allocator: std.mem.Allocator,
+    instructions: []types.Instruction,
     function_table: []const types.FunctionDef,
-    string_buf:    []u8,
-    opts:          Opts,
+    string_buf: []u8,
+    opts: Opts,
 
     /// Compile `src` into bytecode.
     ///
@@ -39,17 +39,17 @@ pub const CompiledQuery = struct {
     /// Returns QuerySyntaxError for malformed filters; OutOfMemory if buffers
     /// cannot be allocated.
     pub fn compile(
-        src:       []const u8,
-        opts:      Opts,
+        src: []const u8,
+        opts: Opts,
         allocator: std.mem.Allocator,
     ) (ZqError || error{OutOfMemory})!CompiledQuery {
         const compiled = try compiler.compile(src, allocator);
         return CompiledQuery{
-            .allocator      = allocator,
-            .instructions   = compiled.instructions,
+            .allocator = allocator,
+            .instructions = compiled.instructions,
             .function_table = compiled.function_table,
-            .string_buf     = compiled.string_buf,
-            .opts           = opts,
+            .string_buf = compiled.string_buf,
+            .opts = opts,
         };
     }
 
@@ -63,8 +63,8 @@ pub const CompiledQuery = struct {
     /// `tape` and `q` must both outlive the returned ResultIterator.
     /// No execution occurs until the first next() call.
     pub fn execute(
-        q:         *const CompiledQuery,
-        tape:      Tape,
+        q: *const CompiledQuery,
+        tape: Tape,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
         return ResultIterator.init(

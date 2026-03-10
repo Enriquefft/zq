@@ -174,7 +174,7 @@ test "empty object" {
     const tape = try parseAll(&p, "{}");
     try std.testing.expectEqual(@as(usize, 2), tape.entries.len);
     try std.testing.expectEqual(types.Tape.Tag.object_start, tape.entries[0].tag);
-    try std.testing.expectEqual(types.Tape.Tag.object_end,   tape.entries[1].tag);
+    try std.testing.expectEqual(types.Tape.Tag.object_end, tape.entries[1].tag);
     // skip must point past object_end
     try std.testing.expectEqual(@as(u32, 2), tape.entries[0].payload.skip);
 }
@@ -185,7 +185,7 @@ test "empty array" {
     const tape = try parseAll(&p, "[]");
     try std.testing.expectEqual(@as(usize, 2), tape.entries.len);
     try std.testing.expectEqual(types.Tape.Tag.array_start, tape.entries[0].tag);
-    try std.testing.expectEqual(types.Tape.Tag.array_end,   tape.entries[1].tag);
+    try std.testing.expectEqual(types.Tape.Tag.array_end, tape.entries[1].tag);
     try std.testing.expectEqual(@as(u32, 2), tape.entries[0].payload.skip);
 }
 
@@ -198,11 +198,11 @@ test "object with one key-value pair" {
     try std.testing.expectEqual(@as(usize, 4), tape.entries.len);
     try std.testing.expectEqual(types.Tape.Tag.object_start, tape.entries[0].tag);
     try std.testing.expectEqual(@as(u32, 4), tape.entries[0].payload.skip);
-    try std.testing.expectEqual(types.Tape.Tag.key,          tape.entries[1].tag);
+    try std.testing.expectEqual(types.Tape.Tag.key, tape.entries[1].tag);
     try std.testing.expectEqualStrings("a", tape.getString(tape.entries[1].payload.string));
-    try std.testing.expectEqual(types.Tape.Tag.int,          tape.entries[2].tag);
+    try std.testing.expectEqual(types.Tape.Tag.int, tape.entries[2].tag);
     try std.testing.expectEqual(@as(i64, 1), tape.entries[2].payload.int);
-    try std.testing.expectEqual(types.Tape.Tag.object_end,   tape.entries[3].tag);
+    try std.testing.expectEqual(types.Tape.Tag.object_end, tape.entries[3].tag);
 }
 
 test "array with three integers" {
@@ -230,8 +230,8 @@ test "nested object inside array" {
     try std.testing.expectEqual(@as(u32, 4), tape.entries[0].payload.skip);
     try std.testing.expectEqual(types.Tape.Tag.object_start, tape.entries[1].tag);
     try std.testing.expectEqual(@as(u32, 3), tape.entries[1].payload.skip);
-    try std.testing.expectEqual(types.Tape.Tag.object_end,   tape.entries[2].tag);
-    try std.testing.expectEqual(types.Tape.Tag.array_end,    tape.entries[3].tag);
+    try std.testing.expectEqual(types.Tape.Tag.object_end, tape.entries[2].tag);
+    try std.testing.expectEqual(types.Tape.Tag.array_end, tape.entries[3].tag);
 }
 
 test "multiple key-value pairs" {
@@ -342,7 +342,7 @@ test "auto-close: truncated object with value" {
     const tape = try parseAll(&p, "{\"a\":1");
     try std.testing.expectEqual(@as(usize, 4), tape.entries.len);
     try std.testing.expectEqual(types.Tape.Tag.object_start, tape.entries[0].tag);
-    try std.testing.expectEqual(types.Tape.Tag.object_end,   tape.entries[3].tag);
+    try std.testing.expectEqual(types.Tape.Tag.object_end, tape.entries[3].tag);
 }
 
 test "auto-close: empty object" {
@@ -367,10 +367,10 @@ test "auto-close: truncated nested" {
     // [{"a":1  <- both containers should be closed
     const tape = try parseAll(&p, "[{\"a\":1");
     try std.testing.expectEqual(@as(usize, 6), tape.entries.len);
-    try std.testing.expectEqual(types.Tape.Tag.array_start,  tape.entries[0].tag);
+    try std.testing.expectEqual(types.Tape.Tag.array_start, tape.entries[0].tag);
     try std.testing.expectEqual(types.Tape.Tag.object_start, tape.entries[1].tag);
-    try std.testing.expectEqual(types.Tape.Tag.object_end,   tape.entries[4].tag);
-    try std.testing.expectEqual(types.Tape.Tag.array_end,    tape.entries[5].tag);
+    try std.testing.expectEqual(types.Tape.Tag.object_end, tape.entries[4].tag);
+    try std.testing.expectEqual(types.Tape.Tag.array_end, tape.entries[5].tag);
 }
 
 test "auto-close: number at EOF inside container" {
