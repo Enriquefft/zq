@@ -54,6 +54,16 @@ pub const Token = struct {
         def_kw, // def
         as_kw, // as
         reduce_kw, // reduce
+
+        // Conditional keywords
+        if_kw, // if
+        then_kw, // then
+        elif_kw, // elif
+        else_kw, // else
+        end_kw, // end
+
+        // String literal
+        string_lit, // "..."
     };
 
     pub fn slice(tok: Token, src: []const u8) []const u8 {
@@ -187,6 +197,19 @@ pub const Lexer = struct {
                 l.pos += 1;
                 return .{ .tag = .dollar, .offset = start, .len = 1 };
             },
+            '"' => {
+                l.pos += 1; // skip opening quote
+                while (l.pos < l.src.len and l.src[l.pos] != '"') {
+                    if (l.src[l.pos] == '\\') {
+                        l.pos += 1; // skip backslash
+                        if (l.pos >= l.src.len) return error.QuerySyntaxError;
+                    }
+                    l.pos += 1;
+                }
+                if (l.pos >= l.src.len) return error.QuerySyntaxError; // unterminated string
+                l.pos += 1; // skip closing quote
+                return .{ .tag = .string_lit, .offset = start, .len = l.pos - start };
+            },
             'a'...'z', 'A'...'Z', '_' => {
                 l.pos += 1;
                 while (l.pos < l.src.len and isIdentCont(l.src[l.pos])) l.pos += 1;
@@ -250,6 +273,16 @@ pub const Lexer = struct {
             .as_kw
         else if (std.mem.eql(u8, slice, "reduce"))
             .reduce_kw
+        else if (std.mem.eql(u8, slice, "if"))
+            .if_kw
+        else if (std.mem.eql(u8, slice, "then"))
+            .then_kw
+        else if (std.mem.eql(u8, slice, "elif"))
+            .elif_kw
+        else if (std.mem.eql(u8, slice, "else"))
+            .else_kw
+        else if (std.mem.eql(u8, slice, "end"))
+            .end_kw
         else
             .ident;
 

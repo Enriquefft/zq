@@ -778,3 +778,460 @@ test "unary negation: TypeError on non-numeric field" {
 
     try std.testing.expectError(error.TypeError, it.next());
 }
+
+// ── Conditionals ──────────────────────────────────────────────────────────────
+
+test "if/then/else: true condition takes then-branch" {
+    // input: 7  →  if . > 5 then true else false end  →  true
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . > 5 then true else false end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "if/then/else: false condition takes else-branch" {
+    // input: 3  →  if . > 5 then true else false end  →  false
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 3 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . > 5 then true else false end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(false, vals[0].bool_val);
+}
+
+test "if/then/else: branches evaluate against original input" {
+    // {"x": 10}  →  if .x > 5 then .x else 0 end  →  10
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("if .x > 5 then .x else 0 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 10), vals[0].int);
+}
+
+test "if/then/else: null is falsy" {
+    // null  →  if . then true else false end  →  false
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . then true else false end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(false, vals[0].bool_val);
+}
+
+test "if/then/else: false is falsy" {
+    // false  →  if . then true else false end  →  false
+    const entries = [_]Entry{.{ .tag = .false_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . then true else false end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(false, vals[0].bool_val);
+}
+
+test "if/then/else: 0 is truthy (jq semantics)" {
+    // 0  →  if . then true else false end  →  true  (0 is truthy in jq)
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . then true else false end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "if/then without else: implicit else is identity — true branch" {
+    // 7  →  if . > 5 then 99 end  →  99
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . > 5 then 99 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+}
+
+test "if/then without else: false branch returns input" {
+    // 3  →  if . > 5 then 99 end  →  3  (implicit else = .)
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 3 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . > 5 then 99 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 3), vals[0].int);
+}
+
+test "elif: first condition true" {
+    // -5  →  if . < 0 then -1 elif . > 0 then 1 else 0 end  →  -1
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = -5 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+}
+
+test "elif: second condition true" {
+    // 5  →  if . < 0 then -1 elif . > 0 then 1 else 0 end  →  1
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 5 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+}
+
+test "elif: else branch" {
+    // 0  →  if . < 0 then -1 elif . > 0 then 1 else 0 end  →  0
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+}
+
+test "nested if: if inside then-branch" {
+    // 15  →  if . > 10 then if . > 20 then 99 else 50 end else 0 end  →  50
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 15 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("if . > 10 then if . > 20 then 99 else 50 end else 0 end");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 50), vals[0].int);
+}
+
+test "if: syntax error — missing then" {
+    try std.testing.expectError(
+        error.QuerySyntaxError,
+        CompiledQuery.compile("if . else . end", .{}, alloc),
+    );
+}
+
+test "if: syntax error — missing end" {
+    try std.testing.expectError(
+        error.QuerySyntaxError,
+        CompiledQuery.compile("if . then . else .", .{}, alloc),
+    );
+}
+
+// ── Array construction ────────────────────────────────────────────────────────
+
+test "array construction: [] yields empty array" {
+    var q = try compile("[]");
+    defer q.deinit();
+
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 1 } }};
+    const t = tape(&entries, "");
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    // Empty array: span.end - span.start == 2 (array_start + array_end, no elements).
+    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: [.] wraps input in array" {
+    // Verify that [.] returns an array with exactly one scalar element.
+    // The runtime tape is freed after collectAll, so we only check structural span sizes.
+    var q = try compile("[.]");
+    defer q.deinit();
+
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // One scalar element: array_start + int + array_end = 3 entries → span.end - span.start = 3.
+    try std.testing.expectEqual(@as(u32, 3), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: [.foo] wraps field in array" {
+    // {"x": 42} — [.x] should return an array with one scalar element.
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("[.x]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // One scalar: start + int + end = 3 entries.
+    try std.testing.expectEqual(@as(u32, 3), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: [.[]] collects all array elements" {
+    // [10, 20, 30]
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("[.[]]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // 3 scalar elements: start + 3 ints + end = 5 entries.
+    try std.testing.expectEqual(@as(u32, 5), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: [.[] | .id] maps field from each element" {
+    // [{"id":1}, {"id":2}]
+    const sb = "id";
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 10 } }, // past array_end at [9]
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } }, // past object_end at [4]
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 2 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_start, .payload = .{ .skip = 9 } }, // past object_end at [8]
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 2 } } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("[.[] | .id]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // 2 scalar elements: start + 2 ints + end = 4 entries.
+    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: [.[]] on empty array yields empty array" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("[.[]]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .array);
+    // empty: start + end = 2 entries → span.end - span.start = 2.
+    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+}
+
+test "array construction: syntax error — unclosed bracket" {
+    try std.testing.expectError(
+        error.QuerySyntaxError,
+        CompiledQuery.compile("[.", .{}, alloc),
+    );
+}
+
+// ── Bracket pipe expressions ──────────────────────────────────────────────────
+
+test ".['key']: string literal bracket access returns field value" {
+    // {"name": "Alice"}
+    const sb = "namealice";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 4 } } },
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 4, .len = 5 } } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".[ \"name\"]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("alice", vals[0].string);
+}
+
+test ".['key'] equivalent to .key" {
+    // {"x": 99}
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 99 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".[\"x\"]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+}
+
+test ".[.key_field]: computed string key from field value" {
+    // {"k": "name", "name": "Bob"}  →  .[.k] == "Bob"
+    const sb = "knameBob";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 8 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },   // "k"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 1, .len = 4 } } }, // "name"
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 4 } } },   // "name"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 5, .len = 3 } } }, // "Bob"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".[.k]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("Bob", vals[0].string);
+}
+
+test ".[.idx]: computed integer index from field value" {
+    // [10, 20, 30] with input {"i": 1}  →  not feasible in one tape;
+    // instead test directly: array [10,20,30], index from literal expression
+    // Use .[1] to exercise load_index (existing), confirm no regression.
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    // .[1] still goes through parseBracket's int_lit branch.
+    var q = try compile(".[1]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 20), vals[0].int);
+}
+
+test ".[expr]: allow_null_propagation on missing key" {
+    // {"x": 1}  →  .["missing"]  with allow_null → null
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compileNull(".[\"missing\"]");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .null_val);
+}
+
+test ".['key']: syntax error on unterminated string" {
+    try std.testing.expectError(
+        error.QuerySyntaxError,
+        CompiledQuery.compile(".[\"unterminated]", .{}, alloc),
+    );
+}

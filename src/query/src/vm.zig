@@ -20,6 +20,18 @@ const IterFrame = struct {
     resume_ip: u32,
 };
 
+/// State for one active `[expr]` array collection.
+/// Pushed by array_collect_start, popped by array_collect_end or ip-exhaustion.
+const CollectFrame = struct {
+    /// Accumulated outputs from the inner expression.
+    buffer: std.ArrayList(StackValue),
+    /// IterFrame stack depth when collection started.
+    /// Used to distinguish inner vs outer iteration frames.
+    outer_stack_depth: u32,
+    /// IP of the matching array_collect_end instruction.
+    end_ip: u32,
+};
+
 /// A value on the evaluation stack.
 const StackValue = union(enum) {
     null_val,
@@ -56,6 +68,11 @@ pub const ResultIterator = struct {
     runtime_tape_view: types.Tape,
     /// Object construction state.
     object_construct: std.ArrayList(ObjectField),
+    /// Stack of saved `current` values for if/elif branch restoration.
+    /// save_input pushes; restore_input pops.
+    if_stack: std.ArrayList(Value),
+    /// Active array collection frames. Pushed by array_collect_start.
+    collect_stack: std.ArrayList(CollectFrame),
     alloc: std.mem.Allocator,
     done: bool,
     /// Defers initial tapeEntryToValue(&self.tape, 0) until after any struct move.
@@ -91,6 +108,16 @@ pub const ResultIterator = struct {
         errdefer object_construct.deinit(allocator);
         try object_construct.ensureTotalCapacity(allocator, 128);
 
+        // Initialize if-branch input stack
+        var if_stack = std.ArrayList(Value){};
+        errdefer if_stack.deinit(allocator);
+        try if_stack.ensureTotalCapacity(allocator, max_stack_depth);
+
+        // Initialize array collect stack (nesting depth rarely exceeds 8)
+        var collect_stack = std.ArrayList(CollectFrame){};
+        errdefer collect_stack.deinit(allocator);
+        try collect_stack.ensureTotalCapacity(allocator, 16);
+
         // Initialize runtime tape
         var runtime_tape = try types.RuntimeTape.init(allocator);
         errdefer runtime_tape.deinit(allocator);
@@ -116,6 +143,8 @@ pub const ResultIterator = struct {
             .runtime_tape = runtime_tape,
             .runtime_tape_view = runtime_tape_view,
             .object_construct = object_construct,
+            .if_stack = if_stack,
+            .collect_stack = collect_stack,
             .alloc = allocator,
             .done = false,
             .initialized = false,
@@ -128,6 +157,9 @@ pub const ResultIterator = struct {
         it.value_stack.deinit(it.alloc);
         it.variable_store.deinit(it.alloc);
         it.object_construct.deinit(it.alloc);
+        it.if_stack.deinit(it.alloc);
+        for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
+        it.collect_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
     }
 
@@ -150,6 +182,9 @@ pub const ResultIterator = struct {
         it.variable_store.items.len = max_value_stack;
         @memset(it.variable_store.items, null);
         it.object_construct.clearRetainingCapacity();
+        it.if_stack.clearRetainingCapacity();
+        for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
+        it.collect_stack.clearRetainingCapacity();
         it.runtime_tape.entries.clearRetainingCapacity();
         it.runtime_tape.string_buf.clearRetainingCapacity();
         it.runtime_tape_view = types.Tape{
@@ -218,6 +253,17 @@ pub const ResultIterator = struct {
         while (true) {
             if (it.ip >= it.instructions.len) {
                 if (it.stack.items.len == 0) {
+                    // If an array collect frame is waiting to finalize, do it now.
+                    // This path is taken when all inner iteration frames are exhausted
+                    // after the last collect_output fired.
+                    if (it.collect_stack.items.len > 0) {
+                        var completed = it.collect_stack.pop().?;
+                        defer completed.buffer.deinit(it.alloc);
+                        const arr_val = try it.buildCollectedArray(&completed);
+                        it.pushValue(arr_val);
+                        it.ip = completed.end_ip + 1; // skip past array_collect_end
+                        continue;
+                    }
                     it.done = true;
                     return null;
                 }
@@ -238,8 +284,22 @@ pub const ResultIterator = struct {
                         try stackValueToValue(try it.popValue())
                     else
                         it.current;
-                    it.ip += 1;
-                    return val;
+
+                    if (it.collect_stack.items.len > 0) {
+                        // Collect mode: buffer value instead of yielding.
+                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                        try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                        if (it.stack.items.len > cf.outer_stack_depth) {
+                            // More inner iterations pending: trigger advanceFrame.
+                            it.ip = @intCast(it.instructions.len);
+                        } else {
+                            // No more inner iterations: jump to array_collect_end.
+                            it.ip = cf.end_ip;
+                        }
+                    } else {
+                        it.ip += 1;
+                        return val;
+                    }
                 },
 
                 .load_key => {
@@ -258,6 +318,40 @@ pub const ResultIterator = struct {
 
                 .load_index => {
                     it.current = try it.doLoadIndex(instr.operand.index);
+                    it.ip += 1;
+                },
+
+                .load_computed => {
+                    // Key/index: pop from value_stack if non-empty, else use current.
+                    const key_sv = if (it.value_stack.items.len > 0)
+                        try it.popValue()
+                    else
+                        try valueToStackValue(it.current);
+                    // Base: pop from if_stack (pushed by save_input before inner expr).
+                    if (it.if_stack.items.len == 0) return error.TypeError;
+                    const base = it.if_stack.pop().?;
+                    it.current = switch (key_sv) {
+                        .tape_value => |tv| switch (tv) {
+                            .string => |s| switch (base) {
+                                .object => |span| lookupKey(span.tape, span, s) orelse
+                                    if (it.opts_allow_null) @as(Value, .null_val) else return error.TypeError,
+                                .null_val => if (it.opts_allow_null) @as(Value, .null_val) else return error.TypeError,
+                                else => return error.TypeError,
+                            },
+                            else => return error.TypeError,
+                        },
+                        .int => |i| blk: {
+                            if (i < 0 or i > std.math.maxInt(u32)) return error.IndexOutOfBounds;
+                            const idx: u32 = @intCast(i);
+                            break :blk switch (base) {
+                                .array => |span| lookupIndex(span.tape, span, idx) orelse
+                                    return error.IndexOutOfBounds,
+                                .null_val => if (it.opts_allow_null) @as(Value, .null_val) else return error.TypeError,
+                                else => return error.TypeError,
+                            };
+                        },
+                        else => return error.TypeError,
+                    };
                     it.ip += 1;
                 },
 
@@ -299,6 +393,57 @@ pub const ResultIterator = struct {
                 .push_current => {
                     it.pushValue(try valueToStackValue(it.current));
                     it.ip += 1;
+                },
+
+                // Conditional branching
+                .save_input => {
+                    it.if_stack.appendAssumeCapacity(it.current);
+                    it.ip += 1;
+                },
+
+                .restore_input => {
+                    if (it.if_stack.items.len == 0) return error.TypeError;
+                    it.current = it.if_stack.pop().?;
+                    it.ip += 1;
+                },
+
+                // Array construction
+                .array_collect_start => {
+                    var buf = std.ArrayList(StackValue){};
+                    errdefer buf.deinit(it.alloc);
+                    try buf.ensureTotalCapacity(it.alloc, 32);
+                    try it.collect_stack.append(it.alloc, CollectFrame{
+                        .buffer = buf,
+                        .outer_stack_depth = @intCast(it.stack.items.len),
+                        .end_ip = instr.operand.index,
+                    });
+                    it.ip += 1;
+                },
+
+                .array_collect_end => {
+                    // Reached when: (a) inner expr is empty [], or (b) output handler
+                    // jumped here after the last (non-iterating) element.
+                    var completed = it.collect_stack.pop().?;
+                    defer completed.buffer.deinit(it.alloc);
+                    const arr_val = try it.buildCollectedArray(&completed);
+                    it.pushValue(arr_val);
+                    it.ip += 1;
+                },
+
+                .jump => {
+                    it.ip = instr.operand.index;
+                },
+
+                .jump_if_false => {
+                    const cond = if (it.value_stack.items.len > 0)
+                        try it.popValue()
+                    else
+                        try valueToStackValue(it.current);
+                    if (!isCondTruthy(cond)) {
+                        it.ip = instr.operand.index;
+                    } else {
+                        it.ip += 1;
+                    }
                 },
 
                 // Object construction operations
@@ -482,6 +627,36 @@ pub const ResultIterator = struct {
                 },
             }
         }
+    }
+
+    /// Convert a completed CollectFrame buffer into an array Value backed by runtime_tape.
+    fn buildCollectedArray(it: *ResultIterator, frame: *const CollectFrame) ZqError!StackValue {
+        it.runtime_tape.entries.clearRetainingCapacity();
+        it.runtime_tape.string_buf.clearRetainingCapacity();
+
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        for (frame.buffer.items) |sv| {
+            try it.stackValueToRuntimeTapeEntry(sv);
+        }
+
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
     }
 
     fn doLoadIndex(it: *ResultIterator, idx: u32) ZqError!Value {
@@ -875,6 +1050,16 @@ pub const ResultIterator = struct {
         // Left is falsy: OR result is right
         _ = try it.popValue();
         it.pushValue(right);
+    }
+
+    /// jq conditional semantics: only `false` and `null` are falsy; everything
+    /// else (0, "", [], {}, ...) is truthy.
+    fn isCondTruthy(val: StackValue) bool {
+        return switch (val) {
+            .null_val => false,
+            .bool_val => |b| b,
+            else => true,
+        };
     }
 
     fn isTruthy(val: StackValue) ZqError!bool {

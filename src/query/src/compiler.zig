@@ -474,8 +474,120 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             // Object literal
             try parseObjectLiteral(ctx);
         },
+        .if_kw => {
+            // Conditional: if COND then THEN [elif COND then THEN]* [else ELSE] end
+            try parseIfBody(ctx);
+        },
+        .lbracket => {
+            // Array construction: [expr] — collect all outputs of expr into an array.
+            try parseArrayConstruct(ctx);
+        },
         else => return error.QuerySyntaxError,
     }
+}
+
+/// Parse the body of an `if` or `elif` expression (the `if`/`elif` keyword has
+/// already been consumed by the caller).
+///
+/// Emits:
+///   save_input
+///   <COND>
+///   jump_if_false → else-branch
+///   restore_input
+///   <THEN>
+///   jump → end
+///   restore_input   ← else-branch entry
+///   (<ELSE> | parseIfBody for elif | identity for implicit else)
+fn parseIfBody(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Save the current input so both branches can evaluate against it.
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // Parse condition (stops at 'then').
+    try parsePipe(ctx);
+
+    // Expect 'then'.
+    const then_tok = try ctx.lex.next();
+    if (then_tok.tag != .then_kw) return error.QuerySyntaxError;
+
+    // Emit conditional jump with a placeholder target (backpatched below).
+    const jif_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump_if_false, .operand = .{ .index = 0 } });
+
+    // Restore input before the then-branch.
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // Parse then-body (stops at elif/else/end).
+    try parsePipe(ctx);
+
+    // Unconditional jump to skip the else-branch (placeholder backpatched below).
+    const jmp_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = 0 } });
+
+    // Backpatch jump_if_false to point here (start of else-branch).
+    ctx.raw.items[jif_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // Restore input before the else-branch.
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // Parse elif / else / end.
+    const next_tok = try ctx.lex.peek();
+    switch (next_tok.tag) {
+        .elif_kw => {
+            _ = try ctx.lex.next(); // consume 'elif'
+            // Recursively compile the elif as a nested if body.
+            try parseIfBody(ctx);
+        },
+        .else_kw => {
+            _ = try ctx.lex.next(); // consume 'else'
+            try parsePipe(ctx); // parse else-body
+            const end_tok = try ctx.lex.next();
+            if (end_tok.tag != .end_kw) return error.QuerySyntaxError;
+        },
+        .end_kw => {
+            _ = try ctx.lex.next(); // consume 'end'
+            // Implicit else: `.` — identity, passes current through.
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .identity, .operand = .{ .none = {} } });
+        },
+        else => return error.QuerySyntaxError,
+    }
+
+    // Backpatch unconditional jump to point here (past the entire else block).
+    ctx.raw.items[jmp_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+}
+
+/// Parse an array construction expression: [expr] or [].
+/// The opening `[` has already been consumed by parsePrimary.
+///
+/// Emits:
+///   array_collect_start   operand.index = IP of array_collect_end
+///   [<expr> output]       only when inner expression is non-empty
+///   array_collect_end
+///
+/// The VM's output handler is intercepted in collect mode: instead of yielding
+/// a value, it appends to the active collect frame and advances iteration.
+/// array_collect_end finalizes the frame into an array Value.
+fn parseArrayConstruct(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Emit array_collect_start with placeholder end_ip (backpatched below).
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    const peek = try ctx.lex.peek();
+    if (peek.tag != .rbracket) {
+        // Parse the inner expression (generator).
+        try parsePipe(ctx);
+        // Emit an explicit output inside the collect scope. The VM intercepts
+        // this in collect mode: instead of yielding, it buffers the value.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+    }
+
+    // Consume the closing `]`.
+    const close = try ctx.lex.next();
+    if (close.tag != .rbracket) return error.QuerySyntaxError;
+
+    // Emit array_collect_end and backpatch start.
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
 }
 
 /// Parse a variable reference: $var
@@ -665,7 +777,11 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const rparen = try ctx.lex.next();
         if (rparen.tag != .rparen) return error.QuerySyntaxError;
     } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
-        peek.tag == .true_kw or peek.tag == .false_kw)
+        peek.tag == .true_kw or peek.tag == .false_kw or
+        peek.tag == .if_kw or peek.tag == .then_kw or peek.tag == .elif_kw or
+        peek.tag == .else_kw or peek.tag == .end_kw or peek.tag == .and_kw or
+        peek.tag == .or_kw or peek.tag == .not_kw or peek.tag == .def_kw or
+        peek.tag == .as_kw or peek.tag == .reduce_kw)
     {
         // Literal key - push as string value for object construction
         const key = try ctx.lex.next();
@@ -714,13 +830,15 @@ fn parseSuffixes(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
 /// Parse the body of `[...]` (the opening `[` has already been consumed).
 fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const t = try ctx.lex.next();
+    const t = try ctx.lex.peek();
     switch (t.tag) {
         .rbracket => {
+            _ = try ctx.lex.next();
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
         },
         .int_lit => {
-            const n = std.fmt.parseInt(i64, t.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+            const tok = try ctx.lex.next();
+            const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
             if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
             const close = try ctx.lex.next();
             if (close.tag != .rbracket) return error.QuerySyntaxError;
@@ -729,7 +847,25 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 .operand = .{ .index = @intCast(n) },
             });
         },
-        else => return error.QuerySyntaxError,
+        .string_lit => {
+            const tok = try ctx.lex.next();
+            const raw_str = tok.slice(ctx.src);
+            // Strip the surrounding double-quotes to get the bare key bytes.
+            const content = raw_str[1 .. raw_str.len - 1];
+            const ref = try internStr(&ctx.intern, ctx.alloc, content);
+            const close = try ctx.lex.next();
+            if (close.tag != .rbracket) return error.QuerySyntaxError;
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
+        },
+        else => {
+            // Computed access .[expr]: save base to if_stack, evaluate expr,
+            // then load_computed pops base and applies current/top-of-stack as key.
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+            try parsePipe(ctx);
+            const close = try ctx.lex.next();
+            if (close.tag != .rbracket) return error.QuerySyntaxError;
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_computed, .operand = .{ .none = {} } });
+        },
     }
 }
 
@@ -806,6 +942,14 @@ fn fuse(
 
             const op: Instruction.Op = if (keys.items.len == 1) .load_key else .load_path;
             try fused.append(alloc, RawInstr{ .op = op, .operand = .{ .str_ref = ref } });
+
+            // Fill index_map for the consumed pipe+load_key pairs so that any
+            // raw instruction index (e.g. a jump or array_collect_start end_ip)
+            // pointing past this chain resolves to the correct fused index.
+            var k = i + 1;
+            while (k < j) : (k += 1) {
+                index_map.appendAssumeCapacity(@intCast(fused.items.len - 1));
+            }
             i = j;
         } else {
             try fused.append(alloc, raw[i]);
@@ -830,6 +974,7 @@ fn fuse(
                     .len = r.operand.str_ref.len,
                 } },
                 .load_index, .capture_variable, .load_variable, .pop_variable, .def_function, .call_function => .{ .index = r.operand.index },
+                .load_computed => .{ .none = {} },
                 .push_bool => .{ .bool = r.operand.bool },
                 .push_int => .{ .int = r.operand.int },
                 .push_float => .{ .float = r.operand.float },
@@ -857,6 +1002,13 @@ fn fuse(
                 .object_construct_start => .{ .none = {} },
                 .object_key => .{ .none = {} },
                 .object_construct_end => .{ .none = {} },
+                // Conditional branching: remap raw instruction index → fused index.
+                .jump, .jump_if_false => .{ .index = index_map.items[r.operand.index] },
+                .save_input => .{ .none = {} },
+                .restore_input => .{ .none = {} },
+                // Array construction: remap end_ip raw → fused index.
+                .array_collect_start => .{ .index = index_map.items[r.operand.index] },
+                .array_collect_end => .{ .none = {} },
             },
         };
     }

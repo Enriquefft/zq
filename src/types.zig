@@ -155,6 +155,9 @@ pub const Instruction = struct {
         load_key,
         /// Descend into an array index. operand.index = position.
         load_index,
+        /// Computed descent: pop if_stack for base; pop value_stack (or use current)
+        /// for key/index. String key → object field; integer → array element.
+        load_computed,
         /// Fused multi-level path descent. operand.string = "a.b.c".
         load_path,
         /// Iterate: push each element of array/object.
@@ -229,6 +232,25 @@ pub const Instruction = struct {
         push_string,
         /// Push current value to stack.
         push_current,
+
+        // Conditional branching
+        /// Unconditional jump. operand.index = target instruction index.
+        jump,
+        /// Pop value stack (or use current); if falsy jump to operand.index.
+        /// jq truthiness: only `false` and `null` are falsy.
+        jump_if_false,
+        /// Push current value onto the if-input stack (saves input for branch restoration).
+        save_input,
+        /// Pop from the if-input stack and set current (restores input for a branch).
+        restore_input,
+
+        // Array construction operations
+        /// Begin collecting generator outputs into an array.
+        /// operand.index = IP of the matching array_collect_end instruction.
+        array_collect_start,
+        /// Finalize collection: pop the collect frame and push the assembled array
+        /// onto the value stack.
+        array_collect_end,
     };
 
     pub const Operand = union {

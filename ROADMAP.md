@@ -59,17 +59,17 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | Feature | Scope | What it unlocks |
 |---------|-------|-----------------|
 | [x] **Arithmetic** (`+`, `-`, `*`, `/`, `%`) | Compiler + VM | Object merge (`+`), string concat, array concat, numeric math. Unblocks ~40% of failing tests. |
-| [ ] **Unary negation** (`-expr`) | Compiler + VM | `-1`, `-.foo` |
+| [x] **Unary negation** (`-expr`) | Compiler + VM | `-1`, `-.foo` |
 | [x] **Comparisons** (`==`, `!=`, `<`, `>`, `<=`, `>=`) | Compiler + VM | Required for `select`, `if/then`, sorting |
 | [x] **Boolean operators** (`and`, `or`, `not`) | Compiler + VM | Required for any conditional logic |
-| [ ] **Conditionals** (`if/then/elif/else/end`) | Compiler + VM | Control flow. ~20 blocked tests. |
+| [x] **Conditionals** (`if/then/elif/else/end`) | Compiler + VM | Control flow. ~20 blocked tests. |
 | [x] **Variables** (`expr as $x \| ...`) | Compiler + VM (scope stack) | Required for object construction, reduce, def, and most non-trivial filters |
 | [x] **Comma operator** (`a, b`) | Compiler + VM (generator stack) | Multiple outputs from a single expression. Required for array/object construction. |
 | [x] **Object construction** (`{a: .b, c: .d}`) | Compiler + VM | The #1 real-world use case. Shorthand `{a}` = `{a: .a}`. Computed keys `{(.k): .v}`. |
-| [ ] **Array construction** (`[expr]`) | Compiler + VM | Collect generator outputs into array. `[.[] \| .name]`. |
+| [x] **Array construction** (`[expr]`) | Compiler + VM | Collect generator outputs into array. `[.[] \| .name]`. |
 | [x] **String interpolation** (`"hello \(.name)"`) | Lexer + Compiler + VM | Very common in practice. Required for readable output. |
 | [x] **Recursive descent** (`..`) | Compiler + VM | Deep search. `.. \| .name?` |
-| [ ] **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index |
+| [x] **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index |
 
 ### Query language — P1
 
