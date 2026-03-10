@@ -16,30 +16,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-linux
-            os: linux
-            arch: amd64
-            ext: tar.gz
-          - target: aarch64-linux
-            os: linux
-            arch: arm64
-            ext: tar.gz
-          - target: x86_64-macos
-            os: macos
-            arch: amd64
-            ext: tar.gz
-          - target: aarch64-macos
-            os: macos
-            arch: arm64
-            ext: tar.gz
-          - target: x86_64-windows
-            os: windows
-            arch: amd64
-            ext: zip
-          - target: x86_64-freebsd
-            os: freebsd
-            arch: amd64
-            ext: tar.gz
+          - { target: x86_64-linux,   os: linux,   arch: amd64 }
+          - { target: aarch64-linux,  os: linux,   arch: arm64 }
+          - { target: x86_64-macos,   os: macos,   arch: amd64 }
+          - { target: aarch64-macos,  os: macos,   arch: arm64 }
+          - { target: x86_64-freebsd, os: freebsd, arch: amd64 }
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -55,25 +36,17 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "name=zq-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
 
-      - name: Package (tar.gz)
-        if: matrix.ext == 'tar.gz'
+      - name: Package
         run: |
           mkdir staging
           cp zig-out/bin/zq staging/
           tar -czf "${{ steps.meta.outputs.name }}.tar.gz" -C staging zq
 
-      - name: Package (zip)
-        if: matrix.ext == 'zip'
-        run: |
-          mkdir staging
-          cp zig-out/bin/zq.exe staging/
-          cd staging && zip "../${{ steps.meta.outputs.name }}.zip" zq.exe
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}
-          path: ${{ steps.meta.outputs.name }}.${{ matrix.ext }}
+          path: ${{ steps.meta.outputs.name }}.tar.gz
           retention-days: 1
 
   release:
@@ -98,5 +71,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/zq-*.tar.gz
-            artifacts/zq-*.zip
             artifacts/checksums-sha256.txt
