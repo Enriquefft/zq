@@ -8,11 +8,11 @@ const SliceView = io.SliceView;
 
 /// Write `content` to a new temp file, return an open read-only fd.
 /// Caller owns the fd and must close it.
-fn tmpFileWithContent(dir: std.fs.Dir, name: []const u8, content: []const u8) !std.posix.fd_t {
+fn tmpFileWithContent(dir: std.fs.Dir, name: []const u8, content: []const u8) !std.fs.File {
     const f = try dir.createFile(name, .{ .read = true });
     try f.writeAll(content);
     try f.seekTo(0);
-    return f.handle;
+    return f;
 }
 
 // ─── mmap backend ─────────────────────────────────────────────────────────────
@@ -23,10 +23,10 @@ test "mmap: peek returns full content as single view" {
     defer tmp.cleanup();
 
     const content = "hello, world";
-    const fd = try tmpFileWithContent(tmp.dir, "peek.json", content);
-    defer std.posix.close(fd);
+    const file = try tmpFileWithContent(tmp.dir, "peek.json", content);
+    defer file.close();
 
-    var src = try Source.init(fd, alloc);
+    var src = try Source.init(file, alloc);
     defer src.deinit();
 
     const view = try src.peek();
@@ -40,10 +40,10 @@ test "mmap: consume advances cursor; is_eof set when all bytes consumed" {
     defer tmp.cleanup();
 
     const content = "abcde";
-    const fd = try tmpFileWithContent(tmp.dir, "consume.json", content);
-    defer std.posix.close(fd);
+    const file = try tmpFileWithContent(tmp.dir, "consume.json", content);
+    defer file.close();
 
-    var src = try Source.init(fd, alloc);
+    var src = try Source.init(file, alloc);
     defer src.deinit();
 
     src.consume(3);
@@ -62,10 +62,10 @@ test "mmap: refill always returns false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const fd = try tmpFileWithContent(tmp.dir, "refill.json", "data");
-    defer std.posix.close(fd);
+    const file = try tmpFileWithContent(tmp.dir, "refill.json", "data");
+    defer file.close();
 
-    var src = try Source.init(fd, alloc);
+    var src = try Source.init(file, alloc);
     defer src.deinit();
 
     try std.testing.expect(!try src.refill());
@@ -81,7 +81,7 @@ test "ring: peek returns data written to pipe" {
     const written = try std.posix.write(fds[1], "hello");
     _ = written;
 
-    var src = try Source.init(fds[0], alloc);
+    var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
     defer src.deinit();
 
     _ = try src.refill();
@@ -97,7 +97,7 @@ test "ring: consume + refill cycle drains pipe" {
     _ = try std.posix.write(fds[1], "abc");
     std.posix.close(fds[1]); // signal EOF
 
-    var src = try Source.init(fds[0], alloc);
+    var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
     defer src.deinit();
 
     _ = try src.refill();
@@ -124,7 +124,7 @@ test "ring: is_eof only true when buffer drained and pipe closed" {
     _ = try std.posix.write(fds[1], "xy");
     std.posix.close(fds[1]);
 
-    var src = try Source.init(fds[0], alloc);
+    var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
     defer src.deinit();
 
     _ = try src.refill();
@@ -143,7 +143,7 @@ test "ring: buffer compacts on refill when start > 0" {
 
     _ = try std.posix.write(fds[1], "firstsecond");
 
-    var src = try Source.init(fds[0], alloc);
+    var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
     defer src.deinit();
 
     _ = try src.refill();

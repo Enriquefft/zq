@@ -18,16 +18,16 @@ const Backend = union(enum) {
 pub const Source = struct {
     backend: Backend,
 
-    /// Detects whether fd is a regular file (uses mmap) or a stream (uses ring buffer).
-    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator) ZqError!Source {
-        const stat = std.posix.fstat(fd) catch return error.IoError;
+    /// Detects whether file is a regular file (uses mmap) or a stream (uses ring buffer).
+    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) ZqError!Source {
+        const stat = file.stat() catch return error.IoError;
         const size: usize = @intCast(stat.size);
 
-        if (std.posix.S.ISREG(stat.mode) and size > 0) {
-            const m = MmapBackend.init(fd, size) catch return error.IoError;
+        if (stat.kind == .file and size > 0) {
+            const m = MmapBackend.init(file, size) catch return error.IoError;
             return .{ .backend = .{ .mmap = m } };
         } else {
-            const r = RingBuffer.init(fd, allocator) catch return error.IoError;
+            const r = RingBuffer.init(file, allocator) catch return error.IoError;
             return .{ .backend = .{ .ring = r } };
         }
     }

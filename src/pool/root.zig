@@ -578,7 +578,7 @@ pub const Pool = struct {
     // File-mode mmap lifetime management.
     // Non-null between submit_file() and the point in deinit() where threads join.
     // Workers hold read-only slices into this mapping; it must outlive all threads.
-    _mmap: ?[]u8,
+    _mmap: ?io_mod.MappedFile,
 
     // collect() cursor — maintains position across calls so multi-value queries
     // (e.g. `.[]`) deliver every output value before advancing to the next record.
@@ -639,7 +639,7 @@ pub const Pool = struct {
         p.allocator.free(p.threads);
         release_shared(p._shared, p.allocator);
         // Unmap only after all threads have exited.
-        if (p._mmap) |m| std.posix.munmap(@alignCast(m));
+        if (p._mmap) |*m| m.deinit();
         // Free any partially-consumed chunk that collect() hadn't exhausted.
         if (p._delivering) |*cr| cr.arena.deinit();
     }
@@ -655,10 +655,10 @@ pub const Pool = struct {
     /// returns null as soon as all work is done.
     pub fn submit_file(
         p: *Pool,
-        fd: std.posix.fd_t,
+        file: std.fs.File,
         cq: *const query_mod.CompiledQuery,
     ) ZqError!void {
-        const stat = std.posix.fstat(fd) catch return error.IoError;
+        const stat = file.stat() catch return error.IoError;
         const file_size = @as(usize, @intCast(stat.size));
 
         if (file_size == 0) {
@@ -667,17 +667,8 @@ pub const Pool = struct {
             return;
         }
 
-        const mmap = std.posix.mmap(
-            null,
-            file_size,
-            std.posix.PROT.READ,
-            .{ .TYPE = .PRIVATE },
-            fd,
-            0,
-        ) catch return error.IoError;
-        p._mmap = @as([]u8, mmap);
-
-        const data: []const u8 = mmap;
+        p._mmap = io_mod.MappedFile.init(file, file_size) catch return error.IoError;
+        const data: []const u8 = p._mmap.?.data;
         const n_threads = @max(1, p.threads.len);
         const n_chunks = n_threads * CHUNK_FACTOR;
 

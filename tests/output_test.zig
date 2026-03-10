@@ -34,7 +34,7 @@ fn renderValue(val: Value, format: Format) ![]u8 {
 
     // Write side: use a Writer, flush, deinit, then close write fd.
     {
-        var w = try Writer.init(fds[1], alloc);
+        var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
         errdefer {
             w.deinit();
             std.posix.close(fds[1]);
@@ -63,7 +63,7 @@ fn renderValue(val: Value, format: Format) ![]u8 {
 // ── init / deinit ─────────────────────────────────────────────────────────────
 
 test "init/deinit: stdout writer initializes and deinits cleanly" {
-    var w = try Writer.init(std.posix.STDOUT_FILENO, alloc);
+    var w = try Writer.init(std.fs.File.stdout(), alloc);
     defer w.deinit();
     // No assertion needed — absence of crash or memory leak is the invariant.
     _ = w.is_tty();
@@ -74,7 +74,7 @@ test "is_tty: pipe fd is not a tty" {
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
 
-    var w = try Writer.init(fds[1], alloc);
+    var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
     defer w.deinit();
 
     try std.testing.expect(!w.is_tty());
@@ -519,7 +519,7 @@ test "multiple writes: compact values accumulate in buffer" {
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
 
-    var w = try Writer.init(fds[1], alloc);
+    var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
     try w.write_value(.{ .int = 1 }, .compact);
     try w.write_value(.{ .int = 2 }, .compact);
@@ -543,7 +543,7 @@ test "multiple writes: jsonl values each have their own newline" {
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
 
-    var w = try Writer.init(fds[1], alloc);
+    var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
     try w.write_value(.{ .int = 10 }, .jsonl);
     try w.write_value(.{ .int = 20 }, .jsonl);
@@ -569,7 +569,7 @@ test "flush: flushing empty buffer is a no-op" {
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
 
-    var w = try Writer.init(fds[1], alloc);
+    var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
     defer w.deinit();
 
     // Flush with nothing buffered should not error.

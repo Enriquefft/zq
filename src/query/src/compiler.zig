@@ -363,7 +363,7 @@ fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     }
 }
 
-/// parseUnary: `not`, `-`
+/// parseUnary: `not`, unary `-`
 fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.peek();
     if (t.tag == .not_kw) {
@@ -372,18 +372,11 @@ fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .not, .operand = .{ .none = {} } });
     } else if (t.tag == .minus) {
         _ = try ctx.lex.next();
-        // Check if this is a negative number literal
-        const next = try ctx.lex.peek();
-        if (next.tag == .int_lit or next.tag == .float_lit) {
-            try parsePrimary(ctx);
-            // The literal parser already handles the negative sign
-        } else {
-            // This is a unary minus operator
-            try parseUnary(ctx);
-            // Negate by pushing -1 and multiplying
-            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = -1 } });
-            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .mul, .operand = .{ .none = {} } });
-        }
+        // Recursively parse the operand, then emit negate.
+        // Note: `-1` (no space) is handled by the lexer as a single int_lit token,
+        // so this branch only fires for `-.foo`, `-(expr)`, `- 1` (with space), etc.
+        try parseUnary(ctx);
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .negate, .operand = .{ .none = {} } });
     } else {
         try parsePrimary(ctx);
     }
@@ -860,6 +853,7 @@ fn fuse(
                 .and_op => .{ .none = {} },
                 .or_op => .{ .none = {} },
                 .not => .{ .none = {} },
+                .negate => .{ .none = {} },
                 .object_construct_start => .{ .none = {} },
                 .object_key => .{ .none = {} },
                 .object_construct_end => .{ .none = {} },

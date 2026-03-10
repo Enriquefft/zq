@@ -17,24 +17,20 @@ const alloc = std.testing.allocator;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Write `data` to a tmp file and return a readable fd.
-/// Caller must close the fd.
-fn tmp_file_fd(data: []const u8) !std.posix.fd_t {
-    const tmp = std.testing.tmpDir(.{});
-    // We can't easily use tmpDir for a raw fd; use memfd on Linux instead.
-    // Fall back to writing to /tmp when memfd_create is unavailable.
-    _ = tmp;
+/// Write `data` to a tmp file and return a readable File.
+/// Caller must close the file.
+fn tmp_file_fd(data: []const u8) !std.fs.File {
     const fd = std.posix.memfd_create("pool_test", 0) catch {
         // Fallback: write to a named temp file.
         const path = "/tmp/_zq_pool_test_tmp";
         const f = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = true });
         try f.writeAll(data);
         try f.seekTo(0);
-        return f.handle;
+        return f;
     };
     _ = try std.posix.write(fd, data);
     try std.posix.lseek_SET(fd, 0);
-    return fd;
+    return std.fs.File{ .handle = fd };
 }
 
 /// Drain all results from the pool into an ArrayList of Values.
@@ -91,13 +87,13 @@ test "submit_file: single integer line" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("42\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("42\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -110,13 +106,13 @@ test "submit_file: three integer lines in order" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("1\n2\n3\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("1\n2\n3\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -131,13 +127,13 @@ test "submit_file: no trailing newline" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("99");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("99");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -150,13 +146,13 @@ test "submit_file: empty file returns no results" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -168,13 +164,13 @@ test "submit_file: blank lines are skipped" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("\n\n7\n\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("\n\n7\n\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -189,13 +185,13 @@ test "submit_file: .x field projection" {
     var cq = try compile(".x");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("{\"x\":10}\n{\"x\":20}\n{\"x\":30}\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("{\"x\":10}\n{\"x\":20}\n{\"x\":30}\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -210,13 +206,13 @@ test "submit_file: string value round-trip" {
     var cq = try compile(".name");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -239,13 +235,13 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
         try file_buf.writer(alloc).print("{d}\n", .{i});
     }
 
-    const fd = try tmp_file_fd(file_buf.items);
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd(file_buf.items);
+    defer file.close();
 
     var p = try Pool.init(4, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -262,13 +258,13 @@ test "submit_file: malformed JSON returns parse error" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("not-json\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("not-json\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const result = p.collect();
     try std.testing.expectError(error.UnexpectedToken, result);
@@ -279,13 +275,13 @@ test "submit_file: type error propagated from query" {
     var cq = try compile(".x");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("42\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("42\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const result = p.collect();
     try std.testing.expectError(error.TypeError, result);
@@ -297,13 +293,13 @@ test "submit_file: boolean values" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("true\nfalse\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("true\nfalse\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -317,13 +313,13 @@ test "submit_file: null value" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("null\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("null\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -336,13 +332,13 @@ test "submit_file: float value" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("3.14\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("3.14\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -368,7 +364,7 @@ test "submit_stream: three lines via pipe" {
     std.posix.close(write_fd);
 
     const io_mod = @import("io");
-    var src = try io_mod.Source.init(read_fd, alloc);
+    var src = try io_mod.Source.init(std.fs.File{ .handle = read_fd }, alloc);
     defer src.deinit();
     defer std.posix.close(read_fd);
 
@@ -394,7 +390,7 @@ test "submit_stream: empty stream returns no results" {
     std.posix.close(pipe_fds[1]); // close write end immediately → EOF
 
     const io_mod = @import("io");
-    var src = try io_mod.Source.init(pipe_fds[0], alloc);
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
     defer src.deinit();
     defer std.posix.close(pipe_fds[0]);
 
@@ -418,7 +414,7 @@ test "submit_stream: no trailing newline" {
     std.posix.close(pipe_fds[1]);
 
     const io_mod = @import("io");
-    var src = try io_mod.Source.init(pipe_fds[0], alloc);
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
     defer src.deinit();
     defer std.posix.close(pipe_fds[0]);
 
@@ -440,13 +436,13 @@ test "collect returns null when called after drain" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("1\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("1\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     free_values(vals);
@@ -470,13 +466,13 @@ test "zero threads: submit_file processes records synchronously" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const fd = try tmp_file_fd("7\n8\n");
-    defer std.posix.close(fd);
+    const file = try tmp_file_fd("7\n8\n");
+    defer file.close();
 
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(fd, &cq);
+    try p.submit_file(file, &cq);
 
     const vals = try drain(&p);
     defer free_values(vals);

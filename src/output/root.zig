@@ -9,13 +9,13 @@ pub const Format = types.Format;
 /// Internal buffer capacity: 64 KB.
 const BUF_CAP: usize = 64 * 1024;
 
-/// Buffered serializer targeting a single file descriptor.
+/// Buffered serializer targeting a single file.
 ///
-/// Accumulates output in a 64 KB heap buffer and issues `write()` only when
+/// Accumulates output in a 64 KB heap buffer and issues `writeAll()` only when
 /// the buffer is full or `flush()` is called explicitly. This reduces syscalls
 /// from one-per-value to a handful for typical workloads.
 pub const Writer = struct {
-    fd: std.posix.fd_t,
+    file: std.fs.File,
     buf: []u8,
     len: usize,
     allocator: std.mem.Allocator,
@@ -23,12 +23,12 @@ pub const Writer = struct {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    /// Allocate a 64 KB buffer and detect whether `fd` is a terminal.
-    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator) error{OutOfMemory}!Writer {
+    /// Allocate a 64 KB buffer and detect whether `file` is a terminal.
+    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) error{OutOfMemory}!Writer {
         const buf = try allocator.alloc(u8, BUF_CAP);
-        const tty = std.posix.isatty(fd);
+        const tty = file.isTty();
         return Writer{
-            .fd = fd,
+            .file = file,
             .buf = buf,
             .len = 0,
             .allocator = allocator,
@@ -48,7 +48,7 @@ pub const Writer = struct {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// True if `fd` refers to a terminal device (result cached from `init`).
+    /// True if `file` refers to a terminal device (result cached from `init`).
     pub fn is_tty(w: *const Writer) bool {
         return w.tty;
     }
@@ -56,7 +56,7 @@ pub const Writer = struct {
     /// Serialize `val` to the internal buffer using `format`.
     /// Auto-flushes before serializing if the buffer cannot hold a single
     /// worst-case value (64 KB flush boundary). Returns `error.IoError` if
-    /// any underlying `write()` syscall fails.
+    /// any underlying `writeAll()` call fails.
     pub fn write_value(w: *Writer, val: Value, format: Format) ZqError!void {
         // Flush proactively when the buffer is more than half full to avoid
         // splitting large values. Entire values are written atomically to the
@@ -80,7 +80,7 @@ pub const Writer = struct {
     /// Write all buffered bytes to the OS and reset the buffer cursor.
     pub fn flush(w: *Writer) ZqError!void {
         if (w.len == 0) return;
-        try writeAll(w.fd, w.buf[0..w.len]);
+        w.file.writeAll(w.buf[0..w.len]) catch return error.IoError;
         w.len = 0;
     }
 
@@ -335,17 +335,4 @@ fn formatFloat(buf: *[64]u8, f: f64) []const u8 {
     // Non-integer float - format with decimal part
     const s = std.fmt.bufPrint(buf, "{d}", .{f}) catch unreachable;
     return s;
-}
-
-// ── OS write helper ───────────────────────────────────────────────────────────
-
-/// Write all bytes in `data` to `fd`, retrying on EINTR. Returns `error.IoError`
-/// on any non-EINTR failure or if a short write occurs with no progress.
-fn writeAll(fd: std.posix.fd_t, data: []const u8) ZqError!void {
-    var remaining = data;
-    while (remaining.len > 0) {
-        const n = std.posix.write(fd, remaining) catch return error.IoError;
-        if (n == 0) return error.IoError;
-        remaining = remaining[n..];
-    }
 }

@@ -664,3 +664,117 @@ test "reset: iterator correctly re-evaluates field access on different objects" 
     try std.testing.expectEqual(@as(i64, 55), (try it.next()).?.int);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
+
+// ── Unary negation ────────────────────────────────────────────────────────────
+
+test "unary negation: -1 literal yields int -1" {
+    var q = try compile("-1");
+    defer q.deinit();
+
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+}
+
+test "unary negation: -5 literal preserves int type" {
+    var q = try compile("-5");
+    defer q.deinit();
+
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    // -5 is parsed as a single int_lit token; result is int not float
+    try std.testing.expectEqual(@as(i64, -5), vals[0].int);
+}
+
+test "unary negation: -.foo negates integer field, preserves int type" {
+    // {"x": 7}
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 7 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("-.x");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, -7), vals[0].int);
+}
+
+test "unary negation: -.foo negates float field, preserves float type" {
+    // {"v": 3.14}
+    const sb = "v";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .float, .payload = .{ .float = 3.14 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("-.v");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectApproxEqAbs(@as(f64, -3.14), vals[0].float, 1e-9);
+}
+
+test "unary negation: -(.x) negates via parenthesized field" {
+    // {"x": 9}  =>  -(.x) == -9
+    const sb = "x";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 9 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("-(.x)");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, -9), vals[0].int);
+}
+
+test "unary negation: TypeError on non-numeric field" {
+    // {"s": "hello"}
+    const sb = "shello";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 1, .len = 5 } } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("-.s");
+    defer q.deinit();
+
+    var it = try q.execute(t, alloc);
+    defer it.deinit();
+
+    try std.testing.expectError(error.TypeError, it.next());
+}

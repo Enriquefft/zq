@@ -430,6 +430,20 @@ pub const ResultIterator = struct {
                     it.ip += 1;
                 },
 
+                .negate => {
+                    const val = if (it.value_stack.items.len > 0)
+                        try it.popValue()
+                    else
+                        try valueToStackValue(it.current);
+                    const result: StackValue = switch (val) {
+                        .int => |i| .{ .int = -i },
+                        .float => |f| .{ .float = -f },
+                        else => return error.TypeError,
+                    };
+                    it.pushValue(result);
+                    it.ip += 1;
+                },
+
                 .capture_variable => {
                     const var_id = instr.operand.index;
                     // If value stack is empty, capture current value

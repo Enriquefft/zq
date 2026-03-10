@@ -227,7 +227,7 @@ pub const Lexer = struct {
             while (l.pos < l.src.len and std.ascii.isDigit(l.src[l.pos])) l.pos += 1;
         }
 
-        const tag: Token.Tag = if (is_float) .ident else .int_lit;
+        const tag: Token.Tag = if (is_float) .float_lit else .int_lit;
         return .{ .tag = tag, .offset = start, .len = l.pos - start };
     }
 

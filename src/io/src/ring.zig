@@ -7,18 +7,18 @@ pub const RingBuffer = struct {
     buf: []u8,
     start: usize,
     end: usize,
-    fd: std.posix.fd_t,
+    file: std.fs.File,
     allocator: std.mem.Allocator,
     eof: bool,
     grown: bool,
 
-    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator) !RingBuffer {
+    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) !RingBuffer {
         const buf = try allocator.alloc(u8, INITIAL_CAP);
         return .{
             .buf = buf,
             .start = 0,
             .end = 0,
-            .fd = fd,
+            .file = file,
             .allocator = allocator,
             .eof = false,
             .grown = false,
@@ -64,8 +64,7 @@ pub const RingBuffer = struct {
             self.grown = true;
         }
 
-        // std.posix.read handles EINTR internally; all remaining errors are fatal.
-        const n = std.posix.read(self.fd, self.buf[self.end..]) catch return error.IoError;
+        const n = self.file.read(self.buf[self.end..]) catch return error.IoError;
 
         if (n == 0) {
             self.eof = true;

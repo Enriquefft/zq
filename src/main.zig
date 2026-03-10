@@ -88,8 +88,7 @@ pub fn main() !u8 {
     defer cq.deinit();
 
     // Set up output writer on stdout.
-    const stdout_fd = std.posix.STDOUT_FILENO;
-    var writer = output_mod.Writer.init(stdout_fd, allocator) catch {
+    var writer = output_mod.Writer.init(std.fs.File.stdout(), allocator) catch {
         printErr("zq: out of memory\n");
         return EXIT_SYSTEM;
     };
@@ -109,23 +108,22 @@ pub fn main() !u8 {
         };
     } else if (config.files.len == 0) {
         // Read from stdin.
-        const stdin_fd = std.posix.STDIN_FILENO;
-        last_was_false_or_null = processSource(stdin_fd, &cq, &writer, format, allocator, &had_parse_errors) catch |e| {
+        last_was_false_or_null = processSource(std.fs.File.stdin(), &cq, &writer, format, allocator, &had_parse_errors) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
         };
     } else {
         for (config.files) |path| {
-            const fd = openFile(path) catch {
+            const file = openFile(path) catch {
                 printErr("zq: could not open ");
                 printErr(path);
                 printErr("\n");
                 return EXIT_SYSTEM;
             };
-            defer std.posix.close(fd);
+            defer file.close();
 
-            last_was_false_or_null = processFile(fd, &cq, &writer, format, allocator) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, allocator) catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 return EXIT_SYSTEM;
@@ -148,14 +146,14 @@ pub fn main() !u8 {
 /// Process a streaming source (stdin, pipe) single-threaded with a persistent
 /// iterator that is reset() per JSONL record — zero allocations after the first.
 fn processSource(
-    fd: std.posix.fd_t,
+    file: std.fs.File,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
     allocator: std.mem.Allocator,
     had_errors: *bool,
 ) !bool {
-    var src = try io_mod.Source.init(fd, allocator);
+    var src = try io_mod.Source.init(file, allocator);
     defer src.deinit();
 
     var parser = try parser_mod.Parser.init(allocator);
@@ -234,7 +232,7 @@ fn processSource(
 /// Process a regular file in parallel using the worker Pool.
 /// Uses all available CPU cores. Results are delivered in submission order.
 fn processFile(
-    fd: std.posix.fd_t,
+    file: std.fs.File,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
@@ -244,7 +242,7 @@ fn processFile(
     var pool = try pool_mod.Pool.init(n_threads, allocator);
     defer pool.deinit();
 
-    try pool.submit_file(fd, cq);
+    try pool.submit_file(file, cq);
 
     var last_was_false_or_null = false;
     while (try pool.collect()) |result| {
@@ -318,9 +316,8 @@ fn writeRecord(
     return last_was_false_or_null;
 }
 
-fn openFile(path: []const u8) !std.posix.fd_t {
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.IoError;
-    return file.handle;
+fn openFile(path: []const u8) !std.fs.File {
+    return std.fs.cwd().openFile(path, .{}) catch return error.IoError;
 }
 
 // ── Arg Parsing ──────────────────────────────────────────────────────────────
@@ -512,11 +509,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 // ── Error Output Helpers ─────────────────────────────────────────────────────
 
 fn printErr(msg: []const u8) void {
-    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch {};
+    std.fs.File.stderr().writeAll(msg) catch {};
 }
 
 fn printErrByte(b: u8) void {
-    _ = std.posix.write(std.posix.STDERR_FILENO, &.{b}) catch {};
+    std.fs.File.stderr().writer().writeByte(b) catch {};
 }
 
 fn printZqErr(e: anyerror) void {

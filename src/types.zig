@@ -197,6 +197,8 @@ pub const Instruction = struct {
         or_op,
         /// Logical not: pop 1 value, push boolean.
         not,
+        /// Negate: pop 1 numeric value, push negated value (int→int, float→float).
+        negate,
 
         // Variable operations
         /// Capture top of stack into variable. operand.index = variable id.
