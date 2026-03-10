@@ -10,3 +10,4 @@ trace.zq
 
 # Large benchmark data
 benchmarks/data/huge.jsonl
+.claude/settings.local.json
