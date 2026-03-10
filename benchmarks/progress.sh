@@ -31,8 +31,7 @@ update_main_progress() {
 
     MAIN_PROGRESS=$current
 
-    # Clear line and show progress
-    echo -ne "${ERASE_LINE}" >&2
+    # Show progress on own line
     local percentage=$((current * 100 / total))
     local filled=$((percentage / 5))
     local empty=$((20 - filled))
@@ -51,7 +50,7 @@ update_main_progress() {
         i=$((i + 1))
     done
 
-    printf "\r${COLOR_GREEN}|${COLOR_RESET} [%s] %3d%% - %s${COLOR_GREEN}|${COLOR_RESET}" \
+    printf "${COLOR_GREEN}| [%s] %3d%% - %s |${COLOR_RESET}\n" \
            "$bar" "$percentage" "$phase_name" >&2
 
     if [ $current -eq $total ]; then

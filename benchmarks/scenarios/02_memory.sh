@@ -73,4 +73,3 @@ run_memory_test "zq" timeout 60 "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
 
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2
-cat "$RESULT_FILE"

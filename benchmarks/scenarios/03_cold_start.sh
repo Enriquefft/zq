@@ -66,4 +66,3 @@ end_phase_timer "Hyperfine benchmark"
 
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2
-cat "$RESULT_FILE"

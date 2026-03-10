@@ -139,5 +139,21 @@ for tool in jq jaq yq zq; do
 done
 echo "" >> "$RESULT_FILE"
 
+# Print summary table to stderr for quick viewing
+echo "" >&2
+echo "## Results Summary" >&2
+echo "" >&2
+printf "| %-4s | %-14s | %-13s | %-8s | %-9s |\n" "Tool" "Records Output" "Valid Records" "Recovery" "Exit Code" >&2
+printf "|------|---------------|---------------|----------|----------|\n" >&2
+for tool in jq jaq yq zq; do
+    if [ -n "${TOOL_RECORDS[$tool]+x}" ]; then
+        local_records=${TOOL_RECORDS[$tool]}
+        local_exit=${TOOL_EXIT[$tool]}
+        local_pct=$(( VALID_RECORDS > 0 ? local_records * 100 / VALID_RECORDS : 0 ))
+        printf "| %-4s | %-14s | %-13s | %-8s | %-9s |\n" \
+            "$tool" "$local_records" "$VALID_RECORDS" "${local_pct}%" "$local_exit" >&2
+    fi
+done
+echo "" >&2
+
 echo "Benchmark results saved to: $RESULT_FILE" >&2
-cat "$RESULT_FILE"
