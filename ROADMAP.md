@@ -49,7 +49,7 @@ Performance:        11.6x jq on 15M-line JSONL (parallel)
 
 - [ ] 60%+ of migrated jq compat tests pass
 - [ ] All P0/P1 features below are implemented
-- [ ] `zq` binary under 2 MB static
+- [x] `zq` binary under 2 MB static
 - [ ] Zero known crashes on valid JSON input
 
 ### Query language — P0
