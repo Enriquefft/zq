@@ -1,7 +1,6 @@
 #!/bin/bash
-# Scenario 4: Fault Tolerance Metric
-# Compare recovery rate on malformed/incomplete streams
-# Narrative: "LLMs hallucinate. They cut off JSON. jq dies. zq survives."
+# Scenario 4: Malformed Data Resilience
+# Throughput and data recovery when processing streams with invalid JSON records
 
 set -e
 
@@ -14,11 +13,11 @@ source "$BENCHMARK_DIR/progress.sh"
 
 mkdir -p "$BENCHMARK_DIR/results"
 
-echo "# Scenario 4: Fault Tolerance" > "$RESULT_FILE"
+echo "# Scenario 4: Malformed Data Resilience" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
-echo "**Narrative:** LLMs hallucinate. They cut off JSON. jq dies. zq survives." >> "$RESULT_FILE"
+echo "**Description:** Throughput and data recovery when processing streams with invalid JSON records" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 # Check if malformed file exists, generate if needed
@@ -124,10 +123,8 @@ run_fault_test() {
 [ "$SKIP_YQ"  != true ] && run_fault_test "yq"  yq  '.valid' "$MALFORMED_FILE"
 run_fault_test "zq" timeout 30 "$BENCHMARK_DIR/../zig-out/bin/zq" '.valid' "$MALFORMED_FILE"
 
-# Generate analysis dynamically from captured results
-echo "## Analysis" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
-echo "**Recovery Rate = Records Output / Valid Records × 100%**" >> "$RESULT_FILE"
+# Generate results summary
+echo "## Results Summary" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "| Tool | Records Output | Valid Records | Recovery | Exit Code |" >> "$RESULT_FILE"
 echo "|------|---------------|---------------|----------|-----------|" >> "$RESULT_FILE"
@@ -140,11 +137,6 @@ for tool in jq jaq yq zq; do
             "$tool" "$local_records" "$VALID_RECORDS" "${local_pct}%" "$local_exit" >> "$RESULT_FILE"
     fi
 done
-echo "" >> "$RESULT_FILE"
-echo "**Why this matters:**" >> "$RESULT_FILE"
-echo "- LLMs frequently generate incomplete or malformed JSON" >> "$RESULT_FILE"
-echo "- Network streams can be cut off mid-record" >> "$RESULT_FILE"
-echo "- Logs from distributed systems often contain corrupted entries" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2

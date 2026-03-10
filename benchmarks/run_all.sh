@@ -108,12 +108,12 @@ echo "Running benchmarks..."
 echo "" >> "$SUMMARY_FILE"
 
 # Scenario 1
-start_phase_timer "Embarrassing Parallelism"
+start_phase_timer "Multi-core Scalability"
 bash "$BENCHMARK_DIR/scenarios/01_parallelism.sh"
-end_phase_timer "Embarrassing Parallelism"
-update_main_progress 1 4 "Embarrassing Parallelism"
+end_phase_timer "Multi-core Scalability"
+update_main_progress 1 4 "Multi-core Scalability"
 echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 1: Embarrassing Parallelism" >> "$SUMMARY_FILE"
+echo "## Scenario 1: Multi-core Scalability" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Full results: [01_parallelism.md](01_parallelism.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
@@ -130,23 +130,23 @@ echo "Full results: [02_memory.md](02_memory.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 
 # Scenario 3
-start_phase_timer "Cold Start"
+start_phase_timer "Startup Latency"
 bash "$BENCHMARK_DIR/scenarios/03_cold_start.sh"
-end_phase_timer "Cold Start"
-update_main_progress 3 4 "Cold Start"
+end_phase_timer "Startup Latency"
+update_main_progress 3 4 "Startup Latency"
 echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 3: Cold Start" >> "$SUMMARY_FILE"
+echo "## Scenario 3: Startup Latency" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Full results: [03_cold_start.md](03_cold_start.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 
 # Scenario 4
-start_phase_timer "Fault Tolerance"
+start_phase_timer "Malformed Data Resilience"
 bash "$BENCHMARK_DIR/scenarios/04_fault_tolerance.sh"
-end_phase_timer "Fault Tolerance"
-update_main_progress 4 4 "Fault Tolerance"
+end_phase_timer "Malformed Data Resilience"
+update_main_progress 4 4 "Malformed Data Resilience"
 echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 4: Fault Tolerance" >> "$SUMMARY_FILE"
+echo "## Scenario 4: Malformed Data Resilience" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Full results: [04_fault_tolerance.md](04_fault_tolerance.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
@@ -161,18 +161,14 @@ cat >> "$SUMMARY_FILE" << EOF
 
 ---
 
-## Overall Summary
+## Test Scenarios
 
-This benchmark suite demonstrates zq's key advantages over jq, jaq, and yq:
+This benchmark suite includes four test scenarios:
 
-1. **Multi-core parallelism**: zq utilizes all CPU cores for significant speedup on large files
-2. **Memory efficiency**: Streaming processing with minimal memory footprint
-3. **Fast startup**: Native Zig binary with minimal latency
-4. **Fault tolerance**: Robust error handling for real-world data
-
-**Conclusion:** zq offers a 10x-20x performance improvement over jq for large-scale JSON processing,
-while maintaining compatibility with the jq query language for most use cases. It also outperforms
-jaq and yq in most scenarios, particularly for large files and streaming operations.
+1. **Multi-core Scalability**: Throughput on large-scale batch processing
+2. **Memory Efficiency**: Resource footprint during streaming operations
+3. **Startup Latency**: Process initialization overhead
+4. **Malformed Data Resilience**: Recovery rates when handling invalid JSON records
 
 ---
 

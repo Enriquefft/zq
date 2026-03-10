@@ -1,7 +1,6 @@
 #!/bin/bash
-# Scenario 2: Memory Efficiency Metric
-# Compare peak memory consumption (RSS) during streaming operations
-# Narrative: "Process petabytes on a Raspberry Pi."
+# Scenario 2: Memory Efficiency
+# Memory footprint stability when processing large datasets in streaming mode
 
 set -e
 
@@ -38,7 +37,7 @@ echo "# Scenario 2: Memory Efficiency" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
-echo "**Narrative:** Process petabytes on a Raspberry Pi." >> "$RESULT_FILE"
+echo "**Description:** Memory footprint stability when processing large datasets in streaming mode" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 echo "## Test Details" >> "$RESULT_FILE"
@@ -72,12 +71,6 @@ run_memory_test() {
 [ "$SKIP_JAQ" != true ] && run_memory_test "jaq" jaq 'select(.id > 500000)' "$DATA_FILE"
 run_memory_test "zq" timeout 60 "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
 
-echo "## Analysis" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
-echo "Key metrics:" >> "$RESULT_FILE"
-echo "- **Maximum resident set size (RSS)**: Peak memory usage during execution" >> "$RESULT_FILE"
-echo "- **Streaming behavior**: Does the tool process records incrementally or buffer the file?" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2
 cat "$RESULT_FILE"

@@ -1,7 +1,6 @@
 #!/bin/bash
-# Scenario 1: Embarrassing Parallelism Metric
-# Compare wall-clock time on large JSONL file
-# Narrative: "We stopped waiting for single-threaded code in 2010. Why is jq still single-threaded?"
+# Scenario 1: Multi-core Scalability
+# Throughput performance on multi-core systems processing large datasets
 
 set -e
 
@@ -40,11 +39,11 @@ command -v jaq &> /dev/null || { echo "Warning: jaq not found, skipping." >&2; S
 # yq does not support JSONL multi-record files — skip it here
 SKIP_YQ=true
 
-echo "# Scenario 1: Embarrassing Parallelism" > "$RESULT_FILE"
+echo "# Scenario 1: Multi-core Scalability" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
-echo "**Narrative:** We stopped waiting for single-threaded code in 2010. Why is jq still single-threaded?" >> "$RESULT_FILE"
+echo "**Description:** Throughput performance on multi-core systems processing large JSONL datasets" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 echo "## Test Details" >> "$RESULT_FILE"
@@ -74,14 +73,6 @@ start_phase_timer "Hyperfine benchmark (parallelism comparison)"
 hyperfine "${HYPERFINE_ARGS[@]}" | tee -a "$RESULT_FILE"
 end_phase_timer "Hyperfine benchmark"
 
-echo "" >> "$RESULT_FILE"
-echo "## Analysis" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
-echo "This benchmark demonstrates the power of multi-core processing." >> "$RESULT_FILE"
-echo "- jq runs on a single core by default" >> "$RESULT_FILE"
-echo "- zq utilizes all available cores for parallel processing" >> "$RESULT_FILE"
-echo "- The speedup factor should approximate the number of CPU cores" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2
 cat "$RESULT_FILE"

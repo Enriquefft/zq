@@ -1,7 +1,6 @@
 #!/bin/bash
-# Scenario 3: Cold Start Metric (Dev Experience)
-# Compare execution time for trivial query on tiny input
-# Narrative: "Snappy enough for a shell loop."
+# Scenario 3: Startup Latency
+# Time overhead of process initialization and single-record processing
 
 set -e
 
@@ -35,11 +34,11 @@ command -v jq  &> /dev/null || { echo "Warning: jq not found, skipping." >&2;  S
 command -v jaq &> /dev/null || { echo "Warning: jaq not found, skipping." >&2; SKIP_JAQ=true; }
 command -v yq  &> /dev/null || { echo "Warning: yq not found, skipping." >&2;  SKIP_YQ=true;  }
 
-echo "# Scenario 3: Cold Start (Dev Experience)" > "$RESULT_FILE"
+echo "# Scenario 3: Startup Latency" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "**Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
-echo "**Narrative:** Snappy enough for a shell loop." >> "$RESULT_FILE"
+echo "**Description:** Time overhead of process initialization and single-record processing" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 echo "## Test Details" >> "$RESULT_FILE"
@@ -65,20 +64,6 @@ start_phase_timer "Hyperfine benchmark (cold start comparison)"
 "${HYPERFINE_ARGS[@]}" | tee -a "$RESULT_FILE"
 end_phase_timer "Hyperfine benchmark"
 
-echo "" >> "$RESULT_FILE"
-echo "## Analysis" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
-echo "Startup latency matters for:" >> "$RESULT_FILE"
-echo "- **Interactive use**: Developers running ad-hoc queries in a shell" >> "$RESULT_FILE"
-echo "- **Loop scenarios**: Processing records one at a time in scripts" >> "$RESULT_FILE"
-echo "- **Pipeline usage**: When zq is invoked per-request (e.g., inside a loop with \`curl | zq\`)" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
-echo "**Performance targets:**" >> "$RESULT_FILE"
-echo "- **< 10ms**: Excellent — feels instantaneous" >> "$RESULT_FILE"
-echo "- **10–50ms**: Good — fast enough for interactive use" >> "$RESULT_FILE"
-echo "- **50–100ms**: Acceptable — minor latency noticeable" >> "$RESULT_FILE"
-echo "- **> 100ms**: Slow — will feel sluggish in shell loops" >> "$RESULT_FILE"
-echo "" >> "$RESULT_FILE"
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2
 cat "$RESULT_FILE"

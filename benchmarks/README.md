@@ -1,6 +1,6 @@
 # zq Benchmark Suite
 
-Comprehensive benchmark infrastructure for comparing zq against jq, jaq, and yq across 4 key scenarios.
+Benchmark infrastructure for comparing zq against jq, jaq, and yq across 4 scenarios.
 
 ## Quick Start
 
@@ -31,37 +31,29 @@ cd benchmarks
 
 ## Benchmark Scenarios
 
-### 1. Embarrassing Parallelism (`scenarios/01_parallelism.sh`)
-**Metric:** Wall-clock time on large JSONL file
-**Narrative:** "We stopped waiting for single-threaded code in 2010. Why is jq still single-threaded?"
-**Target:** 10-20x speedup on multi-core systems
+### 1. Multi-core Scalability (`scenarios/01_parallelism.sh`)
+**Metric:** Wall-clock time on large JSONL file (648M, 15M lines)
 
 ```bash
 ./scenarios/01_parallelism.sh
 ```
 
 ### 2. Memory Efficiency (`scenarios/02_memory.sh`)
-**Metric:** Peak memory consumption (RSS) during streaming
-**Narrative:** "Process petabytes on a Raspberry Pi."
-**Target:** Near-constant memory footprint regardless of file size
+**Metric:** Peak memory consumption (RSS) during streaming on large JSONL file
 
 ```bash
 ./scenarios/02_memory.sh
 ```
 
-### 3. Cold Start (`scenarios/03_cold_start.sh`)
-**Metric:** Execution time for trivial query on tiny input
-**Narrative:** "Snappy enough for a shell loop."
-**Target:** < 10ms for instant feel
+### 3. Startup Latency (`scenarios/03_cold_start.sh`)
+**Metric:** Execution time on single JSON object with simple query
 
 ```bash
 ./scenarios/03_cold_start.sh
 ```
 
-### 4. Fault Tolerance (`scenarios/04_fault_tolerance.sh`)
-**Metric:** Recovery rate on malformed/incomplete streams
-**Narrative:** "LLMs hallucinate. They cut off JSON. jq dies. zq survives."
-**Target:** 100% recovery (process all valid records)
+### 4. Malformed Data Resilience (`scenarios/04_fault_tolerance.sh`)
+**Metric:** Recovery and exit code when processing stream with malformed JSON records
 
 ```bash
 ./scenarios/04_fault_tolerance.sh
@@ -141,9 +133,3 @@ cat "$RESULT_FILE"
 
 Make it executable: `chmod +x scenarios/05_my_scenario.sh`
 
-## Performance Targets
-
-- **Parallelism**: 10-20x speedup on 8-core systems
-- **Memory**: < 100MB RSS for streaming large files
-- **Cold Start**: < 10ms for simple queries
-- **Fault Tolerance**: 100% recovery on 10% malformed data
