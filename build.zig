@@ -182,7 +182,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
 
     const compat_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/compat_test.zig"),
+        .root_source_file = b.path("tests/compat/root.zig"),
         .target = target,
         .optimize = optimize,
     });

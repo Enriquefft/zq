@@ -1,51 +1,80 @@
 #!/usr/bin/perl
-# generate_compat_tests.pl — regenerate tests/compat_test.zig from jq's test suite.
+# generate_compat_tests.pl — regenerate tests/compat/ from jq's test suite.
 #
 # Usage:
 #   perl tests/scripts/generate_compat_tests.pl [path/to/jq.test]
 #
 # Default source: ../jq/tests/jq.test (relative to the zq repo root).
-# Output:        tests/compat_test.zig  (written to repo root-relative path)
+# Output:        tests/compat/  (helpers.zig + root.zig + one file per section)
 #
-# How the jq.test format works:
-#   - Lines starting with # are comments; blank lines separate test cases.
-#   - A normal test case is three sections: filter / input JSON / expected outputs.
-#   - %%FAIL (or %%FAIL IGNORE MSG) marks a case where the filter itself is
-#     invalid jq syntax; the filter is the *next* non-blank line, followed by
-#     the expected error message lines (which we discard).
+# Sections are defined by explicit line-number boundaries from jq.test.
+# Update SECTIONS below when jq.test is updated.
 #
-# What the generated tests do:
-#   - Every test calls runFilter(filter, input) and asserts the serialized
-#     results match the expected output lines.
-#   - QuerySyntaxError → SkipZigTest  (filter not yet implemented in zq)
-#   - Any other error   → test FAILS  (real compatibility gap to fix)
-#   - %%FAIL tests call expectCompileError() instead.
+# Generated file strategy:
+#   helpers.zig     — shared utilities (runFilter, expectCompileError, etc.)
+#   root.zig        — comptime-imports all section files
+#   <section>.zig   — one file per section, named by topic
 #
-# Serialization matches jq compact output:
-#   - Control chars (0x00-0x1F) → \uXXXX
-#   - Non-ASCII Unicode          → \uXXXX (or surrogate pair for > U+FFFF)
-#   - Printable ASCII (except " and \) → literal
-#
-# To regenerate after updating jq:
-#   perl tests/scripts/generate_compat_tests.pl && zig build test
+# QuerySyntaxError → test FAILS  (filter not yet implemented — fix it)
+# Any other error  → test FAILS  (real compatibility gap)
+# Wrong output     → assertion FAILS
+# %%FAIL tests     → expectCompileError()
 
 use strict;
 use warnings;
-
 use File::Basename qw(dirname);
 use Cwd qw(abs_path);
+use File::Path qw(make_path);
 
-# Resolve the directory containing this script, then navigate from there.
-my $script_dir   = dirname(abs_path($0));          # .../zq/tests/scripts
-my $zq_root      = dirname(dirname($script_dir));  # .../zq
-my $projects_dir = dirname($zq_root);              # .../Projects
+my $script_dir   = dirname(abs_path($0));
+my $zq_root      = dirname(dirname($script_dir));
+my $projects_dir = dirname($zq_root);
 
 my $jq_test = $ARGV[0] // "$projects_dir/jq/tests/jq.test";
-my $out_file = "$script_dir/../compat_test.zig";
+my $out_dir  = "$script_dir/../compat";
 
-open my $fh, '<:utf8', $jq_test or die "Cannot open $jq_test: $!\n";
+make_path($out_dir);
+
+# ── Section boundaries ────────────────────────────────────────────────────────
+# Each entry: [start_line, stem]
+# A test belongs to a section if its source line >= start_line of that section
+# and < start_line of the next section.
+# Update these line numbers when jq.test changes significantly.
+my @SECTIONS = (
+    [    1, 'literals'          ],  # Simple value tests / parser
+    [  111, 'object_construction'],  # Dictionary construction syntax
+    [  145, 'field_access'       ],  # Field access, piping
+    [  210, 'array_indices'      ],  # Negative array indices / slices
+    [  234, 'iteration'          ],  # Multiple outputs, iteration, generators
+    [  495, 'variables'          ],  # Variables, destructuring, as-patterns
+    [  574, 'builtins'           ],  # Builtin functions
+    [  780, 'user_functions'     ],  # User-defined functions
+    [ 1107, 'paths'              ],  # Paths, getpath, setpath, delpaths
+    [ 1219, 'assignment'         ],  # Assignment operators
+    [ 1311, 'conditionals'       ],  # Conditionals: if/elif/else
+    [ 1389, 'comparisons'        ],  # Numeric comparison, equality
+    [ 1447, 'try_catch'          ],  # Try/catch, ? operator, error handling
+    [ 1740, 'string_ops'         ],  # String operations, format strings
+    [ 1884, 'datetime'           ],  # Date/time functions
+    [ 2057, 'numbers'            ],  # Number handling, precision, literals
+    [ 2214, 'unary_negation'     ],  # Unary negation numerical precision
+    [ 2293, 'object_merge'       ],  # Object construction & recursive merge
+    [ 2415, 'regression'         ],  # Regression tests, edge cases
+);
+
+sub section_for_line {
+    my ($n) = @_;
+    my $stem = $SECTIONS[0][1];
+    for my $s (@SECTIONS) {
+        last if $s->[0] > $n;
+        $stem = $s->[1];
+    }
+    return $stem;
+}
 
 # ── Parse all test cases ──────────────────────────────────────────────────────
+
+open my $fh, '<:utf8', $jq_test or die "Cannot open $jq_test: $!\n";
 
 my @tests;
 my $line_num = 0;
@@ -55,7 +84,7 @@ while (defined(my $line = <$fh>)) {
     chomp $line;
     next if $line =~ /^\s*$/ || $line =~ /^#/;
 
-    # %%FAIL: a filter that must not compile.
+    # %%FAIL: filter that must not compile.
     if ($line =~ /^%%FAIL/) {
         my $fail_line = $line_num;
         my $filter = '';
@@ -66,22 +95,27 @@ while (defined(my $line = <$fh>)) {
             $filter = $line;
             last;
         }
-        # Consume error-message lines until blank.
         while (defined($line = <$fh>)) {
             $line_num++;
             chomp $line;
             last if $line =~ /^\s*$/;
         }
-        push @tests, { line => $fail_line, kind => 'fail', filter => $filter, input => 'null', outputs => [] };
+        push @tests, {
+            line    => $fail_line,
+            kind    => 'fail',
+            filter  => $filter,
+            input   => 'null',
+            outputs => [],
+            section => section_for_line($fail_line),
+        };
         next;
     }
 
-    # Normal test: filter line already read.
-    my $filter      = $line;
+    # Normal test.
     my $filter_line = $line_num;
+    my $filter      = $line;
     my $input       = '';
 
-    # Input: next non-comment, non-blank line.
     while (defined($line = <$fh>)) {
         $line_num++;
         chomp $line;
@@ -91,7 +125,6 @@ while (defined(my $line = <$fh>)) {
         last;
     }
 
-    # Outputs: all non-comment lines until next blank.
     my @outputs;
     while (defined($line = <$fh>)) {
         $line_num++;
@@ -101,34 +134,39 @@ while (defined(my $line = <$fh>)) {
         push @outputs, $line;
     }
 
-    push @tests, { line => $filter_line, kind => 'normal', filter => $filter, input => $input, outputs => [@outputs] };
+    push @tests, {
+        line    => $filter_line,
+        kind    => 'normal',
+        filter  => $filter,
+        input   => $input,
+        outputs => [@outputs],
+        section => section_for_line($filter_line),
+    };
 }
 close $fh;
 
-printf "Parsed %d test cases from %s\n", scalar @tests, $jq_test;
+printf "Parsed %d test cases\n", scalar @tests;
 
 # ── Escaping helpers ──────────────────────────────────────────────────────────
 
-# Escape a string for embedding inside a Zig double-quoted string literal.
 sub zig_str {
     my ($s) = @_;
     my $r = '';
     for my $c (split //, $s) {
         my $o = ord($c);
-        if    ($c eq '"')   { $r .= '\\"'  }
-        elsif ($c eq '\\')  { $r .= '\\\\'  }
-        elsif ($c eq "\n")  { $r .= '\\n'  }
-        elsif ($c eq "\r")  { $r .= '\\r'  }
-        elsif ($c eq "\t")  { $r .= '\\t'  }
-        elsif ($o == 0x08)  { $r .= '\\x08' }
-        elsif ($o == 0x0C)  { $r .= '\\x0c' }
-        elsif ($o < 0x20)   { $r .= sprintf('\\x%02x', $o) }
-        else                { $r .= $c }
+        if    ($c eq '"')  { $r .= '\\"'   }
+        elsif ($c eq '\\') { $r .= '\\\\'  }
+        elsif ($c eq "\n") { $r .= '\\n'   }
+        elsif ($c eq "\r") { $r .= '\\r'   }
+        elsif ($c eq "\t") { $r .= '\\t'   }
+        elsif ($o == 0x08) { $r .= '\\x08' }
+        elsif ($o == 0x0C) { $r .= '\\x0c' }
+        elsif ($o < 0x20)  { $r .= sprintf('\\x%02x', $o) }
+        else               { $r .= $c }
     }
     return $r;
 }
 
-# Produce a safe Zig test-name string: printable ASCII, no backslash/quote, ≤60 chars.
 sub test_name {
     my ($s) = @_;
     my $r = '';
@@ -142,33 +180,39 @@ sub test_name {
     return $r;
 }
 
-# ── Emit Zig source ───────────────────────────────────────────────────────────
+# ── Group tests by section ────────────────────────────────────────────────────
 
-my $out = <<'ZIG';
+my %sections;
+my @section_order = map { $_->[1] } @SECTIONS;
+
+for my $t (@tests) {
+    push @{ $sections{$t->{section}} }, $t;
+}
+
+# ── helpers.zig ───────────────────────────────────────────────────────────────
+
+my $helpers_src = <<'ZIG';
 // !! GENERATED FILE — do not edit by hand.
 // !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
 //
-// One test per jq test case.  Strategy:
-//   QuerySyntaxError → SkipZigTest   (filter not yet implemented)
-//   Any other error  → test FAILS    (real compatibility gap)
-//   Wrong output     → assertion FAILS
-//   %%FAIL tests     → expectCompileError()
+// Shared utilities for all compat test sections.
+// Each section file does:  const h = @import("helpers.zig");
 
 const std = @import("std");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
 const types = @import("types");
-const err_mod = @import("error");
 
 const Parser = parser_mod.Parser;
 const CompiledQuery = query_mod.CompiledQuery;
 const Value = types.Value;
 const Tape = types.Tape;
-const alloc = std.testing.allocator;
+
+pub const alloc = std.testing.allocator;
 
 // ── Tape helpers ──────────────────────────────────────────────────────────────
 
-fn entryToValue(tape: *const Tape, idx: u32) Value {
+pub fn entryToValue(tape: *const Tape, idx: u32) Value {
     const entry = tape.entries[idx];
     return switch (entry.tag) {
         .null_val     => .null_val,
@@ -183,7 +227,7 @@ fn entryToValue(tape: *const Tape, idx: u32) Value {
     };
 }
 
-fn skipTapeEntry(tape: *const Tape, idx: u32) u32 {
+pub fn skipTapeEntry(tape: *const Tape, idx: u32) u32 {
     const entry = tape.entries[idx];
     return switch (entry.tag) {
         .array_start, .object_start => entry.payload.skip,
@@ -191,9 +235,9 @@ fn skipTapeEntry(tape: *const Tape, idx: u32) u32 {
     };
 }
 
-// ── Value → compact JSON (jq-compatible escaping) ─────────────────────────────
+// ── Value → compact JSON ──────────────────────────────────────────────────────
 
-fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
+pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
     switch (val) {
         .null_val  => try buf.appendSlice(alloc, "null"),
         .bool_val  => |b| try buf.appendSlice(alloc, if (b) "true" else "false"),
@@ -251,11 +295,8 @@ fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!void {
     }
 }
 
-/// jq-compatible escaping:
-///   - Control chars (0x00-0x1F)  → \uXXXX
-///   - Non-ASCII Unicode            → \uXXXX (surrogate pairs for > U+FFFF)
-///   - Printable ASCII (≠ " or \) → literal
-fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
+/// jq-compatible escaping.
+pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
         const byte = s[i];
@@ -275,19 +316,13 @@ fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
             i += 1;
         } else {
             const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
-                try buf.appendSlice(alloc, "\\ufffd");
-                i += 1;
-                continue;
+                try buf.appendSlice(alloc, "\\ufffd"); i += 1; continue;
             };
             if (i + seq_len > s.len) {
-                try buf.appendSlice(alloc, "\\ufffd");
-                i += 1;
-                continue;
+                try buf.appendSlice(alloc, "\\ufffd"); i += 1; continue;
             }
             const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
-                try buf.appendSlice(alloc, "\\ufffd");
-                i += seq_len;
-                continue;
+                try buf.appendSlice(alloc, "\\ufffd"); i += seq_len; continue;
             };
             if (cp <= 0xFFFF) {
                 var tmp: [6]u8 = undefined;
@@ -306,16 +341,16 @@ fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     }
 }
 
-// ── Core run helpers ──────────────────────────────────────────────────────────
+// ── Core runners ──────────────────────────────────────────────────────────────
 
 /// Parse input JSON, compile filter, execute, collect serialized results.
-/// Returns an owned slice of owned compact-JSON strings.
-fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
+/// Caller owns the returned slice and each string within it.
+pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     var p = try Parser.init(alloc);
     defer p.deinit();
 
     const tape = switch (try p.feed(input_json, true)) {
-        .done      => |t| t,
+        .done      => |d| d.tape,
         .need_more => return error.ParseIncomplete,
     };
 
@@ -342,7 +377,7 @@ fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
 }
 
 /// Verify that compiling `filter` returns QuerySyntaxError (%%FAIL tests).
-fn expectCompileError(filter: []const u8) !void {
+pub fn expectCompileError(filter: []const u8) !void {
     var q = CompiledQuery.compile(filter, .{}, alloc) catch |e| {
         if (e == error.QuerySyntaxError) return;
         return e;
@@ -350,47 +385,95 @@ fn expectCompileError(filter: []const u8) !void {
     q.deinit();
     return error.ExpectedCompileError;
 }
+ZIG
+
+# ── Emit section files ────────────────────────────────────────────────────────
+
+my @written_stems;
+
+for my $stem (@section_order) {
+    my $sec_tests = $sections{$stem} // [];
+    next unless @$sec_tests;
+
+    my $count = scalar @$sec_tests;
+    my $file  = "$out_dir/${stem}.zig";
+
+    my $src = <<"ZIG";
+// !! GENERATED FILE — do not edit by hand.
+// !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
+//
+// jq compat — $stem ($count tests)
+// QuerySyntaxError → test FAILS  (filter not yet implemented — fix it)
+// Any other error  → test FAILS  (real compatibility gap)
+
+const std = \@import("std");
+const h = \@import("helpers.zig");
 
 ZIG
 
-# ── One test function per case ────────────────────────────────────────────────
+    for my $t (@$sec_tests) {
+        my $name   = test_name($t->{filter});
+        my $fl     = $t->{line};
+        my $filter = zig_str($t->{filter});
+        my $input  = zig_str($t->{input});
+        my @outs   = @{$t->{outputs}};
 
-for my $t (@tests) {
-    my $name   = test_name($t->{filter});
-    my $fl     = $t->{line};
-    my $filter = zig_str($t->{filter});
-    my $input  = zig_str($t->{input});
-    my @outs   = @{$t->{outputs}};
+        $src .= "test \"jq:L${fl} ${name}\" {\n";
 
-    $out .= "test \"jq:L${fl} ${name}\" {\n";
-
-    if ($t->{kind} eq 'fail') {
-        $out .= "    // %%FAIL: filter should not compile\n";
-        $out .= "    try expectCompileError(\"${filter}\");\n";
-    } else {
-        my $n = scalar @outs;
-        $out .= "    const results = runFilter(\n";
-        $out .= "        \"${filter}\",\n";
-        $out .= "        \"${input}\",\n";
-        $out .= "    ) catch |e| switch (e) {\n";
-        $out .= "        error.QuerySyntaxError => return error.SkipZigTest, // filter not yet implemented\n";
-        $out .= "        else => return e, // real failure: wrong type, bad input, etc.\n";
-        $out .= "    };\n";
-        $out .= "    defer { for (results) |s| alloc.free(s); alloc.free(results); }\n";
-        $out .= "    try std.testing.expectEqual(\@as(usize, ${n}), results.len);\n";
-        for my $i (0..$#outs) {
-            my $expected = zig_str($outs[$i]);
-            $out .= "    try std.testing.expectEqualStrings(\"${expected}\", results[${i}]);\n";
+        if ($t->{kind} eq 'fail') {
+            $src .= "    // %%FAIL: filter should not compile\n";
+            $src .= "    try h.expectCompileError(\"${filter}\");\n";
+        } else {
+            my $n = scalar @outs;
+            $src .= "    const results = try h.runFilter(\n";
+            $src .= "        \"${filter}\",\n";
+            $src .= "        \"${input}\",\n";
+            $src .= "    );\n";
+            $src .= "    defer { for (results) |s| h.alloc.free(s); h.alloc.free(results); }\n";
+            $src .= "    try std.testing.expectEqual(\@as(usize, ${n}), results.len);\n";
+            for my $i (0..$#outs) {
+                my $expected = zig_str($outs[$i]);
+                $src .= "    try std.testing.expectEqualStrings(\"${expected}\", results[${i}]);\n";
+            }
         }
+
+        $src .= "}\n\n";
     }
 
-    $out .= "}\n\n";
+    open my $fh_out, '>:utf8', $file or die "Cannot write $file: $!\n";
+    print $fh_out $src;
+    close $fh_out;
+
+    push @written_stems, $stem;
+    printf "  %-24s  %3d tests\n", "${stem}.zig", $count;
 }
 
-# ── Write output ──────────────────────────────────────────────────────────────
+# ── helpers.zig ───────────────────────────────────────────────────────────────
 
-open my $fh_out, '>:utf8', $out_file or die "Cannot write $out_file: $!\n";
-print $fh_out $out;
-close $fh_out;
+open my $fh_h, '>:utf8', "$out_dir/helpers.zig"
+    or die "Cannot write helpers.zig: $!\n";
+print $fh_h $helpers_src;
+close $fh_h;
+print "  helpers.zig\n";
 
-printf "Written %d tests to %s\n", scalar @tests, $out_file;
+# ── root.zig ──────────────────────────────────────────────────────────────────
+
+my $root = <<'ZIG';
+// !! GENERATED FILE — do not edit by hand.
+// !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
+//
+// Root entry point: imports all section files so their tests run as one binary.
+
+comptime {
+ZIG
+
+$root .= "    _ = \@import(\"${_}.zig\");\n" for @written_stems;
+$root .= "}\n";
+
+open my $fh_r, '>:utf8', "$out_dir/root.zig"
+    or die "Cannot write root.zig: $!\n";
+print $fh_r $root;
+close $fh_r;
+
+printf "\n%d sections, %d total tests → %s\n",
+    scalar @written_stems, scalar @tests, $out_dir;
