@@ -982,7 +982,8 @@ pub const ResultIterator = struct {
         switch (base) {
             .object => |span| {
                 const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .object_start, .payload = .{ .skip = 0 },
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
                 });
                 var pos = span.start + 1;
                 const end = span.end - 1;
@@ -993,7 +994,8 @@ pub const ResultIterator = struct {
                     const val_pos = pos + 1;
                     const new_key_ref = try it.runtime_tape.internString(it.alloc, this_key);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
-                        .tag = .key, .payload = .{ .string = new_key_ref },
+                        .tag = .key,
+                        .payload = .{ .string = new_key_ref },
                     });
                     if (std.mem.eql(u8, this_key, key)) {
                         try it.stackValueToRuntimeTapeEntry(new_val);
@@ -1007,12 +1009,14 @@ pub const ResultIterator = struct {
                 if (!found) {
                     const new_key_ref = try it.runtime_tape.internString(it.alloc, key);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
-                        .tag = .key, .payload = .{ .string = new_key_ref },
+                        .tag = .key,
+                        .payload = .{ .string = new_key_ref },
                     });
                     try it.stackValueToRuntimeTapeEntry(new_val);
                 }
                 const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .object_end, .payload = .{ .none = {} },
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
                 it.runtime_tape_view.entries = it.runtime_tape.entries.items;
@@ -1025,15 +1029,18 @@ pub const ResultIterator = struct {
             },
             .null_val => {
                 const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .object_start, .payload = .{ .skip = 0 },
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
                 });
                 const new_key_ref = try it.runtime_tape.internString(it.alloc, key);
                 _ = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .key, .payload = .{ .string = new_key_ref },
+                    .tag = .key,
+                    .payload = .{ .string = new_key_ref },
                 });
                 try it.stackValueToRuntimeTapeEntry(new_val);
                 const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .object_end, .payload = .{ .none = {} },
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
                 it.runtime_tape_view.entries = it.runtime_tape.entries.items;
@@ -1060,7 +1067,8 @@ pub const ResultIterator = struct {
         switch (base) {
             .array => |span| {
                 const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_start, .payload = .{ .skip = 0 },
+                    .tag = .array_start,
+                    .payload = .{ .skip = 0 },
                 });
                 var pos = span.start + 1;
                 const end = span.end - 1;
@@ -1076,7 +1084,8 @@ pub const ResultIterator = struct {
                     i += 1;
                 }
                 const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_end, .payload = .{ .none = {} },
+                    .tag = .array_end,
+                    .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
                 it.runtime_tape_view.entries = it.runtime_tape.entries.items;

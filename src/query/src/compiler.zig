@@ -332,8 +332,7 @@ fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
                     else => return false,
                 }
             },
-            .pipe_eq, .plus_eq, .minus_eq, .star_eq,
-            .slash_eq, .percent_eq, .double_slash_eq => return true,
+            .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => return true,
             else => return false,
         }
     }
@@ -388,8 +387,7 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     else => return error.QuerySyntaxError,
                 }
             },
-            .pipe_eq, .plus_eq, .minus_eq, .star_eq,
-            .slash_eq, .percent_eq, .double_slash_eq => break,
+            .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => break,
             else => break,
         }
     }
@@ -399,10 +397,12 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
         switch (step.kind) {
             .key => try ctx.raw.append(ctx.alloc, RawInstr{
-                .op = .navigate_key, .operand = .{ .str_ref = step.key },
+                .op = .navigate_key,
+                .operand = .{ .str_ref = step.key },
             }),
             .index => try ctx.raw.append(ctx.alloc, RawInstr{
-                .op = .navigate_index, .operand = .{ .index = step.index },
+                .op = .navigate_index,
+                .operand = .{ .index = step.index },
             }),
         }
     }
@@ -453,10 +453,12 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const step = path_steps.items[i];
         switch (step.kind) {
             .key => try ctx.raw.append(ctx.alloc, RawInstr{
-                .op = .update_key, .operand = .{ .str_ref = step.key },
+                .op = .update_key,
+                .operand = .{ .str_ref = step.key },
             }),
             .index => try ctx.raw.append(ctx.alloc, RawInstr{
-                .op = .update_index, .operand = .{ .index = step.index },
+                .op = .update_index,
+                .operand = .{ .index = step.index },
             }),
         }
     }

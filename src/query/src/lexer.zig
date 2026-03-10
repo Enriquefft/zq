@@ -69,19 +69,19 @@ pub const Token = struct {
         double_slash, // //
 
         // Try-catch keywords
-        try_kw,   // try
+        try_kw, // try
         catch_kw, // catch
 
         // Optional operator
         question, // ?
 
         // Update-assignment operators
-        pipe_eq,         // |=
-        plus_eq,         // +=
-        minus_eq,        // -=
-        star_eq,         // *=
-        slash_eq,        // /=
-        percent_eq,      // %=
+        pipe_eq, // |=
+        plus_eq, // +=
+        minus_eq, // -=
+        star_eq, // *=
+        slash_eq, // /=
+        percent_eq, // %=
         double_slash_eq, // //=
     };
 
