@@ -1166,9 +1166,9 @@ test ".[.key_field]: computed string key from field value" {
     const sb = "knameBob";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 8 } },
-        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },   // "k"
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "k"
         .{ .tag = .string, .payload = .{ .string = .{ .offset = 1, .len = 4 } } }, // "name"
-        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 4 } } },   // "name"
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 4 } } }, // "name"
         .{ .tag = .string, .payload = .{ .string = .{ .offset = 5, .len = 3 } } }, // "Bob"
         .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
@@ -2004,11 +2004,11 @@ test "update |=: replace object field" {
     const sb = "ab";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 6 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 2 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
     var q = try compile(".a |= . + 10");
@@ -2038,9 +2038,9 @@ test "update +=: increment field" {
     const sb = "n";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 5 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 5 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
     var q = try compile(".n += 3");
@@ -2065,11 +2065,11 @@ test "update +=: increment field" {
 test "update |=: replace array element" {
     // [1,2,3] | .[1] |= . * 10  →  [1,20,3]
     const entries = [_]Entry{
-        .{ .tag = .array_start,  .payload = .{ .skip = 5 } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .int,          .payload = .{ .int = 2 } },
-        .{ .tag = .int,          .payload = .{ .int = 3 } },
-        .{ .tag = .array_end,    .payload = .{ .none = {} } },
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, "");
     var q = try compile(".[1] |= . * 10");
@@ -2098,9 +2098,9 @@ test "update //=: uses default when field is null" {
     const sb = "x";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .null_val,     .payload = .{ .none = {} } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
     var q = try compile(".x //= 99");
@@ -2121,9 +2121,9 @@ test "update //=: keeps existing truthy value" {
     const sb = "x";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 4 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 42 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 42 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
     var q = try compile(".x //= 99");
@@ -2142,12 +2142,12 @@ test "update |=: nested path .a.b" {
     const sb = "ab";
     const entries = [_]Entry{
         .{ .tag = .object_start, .payload = .{ .skip = 7 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
         .{ .tag = .object_start, .payload = .{ .skip = 6 } },
-        .{ .tag = .key,          .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
-        .{ .tag = .int,          .payload = .{ .int = 1 } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
-        .{ .tag = .object_end,   .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
     };
     const t = tape(&entries, sb);
     var q = try compile(".a.b |= . + 100");
