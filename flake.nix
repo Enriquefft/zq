@@ -26,6 +26,7 @@
             jq
             jaq
             yq
+            just
           ];
         };
 
