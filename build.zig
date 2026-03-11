@@ -92,6 +92,24 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // ── Microbenchmark ─────────────────────────────────────────────────────────
+    const microbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/microbench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    microbench_mod.addImport("error", error_module);
+    microbench_mod.addImport("types", types_module);
+    microbench_mod.addImport("parser", parser_module);
+    microbench_mod.addImport("query", query_module);
+    microbench_mod.addImport("output", output_module);
+
+    const microbench = b.addExecutable(.{
+        .name = "microbench",
+        .root_module = microbench_mod,
+    });
+    b.installArtifact(microbench);
+
     // ── Tests ─────────────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run all tests");
 

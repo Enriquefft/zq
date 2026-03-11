@@ -537,78 +537,112 @@ const IoCtx = struct {
     query: *const query_mod.CompiledQuery,
     queue: *JobQueue,
     sequencer: *Sequencer,
+    limiter: *InFlightLimiter,
     allocator: std.mem.Allocator,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
-    // In stream mode chunk_id == seq_base (one record per chunk).
-    var seq: u64 = 0;
-    var line_buf = std.ArrayList(u8){};
-    defer line_buf.deinit(ctx.allocator);
+    var chunk_id: u64 = 0;
+
+    // partial_line: holds bytes of an incomplete line spanning RingBuffer boundaries.
+    var partial_line = std.ArrayList(u8){};
+    defer partial_line.deinit(ctx.allocator);
+
+    // batch_buf: accumulates complete newline-terminated lines until STREAM_BATCH_SIZE.
+    var batch_buf = std.ArrayList(u8){};
+    defer batch_buf.deinit(ctx.allocator);
 
     loop: while (true) {
         const view = ctx.src.peek() catch break :loop;
 
         if (view.bytes.len == 0) {
-            if (view.is_eof) break :loop;
+            if (view.is_eof) {
+                // EOF: flush partial line into batch, then flush batch.
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+                flushBatch(&batch_buf, &chunk_id, ctx);
+                break :loop;
+            }
+            // No data available but not EOF (pipe stall): flush for latency.
+            if (batch_buf.items.len > 0 or partial_line.items.len > 0) {
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+                flushBatch(&batch_buf, &chunk_id, ctx);
+            }
             _ = ctx.src.refill() catch break :loop;
             continue;
         }
 
+        // Scan view for newlines, appending complete lines to batch_buf.
         var consumed_offset: usize = 0;
         var scan: usize = 0;
         while (scan < view.bytes.len) : (scan += 1) {
             if (view.bytes[scan] == '\n') {
-                line_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..scan]) catch break :loop;
+                // Complete line: partial_line (if any) + view[consumed_offset..scan] + '\n'
+                if (partial_line.items.len > 0) {
+                    partial_line.appendSlice(ctx.allocator, view.bytes[consumed_offset..scan]) catch break :loop;
+                    batch_buf.appendSlice(ctx.allocator, partial_line.items) catch break :loop;
+                    partial_line.clearRetainingCapacity();
+                } else {
+                    batch_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..scan]) catch break :loop;
+                }
+                batch_buf.append(ctx.allocator, '\n') catch break :loop;
                 consumed_offset = scan + 1;
 
-                const trimmed = std.mem.trimRight(u8, line_buf.items, " \t\r");
-                if (trimmed.len > 0) {
-                    const data = ctx.allocator.dupe(u8, trimmed) catch break :loop;
-                    ctx.queue.push(.{
-                        .data = data,
-                        .seq_base = seq,
-                        .chunk_id = seq,
-                        .query = ctx.query,
-                        .owns_data = true,
-                        .allocator = ctx.allocator,
-                    });
-                    seq += 1;
+                // Flush when batch reaches threshold.
+                if (batch_buf.items.len >= STREAM_BATCH_SIZE) {
+                    flushBatch(&batch_buf, &chunk_id, ctx);
                 }
-                line_buf.clearRetainingCapacity();
             }
         }
 
-        line_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..]) catch break :loop;
+        // Remainder after last newline goes into partial_line.
+        if (consumed_offset < view.bytes.len) {
+            partial_line.appendSlice(ctx.allocator, view.bytes[consumed_offset..]) catch break :loop;
+        }
         ctx.src.consume(view.bytes.len);
 
-        if (view.is_eof) break :loop;
+        if (view.is_eof) {
+            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+            flushBatch(&batch_buf, &chunk_id, ctx);
+            break :loop;
+        }
         _ = ctx.src.refill() catch break :loop;
     }
 
-    // Flush any remaining bytes as the final record (no trailing newline).
-    {
-        const trimmed = std.mem.trimRight(u8, line_buf.items, " \t\r");
-        if (trimmed.len > 0) {
-            const data = ctx.allocator.dupe(u8, trimmed) catch {
-                ctx.sequencer.set_total_chunks(seq);
-                ctx.queue.signal_done();
-                return;
-            };
-            ctx.queue.push(.{
-                .data = data,
-                .seq_base = seq,
-                .chunk_id = seq,
-                .query = ctx.query,
-                .owns_data = true,
-                .allocator = ctx.allocator,
-            });
-            seq += 1;
-        }
-    }
-
-    ctx.sequencer.set_total_chunks(seq);
+    ctx.sequencer.set_total_chunks(chunk_id);
     ctx.queue.signal_done();
+}
+
+/// Flush the accumulated batch as a single Job.  Acquires an in-flight slot
+/// for backpressure, dupes the buffer, and pushes to the worker queue.
+fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
+    if (batch_buf.items.len == 0) return;
+    if (!ctx.limiter.acquire()) return; // shutdown
+    const data = ctx.allocator.dupe(u8, batch_buf.items) catch return;
+    ctx.queue.push(.{
+        .data = data,
+        .seq_base = chunk_id.*,
+        .chunk_id = chunk_id.*,
+        .query = ctx.query,
+        .owns_data = true,
+        .allocator = ctx.allocator,
+    });
+    chunk_id.* += 1;
+    batch_buf.clearRetainingCapacity();
+}
+
+/// Append any remaining partial line (without trailing newline) to the batch
+/// buffer, so it is included in the final flush.
+fn flushPartialToBatch(
+    partial_line: *std.ArrayList(u8),
+    batch_buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const trimmed = std.mem.trimRight(u8, partial_line.items, " \t\r");
+    if (trimmed.len > 0) {
+        try batch_buf.appendSlice(allocator, trimmed);
+        try batch_buf.append(allocator, '\n');
+    }
+    partial_line.clearRetainingCapacity();
 }
 
 // ── File feeder thread ────────────────────────────────────────────────────────
@@ -731,6 +765,12 @@ const QUEUE_CAP: usize = 256;
 /// Chunks per thread — more chunks than threads allows the OS scheduler to
 /// balance load when records have uneven parse/query cost.
 const CHUNK_FACTOR: usize = 4;
+
+/// Stream-mode batch size in bytes.  The IO thread accumulates complete lines
+/// until this threshold is reached, then pushes the batch as a single Job.
+/// At ~300 B/record this yields ~850 records/batch, reducing millions of jobs
+/// to a few thousand — same order of magnitude as file mode's chunk count.
+const STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
 
 /// File-mode backpressure: max simultaneously-live ChunkResults per thread.
 /// With 2× n_threads slots, each worker can have one chunk being processed and
@@ -905,6 +945,7 @@ pub const Pool = struct {
             .query = cq,
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
+            .limiter = &p._shared.limiter,
             .allocator = p.allocator,
         };
 

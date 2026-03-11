@@ -107,12 +107,49 @@ pub fn main() !u8 {
             return EXIT_SYSTEM;
         };
     } else if (config.files.len == 0) {
-        // Read from stdin.
-        last_was_false_or_null = processSource(std.fs.File.stdin(), &cq, &writer, format, allocator, &had_parse_errors) catch |e| {
+        // Read from stdin using parallel pool.
+        var src = io_mod.Source.init(std.fs.File.stdin(), allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
         };
+        defer src.deinit();
+
+        const n_threads = std.Thread.getCpuCount() catch 4;
+        var pool = pool_mod.Pool.init(n_threads, allocator) catch |e| {
+            printErr("zq: ");
+            printZqErr(e);
+            return EXIT_SYSTEM;
+        };
+        defer pool.deinit();
+
+        pool.submit_stream(&src, &cq);
+
+        while (true) {
+            const maybe = pool.collect() catch |e| {
+                printErr("zq: ");
+                printZqErr(e);
+                had_parse_errors = true;
+                continue;
+            };
+            const result = maybe orelse break;
+            const val = result.value;
+            writer.write_value(val, format) catch {
+                printErr("zq: write error\n");
+                return EXIT_SYSTEM;
+            };
+            if (format == .pretty or format == .compact) {
+                writer.write_value(.{ .string = "\n" }, .raw) catch {
+                    printErr("zq: write error\n");
+                    return EXIT_SYSTEM;
+                };
+            }
+            last_was_false_or_null = switch (val) {
+                .null_val => true,
+                .bool_val => |b| !b,
+                else => false,
+            };
+        }
     } else {
         for (config.files) |path| {
             const file = openFile(path) catch {

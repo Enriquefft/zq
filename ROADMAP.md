@@ -25,7 +25,7 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-10)
 
-**Last updated:** Commit 365d47e + bounded chunk count + ordered output queue
+**Last updated:** Batched stream mode — stdin now parallel
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
@@ -38,17 +38,15 @@ Cold start:         ✓ sub-millisecond
 Parallel (file arg, .id, 648 MB JSONL):
   jq   21.8s   3.6 MB RSS
   jaq  15.3s   666 MB RSS
-  zq    1.4s   1702 MB RSS   ← 15x faster than jq; memory 2.6x input (target: 2x)
+  zq    1.6s   1613 MB RSS   ← 14x faster than jq
 
 Parallel (file arg, select(.id > 500000)):
   jq   42.6s   3.6 MB RSS
   jaq  27.7s   666 MB RSS
-  zq    1.1s   1467 MB RSS   ← fast, but memory still 2.3x input
+  zq    1.4s   1613 MB RSS
 
 Streaming (cat | zq .id):
-  zq   215s    3.4 MB RSS    ← memory excellent, speed 10x slower than jq
-
-Single-threaded per-record: ~14.6 µs/record vs jq ~1.45 µs (10x slower)
+  zq    1.8s   17 MB RSS     ← was 215s; 120x faster; memory now 17 MB (was 3.4 MB)
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete.
@@ -136,6 +134,7 @@ Current state: 1702 MB RSS for 648 MB JSONL (2.6x input). Target < 2x. Progress:
 |------|--------|
 | [x] **Bounded chunk count** | InFlightLimiter caps in-flight chunks at `IN_FLIGHT_FACTOR × n_threads`. Feeder thread lazily enqueues chunks; collect() releases each slot after freeing the arena. Memory bounded to ~`chunk_size × n_threads`, not file size. **Result: 2998 MB → 1764 MB (-41%), 38s → 1.41s (27× faster).** |
 | [x] **Ordered output queue** | Fixed-size ring buffer replaces HashMap in Sequencer. Capacity `= max(IN_FLIGHT_FACTOR×n_threads, QUEUE_CAP+n_threads)` guarantees no slot collision in both file and stream modes. O(1) post and fetch with zero dynamic allocation in the hot path. **Result: 1764 MB → 1702 MB (-3.5%).** |
+| [x] **Batched stream mode** | stdin now routes through the parallel pool via `submit_stream()`. IO thread accumulates lines into 256 KB batches before creating jobs, reducing orchestration overhead from 2.16M ops to ~2,540 (matching file mode order of magnitude). InFlightLimiter backpressure added to stream mode. **Result: streaming 215s → 1.8s (120x faster); RSS stays low at ~17 MB.** |
 
 **Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). Current: 2.6x — remaining gap closed by two-path execution (v0.5) or adaptive chunk sizing (v1.0).
 
@@ -318,7 +317,7 @@ The killer feature. Pool module fully implemented; needs CLI surface.
 | [x] **In-order output guarantee** | Chunk-level Sequencer delivers ChunkResults in submission order. collect() cursor walks records/values in order. |
 | [x] **Per-line error handling** | Parse/query errors become RecordOutcome.err; collect() surfaces them per-record without aborting the pipeline. |
 | [x] **Work stealing** | MPMC JobQueue with N_CHUNKS jobs; workers pull freely. Newline-aligned byte-range chunks prevent record splits. |
-| [x] **Stream pipeline** | IO thread reads lines from stdin/pipe; each line is a single-record ChunkResult posted to the worker queue. |
+| [x] **Stream pipeline** | IO thread reads lines from stdin/pipe in 256 KB batches, posted to the worker queue. InFlightLimiter backpressure prevents unbounded memory growth. **Result: stdin 215s → 1.8s (120x faster), 17 MB RSS.** |
 | [ ] **Scaling** | Near-linear scaling up to core count on JSONL. Measured: 11.6x jq at 11 cores (1103% CPU). |
 
 ### Streaming & incomplete JSON (LLM use case)
@@ -434,7 +433,8 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Startup time | **0.8ms** (6x faster than jq) | < 3ms ✓ | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB ✓ | < 3 MB | < 5 MB |
 | Memory (648 MB JSONL, parallel) | **1702 MB** (2.6x input) | < 2x input | < 2x input | < 2x input |
-| Memory (streaming pipe) | **3.4 MB** | — | — | — |
+| Memory (streaming pipe) | **17 MB** | — | — | — |
+| Throughput vs jq (streaming, 15M JSONL, `.id`) | **12x** (1.8s vs 22s) | — | — | 10x |
 | Test count | 383 | 400+ | 800+ | 1000+ |
 
 ---
