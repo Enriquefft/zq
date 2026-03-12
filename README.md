@@ -73,16 +73,20 @@ The filter language already covers the most common real-world operators: field a
 
 ## Installation
 
-> Coming with v0.1. Build from source in the meantime:
+### Build from source
 
 ```sh
-git clone https://github.com/yourname/zq
+git clone https://github.com/Enriquefft/zq
 cd zq
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zq '.foo' <<< '{"foo": 42}'
 ```
 
-Requires Zig 0.15.2.
+Requires [Zig 0.15.2](https://ziglang.org/download/).
+
+**Alternative (Nix):** If you have Nix + direnv, just `direnv allow` — all dependencies are pinned.
+
+**Using just:** `just build` (dev) or `just release` (optimized).
 
 ---
 
