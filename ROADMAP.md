@@ -101,29 +101,29 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 ### Query language — P2
 
-| Feature | Scope |
-|---------|-------|
-| [ ] **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation |
-| [x] **`def`** (user-defined functions, including recursion) | Composability |
-| [ ] **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration |
-| [ ] **`while`/`until`/`repeat`** | Loop constructs |
-| [ ] **`label`/`break`** | Non-local exit from generators |
-| [ ] **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra |
-| [ ] **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings |
+| Feature | Scope | Complexity |
+|---------|-------|------------|
+| [ ] **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
+| [x] **`def`** (user-defined functions, including recursion) | Composability | High |
+| [ ] **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
+| [ ] **`while`/`until`/`repeat`** | Loop constructs | Low |
+| [ ] **`label`/`break`** | Non-local exit from generators | High |
+| [ ] **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra | Medium |
+| [ ] **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings | Low |
 
 ### CLI
 
-| Feature | Priority |
-|---------|----------|
-| [ ] `-s` / `--slurp` | P0 — read all inputs into array |
-| [ ] `-S` / `--sort-keys` | P1 — alphabetical key ordering in output |
-| [ ] `-R` / `--raw-input` | P1 — read lines as strings |
-| [ ] `-j` / `--join-output` | P1 — raw output without trailing newline |
-| [ ] `-f` / `--from-file` | P1 — read filter from file |
-| [ ] `--arg NAME VALUE` | P1 — bind string variable |
-| [ ] `--argjson NAME VALUE` | P1 — bind JSON variable |
-| [ ] `--tab` / `--indent N` | P2 — indentation control |
-| [ ] `--args` / `--jsonargs` | P2 — positional arguments via `$ARGS` |
+| Feature | Priority | Complexity |
+|---------|----------|------------|
+| [ ] `-s` / `--slurp` | P0 — read all inputs into array | Medium |
+| [ ] `-S` / `--sort-keys` | P1 — alphabetical key ordering in output | Low |
+| [ ] `-R` / `--raw-input` | P1 — read lines as strings | Low |
+| [ ] `-j` / `--join-output` | P1 — raw output without trailing newline | Low |
+| [ ] `-f` / `--from-file` | P1 — read filter from file | Low |
+| [ ] `--arg NAME VALUE` | P1 — bind string variable | Medium |
+| [ ] `--argjson NAME VALUE` | P1 — bind JSON variable | Medium |
+| [ ] `--tab` / `--indent N` | P2 — indentation control | Low |
+| [ ] `--args` / `--jsonargs` | P2 — positional arguments via `$ARGS` | Medium |
 
 ### Memory optimization — P0
 
