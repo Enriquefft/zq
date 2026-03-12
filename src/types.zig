@@ -132,6 +132,49 @@ pub const RuntimeTape = struct {
     }
 };
 
+// ─── Builtin IDs ─────────────────────────────────────────────────────────────
+/// Identifies a built-in function called via the `call_builtin` opcode.
+/// The numeric values are stable — do not reorder.
+pub const BuiltinId = enum(u16) {
+    length,
+    keys,
+    keys_unsorted,
+    values,
+    has,
+    in_,
+    type_,
+    empty,
+    tostring,
+    tonumber,
+    error_,
+    add,
+    range,
+    range2,
+    range3,
+    sort,
+    sort_by,
+    group_by,
+    reverse,
+    flatten,
+    flatten_n,
+    min,
+    max,
+    min_by,
+    max_by,
+    to_entries,
+    from_entries,
+    any,
+    all,
+    contains,
+    inside,
+    del,
+    indices,
+    index_,
+    rindex,
+    unique,
+    unique_by,
+};
+
 // ─── Slice Args ──────────────────────────────────────────────────────────────
 /// Operands for the `slice` instruction (.[from:to]).
 /// Uses i32 to keep @sizeOf(SliceArgs) = 12, within the 16-byte Operand union slot.
@@ -280,6 +323,10 @@ pub const Instruction = struct {
         /// operand.index = IP after catch handler (0 = no handler, just ip+1).
         try_end,
 
+        // Builtin dispatch
+        /// Call a built-in function. operand.index = BuiltinId (as i64).
+        call_builtin,
+
         // Slicing
         /// Extract a sub-array or sub-string. operand.slice_args = bounds.
         /// Handles .[from:to], .[from:], .[:to], .[:] patterns.
@@ -306,7 +353,7 @@ pub const Instruction = struct {
     pub const Operand = union {
         string: []const u8,
         str_ref: Tape.StringRef,
-        index: u32,
+        index: i64,
         bool: bool,
         int: i64,
         float: f64,

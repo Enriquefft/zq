@@ -850,7 +850,7 @@ test "jq:L1716 map(has(_foo_))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, false]", results[0]);
+    try std.testing.expectEqualStrings("[true,false]", results[0]);
 }
 
 test "jq:L1720 map(has(2))" {
@@ -863,7 +863,7 @@ test "jq:L1720 map(has(2))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[false, true]", results[0]);
+    try std.testing.expectEqualStrings("[false,true]", results[0]);
 }
 
 test "jq:L1724 has(nan)" {

@@ -298,7 +298,7 @@ test "jq:L2181 map(. == 1)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true, true, true, true, true]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,true,true,true,true]", results[0]);
 }
 
 test "jq:L2187 .[0] | tostring | . == if have_decnum then _1391186036643..." {

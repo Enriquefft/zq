@@ -25,6 +25,8 @@ pub const ZqError = error{
     IndexOutOfBounds,
     /// Memory allocation failed during operation.
     OutOfMemory,
+    /// User-raised error via the `error` builtin.
+    UserError,
 };
 
 /// All error conditions zq can produce. Mirrors ZqError 1:1.
@@ -46,6 +48,8 @@ pub const ErrorKind = enum {
     index_out_of_bounds,
     /// Memory allocation failed during operation.
     out_of_memory,
+    /// User-raised error via the `error` builtin.
+    user_error,
 };
 
 /// Rich diagnostic context attached to every user-facing error.
@@ -80,6 +84,7 @@ pub fn kindFromZqError(e: ZqError) ErrorKind {
         error.TypeError => .type_error,
         error.IndexOutOfBounds => .index_out_of_bounds,
         error.OutOfMemory => .out_of_memory,
+        error.UserError => .user_error,
     };
 }
 

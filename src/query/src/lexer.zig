@@ -14,8 +14,8 @@ pub const Token = struct {
         lbracket, // [
         rbracket, // ]
         ident, // [a-zA-Z_][a-zA-Z0-9_]*
-        int_lit, // -?[0-9]+
-        float_lit, // -?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?
+        int_lit, // [0-9]+
+        float_lit, // [0-9]+\.[0-9]+([eE][+-]?[0-9]+)?
         eof,
 
         // Arithmetic operators
@@ -160,12 +160,9 @@ pub const Lexer = struct {
             },
             '-' => {
                 l.pos += 1;
-                if (l.pos < l.src.len) {
-                    if (l.src[l.pos] == '=') {
-                        l.pos += 1;
-                        return .{ .tag = .minus_eq, .offset = start, .len = 2 };
-                    }
-                    if (std.ascii.isDigit(l.src[l.pos])) return l.scanNumberLiteral(start);
+                if (l.pos < l.src.len and l.src[l.pos] == '=') {
+                    l.pos += 1;
+                    return .{ .tag = .minus_eq, .offset = start, .len = 2 };
                 }
                 return .{ .tag = .minus, .offset = start, .len = 1 };
             },

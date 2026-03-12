@@ -293,11 +293,12 @@ test "execute error -2: TypeError — key on array" {
     try std.testing.expectEqual(@as(c_int, -2), rc);
 }
 
-test "execute error -2: IndexOutOfBounds — array too short" {
+test "execute success: out-of-bounds index returns null" {
     const h = mustCompile(".[5]");
     defer zq_free(h);
     const rc = zq_execute(h, "[1]".ptr, "[1]".len);
-    try std.testing.expectEqual(@as(c_int, -2), rc);
+    // Out-of-bounds read is jq-compatible: returns null, not an error.
+    try std.testing.expectEqual(@as(c_int, 0), rc);
 }
 
 test "execute error -2: TypeError — iterate non-array" {

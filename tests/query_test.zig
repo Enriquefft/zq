@@ -103,7 +103,7 @@ test ".foo: returns value for present key" {
     try std.testing.expectEqual(@as(i64, 99), vals[0].int);
 }
 
-test ".foo: missing key returns TypeError in strict mode" {
+test ".foo: missing key returns null (jq-compatible)" {
     const sb = "bar";
     const ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
@@ -117,10 +117,10 @@ test ".foo: missing key returns TypeError in strict mode" {
     var q = try compile(".foo"); // key "foo" absent
     defer q.deinit();
 
-    var it = try q.execute(t, alloc);
-    defer it.deinit();
-
-    try std.testing.expectError(error.TypeError, it.next());
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .null_val);
 }
 
 test ".foo: missing key returns null with allow_null_propagation" {
@@ -241,7 +241,7 @@ test ".[0]: returns first element" {
     try std.testing.expectEqual(@as(i64, 5), vals[0].int);
 }
 
-test ".[5]: IndexOutOfBounds on short array" {
+test ".[5]: out of bounds read returns null" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 3 } },
         .{ .tag = .int, .payload = .{ .int = 1 } },
@@ -252,10 +252,11 @@ test ".[5]: IndexOutOfBounds on short array" {
     var q = try compile(".[5]");
     defer q.deinit();
 
-    var it = try q.execute(t, alloc);
-    defer it.deinit();
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
 
-    try std.testing.expectError(error.IndexOutOfBounds, it.next());
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(Value.null_val, vals[0]);
 }
 
 // ── Iterate ───────────────────────────────────────────────────────────────────
@@ -463,13 +464,14 @@ test ".a.b: null propagation through null intermediate value" {
     };
     const t = tape(&entries, sb);
 
-    // Strict mode: TypeError because null.b is not allowed.
+    // jq-compatible: null.b returns null (null propagation).
     {
         var q = try compile(".a | .b");
         defer q.deinit();
-        var it = try q.execute(t, alloc);
-        defer it.deinit();
-        try std.testing.expectError(error.TypeError, it.next());
+        const vals = try collectAll(&q, t);
+        defer alloc.free(vals);
+        try std.testing.expectEqual(@as(usize, 1), vals.len);
+        try std.testing.expect(vals[0] == .null_val);
     }
 
     // allow_null_propagation: null propagates silently.
@@ -483,17 +485,18 @@ test ".a.b: null propagation through null intermediate value" {
     }
 }
 
-test "TypeError is NOT suppressed for key on integer" {
+test "key on integer returns null (jq-compatible)" {
     // 42 — integer root
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 42 } }};
     const t = tape(&entries, "");
 
-    // Even with allow_null_propagation, key-on-integer is always TypeError.
+    // jq-compatible: .foo on integer returns null.
     var q = try compileNull(".foo");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
-    defer it.deinit();
-    try std.testing.expectError(error.TypeError, it.next());
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .null_val);
 }
 
 // ── Syntax errors ─────────────────────────────────────────────────────────────
@@ -1466,7 +1469,7 @@ test "try: no error - yields value" {
     try std.testing.expectEqual(@as(i64, 42), vals[0].int);
 }
 
-test "try: missing key - yields nothing" {
+test "try: missing key - yields null (jq-compatible)" {
     const sb = "bar";
     const bar_ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
@@ -1483,7 +1486,9 @@ test "try: missing key - yields nothing" {
     const vals = try collectAll(&q, t);
     defer alloc.free(vals);
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    // Missing key returns null (no error to suppress), so try passes it through.
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expect(vals[0] == .null_val);
 }
 
 test "try: type error - yields nothing" {
@@ -1499,7 +1504,7 @@ test "try: type error - yields nothing" {
     try std.testing.expectEqual(@as(usize, 0), vals.len);
 }
 
-test "try-catch: missing key uses catch handler" {
+test "try-catch: missing key yields null (jq-compatible, no error to catch)" {
     const sb = "bar";
     const bar_ref = StringRef{ .offset = 0, .len = 3 };
     const entries = [_]Entry{
@@ -1516,8 +1521,9 @@ test "try-catch: missing key uses catch handler" {
     const vals = try collectAll(&q, t);
     defer alloc.free(vals);
 
+    // Missing key returns null (no error), so catch handler is not invoked.
     try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("fallback", vals[0].string);
+    try std.testing.expect(vals[0] == .null_val);
 }
 
 test "try-catch: catch receives error name string" {
@@ -1562,10 +1568,12 @@ test "try: index out of bounds - yields nothing" {
     const vals = try collectAll(&q, t);
     defer alloc.free(vals);
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    // Out-of-bounds index returns null (jq-compatible); try does not suppress it.
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(Value.null_val, vals[0]);
 }
 
-test "try-catch: index out of bounds uses catch handler" {
+test "try-catch: out-of-bounds index yields null (no error to catch)" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 3 } },
         .{ .tag = .int, .payload = .{ .int = 1 } },
@@ -1579,8 +1587,9 @@ test "try-catch: index out of bounds uses catch handler" {
     const vals = try collectAll(&q, t);
     defer alloc.free(vals);
 
+    // Out-of-bounds read returns null, not an error; catch handler is not invoked.
     try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+    try std.testing.expectEqual(Value.null_val, vals[0]);
 }
 
 test "try: iterate non-array - yields nothing" {

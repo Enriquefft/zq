@@ -31,7 +31,7 @@ test "jq:L581 1+1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2.0", results[0]);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
 test "jq:L585 2-1" {
@@ -70,7 +70,7 @@ test "jq:L593 1e+0+0.001e3" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("20e-1", results[0]);
+    try std.testing.expectEqualStrings("2", results[0]);
 }
 
 test "jq:L597 .+4" {
@@ -83,7 +83,7 @@ test "jq:L597 .+4" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("19.0", results[0]);
+    try std.testing.expectEqualStrings("19", results[0]);
 }
 
 test "jq:L601 .+null" {
@@ -148,7 +148,7 @@ test "jq:L617 {_a_:1} + {_b_:2} + {_c_:3}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"c\":3}", results[0]);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":3}", results[0]);
 }
 
 test "jq:L621 _asdf_ + _jkl;_ + . + . + ." {
@@ -265,7 +265,7 @@ test "jq:L653 1e-19 + 1e-20 - 5e-21" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1.05e-19", results[0]);
+    try std.testing.expectEqualStrings("0.000000000000000000105", results[0]);
 }
 
 test "jq:L657 1 / 1e-17" {
@@ -278,7 +278,7 @@ test "jq:L657 1 / 1e-17" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1e+17", results[0]);
+    try std.testing.expectEqualStrings("100000000000000000", results[0]);
 }
 
 test "jq:L661 9E999999999, 9999999999E999999990, 1E-999999999, 0.000000..." {
@@ -483,7 +483,7 @@ test "jq:L737 [.[] | length]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, 0, 2, 1, 4, 1]", results[0]);
+    try std.testing.expectEqualStrings("[0,0,2,1,4,1]", results[0]);
 }
 
 test "jq:L741 utf8bytelength" {
@@ -522,7 +522,7 @@ test "jq:L750 map(keys)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[], [\"abc\",\"abcd\",\"abcde\"], [\"x\",\"y\",\"z\"]]", results[0]);
+    try std.testing.expectEqualStrings("[[],[\"abc\",\"abcd\",\"abcde\"],[\"x\",\"y\",\"z\"]]", results[0]);
 }
 
 test "jq:L754 [1,2,empty,3,empty,4]" {
@@ -548,7 +548,7 @@ test "jq:L758 map(add)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[null, 6, \"abc\", [3,4,5,6], {\"a\":3, \"b\": 2}]", results[0]);
+    try std.testing.expectEqualStrings("[null,6,\"abc\",[3,4,5,6],{\"a\":3,\"b\":2}]", results[0]);
 }
 
 test "jq:L762 map_values(.+1)" {

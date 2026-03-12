@@ -644,7 +644,15 @@ pub const Parser = struct {
             try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = val } });
         } else {
             const val = std.fmt.parseInt(i64, num_str, 10) catch return error.InvalidNumber;
-            try p.tape_buf.append(p.allocator, .{ .tag = .int, .payload = .{ .int = val } });
+            // jq uses float64 for all numbers. Integers that cannot be exactly represented
+            // in float64 (|n| > 2^53) are stored as float to match jq precision semantics.
+            const max_exact: i64 = 1 << 53; // 9007199254740992
+            if (val > max_exact or val < -max_exact) {
+                const fval: f64 = @floatFromInt(val);
+                try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = fval } });
+            } else {
+                try p.tape_buf.append(p.allocator, .{ .tag = .int, .payload = .{ .int = val } });
+            }
         }
         p.transitionAfterValue();
     }

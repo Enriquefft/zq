@@ -44,7 +44,7 @@ test "jq:L1229 .foo |= .+1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"foo\": 43}", results[0]);
+    try std.testing.expectEqualStrings("{\"foo\":43}", results[0]);
 }
 
 test "jq:L1233 .[] += 2, .[] *= 2, .[] -= 2, .[] /= 2, .[] %=2" {

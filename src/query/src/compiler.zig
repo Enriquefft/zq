@@ -29,7 +29,7 @@ const StrRef = struct { offset: u32, len: u32 };
 
 const RawOp = union {
     str_ref: StrRef,
-    index: u32,
+    index: i64,
     bool: bool,
     int: i64,
     float: f64,
@@ -85,7 +85,7 @@ const FunctionEntry = struct {
 const PathStep = struct {
     kind: enum { key, index },
     key: StrRef = .{ .offset = 0, .len = 0 },
-    index: u32 = 0,
+    index: i64 = 0,
 };
 
 // ── Scope management ─────────────────────────────────────────────────────
@@ -366,10 +366,10 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     .int_lit => {
                         const tok = try ctx.lex.next();
                         const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
-                        if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
+                        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
                         const close = try ctx.lex.next();
                         if (close.tag != .rbracket) return error.QuerySyntaxError;
-                        try path_steps.append(ctx.alloc, PathStep{ .kind = .index, .index = @intCast(n) });
+                        try path_steps.append(ctx.alloc, PathStep{ .kind = .index, .index = n });
                         const sep = try ctx.lex.peek();
                         if (sep.tag == .dot) _ = try ctx.lex.next();
                     },
@@ -377,7 +377,7 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                         const tok = try ctx.lex.next();
                         const raw_str = tok.slice(ctx.src);
                         const content = raw_str[1 .. raw_str.len - 1];
-                        const ref = try internStr(&ctx.intern, ctx.alloc, content);
+                        const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
                         const close = try ctx.lex.next();
                         if (close.tag != .rbracket) return error.QuerySyntaxError;
                         try path_steps.append(ctx.alloc, PathStep{ .kind = .key, .key = ref });
@@ -636,28 +636,535 @@ fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     }
 }
 
-/// Check if an identifier is a built-in function name
-fn isBuiltinFunction(name: []const u8) bool {
-    // Common jq built-in functions
-    const builtins = [_][]const u8{
-        "map",       "select",     "reduce",       "range",        "foreach",        "walk",
-        "keys",      "values",     "to_entries",   "from_entries", "add",            "sub",
-        "mul",       "div",        "mod",          "length",       "utf8bytelength", "explode",
-        "split",     "join",       "min",          "max",          "any",            "all",
-        "first",     "last",       "nth",          "type",         "has",            "paths",
-        "del",       "setpath",    "with_entries", "limit",        "sort",           "sort_by",
-        "group_by",  "unique",     "unique_by",    "map_values",   "index",          "rindex",
-        "inside",    "startswith", "endswith",     "contains",     "test",           "match",
-        "capture",   "matches",    "splitn",       "inputs",       "env",            "tonumber",
-        "tostreams", "tostring",
-    };
+/// Zero-argument builtins: emitted as call_builtin(id) with no parens consumed.
+fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
+    if (std.mem.eql(u8, name, "length")) return .length;
+    if (std.mem.eql(u8, name, "keys")) return .keys;
+    if (std.mem.eql(u8, name, "keys_unsorted")) return .keys_unsorted;
+    if (std.mem.eql(u8, name, "values")) return .values;
+    if (std.mem.eql(u8, name, "type")) return .type_;
+    if (std.mem.eql(u8, name, "empty")) return .empty;
+    if (std.mem.eql(u8, name, "tostring")) return .tostring;
+    if (std.mem.eql(u8, name, "tonumber")) return .tonumber;
+    if (std.mem.eql(u8, name, "error")) return .error_;
+    if (std.mem.eql(u8, name, "add")) return .add;
+    if (std.mem.eql(u8, name, "sort")) return .sort;
+    if (std.mem.eql(u8, name, "reverse")) return .reverse;
+    // flatten is handled as both zero-arg and one-arg; caller must check for parens
+    if (std.mem.eql(u8, name, "flatten")) return .flatten;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "to_entries")) return .to_entries;
+    if (std.mem.eql(u8, name, "from_entries")) return .from_entries;
+    if (std.mem.eql(u8, name, "any")) return .any;
+    if (std.mem.eql(u8, name, "all")) return .all;
+    if (std.mem.eql(u8, name, "unique")) return .unique;
+    return null;
+}
 
-    for (builtins) |builtin| {
-        if (std.mem.eql(u8, name, builtin)) {
-            return true;
-        }
+/// Arg-taking builtins: name requires parens and special argument handling.
+fn isArgBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "map") or
+        std.mem.eql(u8, name, "select") or
+        std.mem.eql(u8, name, "has") or
+        std.mem.eql(u8, name, "in") or
+        std.mem.eql(u8, name, "range") or
+        std.mem.eql(u8, name, "flatten") or
+        std.mem.eql(u8, name, "contains") or
+        std.mem.eql(u8, name, "inside") or
+        std.mem.eql(u8, name, "indices") or
+        std.mem.eql(u8, name, "index") or
+        std.mem.eql(u8, name, "rindex") or
+        std.mem.eql(u8, name, "sort_by") or
+        std.mem.eql(u8, name, "group_by") or
+        std.mem.eql(u8, name, "min_by") or
+        std.mem.eql(u8, name, "max_by") or
+        std.mem.eql(u8, name, "unique_by") or
+        std.mem.eql(u8, name, "with_entries") or
+        std.mem.eql(u8, name, "any") or
+        std.mem.eql(u8, name, "all") or
+        std.mem.eql(u8, name, "first") or
+        std.mem.eql(u8, name, "last") or
+        std.mem.eql(u8, name, "limit") or
+        std.mem.eql(u8, name, "del");
+}
+
+/// Compile a `map(f)` expression.
+/// Desugars to: array_collect_start | iterate | <f> | output | array_collect_end
+fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Consume opening paren
+    _ = try ctx.lex.next();
+
+    // Emit array_collect_start with placeholder end_ip
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Emit iterate: iterates over current value
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+
+    // Parse the mapping expression
+    try parseLogical(ctx);
+
+    // Emit output to collect each element
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // Consume closing paren
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit array_collect_end and backpatch start
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Compile a `select(f)` expression.
+/// Desugars to:
+///   save_input
+///   <f>
+///   jump_if_false(skip)
+///   restore_input
+///   jump(done)
+/// skip:
+///   restore_input
+///   call_builtin(empty)
+/// done:
+fn compileSelect(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Consume opening paren
+    _ = try ctx.lex.next();
+
+    // save_input so we can restore the original for output
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // Parse the predicate expression
+    try parseLogical(ctx);
+
+    // Consume closing paren
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // jump_if_false → skip (placeholder)
+    const jif_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump_if_false, .operand = .{ .index = 0 } });
+
+    // Truthy path: restore_input (gives original value as output)
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // jump → done (placeholder)
+    const jmp_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = 0 } });
+
+    // skip: restore_input then call_builtin(empty)
+    const skip_ip: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[jif_pos].operand = .{ .index = skip_ip };
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.empty) },
+    });
+
+    // done:
+    const done_ip: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[jmp_pos].operand = .{ .index = done_ip };
+}
+
+/// Compile `has(expr)`: compile expr (pushes key), then call_builtin(has).
+fn compileHas(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.has) },
+    });
+}
+
+/// Compile `in(expr)`: save_input, compile expr (pushes object), call_builtin(in_).
+fn compileIn(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.in_) },
+    });
+}
+
+/// Compile `range(n)`, `range(from;to)`, or `range(from;to;by)`.
+fn compileRange(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Parse first argument
+    try parseLogical(ctx);
+
+    // Check for semicolons
+    const t1 = try ctx.lex.peek();
+    if (t1.tag == .rparen) {
+        _ = try ctx.lex.next();
+        try ctx.raw.append(ctx.alloc, RawInstr{
+            .op = .call_builtin,
+            .operand = .{ .index = @intFromEnum(types.BuiltinId.range) },
+        });
+        return;
     }
-    return false;
+    if (t1.tag != .semicolon) return error.QuerySyntaxError;
+    _ = try ctx.lex.next(); // consume ';'
+
+    // Parse second argument
+    try parseLogical(ctx);
+
+    const t2 = try ctx.lex.peek();
+    if (t2.tag == .rparen) {
+        _ = try ctx.lex.next();
+        try ctx.raw.append(ctx.alloc, RawInstr{
+            .op = .call_builtin,
+            .operand = .{ .index = @intFromEnum(types.BuiltinId.range2) },
+        });
+        return;
+    }
+    if (t2.tag != .semicolon) return error.QuerySyntaxError;
+    _ = try ctx.lex.next(); // consume ';'
+
+    // Parse third argument
+    try parseLogical(ctx);
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.range3) },
+    });
+}
+
+// ── Tier 2 arg-taking builtins ──────────────────────────────────────────────
+
+/// Compile `flatten(n)`: compile arg (pushes depth), then call_builtin(flatten_n).
+fn compileFlattenN(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.flatten_n) },
+    });
+}
+
+/// Compile `contains(b)`: compile arg (pushes b), then call_builtin(contains).
+fn compileContains(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.contains) },
+    });
+}
+
+/// Compile `inside(b)`: compile arg (pushes b), then call_builtin(inside).
+fn compileInside(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.inside) },
+    });
+}
+
+/// Compile `indices(s)`: compile arg, then call_builtin(indices).
+fn compileIndices(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.indices) },
+    });
+}
+
+/// Compile `index(s)`: compile arg, then call_builtin(index_).
+fn compileIndex(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.index_) },
+    });
+}
+
+/// Compile `rindex(s)`: compile arg, then call_builtin(rindex).
+fn compileRindex(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.rindex) },
+    });
+}
+
+/// Compile filter-arg builtins (sort_by, group_by, min_by, max_by, unique_by).
+/// Pattern: save_input, array_collect_start, iterate, <f>, output, array_collect_end, call_builtin(X)
+fn compileFilterArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Save original array so we can pair elements with keys
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // Collect keys: [.[] | f]
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+
+    // Parse the filter expression
+    try parseLogical(ctx);
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // array_collect_end
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // call_builtin — pops keys array from value_stack, original array from if_stack
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(bid) },
+    });
+}
+
+/// Compile `with_entries(f)`: desugar to `to_entries | map(f) | from_entries`.
+fn compileWithEntries(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // to_entries
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.to_entries) },
+    });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // map(f): array_collect_start, iterate, <f>, output, array_collect_end
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+
+    // Parse the filter expression
+    try parseLogical(ctx);
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // from_entries
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.from_entries) },
+    });
+}
+
+/// Compile `any(f)` or `all(f)` with 1 or 2 args.
+/// 1 arg: desugar to `[.[] | f] | any/all`
+/// 2 args: desugar to `[gen | cond] | any/all`
+fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Collect outputs: array_collect_start
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse first arg (either the filter f, or the generator gen)
+    try parseLogical(ctx);
+
+    // Check for semicolon (2-arg form: any(gen;cond))
+    const semi = try ctx.lex.peek();
+    if (semi.tag == .semicolon) {
+        _ = try ctx.lex.next(); // consume ';'
+        // First arg was the generator. Pipe into it, then parse cond.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+        try parseLogical(ctx);
+    } else {
+        // 1-arg form: desugar to [.[] | f]
+        // We need to insert iterate before the filter. Use insertRawInstr.
+        // Actually, we need: iterate, <f>. The filter is already emitted.
+        // Insert iterate before the filter.
+        try insertRawInstr(ctx, start_pos + 1, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+    }
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // array_collect_end
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // pipe + call any/all
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(bid) },
+    });
+}
+
+/// Compile `first(f)`: desugar to `[f] | .[0]`.
+/// Actually, more efficient: just collect first output. For now, use `[f] | .[0]`.
+fn compileFirst(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Collect [f]
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    try parsePipe(ctx);
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // .[0]
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_index, .operand = .{ .index = 0 } });
+}
+
+/// Compile `last(f)`: desugar to `[f] | .[-1]`.
+fn compileLast(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Collect [f]
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    try parsePipe(ctx);
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // .[-1]
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_index, .operand = .{ .index = -1 } });
+}
+
+/// Compile `limit(n;f)`: currently collects all outputs of f into an array.
+/// TODO: Implement proper early termination via limit_start/limit_end opcodes.
+/// Without dynamic slicing or early-termination opcodes, this collects all outputs
+/// of f and returns them as an array. Callers like `first(f)` desugar to
+/// `[f] | .[0]` which avoids needing limit entirely.
+fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Parse n (currently unused — full limit needs dynamic slicing or new opcodes)
+    try parseLogical(ctx);
+
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
+
+    // Discard n from the value stack
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // Collect [f]
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    try parsePipe(ctx);
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Compile `del(.key)` or `del(.[n])`: static single-level path deletion.
+fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Parse the path expression inside del()
+    const path_tok = try ctx.lex.next();
+    if (path_tok.tag != .dot) return error.QuerySyntaxError;
+
+    const next_tok = try ctx.lex.peek();
+    switch (next_tok.tag) {
+        .ident => {
+            // del(.key) — push key string, call_builtin(del)
+            const ident = try ctx.lex.next();
+            const ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
+        },
+        .lbracket => {
+            // del(.[n]) or del(.["key"])
+            _ = try ctx.lex.next(); // consume '['
+            const inner = try ctx.lex.peek();
+            switch (inner.tag) {
+                .int_lit => {
+                    const tok = try ctx.lex.next();
+                    const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = n } });
+                },
+                .string_lit => {
+                    const tok = try ctx.lex.next();
+                    const raw_str = tok.slice(ctx.src);
+                    const content = raw_str[1 .. raw_str.len - 1];
+                    const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
+                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
+                },
+                .minus => {
+                    _ = try ctx.lex.next(); // consume '-'
+                    const num_tok = try ctx.lex.next();
+                    if (num_tok.tag != .int_lit) return error.QuerySyntaxError;
+                    const n = std.fmt.parseInt(i64, num_tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = -n } });
+                },
+                else => return error.QuerySyntaxError,
+            }
+            const close = try ctx.lex.next();
+            if (close.tag != .rbracket) return error.QuerySyntaxError;
+        },
+        else => return error.QuerySyntaxError,
+    }
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.del) },
+    });
 }
 
 /// parsePrimary: literals, identifiers (with .field, [index]), `(` expr `)`, `$var`, `def name:`, `func(...)`
@@ -672,9 +1179,9 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         },
         .string_lit => {
             const raw_str = t.slice(ctx.src);
-            // Strip surrounding double-quotes to get the bare content bytes.
+            // Strip surrounding double-quotes, then decode JSON escape sequences.
             const content = raw_str[1 .. raw_str.len - 1];
-            const ref = try internStr(&ctx.intern, ctx.alloc, content);
+            const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
         },
         .int_lit => {
@@ -685,10 +1192,14 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             const f = std.fmt.parseFloat(f64, t.slice(ctx.src)) catch return error.QuerySyntaxError;
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_float, .operand = .{ .float = f } });
         },
+        .minus => {
+            // Unary minus as a primary expression (e.g. catch -1, or -1 in object values).
+            try parsePrimary(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .negate, .operand = .{ .none = {} } });
+        },
         .ident => {
-            // Check if this is a built-in function or function call
-            const peek = try ctx.lex.peek();
             const ident_name = t.slice(ctx.src);
+            const peek = try ctx.lex.peek();
 
             // `null` is a soft keyword: emit push_null when used as a standalone value.
             if (std.mem.eql(u8, ident_name, "null")) {
@@ -696,18 +1207,112 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 return;
             }
 
-            // Built-in functions: map, select, reduce, etc.
-            // These are handled specially in jq
-            if (peek.tag == .lparen or isBuiltinFunction(ident_name)) {
-                // Function call
-                try parseFunctionCall(ctx, t);
-            } else {
-                // Field access
-                const ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
-                const start = ctx.raw.items.len;
-                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
-                try parseSuffixes(ctx, start);
+            // Builtins that can be zero-arg OR one-arg: check for '(' first.
+            // If followed by '(', fall through to arg-builtin dispatch.
+            if (peek.tag == .lparen and isArgBuiltin(ident_name)) {
+                // Will be handled by the arg-builtin dispatch below
+            } else if (zeroArgBuiltinId(ident_name)) |bid| {
+                // Zero-arg builtins: length, keys, values, type, empty, tostring, tonumber, error, add, keys_unsorted
+                // These do NOT consume parens even if followed by '(' (which would be chaining).
+                try ctx.raw.append(ctx.alloc, RawInstr{
+                    .op = .call_builtin,
+                    .operand = .{ .index = @intFromEnum(bid) },
+                });
+                return;
             }
+
+            // Arg-taking builtins: require '(' and consume it
+            if (peek.tag == .lparen and isArgBuiltin(ident_name)) {
+                if (std.mem.eql(u8, ident_name, "map")) {
+                    try compileMap(ctx);
+                } else if (std.mem.eql(u8, ident_name, "select")) {
+                    try compileSelect(ctx);
+                } else if (std.mem.eql(u8, ident_name, "has")) {
+                    try compileHas(ctx);
+                } else if (std.mem.eql(u8, ident_name, "in")) {
+                    try compileIn(ctx);
+                } else if (std.mem.eql(u8, ident_name, "range")) {
+                    try compileRange(ctx);
+                } else if (std.mem.eql(u8, ident_name, "flatten")) {
+                    try compileFlattenN(ctx);
+                } else if (std.mem.eql(u8, ident_name, "contains")) {
+                    try compileContains(ctx);
+                } else if (std.mem.eql(u8, ident_name, "inside")) {
+                    try compileInside(ctx);
+                } else if (std.mem.eql(u8, ident_name, "indices")) {
+                    try compileIndices(ctx);
+                } else if (std.mem.eql(u8, ident_name, "index")) {
+                    try compileIndex(ctx);
+                } else if (std.mem.eql(u8, ident_name, "rindex")) {
+                    try compileRindex(ctx);
+                } else if (std.mem.eql(u8, ident_name, "sort_by")) {
+                    try compileFilterArgBuiltin(ctx, .sort_by);
+                } else if (std.mem.eql(u8, ident_name, "group_by")) {
+                    try compileFilterArgBuiltin(ctx, .group_by);
+                } else if (std.mem.eql(u8, ident_name, "min_by")) {
+                    try compileFilterArgBuiltin(ctx, .min_by);
+                } else if (std.mem.eql(u8, ident_name, "max_by")) {
+                    try compileFilterArgBuiltin(ctx, .max_by);
+                } else if (std.mem.eql(u8, ident_name, "unique_by")) {
+                    try compileFilterArgBuiltin(ctx, .unique_by);
+                } else if (std.mem.eql(u8, ident_name, "with_entries")) {
+                    try compileWithEntries(ctx);
+                } else if (std.mem.eql(u8, ident_name, "any")) {
+                    try compileAnyAll(ctx, .any);
+                } else if (std.mem.eql(u8, ident_name, "all")) {
+                    try compileAnyAll(ctx, .all);
+                } else if (std.mem.eql(u8, ident_name, "first")) {
+                    try compileFirst(ctx);
+                } else if (std.mem.eql(u8, ident_name, "last")) {
+                    try compileLast(ctx);
+                } else if (std.mem.eql(u8, ident_name, "limit")) {
+                    try compileLimit(ctx);
+                } else if (std.mem.eql(u8, ident_name, "del")) {
+                    try compileDel(ctx);
+                }
+                return;
+            }
+
+            // Zero-arg first/last: no parens needed
+            if (std.mem.eql(u8, ident_name, "first")) {
+                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_index, .operand = .{ .index = 0 } });
+                return;
+            }
+            if (std.mem.eql(u8, ident_name, "last")) {
+                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_index, .operand = .{ .index = -1 } });
+                return;
+            }
+
+            // User-defined function call
+            if (peek.tag == .lparen) {
+                const name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+                const func_id = lookupFunction(ctx, name_ref) orelse return error.QuerySyntaxError;
+                _ = try ctx.lex.next(); // consume '('
+                var arg_count: usize = 0;
+                while (true) {
+                    const next_tok = try ctx.lex.peek();
+                    if (next_tok.tag == .rparen) {
+                        _ = try ctx.lex.next();
+                        break;
+                    }
+                    try parseLogical(ctx);
+                    arg_count += 1;
+                    const sep_tok = try ctx.lex.peek();
+                    if (sep_tok.tag == .semicolon) {
+                        _ = try ctx.lex.next();
+                    } else if (sep_tok.tag != .rparen) {
+                        return error.QuerySyntaxError;
+                    }
+                }
+                try ctx.raw.append(ctx.alloc, RawInstr{ .op = .call_function, .operand = .{ .index = func_id } });
+                return;
+            }
+
+            // Plain identifier → field access
+            const ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+            const start = ctx.raw.items.len;
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
+            try parseSuffixes(ctx, start);
         },
         .dot => {
             const after = try ctx.lex.peek();
@@ -726,8 +1331,10 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try parseSuffixes(ctx, start);
                 },
                 else => {
-                    // Bare dot — identity.
-                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .identity, .operand = .{ .none = {} } });
+                    // Bare dot — push the current value onto the stack.
+                    // Using push_current ensures the value is available for binary operators
+                    // (arithmetic, comparison) regardless of evaluation order.
+                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_current, .operand = .{ .none = {} } });
                 },
             }
         },
@@ -1003,61 +1610,6 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     popScope(ctx, ctx.alloc);
 }
 
-/// Parse a function call: func(arg1; arg2; ...) or builtin(expr)
-fn parseFunctionCall(ctx: *Ctx, name_tok: Token) (ZqError || error{OutOfMemory})!void {
-    const ident_name = name_tok.slice(ctx.src);
-
-    // Check if this is a built-in function
-    if (isBuiltinFunction(ident_name)) {
-        // Built-in function: consume opening paren
-        _ = try ctx.lex.next();
-
-        // Parse the expression for built-in function
-        // Built-in functions like map take a single expression in parentheses
-        // For simplicity, we'll just emit iterate for map
-        try parseLogical(ctx);
-
-        // Expect closing paren
-        const rparen = try ctx.lex.next();
-        if (rparen.tag != .rparen) return error.QuerySyntaxError;
-
-        // For now, map just iterates - proper implementation needed
-        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
-    } else {
-        // User-defined function
-        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
-        const func_id = lookupFunction(ctx, name_ref) orelse return error.QuerySyntaxError;
-
-        // Consume opening paren
-        _ = try ctx.lex.next();
-
-        // Parse arguments
-        var arg_count: usize = 0;
-        while (true) {
-            const next_tok = try ctx.lex.peek();
-            if (next_tok.tag == .rparen) {
-                _ = try ctx.lex.next();
-                break;
-            }
-
-            // Parse argument expression
-            try parseLogical(ctx);
-            arg_count += 1;
-
-            // Check for more arguments or end of list
-            const sep_tok = try ctx.lex.peek();
-            if (sep_tok.tag == .semicolon) {
-                _ = try ctx.lex.next();
-            } else if (sep_tok.tag != .rparen) {
-                return error.QuerySyntaxError;
-            }
-        }
-
-        // Emit call_function instruction
-        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .call_function, .operand = .{ .index = func_id } });
-    }
-}
-
 /// Parse an object literal: {key1: value1, key2: value2, ...}
 fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .object_construct_start, .operand = .{ .none = {} } });
@@ -1103,6 +1655,13 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
         const rparen = try ctx.lex.next();
         if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    } else if (peek.tag == .string_lit) {
+        // Quoted string key: strip surrounding double-quotes, decode escape sequences.
+        const key = try ctx.lex.next();
+        const raw = key.slice(ctx.src);
+        const content = raw[1 .. raw.len - 1];
+        const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_string, .operand = .{ .str_ref = ref } });
     } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
         peek.tag == .true_kw or peek.tag == .false_kw or
         peek.tag == .if_kw or peek.tag == .then_kw or peek.tag == .elif_kw or
@@ -1135,6 +1694,13 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
     // Resets to ctx.raw.items.len after each `?` so the next `?` only wraps
     // what came after the previous one.
     var segment_start: usize = start_pos;
+    // Track whether we have already emitted at least one element (the initial
+    // primary element counts, so we start with true if start_pos < current len).
+    // A pipe is emitted before each subsequent element so it receives the
+    // previous element's result in it.current.
+    // The pipe is emitted BEFORE updating segment_start so that `?` wraps only
+    // the element itself, not the pipe (keeping pipe outside any try block).
+    var had_suffix: bool = ctx.raw.items.len > start_pos;
     while (true) {
         const t = try ctx.lex.peek();
         switch (t.tag) {
@@ -1144,16 +1710,33 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
                 switch (nt.tag) {
                     .ident => {
                         _ = try ctx.lex.next();
+                        // Emit pipe between successive suffix elements so each element
+                        // sees the previous element's result in it.current.
+                        if (had_suffix) {
+                            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+                            segment_start = ctx.raw.items.len;
+                        }
+                        had_suffix = true;
                         const ref = try internStr(&ctx.intern, ctx.alloc, nt.slice(ctx.src));
                         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
                     },
                     .lbracket => {
                         _ = try ctx.lex.next();
+                        if (had_suffix) {
+                            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+                            segment_start = ctx.raw.items.len;
+                        }
+                        had_suffix = true;
                         try parseBracket(ctx);
                     },
                     .dollar => {
                         // .$var - variable reference
                         _ = try ctx.lex.next();
+                        if (had_suffix) {
+                            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+                            segment_start = ctx.raw.items.len;
+                        }
+                        had_suffix = true;
                         try parseVariableReference(ctx);
                     },
                     else => return error.QuerySyntaxError, // trailing dot
@@ -1161,6 +1744,11 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
             },
             .lbracket => {
                 _ = try ctx.lex.next();
+                if (had_suffix) {
+                    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+                    segment_start = ctx.raw.items.len;
+                }
+                had_suffix = true;
                 try parseBracket(ctx);
             },
             .question => {
@@ -1172,23 +1760,45 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
                 try ctx.raw.append(ctx.alloc, RawInstr{ .op = .try_end, .operand = .{ .index = 0 } });
                 // The next `?` (if any) only wraps what comes after this try_end.
                 segment_start = ctx.raw.items.len;
+                // After a ?, the next suffix element starts a new segment but still
+                // follows a previous suffix, so keep had_suffix = true.
             },
             else => break,
         }
     }
 }
 
+/// Parse an optional integer (possibly negative: `-` followed by int_lit) used
+/// in slice/index contexts. Returns the integer value if present, or null.
+fn tryParseIndexInt(ctx: *Ctx) (ZqError || error{OutOfMemory})!?i64 {
+    const peek = try ctx.lex.peek();
+    if (peek.tag == .int_lit) {
+        const tok = try ctx.lex.next();
+        return std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+    }
+    if (peek.tag == .minus) {
+        // Peek one more token to see if it's an int_lit (unary minus in index context)
+        _ = try ctx.lex.next(); // consume minus
+        const after = try ctx.lex.peek();
+        if (after.tag == .int_lit) {
+            const tok = try ctx.lex.next();
+            const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+            return -n;
+        }
+        // Not a number after minus — this is a syntax error in index context
+        return error.QuerySyntaxError;
+    }
+    return null;
+}
+
 /// Parse the tail of a slice expression after `:` has been consumed.
 /// `has_from` / `from` carry the already-parsed left bound (if any).
 /// Emits a single `slice` instruction and consumes the closing `]`.
 fn parseSliceTail(ctx: *Ctx, has_from: bool, from: i32) (ZqError || error{OutOfMemory})!void {
-    const peek = try ctx.lex.peek();
     var has_to = false;
     var to: i32 = 0;
-    if (peek.tag == .int_lit) {
+    if (try tryParseIndexInt(ctx)) |n| {
         has_to = true;
-        const tok = try ctx.lex.next();
-        const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
         if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
         to = @intCast(n);
     }
@@ -1218,9 +1828,8 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             _ = try ctx.lex.next(); // consume ':'
             try parseSliceTail(ctx, false, 0);
         },
-        .int_lit => {
-            const tok = try ctx.lex.next();
-            const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return error.QuerySyntaxError;
+        .int_lit, .minus => {
+            const n = (try tryParseIndexInt(ctx)) orelse return error.QuerySyntaxError;
             const after = try ctx.lex.peek();
             if (after.tag == .colon) {
                 // .[n:...] — slice with left bound (negative allowed)
@@ -1228,22 +1837,22 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
                 try parseSliceTail(ctx, true, @intCast(n));
             } else {
-                // .[n] — index access (negative rejected)
-                if (n < 0 or n > std.math.maxInt(u32)) return error.QuerySyntaxError;
+                // .[n] — index access (negative allowed)
+                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return error.QuerySyntaxError;
                 const close = try ctx.lex.next();
                 if (close.tag != .rbracket) return error.QuerySyntaxError;
                 try ctx.raw.append(ctx.alloc, RawInstr{
                     .op = .load_index,
-                    .operand = .{ .index = @intCast(n) },
+                    .operand = .{ .index = n },
                 });
             }
         },
         .string_lit => {
             const tok = try ctx.lex.next();
             const raw_str = tok.slice(ctx.src);
-            // Strip the surrounding double-quotes to get the bare key bytes.
+            // Strip the surrounding double-quotes and decode escape sequences.
             const content = raw_str[1 .. raw_str.len - 1];
-            const ref = try internStr(&ctx.intern, ctx.alloc, content);
+            const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
             const close = try ctx.lex.next();
             if (close.tag != .rbracket) return error.QuerySyntaxError;
             try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_key, .operand = .{ .str_ref = ref } });
@@ -1266,6 +1875,79 @@ fn internStr(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) e
     const off: u32 = @intCast(buf.items.len);
     try buf.appendSlice(alloc, s);
     return .{ .offset = off, .len = @intCast(s.len) };
+}
+
+/// Intern a JSON string literal after decoding its escape sequences.
+/// `raw` must NOT include the surrounding double-quote characters.
+/// Handles: \\, \", \/, \n, \r, \t, \b, \f, \uXXXX (including surrogates).
+fn internDecodedStr(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, raw: []const u8) (ZqError || error{OutOfMemory})!StrRef {
+    const off: u32 = @intCast(buf.items.len);
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '\\') {
+            try buf.append(alloc, raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= raw.len) return error.QuerySyntaxError;
+        switch (raw[i]) {
+            '\\' => {
+                try buf.append(alloc, '\\');
+                i += 1;
+            },
+            '"' => {
+                try buf.append(alloc, '"');
+                i += 1;
+            },
+            '/' => {
+                try buf.append(alloc, '/');
+                i += 1;
+            },
+            'n' => {
+                try buf.append(alloc, '\n');
+                i += 1;
+            },
+            'r' => {
+                try buf.append(alloc, '\r');
+                i += 1;
+            },
+            't' => {
+                try buf.append(alloc, '\t');
+                i += 1;
+            },
+            'b' => {
+                try buf.append(alloc, '\x08');
+                i += 1;
+            },
+            'f' => {
+                try buf.append(alloc, '\x0C');
+                i += 1;
+            },
+            'u' => {
+                i += 1;
+                if (i + 4 > raw.len) return error.QuerySyntaxError;
+                const hi = std.fmt.parseInt(u21, raw[i..][0..4], 16) catch return error.QuerySyntaxError;
+                i += 4;
+                var codepoint: u21 = hi;
+                // Handle UTF-16 surrogate pairs.
+                if (hi >= 0xD800 and hi <= 0xDBFF) {
+                    if (i + 6 > raw.len or raw[i] != '\\' or raw[i + 1] != 'u')
+                        return error.QuerySyntaxError;
+                    const lo = std.fmt.parseInt(u21, raw[i + 2 ..][0..4], 16) catch return error.QuerySyntaxError;
+                    if (lo < 0xDC00 or lo > 0xDFFF) return error.QuerySyntaxError;
+                    codepoint = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+                var utf8_buf: [4]u8 = undefined;
+                const utf8_len = std.unicode.utf8Encode(@intCast(codepoint), &utf8_buf) catch return error.QuerySyntaxError;
+                try buf.appendSlice(alloc, utf8_buf[0..utf8_len]);
+            },
+            else => return error.QuerySyntaxError,
+        }
+    }
+    const len: u32 = @intCast(buf.items.len - off);
+    return .{ .offset = off, .len = len };
 }
 
 /// Append a dot-joined path from `keys` into `buf`, reading key bytes from `src`.
@@ -1394,21 +2076,43 @@ fn fuse(
                 .object_key => .{ .none = {} },
                 .object_construct_end => .{ .none = {} },
                 // Conditional branching: remap raw instruction index → fused index.
-                .jump, .jump_if_false => .{ .index = index_map.items[r.operand.index] },
+                .jump, .jump_if_false => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 .save_input => .{ .none = {} },
                 .restore_input => .{ .none = {} },
                 // Array construction: remap end_ip raw → fused index.
-                .array_collect_start => .{ .index = index_map.items[r.operand.index] },
+                .array_collect_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 .array_collect_end => .{ .none = {} },
                 // Alternative operator: remap jump target raw → fused index.
                 .alt_start => .{ .none = {} },
-                .alt_check => .{ .index = index_map.items[r.operand.index] },
+                .alt_check => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 // Try-catch: remap non-zero index operands (0 = sentinel, no jump).
-                .try_begin => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
-                .try_end => .{ .index = if (r.operand.index > 0) index_map.items[r.operand.index] else 0 },
+                .try_begin => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = if (r.operand.index > 0) index_map.items[idx_usize] else 0;
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .try_end => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = if (r.operand.index > 0) index_map.items[idx_usize] else 0;
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 .slice => .{ .slice_args = r.operand.slice_args },
                 .navigate_key, .update_key => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
                 .navigate_index, .update_index => .{ .index = r.operand.index },
+                // call_builtin: operand is BuiltinId encoded as index; pass through as-is.
+                .call_builtin => .{ .index = r.operand.index },
             },
         };
     }
