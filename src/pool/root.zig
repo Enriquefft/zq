@@ -434,8 +434,26 @@ fn worker_fn(ctx: WorkerCtx) void {
 
         if (job.format) |fmt| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
-            var chunk_buf = std.ArrayList(u8){};
+
+            // Count records first so meta_list can be exactly pre-allocated.
+            // This prevents interleaving: meta_list is allocated FIRST (exact,
+            // never grows), then chunk_buf is allocated SECOND.  Because
+            // chunk_buf is always the arena's last allocation, it can resize
+            // in-place when output exceeds input size (e.g. pretty format) —
+            // no leaked copies from ArrayList doubling.
+            const record_count = blk: {
+                var count: usize = 0;
+                for (job.data) |b| count += @intFromBool(b == '\n');
+                // Account for a final line without trailing newline.
+                if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
+                break :blk count;
+            };
+
             var meta_list = std.ArrayList(RecordMeta){};
+            meta_list.ensureTotalCapacity(aa, record_count) catch {};
+
+            var chunk_buf = std.ArrayList(u8){};
+            chunk_buf.ensureTotalCapacity(aa, job.data.len) catch {};
 
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
@@ -466,8 +484,10 @@ fn worker_fn(ctx: WorkerCtx) void {
                 };
             }
 
-            const data_slice = chunk_buf.toOwnedSlice(aa) catch chunk_buf.items;
-            const meta_slice = meta_list.toOwnedSlice(aa) catch meta_list.items;
+            // Use .items directly — the arena owns the backing memory and
+            // toOwnedSlice would copy + leak the original pre-allocated buffer.
+            const data_slice = chunk_buf.items;
+            const meta_slice = meta_list.items;
 
             ctx.sequencer.post(ChunkResult{
                 .chunk_id = job.chunk_id,

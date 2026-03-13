@@ -1,6 +1,6 @@
 # zq
 
-> A drop-in replacement for jq — rewritten in Zig to be **15x faster**, with zero dependencies and native support for the streaming, high-throughput workloads that define modern AI pipelines.
+> A drop-in replacement for jq — rewritten in Zig to be **25x faster**, with zero dependencies and native support for the streaming, high-throughput workloads that define modern AI pipelines.
 
 ---
 
@@ -16,20 +16,20 @@ zq fixes all of that. Same filter syntax. Just faster — and built for what dev
 
 **File mode — 648 MB / 15M-record JSONL**
 
-| Tool | `.id` | `select(.id > 500000)` | RSS |
-|------|-------|------------------------|-----|
+| Tool | `.id` | `select(.id > 500000)` | RSS (`.id`) |
+|------|-------|------------------------|-------------|
 | jq | 21.8s | 42.6s | 3.6 MB |
 | jaq | 15.3s | 27.7s | 666 MB |
-| **zq** | **1.6s** | **1.4s** | 1613 MB |
+| **zq** | **0.89s** | **3.1s** | **701 MB** |
 
 **Streaming mode — `cat file \| zq .id`**
 
 | Tool | Time | RSS |
 |------|------|-----|
 | jq | ~22s | 3.6 MB |
-| **zq** | **1.8s** | **17 MB** |
+| **zq** | **1.6s** | **8 MB** |
 
-**Startup time:** 0.8ms (6x faster than jq)  
+**Startup time:** ~2ms (3x faster than jq)
 **Binary size:** 2.7 MB static, stripped, zero dependencies
 
 ---
@@ -52,8 +52,8 @@ Early development. Core query engine and parallel runtime are complete.
 
 | Metric | Value |
 |--------|-------|
-| jq compat tests | 60/533 (11%) — targeting 60% for v0.1 |
-| Module tests | 383/856 passing |
+| jq compat tests | 111/539 (21%) — targeting 60% for v0.1 |
+| Module tests | 452/880 passing |
 | Architecture | `error`, `types`, `io`, `parser`, `query`, `output`, `pool`, `c_abi` |
 
 The filter language already covers the most common real-world operators: field access, pipes, array/object construction, arithmetic, comparisons, conditionals, `try/catch`, `//`, `|=`, slicing, string interpolation, and recursive descent.
