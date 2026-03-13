@@ -23,15 +23,15 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-10)
+## Quick Status (Updated 2026-03-13)
 
-**Last updated:** Batched stream mode — stdin now parallel
+**Last updated:** Audit — checked off implemented P1 builtins, negative indexing, --help
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Module tests:       383/856 passing
-Compat tests:       60/533 passing (11%)
-  ├─ 473 skipped/failing
+Module tests:       440/868 passing
+Compat tests:       111/539 passing (20.6%)
+  ├─ 428 skipped/failing
 Startup:            0.8 ms (6x faster than jq)
 Cold start:         ✓ sub-millisecond
 
@@ -95,9 +95,9 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [x] **Optional operator** (`expr?`) | Compiler + VM | Suppress errors on missing keys. `.foo?` |
 | [x] **Slicing** (`.[2:4]`, `.[2:]`, `.[:4]`) | Compiler + VM | Array and string slicing |
 | [x] **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. `.foo \|= . + 1` |
-| [ ] **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing |
-| [ ] **Core builtins (tier 1)** | VM builtins table | `length`, `keys`, `values`, `has`, `in`, `type`, `empty`, `select`, `map`, `add`, `not`, `error`, `null`, `true`, `false`, `tostring`, `tonumber`, `range`, `keys_unsorted` |
-| [ ] **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit`, `first`, `last`, `indices`, `index`, `rindex` |
+| [x] **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing. `resolveSliceBound()` wraps negative indices from end. |
+| [x] **Core builtins (tier 1)** | VM builtins table | `length`, `keys`, `values`, `has`, `in`, `type`, `empty`, `select`, `map`, `add`, `not`, `error`, `null`, `true`, `false`, `tostring`, `tonumber`, `range`, `keys_unsorted` — all implemented. |
+| [x] **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit` (partial — no early termination), `first`, `last`, `indices`, `index`, `rindex` — all implemented. |
 
 ### Query language — P2
 
@@ -142,10 +142,10 @@ Current state: 1702 MB RSS for 648 MB JSONL (2.6x input). Target < 2x. Progress:
 
 | Item | Priority |
 |------|----------|
-| [x] jq compat test suite fully migrated (533 tests) | P0 |
+| [x] jq compat test suite fully migrated (539 tests) | P0 |
 | [x] CI: `zig build test` on every commit | P0 |
 | [x] Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
-| [ ] Basic `--help` text matching jq's structure | P1 |
+| [x] Basic `--help` text matching jq's structure | P1 |
 | [ ] Error messages include filter position and input context | P2 |
 
 ---
@@ -427,7 +427,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | 11% (60/533) | 60% | 95% | 100% |
+| jq compat test pass rate | **20.6%** (111/539) | 60% | 95% | 100% |
 | Throughput vs jq (parallel, 15M JSONL, `.id`) | **15x** (1.4s vs 21.8s) | > 1x ✓ | 5x | 10x |
 | Throughput vs jq (parallel, 15M JSONL, `select()`) | **38x** (1.1s vs 42.6s) | — | 15x | 20x |
 | Startup time | **0.8ms** (6x faster than jq) | < 3ms ✓ | < 3ms | < 3ms |
@@ -435,7 +435,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (648 MB JSONL, parallel) | **1702 MB** (2.6x input) | < 2x input | < 2x input | < 2x input |
 | Memory (streaming pipe) | **17 MB** | — | — | — |
 | Throughput vs jq (streaming, 15M JSONL, `.id`) | **12x** (1.8s vs 22s) | — | — | 10x |
-| Test count | 383 | 400+ | 800+ | 1000+ |
+| Test count | **440** | 400+ ✓ | 800+ | 1000+ |
 
 ---
 
