@@ -2,9 +2,21 @@
 
 ## Purpose
 Manage a fixed set of worker threads, distribute parse+query work across them, and
-guarantee that `collect()` returns results in the same order that work was submitted.
-This is the orchestration layer that stitches together `io`, `parser`, and `query` for
-parallel execution over JSONL files and streams.
+guarantee that `collect()`/`collect_bytes()` returns results in the same order that
+work was submitted. This is the orchestration layer that stitches together `io`,
+`parser`, `query`, and `output` for parallel execution over JSONL files and streams.
+
+Two execution paths are supported:
+
+- **Structured path** (`format = null`): Workers execute queries and copy values into
+  arena-backed OwnedValues. Use `collect()` to retrieve typed `Value` results. Best
+  for queries that produce complex values (objects/arrays) that need post-processing.
+
+- **Serialized path** (`format != null`): Workers execute queries and serialize values
+  directly into arena-backed byte buffers while the tape is still valid. Use
+  `collect_bytes()` to retrieve pre-serialized output. Drastically reduces memory for
+  per-record queries (`.id`, `select()`, `{a,b}`): arena holds only serialized bytes
+  instead of full OwnedValue copies.
 
 Two execution modes are supported:
 
@@ -18,7 +30,7 @@ Two execution modes are supported:
   execute the query, and post ordered results to the sequencer.
 
 In both modes, the **sequencer** holds results out-of-order in a reorder buffer and
-releases them to `collect()` only in submission order.
+releases them to `collect()`/`collect_bytes()` only in submission order.
 
 ---
 
@@ -31,6 +43,7 @@ const std   = @import("std");
 const err   = @import("error");
 const io    = @import("io");
 const query = @import("query");
+const types = @import("types");
 
 pub const ZqError = err.ZqError;
 
@@ -38,70 +51,59 @@ pub const ZqError = err.ZqError;
 /// Values are views into internally-owned Tape memory; they are valid until
 /// the next call to collect() or deinit().
 pub const Result = struct {
-    /// The output value produced by executing the query against one JSON record.
-    /// `value.string` (and object/array spans) point into pool-managed tape memory.
     value: types.Value,
 };
 
-/// A fixed-size worker pool.  Create once, submit work, drain with collect().
-pub const Pool = struct {
-    /// Allocate thread-local Parser instances, shared job queue, sequencer, and
-    /// result buffer.  Spawns `n_threads` OS threads immediately.
-    ///
-    /// Returns OutOfMemory if internal structures cannot be allocated.
-    /// The allocator is stored internally and used by deinit().
-    pub fn init(n_threads: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Pool;
+/// Pre-serialized bytes for one record, returned by collect_bytes().
+/// Valid until the next call to collect_bytes() or deinit().
+pub const BytesResult = struct {
+    data: []const u8,
+    last_was_false_or_null: bool,
+};
 
-    /// Signal all workers to stop, join every thread, and free all memory.
-    /// Blocks until all threads have exited.  Safe to call in defer.
+/// A fixed-size worker pool.  Create once, submit work, drain with collect()
+/// or collect_bytes().
+pub const Pool = struct {
+    pub fn init(n_threads: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Pool;
     pub fn deinit(p: *Pool) void;
 
     /// Submit a regular file for parallel processing.
-    ///
-    /// The file descriptor must remain valid until collect() returns null.
-    /// The pool reads the file, splits it on newline boundaries, and distributes
-    /// byte-range chunks to worker threads.
-    ///
-    /// `query` must outlive the pool (it is immutable and shared across threads).
+    /// `format`: null → structured path (use collect()), non-null → serialized path (use collect_bytes()).
     pub fn submit_file(
-        p:     *Pool,
-        fd:    std.posix.fd_t,
-        cq:    *const query.CompiledQuery,
+        p:      *Pool,
+        file:   std.fs.File,
+        cq:     *const query.CompiledQuery,
+        format: ?types.Format,
     ) ZqError!void;
 
-    /// Submit a streaming source (stdin, socket, …) for pipeline processing.
-    ///
-    /// A dedicated IO thread reads complete newline-terminated records from `src`
-    /// and distributes them to worker threads.  `src` must remain valid until
-    /// collect() returns null.
-    ///
-    /// `query` must outlive the pool.
+    /// Submit a streaming source for pipeline processing.
+    /// `format`: null → structured path (use collect()), non-null → serialized path (use collect_bytes()).
     pub fn submit_stream(
-        p:   *Pool,
-        src: *io.Source,
-        cq:  *const query.CompiledQuery,
+        p:      *Pool,
+        src:    *io.Source,
+        cq:     *const query.CompiledQuery,
+        format: ?types.Format,
     ) void;
 
-    /// Return the next result in submission order.
-    ///
-    /// Blocks until the next in-order result is available or all work is done.
-    /// Returns null when all submitted records have been processed.
-    /// Returns an error if a worker encountered a parse or query error on a record.
-    ///
-    /// The returned Result is valid until the next call to collect() or deinit().
+    /// Return the next result in submission order (structured path).
     pub fn collect(p: *Pool) ZqError!?Result;
+
+    /// Return pre-serialized bytes for the next record (serialized path).
+    /// Skips empty records (e.g. select(false)).
+    pub fn collect_bytes(p: *Pool) ZqError!?BytesResult;
 };
 ```
 
 ### Functions
 
-| Function            | Signature                                                          | Description                                                                             |
-|---------------------|--------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
-| `Pool.init`         | `usize, Allocator → error{OutOfMemory}!Pool`                       | Allocate all internal state and spawn N worker threads.                                 |
-| `Pool.deinit`       | `*Pool → void`                                                     | Stop all workers, join threads, free memory.                                            |
-| `Pool.submit_file`  | `*Pool, fd_t, *const CompiledQuery → ZqError!void`                 | Read file, split into newline-aligned chunks, enqueue for parallel processing.          |
-| `Pool.submit_stream`| `*Pool, *Source, *const CompiledQuery → void`                      | Attach stream; IO thread reads lines and feeds workers in pipeline mode.                |
-| `Pool.collect`      | `*Pool → ZqError!?Result`                                          | Return next in-order result; null when exhausted; error on per-record failure.          |
+| Function              | Signature                                                              | Description                                                                             |
+|-----------------------|------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| `Pool.init`           | `usize, Allocator → error{OutOfMemory}!Pool`                          | Allocate all internal state and spawn N worker threads.                                 |
+| `Pool.deinit`         | `*Pool → void`                                                         | Stop all workers, join threads, free memory.                                            |
+| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format → ZqError!void`           | Read file, split into newline-aligned chunks, enqueue for parallel processing.          |
+| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format → void`                 | Attach stream; IO thread reads lines and feeds workers in pipeline mode.                |
+| `Pool.collect`        | `*Pool → ZqError!?Result`                                              | Return next in-order result; null when exhausted; error on per-record failure.          |
+| `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                         | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
 
 ### Errors
 
@@ -124,10 +126,11 @@ pub const Pool = struct {
 ## Dependencies
 
 - `src/error/root.zig`  — `ZqError` for propagation
-- `src/types.zig`       — `Value`, `Tape`
-- `src/io/root.zig`     — `Source`, `SliceView`
+- `src/types.zig`       — `Value`, `Tape`, `Format`
+- `src/io/root.zig`     — `Source`, `SliceView`, `MappedFile`
 - `src/parser/root.zig` — `Parser`, `FeedResult`
 - `src/query/root.zig`  — `CompiledQuery`, `ResultIterator`
+- `src/output/root.zig` — `BufferSink`, `serialize()` (serialized path only)
 
 ---
 
@@ -137,7 +140,7 @@ pub const Pool = struct {
   one per thread.
 - **`CompiledQuery` is read-only and shared.** `execute()` is safe to call concurrently
   from multiple threads on the same `CompiledQuery`.
-- **collect() is single-caller.** Only one thread may call collect() at a time.
+- **collect()/collect_bytes() is single-caller.** Only one thread may call these at a time.
   The pool does not synchronize multiple callers.
 - **Results are returned in submission order.** The sequencer holds out-of-order results
   in a bounded reorder buffer and blocks until the next in-sequence result is ready.
@@ -146,7 +149,12 @@ pub const Pool = struct {
 - **`Result.value` is valid only until the next collect() or deinit() call.** Tape
   memory is reused across records; callers must consume or copy values before calling
   collect() again.
-- **`submit_file` and `submit_stream` must not be called after collect() returns null.**
-  The pool is single-use after drain.
+- **`BytesResult.data` is valid only until the next collect_bytes() or deinit() call.**
+  Data points into the arena of the current chunk; freed when advancing past the chunk.
+- **`submit_file` and `submit_stream` must not be called after collect()/collect_bytes()
+  returns null.** The pool is single-use after drain.
 - **`n_threads = 0` is valid** and means the calling thread executes all work inline
   (useful for testing and single-core environments). All invariants still hold.
+- **Serialized path memory savings**: For per-record scalar queries, arena holds only
+  serialized bytes (e.g. "42\n" = 3 bytes) instead of OwnedValue structs + tape copies.
+  With 32 in-flight chunks: ~50 MB vs ~700 MB for a 648 MB file.

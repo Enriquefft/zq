@@ -1,13 +1,16 @@
 # Module: output
 
 ## Purpose
-Serialize `Value` instances produced by the Query module to an output file descriptor.
-Accumulates up to 64 KB in an internal buffer before issuing `write()` syscalls,
-reducing OS round-trips from millions to a few dozen on large workloads.
+Serialize `Value` instances produced by the Query module to an output file descriptor
+or a growable byte buffer. Accumulates up to 64 KB in an internal buffer before issuing
+`write()` syscalls, reducing OS round-trips from millions to a few dozen on large workloads.
 
 Supports four output formats: pretty-printed JSON (default for TTY), compact JSON,
 raw string output, and JSONL (one compact JSON value per newline). TTY detection is
 performed once at `init` time and drives the default format selection by callers.
+
+The serialization logic is generic: the same functions power both `Writer` (file-backed
+buffered output) and `BufferSink` (growable ArrayList target for worker threads).
 
 ---
 
@@ -23,6 +26,17 @@ pub const ZqError = err.ZqError;
 pub const Value   = types.Value;
 pub const Format  = types.Format;
 
+/// Adapts an std.ArrayList(u8) to the writeByte/writeSlice interface
+/// used by the generic serialization functions.  Used by pool workers to
+/// serialize values directly into arena-backed byte buffers.
+pub const BufferSink = struct {
+    list: *std.ArrayList(u8),
+    aa: std.mem.Allocator,
+
+    pub fn writeByte(self: *BufferSink, byte: u8) error{OutOfMemory}!void;
+    pub fn writeSlice(self: *BufferSink, data: []const u8) error{OutOfMemory}!void;
+};
+
 pub const Writer = struct {
     /// Create a Writer targeting `fd`.
     /// `allocator` is stored internally and used by `deinit`.
@@ -36,6 +50,10 @@ pub const Writer = struct {
     /// Flushes automatically when the buffer reaches 64 KB.
     /// Returns `error.IoError` if an underlying `write()` syscall fails.
     pub fn write_value(w: *Writer, val: Value, format: Format) ZqError!void;
+
+    /// Append pre-serialized bytes directly to the internal buffer.
+    /// Used by main.zig to write output from the serialized pool path.
+    pub fn writeSlice(w: *Writer, data: []const u8) ZqError!void;
 
     /// Flush all buffered bytes to the OS.
     /// Returns `error.IoError` if the `write()` syscall fails.
@@ -51,9 +69,11 @@ pub const Writer = struct {
 
 | Function          | Signature                                              | Description                                                                       |
 |-------------------|--------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `serialize`       | `anytype, Value, Format → !void`                      | Serialize `val` into any sink with `writeByte`/`writeSlice` methods.              |
 | `Writer.init`     | `fd, Allocator → error{OutOfMemory}!Writer`           | Allocate 64 KB internal buffer; detect TTY via `isatty`.                          |
 | `Writer.deinit`   | `*Writer → void`                                       | Flush buffered output and free the internal buffer.                               |
 | `Writer.write_value` | `*Writer, Value, Format → ZqError!void`           | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB.            |
+| `Writer.writeSlice`  | `*Writer, []const u8 → ZqError!void`              | Append pre-serialized bytes to the buffer; auto-flush as needed.                  |
 | `Writer.flush`    | `*Writer → ZqError!void`                               | Write all buffered bytes to the OS; reset buffer cursor to zero.                  |
 | `Writer.is_tty`   | `*const Writer → bool`                                 | Return TTY detection result cached at `init` time.                                |
 
@@ -89,13 +109,17 @@ pub const Writer = struct {
 - **Buffer size is fixed at 64 KB.** Allocated once in `init`; never reallocated.
 - **Auto-flush threshold is 64 KB.** `write_value` flushes before appending a value
   that would overflow the buffer, guaranteeing no partial values are split across flush boundaries.
-- **`write_value` is the only serialization site.** Format strategy (pretty/compact/raw/jsonl)
-  is selected by a single switch inside `write_value`; no format logic leaks to callers.
+- **Serialization is generic.** The same `serializeValueCompact`/`serializeValuePretty`/etc.
+  functions are used by both `Writer` (file-backed) and `BufferSink` (growable buffer).
+  They are parameterized on `anytype` requiring `writeByte`/`writeSlice` methods.
+- **`serialize()` is the public entry point** for non-Writer targets.
+- **`Writer.writeSlice()` is public** for writing pre-serialized byte data.
 - **TTY detection is cached.** `isatty` is called once in `init`; `is_tty()` is O(1).
 - **`deinit` flushes.** Any buffered bytes not yet written are flushed during `deinit`.
   Write errors during `deinit` flush are silently dropped (destructor contract).
 - **Non-owning views.** `Writer` does not own the `Value` or `Tape` memory it reads.
   Callers must keep the originating `Tape` alive for the duration of `write_value`.
 - **Not thread-safe.** Each output context (stdout, file) must use its own `Writer`.
+  `BufferSink` is also not thread-safe; each worker creates its own.
 - **`ZqError` and `ErrorKind` parity.** No new `ZqError` variants are added; only
   `IoError` (already present) is raised by this module.

@@ -9,6 +9,208 @@ pub const Format = types.Format;
 /// Internal buffer capacity: 64 KB.
 const BUF_CAP: usize = 64 * 1024;
 
+// ── BufferSink — growable-buffer target for generic serialization ─────────────
+
+/// Adapts an `std.ArrayList(u8)` to the same `writeByte`/`writeSlice` interface
+/// used by the generic serialization functions.  Used by pool workers to
+/// serialize values directly into arena-backed byte buffers.
+pub const BufferSink = struct {
+    list: *std.ArrayList(u8),
+    aa: std.mem.Allocator,
+
+    pub fn writeByte(self: *BufferSink, byte: u8) error{OutOfMemory}!void {
+        try self.list.append(self.aa, byte);
+    }
+
+    pub fn writeSlice(self: *BufferSink, data: []const u8) error{OutOfMemory}!void {
+        try self.list.appendSlice(self.aa, data);
+    }
+};
+
+// ── Public serialize entry point ──────────────────────────────────────────────
+
+/// Serialize `val` into any sink supporting `writeByte`/`writeSlice`.
+/// Format semantics match `Writer.write_value`.
+pub fn serialize(ctx: anytype, val: Value, format: Format) !void {
+    switch (format) {
+        .pretty => try serializeValuePretty(ctx, val, 0),
+        .compact => try serializeValueCompact(ctx, val),
+        .raw => try serializeValueRaw(ctx, val),
+        .jsonl => {
+            try serializeValueCompact(ctx, val);
+            try ctx.writeByte('\n');
+        },
+    }
+}
+
+// ── Generic serialization functions ───────────────────────────────────────────
+//
+// Each function takes `ctx: anytype` which must provide:
+//   fn writeByte(*@TypeOf(ctx), u8) !void
+//   fn writeSlice(*@TypeOf(ctx), []const u8) !void
+
+fn serializeValueCompact(ctx: anytype, val: Value) anyerror!void {
+    switch (val) {
+        .null_val => try ctx.writeSlice("null"),
+        .bool_val => |b| try ctx.writeSlice(if (b) "true" else "false"),
+        .int => |n| {
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+            try ctx.writeSlice(s);
+        },
+        .float => |f| {
+            var tmp: [64]u8 = undefined;
+            const s = formatFloat(&tmp, f);
+            try ctx.writeSlice(s);
+        },
+        .string => |s| {
+            try ctx.writeByte('"');
+            try serializeEscaped(ctx, s);
+            try ctx.writeByte('"');
+        },
+        .array => |span| try serializeArrayCompact(ctx, span),
+        .object => |span| try serializeObjectCompact(ctx, span),
+    }
+}
+
+fn serializeArrayCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
+    try ctx.writeByte('[');
+    const tape = span.tape;
+    var idx = span.start + 1;
+    var first = true;
+    while (idx < span.end - 1) {
+        if (!first) try ctx.writeByte(',');
+        first = false;
+        const entry = tape.entries[idx];
+        const child_val = entryToValue(tape, idx, entry);
+        try serializeValueCompact(ctx, child_val);
+        idx = skipEntry(tape, idx);
+    }
+    try ctx.writeByte(']');
+}
+
+fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
+    try ctx.writeByte('{');
+    const tape = span.tape;
+    var idx = span.start + 1;
+    var first = true;
+    while (idx < span.end - 1) {
+        const key_ref = tape.entries[idx].payload.string;
+        const key_str = tape.getString(key_ref);
+        if (!first) try ctx.writeByte(',');
+        first = false;
+        try ctx.writeByte('"');
+        try serializeEscaped(ctx, key_str);
+        try ctx.writeSlice("\":");
+        idx += 1;
+        const val_entry = tape.entries[idx];
+        const child_val = entryToValue(tape, idx, val_entry);
+        try serializeValueCompact(ctx, child_val);
+        idx = skipEntry(tape, idx);
+    }
+    try ctx.writeByte('}');
+}
+
+fn serializeValuePretty(ctx: anytype, val: Value, depth: u32) anyerror!void {
+    switch (val) {
+        .null_val, .bool_val, .int, .float, .string => {
+            try serializeValueCompact(ctx, val);
+        },
+        .array => |span| try serializeArrayPretty(ctx, span, depth),
+        .object => |span| try serializeObjectPretty(ctx, span, depth),
+    }
+}
+
+fn serializeArrayPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror!void {
+    const tape = span.tape;
+    if (span.end - span.start == 2) {
+        try ctx.writeSlice("[]");
+        return;
+    }
+    try ctx.writeSlice("[\n");
+    var idx = span.start + 1;
+    var first = true;
+    while (idx < span.end - 1) {
+        if (!first) try ctx.writeSlice(",\n");
+        first = false;
+        try serializeIndent(ctx, depth + 1);
+        const entry = tape.entries[idx];
+        const child_val = entryToValue(tape, idx, entry);
+        try serializeValuePretty(ctx, child_val, depth + 1);
+        idx = skipEntry(tape, idx);
+    }
+    try ctx.writeByte('\n');
+    try serializeIndent(ctx, depth);
+    try ctx.writeByte(']');
+}
+
+fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror!void {
+    const tape = span.tape;
+    if (span.end - span.start == 2) {
+        try ctx.writeSlice("{}");
+        return;
+    }
+    try ctx.writeSlice("{\n");
+    var idx = span.start + 1;
+    var first = true;
+    while (idx < span.end - 1) {
+        const key_ref = tape.entries[idx].payload.string;
+        const key_str = tape.getString(key_ref);
+        if (!first) try ctx.writeSlice(",\n");
+        first = false;
+        try serializeIndent(ctx, depth + 1);
+        try ctx.writeByte('"');
+        try serializeEscaped(ctx, key_str);
+        try ctx.writeSlice("\": ");
+        idx += 1;
+        const val_entry = tape.entries[idx];
+        const child_val = entryToValue(tape, idx, val_entry);
+        try serializeValuePretty(ctx, child_val, depth + 1);
+        idx = skipEntry(tape, idx);
+    }
+    try ctx.writeByte('\n');
+    try serializeIndent(ctx, depth);
+    try ctx.writeByte('}');
+}
+
+fn serializeValueRaw(ctx: anytype, val: Value) anyerror!void {
+    switch (val) {
+        .string => |s| try ctx.writeSlice(s),
+        else => try serializeValueCompact(ctx, val),
+    }
+}
+
+fn serializeEscaped(ctx: anytype, s: []const u8) anyerror!void {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        switch (c) {
+            '"' => try ctx.writeSlice("\\\""),
+            '\\' => try ctx.writeSlice("\\\\"),
+            '\n' => try ctx.writeSlice("\\n"),
+            '\r' => try ctx.writeSlice("\\r"),
+            '\t' => try ctx.writeSlice("\\t"),
+            0x08 => try ctx.writeSlice("\\b"),
+            0x0C => try ctx.writeSlice("\\f"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                var tmp: [6]u8 = undefined;
+                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
+                try ctx.writeSlice(seq);
+            },
+            else => try ctx.writeByte(c),
+        }
+    }
+}
+
+fn serializeIndent(ctx: anytype, depth: u32) anyerror!void {
+    var i: u32 = 0;
+    while (i < depth * 2) : (i += 1) {
+        try ctx.writeByte(' ');
+    }
+}
+
+// ── Buffered Writer targeting a single file ───────────────────────────────────
+
 /// Buffered serializer targeting a single file.
 ///
 /// Accumulates output in a 64 KB heap buffer and issues `writeAll()` only when
@@ -58,23 +260,12 @@ pub const Writer = struct {
     /// worst-case value (64 KB flush boundary). Returns `error.IoError` if
     /// any underlying `writeAll()` call fails.
     pub fn write_value(w: *Writer, val: Value, format: Format) ZqError!void {
-        // Flush proactively when the buffer is more than half full to avoid
-        // splitting large values. Entire values are written atomically to the
-        // buffer (the buffer is 64 KB; a single JSON value is unlikely to
-        // exceed that, but we flush first to maximize available space).
         if (w.len > BUF_CAP / 2) {
             try w.flush();
         }
-
-        switch (format) {
-            .pretty => try w.writeValuePretty(val, 0),
-            .compact => try w.writeValueCompact(val),
-            .raw => try w.writeValueRaw(val),
-            .jsonl => {
-                try w.writeValueCompact(val);
-                try w.writeByte('\n');
-            },
-        }
+        // Generic serialize functions return anyerror (needed for recursive generics);
+        // Writer's writeByte/writeSlice only produce ZqError, so @errorCast is safe.
+        serialize(w, val, format) catch |e| return @as(ZqError, @errorCast(e));
     }
 
     /// Write all buffered bytes to the OS and reset the buffer cursor.
@@ -84,17 +275,9 @@ pub const Writer = struct {
         w.len = 0;
     }
 
-    // ── Low-level buffer helpers ───────────────────────────────────────────────
-
-    /// Append a single byte to the buffer, flushing first if full.
-    fn writeByte(w: *Writer, byte: u8) ZqError!void {
-        if (w.len == BUF_CAP) try w.flush();
-        w.buf[w.len] = byte;
-        w.len += 1;
-    }
-
-    /// Append a slice to the buffer, flushing in chunks as needed.
-    fn writeSlice(w: *Writer, data: []const u8) ZqError!void {
+    /// Append pre-serialized bytes directly to the internal buffer.
+    /// Used by main.zig to write output from the serialized pool path.
+    pub fn writeSlice(w: *Writer, data: []const u8) ZqError!void {
         var remaining = data;
         while (remaining.len > 0) {
             const space = BUF_CAP - w.len;
@@ -106,177 +289,13 @@ pub const Writer = struct {
         }
     }
 
-    /// Write `n` space characters (for indentation).
-    fn writeIndent(w: *Writer, depth: u32) ZqError!void {
-        var i: u32 = 0;
-        while (i < depth * 2) : (i += 1) {
-            try w.writeByte(' ');
-        }
-    }
+    // ── Low-level buffer helpers (satisfy generic serialize interface) ─────────
 
-    // ── Format: compact ───────────────────────────────────────────────────────
-
-    fn writeValueCompact(w: *Writer, val: Value) ZqError!void {
-        switch (val) {
-            .null_val => try w.writeSlice("null"),
-            .bool_val => |b| try w.writeSlice(if (b) "true" else "false"),
-            .int => |n| {
-                var tmp: [32]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-                try w.writeSlice(s);
-            },
-            .float => |f| {
-                var tmp: [64]u8 = undefined;
-                const s = formatFloat(&tmp, f);
-                try w.writeSlice(s);
-            },
-            .string => |s| {
-                try w.writeByte('"');
-                try w.writeEscaped(s);
-                try w.writeByte('"');
-            },
-            .array => |span| try w.writeArrayCompact(span),
-            .object => |span| try w.writeObjectCompact(span),
-        }
-    }
-
-    fn writeArrayCompact(w: *Writer, span: Value.TapeSpan) ZqError!void {
-        try w.writeByte('[');
-        const tape = span.tape;
-        var idx = span.start + 1; // skip array_start
-        var first = true;
-        while (idx < span.end - 1) { // stop before array_end
-            if (!first) try w.writeByte(',');
-            first = false;
-            const entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, entry);
-            try w.writeValueCompact(child_val);
-            idx = skipEntry(tape, idx);
-        }
-        try w.writeByte(']');
-    }
-
-    fn writeObjectCompact(w: *Writer, span: Value.TapeSpan) ZqError!void {
-        try w.writeByte('{');
-        const tape = span.tape;
-        var idx = span.start + 1; // skip object_start
-        var first = true;
-        while (idx < span.end - 1) { // stop before object_end
-            // entry at idx is always a key
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            if (!first) try w.writeByte(',');
-            first = false;
-            try w.writeByte('"');
-            try w.writeEscaped(key_str);
-            try w.writeSlice("\":");
-            idx += 1; // advance to value entry
-            const val_entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, val_entry);
-            try w.writeValueCompact(child_val);
-            idx = skipEntry(tape, idx);
-        }
-        try w.writeByte('}');
-    }
-
-    // ── Format: pretty ────────────────────────────────────────────────────────
-
-    fn writeValuePretty(w: *Writer, val: Value, depth: u32) ZqError!void {
-        switch (val) {
-            .null_val, .bool_val, .int, .float, .string => {
-                // Scalars render identically in pretty and compact.
-                try w.writeValueCompact(val);
-            },
-            .array => |span| try w.writeArrayPretty(span, depth),
-            .object => |span| try w.writeObjectPretty(span, depth),
-        }
-    }
-
-    fn writeArrayPretty(w: *Writer, span: Value.TapeSpan, depth: u32) ZqError!void {
-        const tape = span.tape;
-        // Check if array is empty.
-        if (span.end - span.start == 2) {
-            try w.writeSlice("[]");
-            return;
-        }
-        try w.writeSlice("[\n");
-        var idx = span.start + 1;
-        var first = true;
-        while (idx < span.end - 1) {
-            if (!first) try w.writeSlice(",\n");
-            first = false;
-            try w.writeIndent(depth + 1);
-            const entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, entry);
-            try w.writeValuePretty(child_val, depth + 1);
-            idx = skipEntry(tape, idx);
-        }
-        try w.writeByte('\n');
-        try w.writeIndent(depth);
-        try w.writeByte(']');
-    }
-
-    fn writeObjectPretty(w: *Writer, span: Value.TapeSpan, depth: u32) ZqError!void {
-        const tape = span.tape;
-        // Check if object is empty.
-        if (span.end - span.start == 2) {
-            try w.writeSlice("{}");
-            return;
-        }
-        try w.writeSlice("{\n");
-        var idx = span.start + 1;
-        var first = true;
-        while (idx < span.end - 1) {
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            if (!first) try w.writeSlice(",\n");
-            first = false;
-            try w.writeIndent(depth + 1);
-            try w.writeByte('"');
-            try w.writeEscaped(key_str);
-            try w.writeSlice("\": ");
-            idx += 1;
-            const val_entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, val_entry);
-            try w.writeValuePretty(child_val, depth + 1);
-            idx = skipEntry(tape, idx);
-        }
-        try w.writeByte('\n');
-        try w.writeIndent(depth);
-        try w.writeByte('}');
-    }
-
-    // ── Format: raw ───────────────────────────────────────────────────────────
-
-    fn writeValueRaw(w: *Writer, val: Value) ZqError!void {
-        switch (val) {
-            .string => |s| try w.writeSlice(s), // no quotes, no escaping
-            else => try w.writeValueCompact(val),
-        }
-    }
-
-    // ── JSON string escaping ──────────────────────────────────────────────────
-
-    fn writeEscaped(w: *Writer, s: []const u8) ZqError!void {
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            const c = s[i];
-            switch (c) {
-                '"' => try w.writeSlice("\\\""),
-                '\\' => try w.writeSlice("\\\\"),
-                '\n' => try w.writeSlice("\\n"),
-                '\r' => try w.writeSlice("\\r"),
-                '\t' => try w.writeSlice("\\t"),
-                0x08 => try w.writeSlice("\\b"),
-                0x0C => try w.writeSlice("\\f"),
-                0x00...0x07, 0x0B, 0x0E...0x1F => {
-                    var tmp: [6]u8 = undefined;
-                    const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try w.writeSlice(seq);
-                },
-                else => try w.writeByte(c),
-            }
-        }
+    /// Append a single byte to the buffer, flushing first if full.
+    fn writeByte(w: *Writer, byte: u8) ZqError!void {
+        if (w.len == BUF_CAP) try w.flush();
+        w.buf[w.len] = byte;
+        w.len += 1;
     }
 };
 

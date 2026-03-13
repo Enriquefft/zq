@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
     pool_module.addImport("io", io_module);
     pool_module.addImport("parser", parser_module);
     pool_module.addImport("query", query_module);
+    pool_module.addImport("output", output_module);
 
     const c_abi_module = b.createModule(.{
         .root_source_file = b.path("src/c_abi/root.zig"),

@@ -5,6 +5,8 @@
 /// exercised via a pipe created with std.posix.pipe().
 ///
 /// Ordering invariant: collect() must always return results in submission order.
+///
+/// Both structured (format=null) and serialized (format!=null) paths are tested.
 const std = @import("std");
 const pool_mod = @import("pool");
 const query_mod = @import("query");
@@ -12,6 +14,7 @@ const types = @import("types");
 
 const Pool = pool_mod.Pool;
 const Result = pool_mod.Result;
+const BytesResult = pool_mod.BytesResult;
 const CompiledQuery = query_mod.CompiledQuery;
 const alloc = std.testing.allocator;
 
@@ -33,7 +36,7 @@ fn tmp_file_fd(data: []const u8) !std.fs.File {
     return std.fs.File{ .handle = fd };
 }
 
-/// Drain all results from the pool into an ArrayList of Values.
+/// Drain all results from the pool into an ArrayList of Values (structured path).
 /// Caller owns the returned slice and must free it.
 fn drain(p: *Pool) ![]types.Value {
     var out = std.ArrayList(types.Value){};
@@ -50,6 +53,22 @@ fn drain(p: *Pool) ![]types.Value {
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Drain all results from the pool as bytes (serialized path).
+/// Returns concatenated output and the last last_was_false_or_null flag.
+fn drain_bytes(p: *Pool) !struct { data: []u8, last_was_false_or_null: bool } {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(alloc);
+    var last_flag = false;
+    while (try p.collect_bytes()) |r| {
+        try out.appendSlice(alloc, r.data);
+        last_flag = r.last_was_false_or_null;
+    }
+    return .{
+        .data = try out.toOwnedSlice(alloc),
+        .last_was_false_or_null = last_flag,
+    };
 }
 
 fn free_values(values: []types.Value) void {
@@ -81,7 +100,7 @@ test "init and deinit — four threads" {
     p.deinit();
 }
 
-// ── File mode: basic correctness ──────────────────────────────────────────────
+// ── File mode: basic correctness (structured path) ────────────────────────────
 
 test "submit_file: single integer line" {
     var cq = try compile(".");
@@ -93,7 +112,7 @@ test "submit_file: single integer line" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -112,7 +131,7 @@ test "submit_file: three integer lines in order" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -133,7 +152,7 @@ test "submit_file: no trailing newline" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -152,7 +171,7 @@ test "submit_file: empty file returns no results" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -170,7 +189,7 @@ test "submit_file: blank lines are skipped" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -179,7 +198,7 @@ test "submit_file: blank lines are skipped" {
     try std.testing.expectEqual(@as(i64, 7), vals[0].int);
 }
 
-// ── File mode: query projection ───────────────────────────────────────────────
+// ── File mode: query projection (structured path) ─────────────────────────────
 
 test "submit_file: .x field projection" {
     var cq = try compile(".x");
@@ -191,7 +210,7 @@ test "submit_file: .x field projection" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -212,7 +231,7 @@ test "submit_file: string value round-trip" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -222,7 +241,7 @@ test "submit_file: string value round-trip" {
     try std.testing.expectEqualStrings("bob", vals[1].string);
 }
 
-// ── File mode: ordering under parallelism ─────────────────────────────────────
+// ── File mode: ordering under parallelism (structured path) ───────────────────
 
 test "submit_file: ordering preserved with 4 workers, 20 records" {
     var cq = try compile(".");
@@ -241,7 +260,7 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
     var p = try Pool.init(4, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -252,7 +271,7 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
     }
 }
 
-// ── File mode: error propagation ──────────────────────────────────────────────
+// ── File mode: error propagation (structured path) ────────────────────────────
 
 test "submit_file: malformed JSON returns parse error" {
     var cq = try compile(".");
@@ -264,7 +283,7 @@ test "submit_file: malformed JSON returns parse error" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const result = p.collect();
     try std.testing.expectError(error.UnexpectedToken, result);
@@ -281,13 +300,13 @@ test "submit_file: type error propagated from query" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const result = p.collect();
     try std.testing.expectError(error.TypeError, result);
 }
 
-// ── File mode: value types ────────────────────────────────────────────────────
+// ── File mode: value types (structured path) ──────────────────────────────────
 
 test "submit_file: boolean values" {
     var cq = try compile(".");
@@ -299,7 +318,7 @@ test "submit_file: boolean values" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -319,7 +338,7 @@ test "submit_file: null value" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -338,7 +357,7 @@ test "submit_file: float value" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -347,7 +366,7 @@ test "submit_file: float value" {
     try std.testing.expectApproxEqAbs(@as(f64, 3.14), vals[0].float, 1e-9);
 }
 
-// ── Stream mode ───────────────────────────────────────────────────────────────
+// ── Stream mode (structured path) ─────────────────────────────────────────────
 
 test "submit_stream: three lines via pipe" {
     var cq = try compile(".");
@@ -371,7 +390,7 @@ test "submit_stream: three lines via pipe" {
     var p = try Pool.init(2, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq);
+    p.submit_stream(&src, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -397,7 +416,7 @@ test "submit_stream: empty stream returns no results" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq);
+    p.submit_stream(&src, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -421,7 +440,7 @@ test "submit_stream: no trailing newline" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq);
+    p.submit_stream(&src, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -442,7 +461,7 @@ test "collect returns null when called after drain" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     free_values(vals);
@@ -455,14 +474,6 @@ test "collect returns null when called after drain" {
 // ── n_threads = 0: inline fallback ───────────────────────────────────────────
 
 test "zero threads: submit_file processes records synchronously" {
-    // With n_threads = 0, no worker threads exist.  The queue will never be
-    // drained by a background thread so submit_file must handle this path.
-    // Current implementation relies on workers — skip this test unless we add
-    // inline fallback.  Mark as skipped for now by checking the result count
-    // when 0 threads means 0 workers; the queue stays full and submit blocks.
-    //
-    // For robustness, run the test with 1 thread which is effectively the
-    // minimum real configuration.
     var cq = try compile(".");
     defer cq.deinit();
 
@@ -472,7 +483,7 @@ test "zero threads: submit_file processes records synchronously" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq);
+    try p.submit_file(file, &cq, null);
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -480,4 +491,250 @@ test "zero threads: submit_file processes records synchronously" {
     try std.testing.expectEqual(@as(usize, 2), vals.len);
     try std.testing.expectEqual(@as(i64, 7), vals[0].int);
     try std.testing.expectEqual(@as(i64, 8), vals[1].int);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── Serialized path tests ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "serialized: single integer" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("42\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("42\n", result.data);
+    try std.testing.expectEqual(false, result.last_was_false_or_null);
+}
+
+test "serialized: string value" {
+    var cq = try compile(".name");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("{\"name\":\"alice\"}\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("\"alice\"\n", result.data);
+}
+
+test "serialized: multi-value query (.[])" {
+    var cq = try compile(".[]");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("[1,2,3]\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("1\n2\n3\n", result.data);
+}
+
+test "serialized: error propagation" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("not-json\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = p.collect_bytes();
+    try std.testing.expectError(error.UnexpectedToken, result);
+}
+
+test "serialized: ordering with 4 workers" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    var file_buf = std.ArrayList(u8){};
+    defer file_buf.deinit(alloc);
+    for (0..20) |i| {
+        try file_buf.writer(alloc).print("{d}\n", .{i});
+    }
+
+    const file = try tmp_file_fd(file_buf.items);
+    defer file.close();
+
+    var p = try Pool.init(4, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    // Build expected output
+    var expected = std.ArrayList(u8){};
+    defer expected.deinit(alloc);
+    for (0..20) |i| {
+        try expected.writer(alloc).print("{d}\n", .{i});
+    }
+
+    try std.testing.expectEqualStrings(expected.items, result.data);
+}
+
+test "serialized stream: three lines via pipe" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const pipe_fds = try std.posix.pipe();
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+
+    _ = try std.posix.write(write_fd, "10\n20\n30\n");
+    std.posix.close(write_fd);
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = read_fd }, alloc);
+    defer src.deinit();
+    defer std.posix.close(read_fd);
+
+    var p = try Pool.init(2, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("10\n20\n30\n", result.data);
+}
+
+test "serialized: empty select produces no bytes" {
+    var cq = try compile("select(false)");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("1\n2\n3\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqual(@as(usize, 0), result.data.len);
+}
+
+test "serialized: false/null tracking for -e flag" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("false\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("false\n", result.data);
+    try std.testing.expectEqual(true, result.last_was_false_or_null);
+}
+
+test "serialized: null tracking for -e flag" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("null\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    try std.testing.expectEqualStrings("null\n", result.data);
+    try std.testing.expectEqual(true, result.last_was_false_or_null);
+}
+
+test "serialized: collect_bytes returns null after drain" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("1\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact);
+
+    const result = try drain_bytes(&p);
+    alloc.free(result.data);
+
+    const extra = try p.collect_bytes();
+    try std.testing.expectEqual(@as(?BytesResult, null), extra);
+}
+
+test "serialized: jsonl format" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("42\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .jsonl);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    // jsonl format: compact + newline (so "42\n")
+    try std.testing.expectEqualStrings("42\n", result.data);
+}
+
+test "serialized: raw format for string" {
+    var cq = try compile(".name");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("{\"name\":\"hello\"}\n");
+    defer file.close();
+
+    var p = try Pool.init(1, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .raw);
+
+    const result = try drain_bytes(&p);
+    defer alloc.free(result.data);
+
+    // raw format: no quotes for strings, no trailing newline
+    try std.testing.expectEqualStrings("hello", result.data);
 }

@@ -123,32 +123,21 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq);
+        pool.submit_stream(&src, &cq, format);
 
         while (true) {
-            const maybe = pool.collect() catch |e| {
+            const maybe = pool.collect_bytes() catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 had_parse_errors = true;
                 continue;
             };
             const result = maybe orelse break;
-            const val = result.value;
-            writer.write_value(val, format) catch {
+            writer.writeSlice(result.data) catch {
                 printErr("zq: write error\n");
                 return EXIT_SYSTEM;
             };
-            if (format == .pretty or format == .compact) {
-                writer.write_value(.{ .string = "\n" }, .raw) catch {
-                    printErr("zq: write error\n");
-                    return EXIT_SYSTEM;
-                };
-            }
-            last_was_false_or_null = switch (val) {
-                .null_val => true,
-                .bool_val => |b| !b,
-                else => false,
-            };
+            last_was_false_or_null = result.last_was_false_or_null;
         }
     } else {
         for (config.files) |path| {
@@ -279,20 +268,12 @@ fn processFile(
     var pool = try pool_mod.Pool.init(n_threads, allocator);
     defer pool.deinit();
 
-    try pool.submit_file(file, cq);
+    try pool.submit_file(file, cq, format);
 
     var last_was_false_or_null = false;
-    while (try pool.collect()) |result| {
-        const val = result.value;
-        try writer.write_value(val, format);
-        if (format == .pretty or format == .compact) {
-            try writer.write_value(.{ .string = "\n" }, .raw);
-        }
-        last_was_false_or_null = switch (val) {
-            .null_val => true,
-            .bool_val => |b| !b,
-            else => false,
-        };
+    while (try pool.collect_bytes()) |result| {
+        try writer.writeSlice(result.data);
+        last_was_false_or_null = result.last_was_false_or_null;
     }
 
     return last_was_false_or_null;

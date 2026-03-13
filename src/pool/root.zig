@@ -1,5 +1,15 @@
 /// Pool — parallel JSONL processing with chunk-level batching and arena-per-chunk memory.
 ///
+/// Two execution paths
+/// -------------------
+/// **Structured path** (format = null): Workers execute queries and copy values into
+/// arena-backed OwnedValues via own_value(). collect() returns typed Value results.
+///
+/// **Serialized path** (format != null): Workers execute queries and serialize values
+/// directly into arena-backed byte buffers while the tape is still valid. No own_value()
+/// needed — the arena holds only the serialized bytes. collect_bytes() returns raw bytes.
+/// This path drastically reduces memory for per-record queries (.id, select(), {a,b}).
+///
 /// File mode
 /// ---------
 /// submit_file() mmap's the entire file and splits it into n_threads × CHUNK_FACTOR
@@ -17,24 +27,25 @@
 /// Memory model
 /// ------------
 /// Every ChunkResult owns an ArenaAllocator that backs all RecordOutcome slices,
-/// OwnedValue copies, string bytes, and tape-entry copies for that chunk.
-/// collect() frees the arena atomically once the chunk's last value is consumed.
-/// In the hot path for scalar queries (int/float/bool/null), own_value() allocates
-/// nothing — the arena is touched only for strings and object/array tape copies.
+/// OwnedValue copies (structured path) or serialized bytes (serialized path),
+/// string bytes, and tape-entry copies for that chunk.
+/// collect()/collect_bytes() frees the arena atomically once the chunk is exhausted.
 ///
 /// Backpressure (file mode)
 /// ------------------------
 /// An InFlightLimiter caps the number of simultaneously live ChunkResults to
 /// IN_FLIGHT_FACTOR × n_threads.  The feeder acquires a slot before pushing each
-/// chunk to the queue; collect() releases the slot after freeing the chunk's arena.
+/// chunk to the queue; collect()/collect_bytes() releases the slot after freeing
+/// the chunk's arena.
 /// Peak RSS ≈ IN_FLIGHT_FACTOR × chunk_size × n_threads, not the full file size.
 ///
 /// Ordering
 /// --------
 /// The Sequencer holds a fixed-size ring buffer (capacity = QUEUE_CAP + n_threads
 /// slots) indexed by chunk_id % capacity.  Workers write directly into their
-/// assigned slot; collect() reads the slot for next_chunk_id, clears it, then
-/// advances.  No HashMap, no dynamic allocation in the reorder hot path.
+/// assigned slot; collect()/collect_bytes() reads the slot for next_chunk_id,
+/// clears it, then advances.  No HashMap, no dynamic allocation in the reorder
+/// hot path.
 ///
 /// Capacity is sized to the maximum spread of simultaneously live chunk IDs for
 /// both modes (file: IN_FLIGHT_FACTOR×n_threads; stream: QUEUE_CAP+n_threads).
@@ -45,18 +56,26 @@
 const std = @import("std");
 const err_mod = @import("error");
 const io_mod = @import("io");
+const output_mod = @import("output");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
 const types = @import("types");
 
 pub const ZqError = err_mod.ZqError;
 
-// ── Public result type ────────────────────────────────────────────────────────
+// ── Public result types ───────────────────────────────────────────────────────
 
-/// One output value returned by collect().
+/// One output value returned by collect() (structured path).
 /// Valid until the next collect() or deinit() call.
 pub const Result = struct {
     value: types.Value,
+};
+
+/// Pre-serialized bytes for one record, returned by collect_bytes() (serialized path).
+/// Valid until the next collect_bytes() or deinit() call.
+pub const BytesResult = struct {
+    data: []const u8,
+    last_was_false_or_null: bool,
 };
 
 // ── Internal value representation ─────────────────────────────────────────────
@@ -86,12 +105,22 @@ const OwnedValue = union(enum) {
     tape_value: OwnedTapeValue,
 };
 
+// ── Per-record serialized output ──────────────────────────────────────────────
+
+/// Pre-serialized output for a single JSONL record, arena-allocated.
+const SerializedRecord = struct {
+    data: []const u8,
+    last_was_false_or_null: bool,
+};
+
 // ── Per-chunk result structures ────────────────────────────────────────────────
 
 /// Outcome of processing a single JSONL record within a chunk.
 const RecordOutcome = union(enum) {
-    /// Values produced by the query (may be empty if filter yields nothing).
+    /// Values produced by the query (structured path).
     values: []OwnedValue,
+    /// Pre-serialized bytes (serialized path).
+    serialized: SerializedRecord,
     /// The record could not be parsed or the query raised a runtime error.
     err: ZqError,
 };
@@ -108,7 +137,7 @@ const ChunkResult = struct {
     seq_base: u64,
     /// One entry per non-empty record processed in this chunk.
     records: []RecordOutcome,
-    /// Owns all memory for `records` and every OwnedValue within.
+    /// Owns all memory for `records` and every OwnedValue/serialized byte within.
     /// Call arena.deinit() once the chunk is exhausted to free everything atomically.
     arena: std.heap.ArenaAllocator,
 };
@@ -131,6 +160,9 @@ const Job = struct {
     /// When true the worker must free `data` with `allocator` after processing.
     owns_data: bool,
     allocator: std.mem.Allocator,
+    /// When non-null, workers use the serialized path: serialize values directly
+    /// into byte buffers instead of copying them via own_value().
+    format: ?types.Format,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -378,8 +410,8 @@ fn worker_fn(ctx: WorkerCtx) void {
     while (ctx.queue.pop()) |job| {
         defer if (job.owns_data) job.allocator.free(job.data);
 
-        // Per-chunk arena: all OwnedValue memory is allocated here.
-        // Freed atomically by collect() after the chunk is exhausted.
+        // Per-chunk arena: all OwnedValue / serialized-byte memory is allocated here.
+        // Freed atomically by collect()/collect_bytes() after the chunk is exhausted.
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         const aa = arena.allocator();
 
@@ -393,20 +425,29 @@ fn worker_fn(ctx: WorkerCtx) void {
             remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
             if (line.len == 0) continue;
 
-            const outcome = process_line(
-                line,
-                &parser,
-                &opt_it,
-                &current_query,
-                job.query,
-                ctx.allocator, // for the persistent iterator's eval stack
-                aa, // for this record's OwnedValues
-            );
+            const outcome = if (job.format) |fmt|
+                process_line_serialized(
+                    line,
+                    &parser,
+                    &opt_it,
+                    &current_query,
+                    job.query,
+                    ctx.allocator,
+                    aa,
+                    fmt,
+                )
+            else
+                process_line(
+                    line,
+                    &parser,
+                    &opt_it,
+                    &current_query,
+                    job.query,
+                    ctx.allocator,
+                    aa,
+                );
 
             records.append(aa, outcome) catch {
-                // If we can't store the outcome, emit an error entry.
-                // All prior arena allocations for this outcome stay in aa and
-                // will be freed when the chunk's arena is deinited.
                 records.append(aa, .{ .err = error.IoError }) catch {};
             };
         }
@@ -422,7 +463,7 @@ fn worker_fn(ctx: WorkerCtx) void {
     }
 }
 
-/// Parse and execute the query for a single JSONL line.
+/// Parse and execute the query for a single JSONL line (structured path).
 ///
 /// `worker_alloc` — used for the persistent ResultIterator's eval stack (GPA).
 /// `aa`           — per-chunk arena; used for all OwnedValue copies.
@@ -472,6 +513,89 @@ fn process_line(
     const outcome = collect_record_values(&opt_it.*.?, aa);
     parser.reset();
     return outcome;
+}
+
+/// Parse and execute the query for a single JSONL line (serialized path).
+///
+/// Instead of copying values via own_value(), serializes each value directly
+/// into an arena-backed byte buffer while the tape is still valid.
+fn process_line_serialized(
+    line: []const u8,
+    parser: *parser_mod.Parser,
+    opt_it: *?query_mod.ResultIterator,
+    current_query: *?*const query_mod.CompiledQuery,
+    query: *const query_mod.CompiledQuery,
+    worker_alloc: std.mem.Allocator,
+    aa: std.mem.Allocator,
+    format: types.Format,
+) RecordOutcome {
+    // ── Parse ──────────────────────────────────────────────────────────────────
+    const feed_result = parser.feed(line, true) catch |e| {
+        parser.reset();
+        return .{ .err = @as(ZqError, @errorCast(e)) };
+    };
+    const tape = switch (feed_result) {
+        .done => |d| d.tape,
+        .need_more => {
+            parser.reset();
+            return .{ .err = error.UnexpectedEof };
+        },
+    };
+
+    // ── Bind or rebind the ResultIterator ──────────────────────────────────────
+    if (opt_it.* == null or current_query.* != query) {
+        if (opt_it.*) |*it| it.deinit();
+        opt_it.* = query.execute(tape, worker_alloc) catch {
+            parser.reset();
+            opt_it.* = null;
+            current_query.* = null;
+            return .{ .err = error.IoError };
+        };
+        current_query.* = query;
+    } else {
+        opt_it.*.?.reset(tape);
+    }
+
+    // ── Serialize values directly into a byte buffer ──────────────────────────
+    var buf = std.ArrayList(u8){};
+    var sink = output_mod.BufferSink{ .list = &buf, .aa = aa };
+    var last_was_false_or_null = false;
+    while (true) {
+        const maybe = opt_it.*.?.next() catch |e| {
+            parser.reset();
+            return .{ .err = e };
+        };
+        const val = maybe orelse break;
+
+        // Serialize the value using the output module's generic serialize.
+        output_mod.serialize(&sink, val, format) catch {
+            parser.reset();
+            return .{ .err = error.IoError };
+        };
+
+        // Append newline for pretty/compact formats (matches main.zig behavior).
+        if (format == .pretty or format == .compact) {
+            sink.writeByte('\n') catch {
+                parser.reset();
+                return .{ .err = error.IoError };
+            };
+        }
+
+        last_was_false_or_null = switch (val) {
+            .null_val => true,
+            .bool_val => |b| !b,
+            else => false,
+        };
+    }
+
+    parser.reset();
+
+    const data = buf.toOwnedSlice(aa) catch buf.items;
+
+    return .{ .serialized = .{
+        .data = data,
+        .last_was_false_or_null = last_was_false_or_null,
+    } };
 }
 
 /// Drain the iterator and copy all values into `aa`.
@@ -539,6 +663,7 @@ const IoCtx = struct {
     sequencer: *Sequencer,
     limiter: *InFlightLimiter,
     allocator: std.mem.Allocator,
+    format: ?types.Format,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
@@ -625,6 +750,7 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
         .query = ctx.query,
         .owns_data = true,
         .allocator = ctx.allocator,
+        .format = ctx.format,
     });
     chunk_id.* += 1;
     batch_buf.clearRetainingCapacity();
@@ -660,6 +786,7 @@ const FileFeedCtx = struct {
     sequencer: *Sequencer,
     limiter: *InFlightLimiter,
     allocator: std.mem.Allocator,
+    format: ?types.Format,
 };
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
@@ -699,6 +826,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .query = ctx.query,
             .owns_data = false,
             .allocator = ctx.allocator,
+            .format = ctx.format,
         });
         chunk_id += 1;
     }
@@ -731,7 +859,7 @@ const SharedCtx = struct {
     queue: JobQueue,
     sequencer: Sequencer,
     /// Backpressure limiter for file mode.  Feeder acquires before each chunk;
-    /// collect() releases after each arena free.
+    /// collect()/collect_bytes() releases after each arena free.
     limiter: InFlightLimiter,
     allocator: std.mem.Allocator,
     /// Starts at 1 (for the Pool) + n_workers.  Each exiting thread decrements.
@@ -794,6 +922,9 @@ pub const Pool = struct {
     _rec_idx: usize, // index into _delivering.records[]
     _val_idx: usize, // index into _delivering.records[_rec_idx].values[]
 
+    /// Output format for this pool run. null = structured path, non-null = serialized path.
+    _format: ?types.Format,
+
     pub fn init(n_threads: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Pool {
         const shared = try allocator.create(SharedCtx);
         errdefer allocator.destroy(shared);
@@ -845,6 +976,7 @@ pub const Pool = struct {
             ._delivering = null,
             ._rec_idx = 0,
             ._val_idx = 0,
+            ._format = null,
         };
     }
 
@@ -861,7 +993,7 @@ pub const Pool = struct {
         release_shared(p._shared, p.allocator);
         // Unmap only after all threads have exited.
         if (p._mmap) |*m| m.deinit();
-        // Free any partially-consumed chunk that collect() hadn't exhausted.
+        // Free any partially-consumed chunk that collect()/collect_bytes() hadn't exhausted.
         if (p._delivering) |*cr| cr.arena.deinit();
     }
 
@@ -870,14 +1002,20 @@ pub const Pool = struct {
     /// The file is memory-mapped once.  A dedicated feeder thread lazily splits
     /// the mapping into at most n_threads × CHUNK_FACTOR newline-aligned chunks
     /// and enqueues them one at a time, blocking when IN_FLIGHT_FACTOR × n_threads
-    /// chunks are already in-flight.  collect() releases each slot when it frees a
-    /// chunk's arena, so peak RSS is proportional to the in-flight limit, not the
-    /// full file size.
+    /// chunks are already in-flight.  collect()/collect_bytes() releases each slot
+    /// when it frees a chunk's arena, so peak RSS is proportional to the in-flight
+    /// limit, not the full file size.
+    ///
+    /// When `format` is non-null, workers use the serialized path: values are
+    /// serialized directly into byte buffers. Use collect_bytes() to consume.
+    /// When `format` is null, workers use the structured path. Use collect().
     pub fn submit_file(
         p: *Pool,
         file: std.fs.File,
         cq: *const query_mod.CompiledQuery,
+        format: ?types.Format,
     ) ZqError!void {
+        p._format = format;
         const stat = file.stat() catch return error.IoError;
         const file_size = @as(usize, @intCast(stat.size));
 
@@ -907,6 +1045,7 @@ pub const Pool = struct {
             .sequencer = &p._shared.sequencer,
             .limiter = &p._shared.limiter,
             .allocator = p.allocator,
+            .format = format,
         };
 
         p.io_thread = std.Thread.spawn(.{}, struct {
@@ -930,11 +1069,16 @@ pub const Pool = struct {
     /// A dedicated IO thread reads complete newline-terminated lines from `src`
     /// and posts them to worker threads.  Each line is an independent chunk
     /// (chunk_id == seq_base) so the Sequencer delivers results line-by-line.
+    ///
+    /// When `format` is non-null, workers use the serialized path.
+    /// When null, workers use the structured path.
     pub fn submit_stream(
         p: *Pool,
         src: *io_mod.Source,
         cq: *const query_mod.CompiledQuery,
+        format: ?types.Format,
     ) void {
+        p._format = format;
         const ctx_ptr = p.allocator.create(IoCtx) catch {
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
@@ -947,6 +1091,7 @@ pub const Pool = struct {
             .sequencer = &p._shared.sequencer,
             .limiter = &p._shared.limiter,
             .allocator = p.allocator,
+            .format = format,
         };
 
         p.io_thread = std.Thread.spawn(.{}, struct {
@@ -963,7 +1108,7 @@ pub const Pool = struct {
         };
     }
 
-    /// Return the next result in submission order.
+    /// Return the next result in submission order (structured path).
     ///
     /// Blocks until the next in-order value is available or all work is done.
     /// Returns null when all submitted records have been processed.
@@ -987,11 +1132,6 @@ pub const Pool = struct {
             }
 
             // ── Chunk exhausted — free its arena and loop to fetch the next ─────
-            // Safety: the arena is freed HERE, at the start of this call.  The
-            // caller is done with the value returned in the PREVIOUS call (the
-            // contract states "valid until next collect() call").
-            // Release the in-flight slot so the file feeder can enqueue the next
-            // chunk.  No-op in stream mode (limiter.count stays 0).
             if (p._rec_idx >= p._delivering.?.records.len) {
                 p._delivering.?.arena.deinit();
                 p._shared.limiter.release();
@@ -1017,6 +1157,66 @@ pub const Pool = struct {
                         return result;
                     }
                     // All values for this record consumed; advance to next record.
+                    p._rec_idx += 1;
+                    p._val_idx = 0;
+                },
+                .serialized => {
+                    // Wrong path: collect() is for the structured path.
+                    // Advance past this record.
+                    p._rec_idx += 1;
+                    p._val_idx = 0;
+                },
+            }
+        }
+    }
+
+    /// Return pre-serialized bytes for the next record in submission order
+    /// (serialized path).
+    ///
+    /// Blocks until the next in-order record is available or all work is done.
+    /// Returns null when all submitted records have been processed.
+    /// Returns an error if a worker encountered a parse or query error on a record.
+    ///
+    /// Lifetime: the returned data is valid until the NEXT call to collect_bytes()
+    /// or deinit().
+    pub fn collect_bytes(p: *Pool) ZqError!?BytesResult {
+        while (true) {
+            // ── Fetch next chunk if we have none ────────────────────────────────
+            if (p._delivering == null) {
+                const maybe = p._shared.sequencer.next_in_order();
+                if (maybe == null) return null;
+                p._delivering = maybe;
+                p._rec_idx = 0;
+                p._val_idx = 0;
+            }
+
+            // ── Chunk exhausted — free its arena and loop to fetch the next ─────
+            if (p._rec_idx >= p._delivering.?.records.len) {
+                p._delivering.?.arena.deinit();
+                p._shared.limiter.release();
+                p._delivering = null;
+                continue;
+            }
+
+            // ── Dispatch on the current record's outcome ─────────────────────────
+            switch (p._delivering.?.records[p._rec_idx]) {
+                .err => |e| {
+                    p._rec_idx += 1;
+                    p._val_idx = 0;
+                    return e;
+                },
+                .serialized => |sr| {
+                    p._rec_idx += 1;
+                    p._val_idx = 0;
+                    // Skip empty records (e.g. select(false) produces no output).
+                    if (sr.data.len == 0) continue;
+                    return BytesResult{
+                        .data = sr.data,
+                        .last_was_false_or_null = sr.last_was_false_or_null,
+                    };
+                },
+                .values => {
+                    // Wrong path: collect_bytes() is for the serialized path.
                     p._rec_idx += 1;
                     p._val_idx = 0;
                 },
