@@ -434,6 +434,21 @@ fn worker_fn(ctx: WorkerCtx) void {
 
         if (job.format) |fmt| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
+            //
+            // TODO: select() in pretty format produces ~5.5x more output than
+            //   input (each object expands with indentation).  chunk_buf is
+            //   pre-allocated to job.data.len which is insufficient — the arena
+            //   must grow it in-place through multiple resizes.  A smarter
+            //   estimate (e.g. 2× for pretty, 1× for compact) would avoid the
+            //   extra resize copies and reduce peak RSS for output-expanding
+            //   queries.  Current select() RSS is 2065 MB (3.2x input) vs the
+            //   ideal ~1.5x if the output size were known upfront.
+            //
+            // TODO: The newline-counting loop to get exact record_count iterates
+            //   every byte of job.data (~7 MB per chunk).  This could be SIMD-
+            //   accelerated (popcount('\n') over 32-byte AVX2 lanes) to reduce
+            //   the cost from ~100 µs to ~10 µs per chunk.  Currently negligible
+            //   vs parse/query time but matters if parsing gets faster.
 
             // Count records first so meta_list can be exactly pre-allocated.
             // This prevents interleaving: meta_list is allocated FIRST (exact,
