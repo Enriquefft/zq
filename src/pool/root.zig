@@ -26,9 +26,10 @@
 ///
 /// Memory model
 /// ------------
-/// Every ChunkResult owns an ArenaAllocator that backs all RecordOutcome slices,
-/// OwnedValue copies (structured path) or serialized bytes (serialized path),
-/// string bytes, and tape-entry copies for that chunk.
+/// Every ChunkResult owns an ArenaAllocator that backs all payload data for that
+/// chunk.  Structured path: RecordOutcome slices, OwnedValue copies, strings, tape
+/// entries.  Serialized path: one contiguous byte buffer + compact RecordMeta array
+/// (8 bytes/record vs ~32 for the old per-record approach).
 /// collect()/collect_bytes() frees the arena atomically once the chunk is exhausted.
 ///
 /// Backpressure (file mode)
@@ -105,22 +106,33 @@ const OwnedValue = union(enum) {
     tape_value: OwnedTapeValue,
 };
 
-// ── Per-record serialized output ──────────────────────────────────────────────
-
-/// Pre-serialized output for a single JSONL record, arena-allocated.
-const SerializedRecord = struct {
-    data: []const u8,
-    last_was_false_or_null: bool,
-};
-
 // ── Per-chunk result structures ────────────────────────────────────────────────
 
-/// Outcome of processing a single JSONL record within a chunk.
+/// Compact per-record metadata for the serialized path.
+/// 8 bytes per record (vs ~32 for the old RecordOutcome + separate data allocation).
+const RecordMeta = struct {
+    /// Exclusive byte offset in the chunk's data buffer.
+    end_offset: u32,
+    /// For -e flag: true if the last value produced was false or null.
+    last_was_false_or_null: bool,
+    /// If true, error_code is valid and this record produced an error.
+    is_error: bool,
+    /// @intFromError(ZqError), valid when is_error is true.
+    error_code: u16,
+};
+
+/// All serialized output for one chunk — one contiguous buffer, no per-record allocations.
+const SerializedChunk = struct {
+    /// All records' bytes concatenated.
+    data: []const u8,
+    /// One entry per record.
+    records: []const RecordMeta,
+};
+
+/// Outcome of processing a single JSONL record within a chunk (structured path only).
 const RecordOutcome = union(enum) {
     /// Values produced by the query (structured path).
     values: []OwnedValue,
-    /// Pre-serialized bytes (serialized path).
-    serialized: SerializedRecord,
     /// The record could not be parsed or the query raised a runtime error.
     err: ZqError,
 };
@@ -135,9 +147,14 @@ const ChunkResult = struct {
     chunk_id: u64,
     /// Global sequence number of records[0] (informational; not used by collect()).
     seq_base: u64,
-    /// One entry per non-empty record processed in this chunk.
-    records: []RecordOutcome,
-    /// Owns all memory for `records` and every OwnedValue/serialized byte within.
+    /// Path-specific payload.
+    payload: union(enum) {
+        /// Structured path: one RecordOutcome per record.
+        structured: []RecordOutcome,
+        /// Serialized path: one contiguous buffer + compact per-record metadata.
+        serialized: SerializedChunk,
+    },
+    /// Owns all memory for `payload` and every OwnedValue/serialized byte within.
     /// Call arena.deinit() once the chunk is exhausted to free everything atomically.
     arena: std.heap.ArenaAllocator,
 };
@@ -415,18 +432,19 @@ fn worker_fn(ctx: WorkerCtx) void {
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         const aa = arena.allocator();
 
-        // Accumulate RecordOutcomes using the arena allocator.
-        var records = std.ArrayList(RecordOutcome){};
+        if (job.format) |fmt| {
+            // ── Serialized path: single contiguous buffer + compact metadata ──
+            var chunk_buf = std.ArrayList(u8){};
+            var meta_list = std.ArrayList(RecordMeta){};
 
-        var remaining: []const u8 = job.data;
-        while (remaining.len > 0) {
-            const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-            const line = std.mem.trimRight(u8, remaining[0..nl], " \t\r");
-            remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
-            if (line.len == 0) continue;
+            var remaining: []const u8 = job.data;
+            while (remaining.len > 0) {
+                const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+                const line = std.mem.trimRight(u8, remaining[0..nl], " \t\r");
+                remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
+                if (line.len == 0) continue;
 
-            const outcome = if (job.format) |fmt|
-                process_line_serialized(
+                const meta = process_line_serialized(
                     line,
                     &parser,
                     &opt_it,
@@ -435,9 +453,43 @@ fn worker_fn(ctx: WorkerCtx) void {
                     ctx.allocator,
                     aa,
                     fmt,
-                )
-            else
-                process_line(
+                    &chunk_buf,
+                );
+
+                meta_list.append(aa, meta) catch {
+                    meta_list.append(aa, .{
+                        .end_offset = @intCast(chunk_buf.items.len),
+                        .last_was_false_or_null = false,
+                        .is_error = true,
+                        .error_code = @intFromError(@as(ZqError, error.IoError)),
+                    }) catch {};
+                };
+            }
+
+            const data_slice = chunk_buf.toOwnedSlice(aa) catch chunk_buf.items;
+            const meta_slice = meta_list.toOwnedSlice(aa) catch meta_list.items;
+
+            ctx.sequencer.post(ChunkResult{
+                .chunk_id = job.chunk_id,
+                .seq_base = job.seq_base,
+                .payload = .{ .serialized = .{
+                    .data = data_slice,
+                    .records = meta_slice,
+                } },
+                .arena = arena,
+            });
+        } else {
+            // ── Structured path: one RecordOutcome per record ─────────────────
+            var records = std.ArrayList(RecordOutcome){};
+
+            var remaining: []const u8 = job.data;
+            while (remaining.len > 0) {
+                const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+                const line = std.mem.trimRight(u8, remaining[0..nl], " \t\r");
+                remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
+                if (line.len == 0) continue;
+
+                const outcome = process_line(
                     line,
                     &parser,
                     &opt_it,
@@ -447,19 +499,20 @@ fn worker_fn(ctx: WorkerCtx) void {
                     aa,
                 );
 
-            records.append(aa, outcome) catch {
-                records.append(aa, .{ .err = error.IoError }) catch {};
-            };
+                records.append(aa, outcome) catch {
+                    records.append(aa, .{ .err = error.IoError }) catch {};
+                };
+            }
+
+            const records_slice = records.toOwnedSlice(aa) catch records.items;
+
+            ctx.sequencer.post(ChunkResult{
+                .chunk_id = job.chunk_id,
+                .seq_base = job.seq_base,
+                .payload = .{ .structured = records_slice },
+                .arena = arena,
+            });
         }
-
-        const records_slice = records.toOwnedSlice(aa) catch records.items;
-
-        ctx.sequencer.post(ChunkResult{
-            .chunk_id = job.chunk_id,
-            .seq_base = job.seq_base,
-            .records = records_slice,
-            .arena = arena, // ownership transferred; do not use `aa` after this
-        });
     }
 }
 
@@ -518,7 +571,8 @@ fn process_line(
 /// Parse and execute the query for a single JSONL line (serialized path).
 ///
 /// Instead of copying values via own_value(), serializes each value directly
-/// into an arena-backed byte buffer while the tape is still valid.
+/// into the shared chunk buffer while the tape is still valid.
+/// Returns compact RecordMeta instead of a full RecordOutcome.
 fn process_line_serialized(
     line: []const u8,
     parser: *parser_mod.Parser,
@@ -528,17 +582,30 @@ fn process_line_serialized(
     worker_alloc: std.mem.Allocator,
     aa: std.mem.Allocator,
     format: types.Format,
-) RecordOutcome {
+    chunk_buf: *std.ArrayList(u8),
+) RecordMeta {
+    const start: u32 = @intCast(chunk_buf.items.len);
+
     // ── Parse ──────────────────────────────────────────────────────────────────
     const feed_result = parser.feed(line, true) catch |e| {
         parser.reset();
-        return .{ .err = @as(ZqError, @errorCast(e)) };
+        return .{
+            .end_offset = start,
+            .last_was_false_or_null = false,
+            .is_error = true,
+            .error_code = @intFromError(@as(ZqError, @errorCast(e))),
+        };
     };
     const tape = switch (feed_result) {
         .done => |d| d.tape,
         .need_more => {
             parser.reset();
-            return .{ .err = error.UnexpectedEof };
+            return .{
+                .end_offset = start,
+                .last_was_false_or_null = false,
+                .is_error = true,
+                .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
+            };
         },
     };
 
@@ -549,35 +616,57 @@ fn process_line_serialized(
             parser.reset();
             opt_it.* = null;
             current_query.* = null;
-            return .{ .err = error.IoError };
+            return .{
+                .end_offset = start,
+                .last_was_false_or_null = false,
+                .is_error = true,
+                .error_code = @intFromError(@as(ZqError, error.IoError)),
+            };
         };
         current_query.* = query;
     } else {
         opt_it.*.?.reset(tape);
     }
 
-    // ── Serialize values directly into a byte buffer ──────────────────────────
-    var buf = std.ArrayList(u8){};
-    var sink = output_mod.BufferSink{ .list = &buf, .aa = aa };
+    // ── Serialize values directly into the shared chunk buffer ────────────────
+    var sink = output_mod.BufferSink{ .list = chunk_buf, .aa = aa };
     var last_was_false_or_null = false;
     while (true) {
         const maybe = opt_it.*.?.next() catch |e| {
             parser.reset();
-            return .{ .err = e };
+            chunk_buf.shrinkRetainingCapacity(start);
+            return .{
+                .end_offset = start,
+                .last_was_false_or_null = false,
+                .is_error = true,
+                .error_code = @intFromError(e),
+            };
         };
         const val = maybe orelse break;
 
         // Serialize the value using the output module's generic serialize.
         output_mod.serialize(&sink, val, format) catch {
             parser.reset();
-            return .{ .err = error.IoError };
+            chunk_buf.shrinkRetainingCapacity(start);
+            return .{
+                .end_offset = start,
+                .last_was_false_or_null = false,
+                .is_error = true,
+                .error_code = @intFromError(@as(ZqError, error.IoError)),
+            };
         };
 
         // Append newline for pretty/compact formats (matches main.zig behavior).
         if (format == .pretty or format == .compact) {
             sink.writeByte('\n') catch {
                 parser.reset();
-                return .{ .err = error.IoError };
+                chunk_buf.shrinkRetainingCapacity(start);
+                return .{
+                    .end_offset = start,
+                    .last_was_false_or_null = false,
+                    .is_error = true,
+                    .error_code = @intFromError(@as(ZqError, error.IoError)),
+                };
             };
         }
 
@@ -590,12 +679,12 @@ fn process_line_serialized(
 
     parser.reset();
 
-    const data = buf.toOwnedSlice(aa) catch buf.items;
-
-    return .{ .serialized = .{
-        .data = data,
+    return .{
+        .end_offset = @intCast(chunk_buf.items.len),
         .last_was_false_or_null = last_was_false_or_null,
-    } };
+        .is_error = false,
+        .error_code = 0,
+    };
 }
 
 /// Drain the iterator and copy all values into `aa`.
@@ -905,6 +994,11 @@ const STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
 /// one buffered in the Sequencer, keeping all cores busy while bounding RSS.
 const IN_FLIGHT_FACTOR: usize = 2;
 
+/// Thread stack size. Workers need at most ~512 KB (parser depth 512 ×
+/// ~200 B per frame for serialize recursion); 2 MiB provides 4× safety margin.
+/// Default Zig stack is 16 MiB; with 16 threads that wastes ~224 MiB.
+const THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     threads: []std.Thread,
@@ -961,7 +1055,7 @@ pub const Pool = struct {
         }
 
         for (threads) |*t| {
-            t.* = std.Thread.spawn(.{}, worker_thread_entry, .{shared}) catch {
+            t.* = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, worker_thread_entry, .{shared}) catch {
                 return error.OutOfMemory;
             };
             spawned += 1;
@@ -1048,7 +1142,7 @@ pub const Pool = struct {
             .format = format,
         };
 
-        p.io_thread = std.Thread.spawn(.{}, struct {
+        p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
             fn run(c: *FileFeedCtx) void {
                 const alloc = c.allocator;
                 file_feeder_fn(c.*);
@@ -1094,7 +1188,7 @@ pub const Pool = struct {
             .format = format,
         };
 
-        p.io_thread = std.Thread.spawn(.{}, struct {
+        p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
             fn run(c: *IoCtx) void {
                 const alloc = c.allocator;
                 io_thread_fn(c.*);
@@ -1131,40 +1225,42 @@ pub const Pool = struct {
                 p._val_idx = 0;
             }
 
-            // ── Chunk exhausted — free its arena and loop to fetch the next ─────
-            if (p._rec_idx >= p._delivering.?.records.len) {
-                p._delivering.?.arena.deinit();
-                p._shared.limiter.release();
-                p._delivering = null;
-                continue;
-            }
-
-            // ── Dispatch on the current record's outcome ─────────────────────────
-            switch (p._delivering.?.records[p._rec_idx]) {
-                .err => |e| {
-                    // Advance past this record; caller sees the error this call.
-                    p._rec_idx += 1;
-                    p._val_idx = 0;
-                    return e;
-                },
-                .values => |vs| {
-                    if (p._val_idx < vs.len) {
-                        // Return this value; cursor stays on the same record.
-                        const result = Result{
-                            .value = owned_to_value(&vs[p._val_idx]),
-                        };
-                        p._val_idx += 1;
-                        return result;
+            switch (p._delivering.?.payload) {
+                .structured => |recs| {
+                    // ── Chunk exhausted — free its arena and fetch the next ──────
+                    if (p._rec_idx >= recs.len) {
+                        p._delivering.?.arena.deinit();
+                        p._shared.limiter.release();
+                        p._delivering = null;
+                        continue;
                     }
-                    // All values for this record consumed; advance to next record.
-                    p._rec_idx += 1;
-                    p._val_idx = 0;
+
+                    // ── Dispatch on the current record's outcome ────────────────
+                    switch (recs[p._rec_idx]) {
+                        .err => |e| {
+                            p._rec_idx += 1;
+                            p._val_idx = 0;
+                            return e;
+                        },
+                        .values => |vs| {
+                            if (p._val_idx < vs.len) {
+                                const result = Result{
+                                    .value = owned_to_value(&vs[p._val_idx]),
+                                };
+                                p._val_idx += 1;
+                                return result;
+                            }
+                            p._rec_idx += 1;
+                            p._val_idx = 0;
+                        },
+                    }
                 },
                 .serialized => {
-                    // Wrong path: collect() is for the structured path.
-                    // Advance past this record.
-                    p._rec_idx += 1;
-                    p._val_idx = 0;
+                    // Wrong path — free and continue to next chunk.
+                    p._delivering.?.arena.deinit();
+                    p._shared.limiter.release();
+                    p._delivering = null;
+                    continue;
                 },
             }
         }
@@ -1190,35 +1286,39 @@ pub const Pool = struct {
                 p._val_idx = 0;
             }
 
-            // ── Chunk exhausted — free its arena and loop to fetch the next ─────
-            if (p._rec_idx >= p._delivering.?.records.len) {
-                p._delivering.?.arena.deinit();
-                p._shared.limiter.release();
-                p._delivering = null;
-                continue;
-            }
+            switch (p._delivering.?.payload) {
+                .serialized => |ser| {
+                    // ── Chunk exhausted — free its arena and fetch the next ──────
+                    if (p._rec_idx >= ser.records.len) {
+                        p._delivering.?.arena.deinit();
+                        p._shared.limiter.release();
+                        p._delivering = null;
+                        continue;
+                    }
 
-            // ── Dispatch on the current record's outcome ─────────────────────────
-            switch (p._delivering.?.records[p._rec_idx]) {
-                .err => |e| {
+                    const meta = ser.records[p._rec_idx];
+                    const rec_start: u32 = if (p._rec_idx == 0) 0 else ser.records[p._rec_idx - 1].end_offset;
                     p._rec_idx += 1;
                     p._val_idx = 0;
-                    return e;
-                },
-                .serialized => |sr| {
-                    p._rec_idx += 1;
-                    p._val_idx = 0;
+
+                    if (meta.is_error)
+                        return @as(ZqError, @errorCast(@errorFromInt(meta.error_code)));
+
+                    const data = ser.data[rec_start..meta.end_offset];
                     // Skip empty records (e.g. select(false) produces no output).
-                    if (sr.data.len == 0) continue;
+                    if (data.len == 0) continue;
+
                     return BytesResult{
-                        .data = sr.data,
-                        .last_was_false_or_null = sr.last_was_false_or_null,
+                        .data = data,
+                        .last_was_false_or_null = meta.last_was_false_or_null,
                     };
                 },
-                .values => {
-                    // Wrong path: collect_bytes() is for the serialized path.
-                    p._rec_idx += 1;
-                    p._val_idx = 0;
+                .structured => {
+                    // Wrong path — free and continue to next chunk.
+                    p._delivering.?.arena.deinit();
+                    p._shared.limiter.release();
+                    p._delivering = null;
+                    continue;
                 },
             }
         }
