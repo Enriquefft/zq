@@ -1742,8 +1742,118 @@ pub const ResultIterator = struct {
                 .float => |rf| .{ .float = lf * rf },
                 else => error.TypeError,
             },
+            .tape_value => |ltv| switch (ltv) {
+                .object => |lspan| switch (right) {
+                    .tape_value => |rtv| switch (rtv) {
+                        .object => |rspan| try it.recursiveMerge(lspan, rspan),
+                        else => error.TypeError,
+                    },
+                    .null_val => left,
+                    else => error.TypeError,
+                },
+                else => error.TypeError,
+            },
+            .null_val => switch (right) {
+                .tape_value => |rtv| switch (rtv) {
+                    .object => right,
+                    else => error.TypeError,
+                },
+                .null_val => .null_val,
+                else => error.TypeError,
+            },
             else => error.TypeError,
         };
+    }
+
+    /// Recursive merge for object * object (jq semantics).
+    /// When both left and right have the same key and both values are objects,
+    /// recursively merge them. Otherwise, right's value wins.
+    fn recursiveMerge(it: *ResultIterator, lspan: Value.TapeSpan, rspan: Value.TapeSpan) ZqError!StackValue {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        // Write all left keys, merging with right's value when both are objects
+        var lpos = lspan.start + 1;
+        const lend = lspan.end - 1;
+        while (lpos < lend) {
+            const lkey = lspan.tape.getString(lspan.tape.entries[lpos].payload.string);
+            const lval = tapeEntryToValue(lspan.tape, lpos + 1);
+
+            // Look for this key in right
+            var rpos2 = rspan.start + 1;
+            const rend2 = rspan.end - 1;
+            var right_val: ?Value = null;
+            while (rpos2 < rend2) {
+                const rkey = rspan.tape.getString(rspan.tape.entries[rpos2].payload.string);
+                if (std.mem.eql(u8, lkey, rkey)) {
+                    right_val = tapeEntryToValue(rspan.tape, rpos2 + 1);
+                    break;
+                }
+                rpos2 = skipEntry(rspan.tape.*, rpos2 + 1);
+            }
+
+            const new_key_ref = try it.runtime_tape.internString(it.alloc, lkey);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = new_key_ref } });
+
+            if (right_val) |rv| {
+                // Both have the key: if both values are objects, recurse
+                switch (lval) {
+                    .object => |linner| switch (rv) {
+                        .object => |rinner| {
+                            const merged = try it.recursiveMerge(linner, rinner);
+                            try it.stackValueToRuntimeTapeEntry(merged);
+                            // Update views after recursion may have grown the tape
+                            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                        },
+                        else => try it.stackValueToRuntimeTapeEntry(try valueToStackValue(rv)),
+                    },
+                    else => try it.stackValueToRuntimeTapeEntry(try valueToStackValue(rv)),
+                }
+            } else {
+                try it.stackValueToRuntimeTapeEntry(try valueToStackValue(lval));
+            }
+            lpos = skipEntry(lspan.tape.*, lpos + 1);
+        }
+
+        // Append right keys not in left
+        var rpos = rspan.start + 1;
+        const rend = rspan.end - 1;
+        while (rpos < rend) {
+            const rkey = rspan.tape.getString(rspan.tape.entries[rpos].payload.string);
+            var in_left = false;
+            var lpos2 = lspan.start + 1;
+            while (lpos2 < lend) {
+                const lkey2 = lspan.tape.getString(lspan.tape.entries[lpos2].payload.string);
+                if (std.mem.eql(u8, rkey, lkey2)) {
+                    in_left = true;
+                    break;
+                }
+                lpos2 = skipEntry(lspan.tape.*, lpos2 + 1);
+            }
+            if (!in_left) {
+                const new_key_ref = try it.runtime_tape.internString(it.alloc, rkey);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = new_key_ref } });
+                const rval_sv = try valueToStackValue(tapeEntryToValue(rspan.tape, rpos + 1));
+                try it.stackValueToRuntimeTapeEntry(rval_sv);
+            }
+            rpos = skipEntry(rspan.tape.*, rpos + 1);
+        }
+
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape_view,
+            .start = obj_start,
+            .end = obj_end_idx + 1,
+        } } };
     }
 
     fn doDiv(it: *ResultIterator) ZqError!StackValue {
@@ -1778,6 +1888,49 @@ pub const ResultIterator = struct {
                 },
                 else => error.TypeError,
             },
+            .tape_value => |ltv| switch (ltv) {
+                .string => |ls| switch (right) {
+                    .tape_value => |rtv| switch (rtv) {
+                        // string / string = split
+                        .string => |rs| blk: {
+                            // string / string = split (jq semantics)
+                            var parts = std.ArrayList(Value){};
+                            defer parts.deinit(it.alloc);
+                            if (rs.len == 0) {
+                                // Split into individual characters
+                                var ci: usize = 0;
+                                while (ci < ls.len) {
+                                    const seq_len = std.unicode.utf8ByteSequenceLength(ls[ci]) catch 1;
+                                    const cp_end = @min(ci + seq_len, ls.len);
+                                    const sr = try it.runtime_tape.internString(it.alloc, ls[ci..cp_end]);
+                                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                    try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                    ci = cp_end;
+                                }
+                            } else {
+                                var rest: []const u8 = ls;
+                                while (true) {
+                                    if (std.mem.indexOf(u8, rest, rs)) |idx| {
+                                        const sr = try it.runtime_tape.internString(it.alloc, rest[0..idx]);
+                                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                        rest = rest[idx + rs.len ..];
+                                    } else {
+                                        const sr = try it.runtime_tape.internString(it.alloc, rest);
+                                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                        break;
+                                    }
+                                }
+                            }
+                            break :blk try it.buildRuntimeArray(parts.items);
+                        },
+                        else => error.TypeError,
+                    },
+                    else => error.TypeError,
+                },
+                else => error.TypeError,
+            },
             else => error.TypeError,
         };
     }
@@ -1788,6 +1941,34 @@ pub const ResultIterator = struct {
             try it.popValue()
         else
             try valueToStackValue(it.current);
+
+        // Check if either operand is float — use fmod for float modulo
+        const left_is_float = switch (left) {
+            .float => true,
+            else => false,
+        };
+        const right_is_float = switch (right) {
+            .float => true,
+            else => false,
+        };
+
+        if (left_is_float or right_is_float) {
+            const lf = try toFloat(left);
+            const rf = try toFloat(right);
+            // NaN or Inf operands: use @mod which maps to C fmod
+            if (std.math.isNan(lf) or std.math.isNan(rf)) {
+                return .{ .float = std.math.nan(f64) };
+            }
+            if (std.math.isInf(lf)) {
+                if (std.math.isInf(rf)) {
+                    return .{ .float = std.math.nan(f64) };
+                }
+                return .{ .float = std.math.nan(f64) };
+            }
+            if (rf == 0.0) return error.TypeError;
+            return .{ .float = @mod(lf, rf) };
+        }
+
         const left_int = try toInt(left);
         const right_int = try toInt(right);
         if (right_int == 0) return error.TypeError; // modulo by zero
@@ -3382,7 +3563,9 @@ pub const ResultIterator = struct {
         };
         if (f == 0.0) return .{ .float = 0.0 };
         if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
+        // jq significand: value in [1, 2) such that f = significand * 2^exponent
         const exp_val = ilogb64(f);
+        // Divide by 2^exponent to get significand
         const divisor = std.math.pow(f64, 2.0, @as(f64, @floatFromInt(exp_val)));
         return .{ .float = f / divisor };
     }
