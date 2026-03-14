@@ -659,6 +659,47 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "any")) return .any;
     if (std.mem.eql(u8, name, "all")) return .all;
     if (std.mem.eql(u8, name, "unique")) return .unique;
+
+    // Type selectors (Group A)
+    if (std.mem.eql(u8, name, "arrays")) return .arrays;
+    if (std.mem.eql(u8, name, "objects")) return .objects_sel;
+    if (std.mem.eql(u8, name, "strings")) return .strings_sel;
+    if (std.mem.eql(u8, name, "numbers")) return .numbers_sel;
+    if (std.mem.eql(u8, name, "booleans")) return .booleans_sel;
+    if (std.mem.eql(u8, name, "nulls")) return .nulls_sel;
+    if (std.mem.eql(u8, name, "values")) return .values_sel;
+    if (std.mem.eql(u8, name, "scalars")) return .scalars_sel;
+    if (std.mem.eql(u8, name, "iterables")) return .iterables_sel;
+
+    // Math builtins (Group B)
+    if (std.mem.eql(u8, name, "floor")) return .floor;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil;
+    if (std.mem.eql(u8, name, "round")) return .round;
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, name, "fabs")) return .fabs;
+    if (std.mem.eql(u8, name, "nan")) return .nan_val;
+    if (std.mem.eql(u8, name, "infinite")) return .infinite_val;
+    if (std.mem.eql(u8, name, "isnan")) return .isnan_val;
+    if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_val;
+    if (std.mem.eql(u8, name, "isnormal")) return .isnormal_val;
+    if (std.mem.eql(u8, name, "log2")) return .log2_;
+    if (std.mem.eql(u8, name, "log")) return .log_;
+    if (std.mem.eql(u8, name, "exp")) return .exp_;
+    if (std.mem.eql(u8, name, "exp2")) return .exp2_;
+    if (std.mem.eql(u8, name, "sin")) return .sin_;
+    if (std.mem.eql(u8, name, "cos")) return .cos_;
+    if (std.mem.eql(u8, name, "atan")) return .atan_;
+    if (std.mem.eql(u8, name, "tan")) return .tan_;
+    if (std.mem.eql(u8, name, "asin")) return .asin_;
+    if (std.mem.eql(u8, name, "acos")) return .acos_;
+    if (std.mem.eql(u8, name, "sinh")) return .sinh_;
+    if (std.mem.eql(u8, name, "cosh")) return .cosh_;
+    if (std.mem.eql(u8, name, "tanh")) return .tanh_;
+    if (std.mem.eql(u8, name, "significand")) return .significand;
+    if (std.mem.eql(u8, name, "exponent")) return .exponent_;
+    if (std.mem.eql(u8, name, "logb")) return .logb_;
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+
     return null;
 }
 
@@ -686,7 +727,8 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "first") or
         std.mem.eql(u8, name, "last") or
         std.mem.eql(u8, name, "limit") or
-        std.mem.eql(u8, name, "del");
+        std.mem.eql(u8, name, "del") or
+        std.mem.eql(u8, name, "pow");
 }
 
 /// Compile a `map(f)` expression.
@@ -1167,6 +1209,21 @@ fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     });
 }
 
+/// Compile `pow(base; exp)`: two semicolon-separated args.
+fn compilePow(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx); // parse base
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
+    try parseLogical(ctx); // parse exponent
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.pow_) },
+    });
+}
+
 /// parsePrimary: literals, identifiers (with .field, [index]), `(` expr `)`, `$var`, `def name:`, `func(...)`
 fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.next();
@@ -1269,6 +1326,8 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileLimit(ctx);
                 } else if (std.mem.eql(u8, ident_name, "del")) {
                     try compileDel(ctx);
+                } else if (std.mem.eql(u8, ident_name, "pow")) {
+                    try compilePow(ctx);
                 }
                 return;
             }

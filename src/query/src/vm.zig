@@ -1844,6 +1844,47 @@ pub const ResultIterator = struct {
             .max_by => return try it.builtinMaxBy(),
             .unique_by => return try it.builtinUniqueBy(),
             .del => return try it.builtinDel(),
+
+            // ── Type selectors (Group A) ──
+            .arrays => return try it.builtinTypeSelector(.arrays),
+            .objects_sel => return try it.builtinTypeSelector(.objects_sel),
+            .strings_sel => return try it.builtinTypeSelector(.strings_sel),
+            .numbers_sel => return try it.builtinTypeSelector(.numbers_sel),
+            .booleans_sel => return try it.builtinTypeSelector(.booleans_sel),
+            .nulls_sel => return try it.builtinTypeSelector(.nulls_sel),
+            .values_sel => return try it.builtinTypeSelector(.values_sel),
+            .scalars_sel => return try it.builtinTypeSelector(.scalars_sel),
+            .iterables_sel => return try it.builtinTypeSelector(.iterables_sel),
+
+            // ── Math builtins (Group B) ──
+            .floor => return try it.builtinFloor(),
+            .ceil => return try it.builtinCeil(),
+            .round => return try it.builtinRound(),
+            .sqrt => return try it.builtinMathUnary(.sqrt),
+            .fabs => return try it.builtinFabs(),
+            .nan_val => return .{ .float = std.math.nan(f64) },
+            .infinite_val => return .{ .float = std.math.inf(f64) },
+            .isnan_val => return try it.builtinIsnan(),
+            .isinfinite_val => return try it.builtinIsinfinite(),
+            .isnormal_val => return try it.builtinIsnormal(),
+            .pow_ => return try it.builtinPow(),
+            .log2_ => return try it.builtinMathUnary(.log2),
+            .log_ => return try it.builtinMathUnary(.log),
+            .exp_ => return try it.builtinMathUnary(.exp),
+            .exp2_ => return try it.builtinMathUnary(.exp2),
+            .sin_ => return try it.builtinMathUnary(.sin),
+            .cos_ => return try it.builtinMathUnary(.cos),
+            .atan_ => return try it.builtinMathUnary(.atan),
+            .tan_ => return try it.builtinMathUnary(.tan),
+            .asin_ => return try it.builtinMathUnary(.asin),
+            .acos_ => return try it.builtinMathUnary(.acos),
+            .sinh_ => return try it.builtinMathUnary(.sinh),
+            .cosh_ => return try it.builtinMathUnary(.cosh),
+            .tanh_ => return try it.builtinMathUnary(.tanh),
+            .significand => return try it.builtinSignificand(),
+            .exponent_ => return try it.builtinExponent(),
+            .logb_ => return try it.builtinLogb(),
+            .abs => return try it.builtinAbs(),
         }
     }
 
@@ -3142,6 +3183,208 @@ pub const ResultIterator = struct {
             },
             else => return error.TypeError,
         }
+    }
+
+    // ── Type selectors (Group A) ──────────────────────────────────────────────
+
+    fn builtinTypeSelector(it: *ResultIterator, sel: BuiltinId) ZqError!?StackValue {
+        const matches = switch (sel) {
+            .arrays => switch (it.current) {
+                .array => true,
+                else => false,
+            },
+            .objects_sel => switch (it.current) {
+                .object => true,
+                else => false,
+            },
+            .strings_sel => switch (it.current) {
+                .string => true,
+                else => false,
+            },
+            .numbers_sel => switch (it.current) {
+                .int, .float => true,
+                else => false,
+            },
+            .booleans_sel => switch (it.current) {
+                .bool_val => true,
+                else => false,
+            },
+            .nulls_sel => switch (it.current) {
+                .null_val => true,
+                else => false,
+            },
+            .values_sel => switch (it.current) {
+                .null_val => false,
+                else => true,
+            },
+            .scalars_sel => switch (it.current) {
+                .array, .object => false,
+                else => true,
+            },
+            .iterables_sel => switch (it.current) {
+                .array, .object => true,
+                else => false,
+            },
+            else => false,
+        };
+
+        if (matches) {
+            return try valueToStackValue(it.current);
+        } else {
+            // Act like `empty` — produce no output
+            it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+    }
+
+    // ── Math builtins (Group B) ─────────────────────────────────────────────
+
+    fn builtinFloor(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .int => |n| return .{ .int = n },
+            .float => |f| return .{ .int = @intFromFloat(@floor(f)) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinCeil(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .int => |n| return .{ .int = n },
+            .float => |f| return .{ .int = @intFromFloat(@ceil(f)) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinRound(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .int => |n| return .{ .int = n },
+            .float => |f| return .{ .int = @intFromFloat(@round(f)) },
+            else => return error.TypeError,
+        }
+    }
+
+    const MathOp = enum { sqrt, log2, log, exp, exp2, sin, cos, atan, tan, asin, acos, sinh, cosh, tanh };
+
+    fn builtinMathUnary(it: *ResultIterator, comptime op: MathOp) ZqError!?StackValue {
+        const f: f64 = switch (it.current) {
+            .float => |v| v,
+            .int => |n| @as(f64, @floatFromInt(n)),
+            else => return error.TypeError,
+        };
+        const result: f64 = switch (op) {
+            .sqrt => @sqrt(f),
+            .log2 => std.math.log2(f),
+            .log => @log(f),
+            .exp => @exp(f),
+            .exp2 => std.math.exp2(f),
+            .sin => @sin(f),
+            .cos => @cos(f),
+            .atan => std.math.atan(f),
+            .tan => std.math.tan(f),
+            .asin => std.math.asin(f),
+            .acos => std.math.acos(f),
+            .sinh => std.math.sinh(f),
+            .cosh => std.math.cosh(f),
+            .tanh => std.math.tanh(f),
+        };
+        return .{ .float = result };
+    }
+
+    fn builtinFabs(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .int => |n| return .{ .int = if (n < 0) -n else n },
+            .float => |f| return .{ .float = @abs(f) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinAbs(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .int => |n| return .{ .int = if (n < 0) -n else n },
+            .float => |f| return .{ .float = @abs(f) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinIsnan(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .float => |f| return .{ .bool_val = std.math.isNan(f) },
+            .int => return .{ .bool_val = false },
+            else => return .{ .bool_val = false },
+        }
+    }
+
+    fn builtinIsinfinite(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .float => |f| return .{ .bool_val = std.math.isInf(f) },
+            .int => return .{ .bool_val = false },
+            else => return .{ .bool_val = false },
+        }
+    }
+
+    fn builtinIsnormal(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .float => |f| {
+                const is_normal = !std.math.isNan(f) and !std.math.isInf(f) and f != 0.0;
+                return .{ .bool_val = is_normal };
+            },
+            .int => |n| return .{ .bool_val = n != 0 },
+            else => return .{ .bool_val = false },
+        }
+    }
+
+    fn builtinPow(it: *ResultIterator) ZqError!?StackValue {
+        const exp_sv = try it.popValue();
+        const base_sv = if (it.value_stack.items.len > 0)
+            try it.popValue()
+        else
+            try valueToStackValue(it.current);
+        const base_f = try toFloat(base_sv);
+        const exp_f = try toFloat(exp_sv);
+        return .{ .float = std.math.pow(f64, base_f, exp_f) };
+    }
+
+    /// Compute the base-2 exponent of f (like C's ilogb).
+    fn ilogb64(f: f64) i32 {
+        const bits = @as(u64, @bitCast(f));
+        const biased_exp = @as(i32, @intCast((bits >> 52) & 0x7FF));
+        return biased_exp - 1023;
+    }
+
+    fn builtinSignificand(it: *ResultIterator) ZqError!?StackValue {
+        const f: f64 = switch (it.current) {
+            .float => |v| v,
+            .int => |n| @as(f64, @floatFromInt(n)),
+            else => return error.TypeError,
+        };
+        if (f == 0.0) return .{ .float = 0.0 };
+        if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
+        const exp_val = ilogb64(f);
+        const divisor = std.math.pow(f64, 2.0, @as(f64, @floatFromInt(exp_val)));
+        return .{ .float = f / divisor };
+    }
+
+    fn builtinExponent(it: *ResultIterator) ZqError!?StackValue {
+        const f: f64 = switch (it.current) {
+            .float => |v| v,
+            .int => |n| @as(f64, @floatFromInt(n)),
+            else => return error.TypeError,
+        };
+        if (f == 0.0) return .{ .int = 0 };
+        if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = std.math.inf(f64) };
+        return .{ .int = @as(i64, ilogb64(f)) };
+    }
+
+    fn builtinLogb(it: *ResultIterator) ZqError!?StackValue {
+        const f: f64 = switch (it.current) {
+            .float => |v| v,
+            .int => |n| @as(f64, @floatFromInt(n)),
+            else => return error.TypeError,
+        };
+        if (f == 0.0) return .{ .float = -std.math.inf(f64) };
+        if (std.math.isInf(f)) return .{ .float = std.math.inf(f64) };
+        if (std.math.isNan(f)) return .{ .float = std.math.nan(f64) };
+        return .{ .float = @as(f64, @floatFromInt(ilogb64(f))) };
     }
 
     /// Helper: build a runtime tape array from a slice of Values.
