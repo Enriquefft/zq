@@ -18,18 +18,18 @@ zq fixes all of that. Same filter syntax. Just faster — and built for what dev
 
 | Tool | `.id` | `select(.id > 500000)` | RSS (`.id`) |
 |------|-------|------------------------|-------------|
-| jq | 21.8s | 42.6s | 3.6 MB |
+| jq | 21.4s | 41.6s | 3.7 MB |
 | jaq | 15.3s | 27.7s | 666 MB |
-| **zq** | **0.89s** | **3.1s** | **701 MB** |
+| **zq** | **0.87s** | **2.9s** | **715 MB** |
 
 **Streaming mode — `cat file \| zq .id`**
 
 | Tool | Time | RSS |
 |------|------|-----|
-| jq | ~22s | 3.6 MB |
-| **zq** | **1.6s** | **8 MB** |
+| jq | 22.2s | 3.7 MB |
+| **zq** | **1.4s** | **7 MB** |
 
-**Startup time:** ~2ms (3x faster than jq)
+**Startup time:** ~2ms (2x faster than jq)
 **Binary size:** 2.7 MB static, stripped, zero dependencies
 
 ---
@@ -73,20 +73,32 @@ The filter language already covers the most common real-world operators: field a
 
 ## Installation
 
-### Build from source
+### Quick install
 
 ```sh
-git clone https://github.com/Enriquefft/zq
-cd zq
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/zq '.foo' <<< '{"foo": 42}'
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/Enriquefft/zq/main/install.ps1 | iex
 ```
 
-Requires [Zig 0.15.2](https://ziglang.org/download/).
+### Package managers
 
-**Alternative (Nix):** If you have Nix + direnv, just `direnv allow` — all dependencies are pinned.
+```sh
+brew install Enriquefft/zq/zq        # Homebrew (macOS + Linux)
+yay -S zq-bin                         # AUR (Arch Linux)
+nix run github:Enriquefft/zq          # Nix
+```
 
-**Using just:** `just build` (dev) or `just release` (optimized).
+### From source
+
+```sh
+git clone https://github.com/Enriquefft/zq && cd zq
+zig build -Doptimize=ReleaseFast
+```
+
+Requires [Zig 0.15.2](https://ziglang.org/download/). Or with Nix: `direnv allow`.
 
 ---
 

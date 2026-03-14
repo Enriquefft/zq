@@ -1,8 +1,14 @@
 const std = @import("std");
 
+const version = "0.1.0-dev";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const ver = b.option([]const u8, "version", "Version string") orelse version;
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", ver);
 
     // ── Modules ───────────────────────────────────────────────────────────────
     const types_module = b.createModule(.{
@@ -86,6 +92,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("query", query_module);
     exe_mod.addImport("output", output_module);
     exe_mod.addImport("pool", pool_module);
+    exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "zq",

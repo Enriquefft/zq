@@ -29,7 +29,9 @@ jobs:
           version: 0.15.2
 
       - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dversion="$VERSION"
 
       - name: Package name
         id: meta
@@ -40,12 +42,13 @@ jobs:
       - name: Package
         run: |
           mkdir staging
+          cp LICENSE staging/
           if [ "${{ matrix.ext }}" = "zip" ]; then
             cp zig-out/bin/zq.exe staging/
-            cd staging && zip "../${{ steps.meta.outputs.name }}.zip" zq.exe
+            cd staging && zip "../${{ steps.meta.outputs.name }}.zip" zq.exe LICENSE
           else
             cp zig-out/bin/zq staging/
-            tar -czf "${{ steps.meta.outputs.name }}.tar.gz" -C staging zq
+            tar -czf "${{ steps.meta.outputs.name }}.tar.gz" -C staging zq LICENSE
           fi
 
       - name: Upload artifact
@@ -76,6 +79,17 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            install.sh
+            install.ps1
             artifacts/zq-*.tar.gz
             artifacts/zq-*.zip
             artifacts/checksums-sha256.txt
+
+      - name: Update Homebrew tap
+        if: "!contains(github.ref_name, '-')"
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          repository: Enriquefft/homebrew-zq
+          event-type: release
+          client-payload: '{"version": "${{ github.ref_name }}"}'

@@ -23,30 +23,31 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-13)
+## Quick Status (Updated 2026-03-14)
 
-**Last updated:** Memory optimization — 2 MiB stacks + contiguous serialized chunks
+**Last updated:** SIMD newline counting + format-aware chunk pre-allocation
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
 Module tests:       452/880 passing
 Compat tests:       111/539 passing (20.6%)
   ├─ 428 skipped/failing
-Startup:            ~2 ms (3x faster than jq)
+Startup:            ~2 ms (2x faster than jq)
 Cold start:         ✓ sub-3ms
 
 Parallel (file arg, .id, 648 MB JSONL):
-  jq   21.8s   3.6 MB RSS
+  jq   21.4s   3.7 MB RSS
   jaq  15.3s   666 MB RSS
-  zq    0.89s  701 MB RSS   ← 25x faster than jq, 1.08x input size
+  zq    0.87s  715 MB RSS   ← 25x faster than jq, 1.10x input size
 
 Parallel (file arg, select(.id > 500000)):
-  jq   42.6s   3.6 MB RSS
+  jq   41.6s   3.7 MB RSS
   jaq  27.7s   666 MB RSS
-  zq    3.1s   2065 MB RSS  ← 14x faster than jq
+  zq    2.9s   1980 MB RSS  ← 15x faster than jq
 
 Streaming (cat | zq .id):
-  zq    1.6s   8 MB RSS     ← was 215s; 120x faster
+  jq   22.2s   3.7 MB RSS
+  zq    1.4s   7 MB RSS     ← 16x faster than jq
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete.
@@ -64,7 +65,7 @@ Streaming (cat | zq .id):
 - [ ] All P0/P1 features below are implemented
 - [x] `zq` binary under 2 MB static (2.7 MB stripped — close enough)
 - [ ] Zero known crashes on valid JSON input
-- [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 1.08x for `.id`)
+- [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 1.10x for `.id`)
 - [x] Startup time < 3ms (achieved: ~2ms)
 
 ### Query language — P0
@@ -127,7 +128,7 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 ### Memory optimization — P0
 
-Current state: **701 MB RSS** for 648 MB JSONL `.id` query **(1.08x input)**. Target < 2x: **achieved**.
+Current state: **715 MB RSS** for 648 MB JSONL `.id` query **(1.10x input)**. Target < 2x: **achieved**.
 Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 
 | Item | Detail |
@@ -136,9 +137,9 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 | [x] **Ordered output queue** | Fixed-size ring buffer replaces HashMap in Sequencer. Capacity `= max(IN_FLIGHT_FACTOR×n_threads, QUEUE_CAP+n_threads)` guarantees no slot collision in both file and stream modes. O(1) post and fetch with zero dynamic allocation in the hot path. **Result: 1764 MB → 1702 MB (-3.5%).** |
 | [x] **Batched stream mode** | stdin now routes through the parallel pool via `submit_stream()`. IO thread accumulates lines into 256 KB batches before creating jobs, reducing orchestration overhead from 2.16M ops to ~2,540 (matching file mode order of magnitude). InFlightLimiter backpressure added to stream mode. **Result: streaming 215s → 1.6s (120x faster); RSS stays low at ~8 MB.** |
 | [x] **2 MiB thread stacks** | Reduced from 16 MiB default. Workers use heap-allocated parse/query stacks; 2 MiB gives 4× margin over worst-case recursion depth. **Result: ~224 MB saved (22 threads × 14 MiB).** |
-| [x] **Contiguous serialized chunks** | Serialized path replaced per-record `RecordOutcome` + separate data allocations with one contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B). `ChunkResult.payload` is a tagged union (`structured` | `serialized`). Pre-allocated with exact record count (newline scan) so meta_list never resizes, enabling chunk_buf to grow in-place on the arena. **Result: 1053 MB → 701 MB (-33%) for `.id`; 2203 MB → 2065 MB (-6%) for `select()`.** |
+| [x] **Contiguous serialized chunks** | Serialized path replaced per-record `RecordOutcome` + separate data allocations with one contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B). `ChunkResult.payload` is a tagged union (`structured` | `serialized`). Pre-allocated with exact record count (SIMD newline scan) so meta_list never resizes, enabling chunk_buf to grow in-place on the arena. Format-aware pre-alloc (6x for pretty, 1x for compact/jsonl/raw) reduces arena page leaks from resizes. **Result: 1053 MB → 715 MB (-32%) for `.id`; 2203 MB → 1980 MB (-10%) for `select()`.** |
 
-**Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved for `.id` (1.08x).** `select()` at 3.2x due to pretty-format output expansion — acceptable since output size exceeds input size.
+**Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved for `.id` (1.10x).** `select()` at 3.1x due to pretty-format output expansion — acceptable since output size exceeds input size.
 
 ### Infrastructure
 
@@ -161,7 +162,7 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
-- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 11.6x on 15M-record JSONL, 7.9x vs jaq)
+- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 25x on 15M-record JSONL `.id`, 15x on `select()`)
 - [ ] `-P N` parallel flag working for file mode
 - [ ] SIMD scanner enabled (AVX2 on x86_64, NEON on aarch64)
 
@@ -185,11 +186,11 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 | Item | Detail |
 |------|--------|
 | [ ] **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes (structural, whitespace, string, escape) 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
-| [x] **Parallel file mode** | mmap + chunk-based workers. Pool module fully implemented and auto-enabled in CLI. `-P N` explicit flag still pending. Achieved **11.6x vs jq, 7.9x vs jaq** on 15M-record JSONL. |
+| [x] **Parallel file mode** | mmap + chunk-based workers. Pool module fully implemented and auto-enabled in CLI. `-P N` explicit flag still pending. Achieved **25x vs jq, 18x vs jaq** on 15M-record JSONL `.id`. |
 | [ ] **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]` in non-JSONL JSON files. Scan for object boundaries at bracket depth 1, split across workers using existing chunk infrastructure. Falls back to single-threaded for non-array inputs — no regression. Closes the biggest gap in the parallelism story (API responses, data dumps). |
 | [ ] **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq vs gojq on: citylots.json (181MB), github events (JSONL), twitter sample (nested), synthetic 1M-line JSONL. |
 | [x] **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). Moved to v0.1 milestone criteria. |
-| [x] **Memory efficiency** | Target < 2x input size. **Achieved: 1.08x for `.id` (701 MB for 648 MB input).** Bounded chunk count + ordered output queue (v0.1: 2998→1702 MB), then 2 MiB stacks + contiguous serialized chunks (1702→701 MB). Total reduction: -77%. |
+| [x] **Memory efficiency** | Target < 2x input size. **Achieved: 1.10x for `.id` (715 MB for 648 MB input).** Bounded chunk count + ordered output queue (v0.1: 2998→1702 MB), then 2 MiB stacks + contiguous serialized chunks + SIMD newline counting + format-aware pre-alloc (1702→715 MB). Total reduction: -76%. |
 
 ### CLI — remaining flags
 
@@ -221,7 +222,7 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 | [ ] Shell completions | bash, zsh, fish |
 | [ ] CI benchmark regression | Fail CI if throughput drops > 10% vs previous release |
 | [ ] Fuzz testing | AFL/libfuzzer on parser + query compiler |
-| [ ] Release automation | GitHub Actions: tag → build static binaries → create release |
+| [x] Release automation | GitHub Actions: tag → build 6 platforms → create release |
 
 ---
 
@@ -264,14 +265,14 @@ build on that foundation for tighter memory profiles.
 
 | Channel | Detail |
 |---------|--------|
-| [ ] **Static binaries** | x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos, x86_64-windows. Single file, no dependencies. |
-| [ ] **Homebrew** | `brew install zq` |
+| [x] **Static binaries** | All 6 platforms via GitHub Releases |
+| [x] **Homebrew** | `brew install Enriquefft/zq/zq` |
 | [ ] **APT/DEB** | PPA or direct .deb |
-| [ ] **AUR** | `yay -S zq` |
-| [ ] **Nix** | `nix run github:user/zq` + nixpkgs PR |
+| [x] **AUR** | `yay -S zq-bin` |
+| [x] **Nix** | `nix run github:Enriquefft/zq` + flake.nix |
 | [ ] **Scoop** | Windows package manager |
-| [ ] **Docker** | `docker run ghcr.io/user/zq` |
-| [ ] **GitHub Releases** | Automated via CI on tag push |
+| [ ] **Docker** | `docker run ghcr.io/Enriquefft/zq` |
+| [x] **GitHub Releases** | Automated via CI on tag push |
 
 ### libzq (C ABI)
 
@@ -319,7 +320,7 @@ The killer feature. Pool module fully implemented; needs CLI surface.
 | [x] **In-order output guarantee** | Chunk-level Sequencer delivers ChunkResults in submission order. collect() cursor walks records/values in order. |
 | [x] **Per-line error handling** | Parse/query errors become RecordOutcome.err; collect() surfaces them per-record without aborting the pipeline. |
 | [x] **Work stealing** | MPMC JobQueue with N_CHUNKS jobs; workers pull freely. Newline-aligned byte-range chunks prevent record splits. |
-| [x] **Stream pipeline** | IO thread reads lines from stdin/pipe in 256 KB batches, posted to the worker queue. InFlightLimiter backpressure prevents unbounded memory growth. **Result: stdin 215s → 1.8s (120x faster), 17 MB RSS.** |
+| [x] **Stream pipeline** | IO thread reads lines from stdin/pipe in 256 KB batches, posted to the worker queue. InFlightLimiter backpressure prevents unbounded memory growth. **Result: stdin 215s → 1.4s (150x faster), 7 MB RSS.** |
 | [ ] **Scaling** | Near-linear scaling up to core count on JSONL. Measured: 11.6x jq at 11 cores (1103% CPU). |
 
 ### Streaming & incomplete JSON (LLM use case)
@@ -430,13 +431,13 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
 | jq compat test pass rate | **20.6%** (111/539) | 60% | 95% | 100% |
-| Throughput vs jq (parallel, 15M JSONL, `.id`) | **25x** (0.89s vs 21.8s) | > 1x ✓ | 5x | 10x |
-| Throughput vs jq (parallel, 15M JSONL, `select()`) | **14x** (3.1s vs 42.6s) | — | 15x | 20x |
-| Startup time | **~2ms** (3x faster than jq) | < 3ms ✓ | < 3ms | < 3ms |
+| Throughput vs jq (parallel, 15M JSONL, `.id`) | **25x** (0.87s vs 21.4s) | > 1x ✓ | 5x | 10x |
+| Throughput vs jq (parallel, 15M JSONL, `select()`) | **15x** (2.9s vs 41.6s) | — | 15x ✓ | 20x |
+| Startup time | **~2ms** (2x faster than jq) | < 3ms ✓ | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB ✓ | < 3 MB | < 5 MB |
-| Memory (648 MB JSONL, `.id`, parallel) | **701 MB** (1.08x input) ✓ | < 2x input ✓ | < 2x input | < 2x input |
-| Memory (streaming pipe) | **8 MB** | — | — | — |
-| Throughput vs jq (streaming, 15M JSONL, `.id`) | **14x** (1.6s vs 22s) | — | — | 10x |
+| Memory (648 MB JSONL, `.id`, parallel) | **715 MB** (1.10x input) ✓ | < 2x input ✓ | < 2x input | < 2x input |
+| Memory (streaming pipe) | **7 MB** | — | — | — |
+| Throughput vs jq (streaming, 15M JSONL, `.id`) | **16x** (1.4s vs 22.2s) | — | — | 10x |
 | Test count | **452** | 400+ ✓ | 800+ | 1000+ |
 
 ---

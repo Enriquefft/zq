@@ -1,0 +1,65 @@
+# Place this file at .github/workflows/update.yml in the Enriquefft/homebrew-zq repository.
+# Triggered by repository_dispatch from the zq release workflow.
+
+name: Update Formula
+
+on:
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update formula
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          VERSION="${VERSION#v}"
+          FORMULA="Formula/zq.rb"
+          BASE="https://github.com/Enriquefft/zq/releases/download/v${VERSION}"
+
+          # Download checksums
+          curl -fsSL "${BASE}/checksums-sha256.txt" -o checksums.txt
+
+          get_sha() {
+            grep "$1" checksums.txt | awk '{print $1}'
+          }
+
+          MACOS_AMD64=$(get_sha "zq-${VERSION}-macos-amd64.tar.gz")
+          MACOS_ARM64=$(get_sha "zq-${VERSION}-macos-arm64.tar.gz")
+          LINUX_AMD64=$(get_sha "zq-${VERSION}-linux-amd64.tar.gz")
+          LINUX_ARM64=$(get_sha "zq-${VERSION}-linux-arm64.tar.gz")
+
+          # Update version
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" "$FORMULA"
+
+          # Update SHA256 hashes (order: macos-intel, macos-arm, linux-intel, linux-arm)
+          # Use awk to replace each PLACEHOLDER/hash in order
+          awk -v m_amd="$MACOS_AMD64" -v m_arm="$MACOS_ARM64" \
+              -v l_amd="$LINUX_AMD64" -v l_arm="$LINUX_ARM64" '
+          BEGIN { n=0 }
+          /sha256 "/ {
+            n++
+            if (n==1) sub(/sha256 ".*"/, "sha256 \""m_amd"\"")
+            if (n==2) sub(/sha256 ".*"/, "sha256 \""m_arm"\"")
+            if (n==3) sub(/sha256 ".*"/, "sha256 \""l_amd"\"")
+            if (n==4) sub(/sha256 ".*"/, "sha256 \""l_arm"\"")
+          }
+          { print }
+          ' "$FORMULA" > tmp && mv tmp "$FORMULA"
+
+      - name: Commit and push
+        run: |
+          VERSION="${{ github.event.client_payload.version }}"
+          VERSION="${VERSION#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/zq.rb
+          git commit -m "zq ${VERSION}"
+          git push

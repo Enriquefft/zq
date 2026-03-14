@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const io_mod = @import("io");
 const parser_mod = @import("parser");
 const query_mod = @import("query");
@@ -394,7 +395,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                         std.process.exit(EXIT_OK);
                     },
                     'V' => {
-                        printErr("zq 0.1.0\n");
+                        printVersion();
                         std.process.exit(EXIT_OK);
                     },
                     else => {
@@ -468,7 +469,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             printUsage();
             std.process.exit(EXIT_OK);
         } else if (std.mem.eql(u8, arg, "--version")) {
-            printErr("zq 0.1.0\n");
+            printVersion();
             std.process.exit(EXIT_OK);
         } else if (std.mem.eql(u8, arg, "--")) {
             // Everything after -- is positional.
@@ -525,6 +526,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 }
 
 // ── Error Output Helpers ─────────────────────────────────────────────────────
+
+fn printVersion() void {
+    printErr("zq " ++ build_options.version ++ "\n");
+}
 
 fn printErr(msg: []const u8) void {
     std.fs.File.stderr().writeAll(msg) catch {};

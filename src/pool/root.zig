@@ -442,8 +442,7 @@ fn worker_fn(ctx: WorkerCtx) void {
             // in-place when output exceeds input size (e.g. pretty format) —
             // no leaked copies from ArrayList doubling.
             const record_count = blk: {
-                var count: usize = 0;
-                for (job.data) |b| count += @intFromBool(b == '\n');
+                var count = countNewlines(job.data);
                 // Account for a final line without trailing newline.
                 if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
                 break :blk count;
@@ -453,7 +452,11 @@ fn worker_fn(ctx: WorkerCtx) void {
             meta_list.ensureTotalCapacity(aa, record_count) catch {};
 
             var chunk_buf = std.ArrayList(u8){};
-            chunk_buf.ensureTotalCapacity(aa, job.data.len) catch {};
+            const buf_estimate: usize = switch (fmt) {
+                .pretty => job.data.len * 6,
+                .compact, .jsonl, .raw => job.data.len,
+            };
+            chunk_buf.ensureTotalCapacity(aa, buf_estimate) catch {};
 
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
@@ -946,7 +949,26 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
     ctx.queue.signal_done();
 }
 
-/// Return true if `data` contains at least one non-blank line.
+/// Count newline bytes using SIMD (AVX2 on x86-64, NEON on aarch64).
+/// Zig's @Vector compiles to the best available instruction set.
+fn countNewlines(data: []const u8) usize {
+    const Vec = @Vector(32, u8);
+    const nl: Vec = @splat('\n');
+    var total: usize = 0;
+    var i: usize = 0;
+
+    while (i + 32 <= data.len) : (i += 32) {
+        const chunk: Vec = data[i..][0..32].*;
+        const matches = chunk == nl;
+        total += @popCount(@as(u32, @bitCast(matches)));
+    }
+
+    // Scalar tail — at most 31 bytes
+    for (data[i..]) |b| total += @intFromBool(b == '\n');
+
+    return total;
+}
+
 fn hasNonEmptyLine(data: []const u8) bool {
     var rem = data;
     while (rem.len > 0) {

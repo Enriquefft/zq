@@ -1,7 +1,7 @@
 .{
     .name = .zq,
     .fingerprint = 0xb30bc2293a0bfa9e,
-    .version = "0.0.1",
+    .version = "0.1.0-dev",
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
     .paths = .{"."},
