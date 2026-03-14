@@ -2,6 +2,10 @@
 
 > A drop-in replacement for jq — rewritten in Zig to be **25x faster**, with zero dependencies and native support for the streaming, high-throughput workloads that define modern AI pipelines.
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
+```
+
 ---
 
 ## What is it?
