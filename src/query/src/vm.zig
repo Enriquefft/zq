@@ -1885,6 +1885,29 @@ pub const ResultIterator = struct {
             .exponent_ => return try it.builtinExponent(),
             .logb_ => return try it.builtinLogb(),
             .abs => return try it.builtinAbs(),
+
+            // ── String builtins (Group C) ──
+            .ascii_downcase => return try it.builtinAsciiDowncase(),
+            .ascii_upcase => return try it.builtinAsciiUpcase(),
+            .ltrimstr => return try it.builtinLtrimstr(),
+            .rtrimstr => return try it.builtinRtrimstr(),
+            .startswith => return try it.builtinStartswith(),
+            .endswith => return try it.builtinEndswith(),
+            .split_ => return try it.builtinSplit(),
+            .join_ => return try it.builtinJoin(),
+            .explode => return try it.builtinExplode(),
+            .implode => return try it.builtinImplode(),
+            .tojson => return try it.builtinTojson(),
+            .fromjson => return try it.builtinFromjson(),
+            .toboolean => return try it.builtinToboolean(),
+            .ascii_val => return try it.builtinAsciiVal(),
+
+            // ── Misc builtins (Group D) ──
+            .utf8bytelength => return try it.builtinUtf8bytelength(),
+            .transpose => return try it.builtinTranspose(),
+            .builtins_list => return try it.builtinBuiltinsList(),
+            .have_decnum => return .{ .bool_val = false },
+            .bsearch => return try it.builtinBsearch(),
         }
     }
 
@@ -3385,6 +3408,601 @@ pub const ResultIterator = struct {
         if (std.math.isInf(f)) return .{ .float = std.math.inf(f64) };
         if (std.math.isNan(f)) return .{ .float = std.math.nan(f64) };
         return .{ .float = @as(f64, @floatFromInt(ilogb64(f))) };
+    }
+
+    // ── String builtins (Group C) ───────────────────────────────────────────
+
+    fn builtinAsciiDowncase(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(it.alloc);
+                try buf.ensureTotalCapacity(it.alloc, s.len);
+                for (s) |c| {
+                    buf.appendAssumeCapacity(if (c >= 'A' and c <= 'Z') c + 32 else c);
+                }
+                const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinAsciiUpcase(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(it.alloc);
+                try buf.ensureTotalCapacity(it.alloc, s.len);
+                for (s) |c| {
+                    buf.appendAssumeCapacity(if (c >= 'a' and c <= 'z') c - 32 else c);
+                }
+                const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinLtrimstr(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const prefix = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .string => |s| {
+                if (std.mem.startsWith(u8, s, prefix)) {
+                    const trimmed = s[prefix.len..];
+                    const str_ref = try it.runtime_tape.internString(it.alloc, trimmed);
+                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                    return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                }
+                return try valueToStackValue(it.current);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinRtrimstr(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const suffix = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .string => |s| {
+                if (std.mem.endsWith(u8, s, suffix)) {
+                    const trimmed = s[0 .. s.len - suffix.len];
+                    const str_ref = try it.runtime_tape.internString(it.alloc, trimmed);
+                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                    return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                }
+                return try valueToStackValue(it.current);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinStartswith(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const prefix = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .string => |s| return .{ .bool_val = std.mem.startsWith(u8, s, prefix) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinEndswith(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const suffix = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .string => |s| return .{ .bool_val = std.mem.endsWith(u8, s, suffix) },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinSplit(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const sep = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .string => |s| {
+                var parts = std.ArrayList(Value){};
+                defer parts.deinit(it.alloc);
+                if (sep.len == 0) {
+                    // Split into individual characters (codepoints)
+                    var i: usize = 0;
+                    while (i < s.len) {
+                        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                        const cp_end = @min(i + seq_len, s.len);
+                        const str_ref = try it.runtime_tape.internString(it.alloc, s[i..cp_end]);
+                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                        i = cp_end;
+                    }
+                } else {
+                    var rest: []const u8 = s;
+                    while (true) {
+                        if (std.mem.indexOf(u8, rest, sep)) |idx| {
+                            const part = rest[0..idx];
+                            const str_ref = try it.runtime_tape.internString(it.alloc, part);
+                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                            try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                            rest = rest[idx + sep.len ..];
+                        } else {
+                            const str_ref = try it.runtime_tape.internString(it.alloc, rest);
+                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                            try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                            break;
+                        }
+                    }
+                }
+                return try it.buildRuntimeArray(parts.items);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinJoin(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const sep = switch (arg_sv) {
+            .tape_value => |tv| switch (tv) {
+                .string => |s| s,
+                else => return error.TypeError,
+            },
+            else => return error.TypeError,
+        };
+        switch (it.current) {
+            .array => |span| {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(it.alloc);
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var first = true;
+                while (pos < end) {
+                    if (!first) try buf.appendSlice(it.alloc, sep);
+                    first = false;
+                    const elem = tapeEntryToValue(span.tape, pos);
+                    switch (elem) {
+                        .string => |s| try buf.appendSlice(it.alloc, s),
+                        .null_val => {},
+                        else => {
+                            // jq coerces non-string elements to string via tostring
+                            var tmp_buf = std.ArrayList(u8){};
+                            defer tmp_buf.deinit(it.alloc);
+                            try serializeValueCompact(&tmp_buf, it.alloc, elem);
+                            try buf.appendSlice(it.alloc, tmp_buf.items);
+                        },
+                    }
+                    pos = skipEntry(span.tape.*, pos);
+                }
+                const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinExplode(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                var codepoints = std.ArrayList(Value){};
+                defer codepoints.deinit(it.alloc);
+                var i: usize = 0;
+                while (i < s.len) {
+                    const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+                        try codepoints.append(it.alloc, .{ .int = @as(i64, s[i]) });
+                        i += 1;
+                        continue;
+                    };
+                    if (i + seq_len > s.len) {
+                        try codepoints.append(it.alloc, .{ .int = @as(i64, s[i]) });
+                        i += 1;
+                        continue;
+                    }
+                    const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
+                        try codepoints.append(it.alloc, .{ .int = @as(i64, s[i]) });
+                        i += 1;
+                        continue;
+                    };
+                    try codepoints.append(it.alloc, .{ .int = @as(i64, cp) });
+                    i += seq_len;
+                }
+                return try it.buildRuntimeArray(codepoints.items);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinImplode(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .array => |span| {
+                var buf = std.ArrayList(u8){};
+                defer buf.deinit(it.alloc);
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const elem = tapeEntryToValue(span.tape, pos);
+                    const cp: u21 = switch (elem) {
+                        .int => |n| blk: {
+                            if (n < 0 or n > 0x10FFFF) return error.TypeError;
+                            break :blk @intCast(n);
+                        },
+                        else => return error.TypeError,
+                    };
+                    var utf8_buf: [4]u8 = undefined;
+                    const utf8_len = std.unicode.utf8Encode(cp, &utf8_buf) catch return error.TypeError;
+                    try buf.appendSlice(it.alloc, utf8_buf[0..utf8_len]);
+                    pos = skipEntry(span.tape.*, pos);
+                }
+                const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinTojson(it: *ResultIterator) ZqError!?StackValue {
+        var json_buf = std.ArrayList(u8){};
+        defer json_buf.deinit(it.alloc);
+        try serializeValueCompact(&json_buf, it.alloc, it.current);
+        const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    fn builtinFromjson(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                // Try to parse simple JSON values inline
+                const trimmed = std.mem.trim(u8, s, " \t\n\r");
+                if (std.mem.eql(u8, trimmed, "null")) return .null_val;
+                if (std.mem.eql(u8, trimmed, "true")) return .{ .bool_val = true };
+                if (std.mem.eql(u8, trimmed, "false")) return .{ .bool_val = false };
+                // Try integer
+                if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
+                    return .{ .int = n };
+                } else |_| {}
+                // Try float
+                if (std.fmt.parseFloat(f64, trimmed)) |f| {
+                    return .{ .float = f };
+                } else |_| {}
+                // Try quoted string
+                if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') {
+                    // Decode the inner string (handle escape sequences)
+                    const inner = trimmed[1 .. trimmed.len - 1];
+                    var buf = std.ArrayList(u8){};
+                    defer buf.deinit(it.alloc);
+                    var i: usize = 0;
+                    while (i < inner.len) {
+                        if (inner[i] == '\\' and i + 1 < inner.len) {
+                            switch (inner[i + 1]) {
+                                '"' => {
+                                    try buf.append(it.alloc, '"');
+                                    i += 2;
+                                },
+                                '\\' => {
+                                    try buf.append(it.alloc, '\\');
+                                    i += 2;
+                                },
+                                '/' => {
+                                    try buf.append(it.alloc, '/');
+                                    i += 2;
+                                },
+                                'n' => {
+                                    try buf.append(it.alloc, '\n');
+                                    i += 2;
+                                },
+                                'r' => {
+                                    try buf.append(it.alloc, '\r');
+                                    i += 2;
+                                },
+                                't' => {
+                                    try buf.append(it.alloc, '\t');
+                                    i += 2;
+                                },
+                                'b' => {
+                                    try buf.append(it.alloc, '\x08');
+                                    i += 2;
+                                },
+                                'f' => {
+                                    try buf.append(it.alloc, '\x0C');
+                                    i += 2;
+                                },
+                                else => {
+                                    try buf.append(it.alloc, inner[i]);
+                                    i += 1;
+                                },
+                            }
+                        } else {
+                            try buf.append(it.alloc, inner[i]);
+                            i += 1;
+                        }
+                    }
+                    const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                    return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                }
+                // Cannot parse complex JSON (arrays/objects) without the parser module
+                return error.TypeError;
+            },
+            // If already not a string, pass through (jq semantics)
+            else => return try valueToStackValue(it.current),
+        }
+    }
+
+    fn builtinToboolean(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .bool_val => |b| return .{ .bool_val = b },
+            .string => |s| {
+                if (std.mem.eql(u8, s, "true")) return .{ .bool_val = true };
+                if (std.mem.eql(u8, s, "false")) return .{ .bool_val = false };
+                // Build jq-compatible error message
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                try msg_buf.appendSlice(it.alloc, "string (");
+                try appendJsonString(&msg_buf, it.alloc, s);
+                try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a boolean");
+                const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+                return error.UserError;
+            },
+            else => {
+                // Build jq-compatible error: "TYPE (VALUE) cannot be parsed as a boolean"
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                const type_str: []const u8 = switch (it.current) {
+                    .null_val => "null",
+                    .int, .float => "number",
+                    .array => "array",
+                    .object => "object",
+                    else => "unknown",
+                };
+                try msg_buf.appendSlice(it.alloc, type_str);
+                try msg_buf.appendSlice(it.alloc, " (");
+                try serializeValueCompact(&msg_buf, it.alloc, it.current);
+                try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a boolean");
+                const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+                return error.UserError;
+            },
+        }
+    }
+
+    fn builtinAsciiVal(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                if (s.len == 0) return error.TypeError;
+                return .{ .int = @as(i64, s[0]) };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    // ── Misc builtins (Group D) ──────────────────────────────────────────────
+
+    fn builtinUtf8bytelength(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| return .{ .int = @as(i64, @intCast(s.len)) },
+            else => {
+                // jq error: "TYPE (VALUE) only strings have UTF-8 byte length"
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                const type_str: []const u8 = switch (it.current) {
+                    .null_val => "null",
+                    .bool_val => "boolean",
+                    .int, .float => "number",
+                    .array => "array",
+                    .object => "object",
+                    else => "unknown",
+                };
+                try msg_buf.appendSlice(it.alloc, type_str);
+                try msg_buf.appendSlice(it.alloc, " (");
+                try serializeValueCompact(&msg_buf, it.alloc, it.current);
+                try msg_buf.appendSlice(it.alloc, ") only strings have UTF-8 byte length");
+                const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+                return error.UserError;
+            },
+        }
+    }
+
+    fn builtinTranspose(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .array => |span| {
+                // Collect all sub-arrays
+                var rows = std.ArrayList(Value.TapeSpan){};
+                defer rows.deinit(it.alloc);
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const elem = tapeEntryToValue(span.tape, pos);
+                    switch (elem) {
+                        .array => |inner| try rows.append(it.alloc, inner),
+                        else => return error.TypeError,
+                    }
+                    pos = skipEntry(span.tape.*, pos);
+                }
+                if (rows.items.len == 0) {
+                    return try it.buildRuntimeArray(&[_]Value{});
+                }
+                // Find max column count
+                var max_cols: u32 = 0;
+                for (rows.items) |row| {
+                    const row_len = arrayLength(row.tape, row);
+                    if (row_len > max_cols) max_cols = row_len;
+                }
+                // Build transposed result
+                var result_rows = std.ArrayList(Value){};
+                defer result_rows.deinit(it.alloc);
+                var col: u32 = 0;
+                while (col < max_cols) : (col += 1) {
+                    // Build one column array
+                    const inner_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .array_start,
+                        .payload = .{ .skip = 0 },
+                    });
+                    for (rows.items) |row| {
+                        const val = lookupIndex(row.tape, row, col) orelse Value.null_val;
+                        try it.stackValueToRuntimeTapeEntry(try valueToStackValue(val));
+                    }
+                    const inner_end = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .array_end,
+                        .payload = .{ .none = {} },
+                    });
+                    it.runtime_tape.entries.items[inner_start].payload.skip = inner_end + 1;
+                    it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                    try result_rows.append(it.alloc, .{ .array = .{
+                        .tape = &it.runtime_tape_view,
+                        .start = inner_start,
+                        .end = inner_end + 1,
+                    } });
+                }
+                return try it.buildRuntimeArray(result_rows.items);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinBuiltinsList(it: *ResultIterator) ZqError!?StackValue {
+        const builtin_names = [_][]const u8{
+            "length/0",         "keys/0",          "keys_unsorted/0",
+            "values/0",         "has/1",           "in/1",
+            "type/0",           "empty/0",         "tostring/0",
+            "tonumber/0",       "error/0",         "add/0",
+            "range/1",          "range/2",         "range/3",
+            "sort/0",           "sort_by/1",       "group_by/1",
+            "reverse/0",        "flatten/0",       "flatten/1",
+            "min/0",            "max/0",           "min_by/1",
+            "max_by/1",         "to_entries/0",    "from_entries/0",
+            "any/0",            "any/1",           "all/0",
+            "all/1",            "contains/1",      "inside/1",
+            "del/1",            "indices/1",       "index/1",
+            "rindex/1",         "unique/0",        "unique_by/1",
+            "map/1",            "select/1",        "with_entries/1",
+            "first/0",          "first/1",         "last/0",
+            "last/1",           "limit/2",
+            // Type selectors
+            "arrays/0",         "objects/0",       "strings/0",
+            "numbers/0",        "booleans/0",      "nulls/0",
+            "values/0",         "scalars/0",       "iterables/0",
+            // Math
+            "floor/0",          "ceil/0",          "round/0",
+            "sqrt/0",           "fabs/0",          "nan/0",
+            "infinite/0",       "isnan/0",         "isinfinite/0",
+            "isnormal/0",       "pow/2",           "log2/0",
+            "log/0",            "exp/0",           "exp2/0",
+            "sin/0",            "cos/0",           "atan/0",
+            "tan/0",            "asin/0",          "acos/0",
+            "sinh/0",           "cosh/0",          "tanh/0",
+            "significand/0",    "exponent/0",      "logb/0",
+            "abs/0",
+            // String
+            "ascii_downcase/0", "ascii_upcase/0",  "ltrimstr/1",
+            "rtrimstr/1",       "startswith/1",    "endswith/1",
+            "split/1",          "join/1",          "explode/0",
+            "implode/0",        "tojson/0",        "fromjson/0",
+            "toboolean/0",      "ascii/0",
+            // Misc
+            "utf8bytelength/0", "transpose/0",     "builtins/0",
+            "have_decnum/0",    "bsearch/1",       "isempty/1",
+            "map_values/1",
+        };
+        var names = std.ArrayList(Value){};
+        defer names.deinit(it.alloc);
+        for (builtin_names) |name| {
+            const str_ref = try it.runtime_tape.internString(it.alloc, name);
+            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+            try names.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+        }
+        return try it.buildRuntimeArray(names.items);
+    }
+
+    /// `bsearch(x)`: binary search for x in a sorted array.
+    /// Returns the index if found, or (-1 - insertion_point) if not found.
+    fn builtinBsearch(it: *ResultIterator) ZqError!?StackValue {
+        const target_sv = try it.popValue();
+        const target = try stackValueToValue(target_sv);
+        switch (it.current) {
+            .array => |span| {
+                // Collect elements for binary search
+                var elems = std.ArrayList(Value){};
+                defer elems.deinit(it.alloc);
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    try elems.append(it.alloc, tapeEntryToValue(span.tape, pos));
+                    pos = skipEntry(span.tape.*, pos);
+                }
+                // Binary search
+                var lo: i64 = 0;
+                var hi: i64 = @as(i64, @intCast(elems.items.len)) - 1;
+                while (lo <= hi) {
+                    const mid = lo + @divTrunc(hi - lo, 2);
+                    const cmp = jqCompareValues(elems.items[@intCast(mid)], target);
+                    switch (cmp) {
+                        .eq => return .{ .int = mid },
+                        .lt => lo = mid + 1,
+                        .gt => hi = mid - 1,
+                    }
+                }
+                // Not found: return -(insertion_point) - 1
+                return .{ .int = -lo - 1 };
+            },
+            else => {
+                // jq error: "TYPE cannot be searched from"
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                const type_str: []const u8 = switch (it.current) {
+                    .null_val => "null",
+                    .bool_val => "boolean",
+                    .int, .float => "number",
+                    .string => "string",
+                    .array => "array",
+                    .object => "object",
+                };
+                try msg_buf.appendSlice(it.alloc, type_str);
+                try msg_buf.appendSlice(it.alloc, " (");
+                try serializeValueCompact(&msg_buf, it.alloc, it.current);
+                try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
+                const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+                return error.UserError;
+            },
+        }
     }
 
     /// Helper: build a runtime tape array from a slice of Values.

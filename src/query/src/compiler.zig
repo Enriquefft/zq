@@ -700,6 +700,22 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "logb")) return .logb_;
     if (std.mem.eql(u8, name, "abs")) return .abs;
 
+    // String builtins (Group C) — zero-arg
+    if (std.mem.eql(u8, name, "ascii_downcase")) return .ascii_downcase;
+    if (std.mem.eql(u8, name, "ascii_upcase")) return .ascii_upcase;
+    if (std.mem.eql(u8, name, "explode")) return .explode;
+    if (std.mem.eql(u8, name, "implode")) return .implode;
+    if (std.mem.eql(u8, name, "tojson")) return .tojson;
+    if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
+    if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+    if (std.mem.eql(u8, name, "ascii")) return .ascii_val;
+
+    // Misc builtins (Group D) — zero-arg
+    if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+    if (std.mem.eql(u8, name, "transpose")) return .transpose;
+    if (std.mem.eql(u8, name, "builtins")) return .builtins_list;
+    if (std.mem.eql(u8, name, "have_decnum")) return .have_decnum;
+
     return null;
 }
 
@@ -728,7 +744,19 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "last") or
         std.mem.eql(u8, name, "limit") or
         std.mem.eql(u8, name, "del") or
-        std.mem.eql(u8, name, "pow");
+        std.mem.eql(u8, name, "pow") or
+        // String arg builtins (Group C)
+        std.mem.eql(u8, name, "ltrimstr") or
+        std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "startswith") or
+        std.mem.eql(u8, name, "endswith") or
+        std.mem.eql(u8, name, "split") or
+        std.mem.eql(u8, name, "join") or
+        // Misc arg builtins (Group D)
+        std.mem.eql(u8, name, "map_values") or
+        std.mem.eql(u8, name, "isempty") or
+        std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "add");
 }
 
 /// Compile a `map(f)` expression.
@@ -1209,6 +1237,86 @@ fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     });
 }
 
+/// Compile a simple arg-taking builtin: `name(expr)`.
+/// Parses `(expr)`, then emits `call_builtin(bid)`.
+fn compileSimpleArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseLogical(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(bid) },
+    });
+}
+
+/// Compile `add(f)`: collect all outputs of f into an array, then add.
+/// Desugars to: [f] | add
+fn compileAddWithArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Emit array_collect_start with placeholder end_ip
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse the generator expression (handles comma-separated generators)
+    try parsePipe(ctx);
+
+    // Consume closing paren
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit output to collect each element
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // Emit array_collect_end and backpatch start
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // Pipe to add
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.add) },
+    });
+}
+
+/// Compile `isempty(f)`: true if f produces no output, false otherwise.
+/// Desugars to: [f | false] | length == 0
+fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Emit array_collect_start
+    const collect_start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse the inner filter f
+    try parseLogical(ctx);
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit: pipe, push_bool(false), output — produces false for each output of f
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_bool, .operand = .{ .bool = false } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // Emit array_collect_end
+    const collect_end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[collect_start_pos].operand = .{ .index = collect_end_pos };
+
+    // Pipe to check: length == 0
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.length) },
+    });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = 0 } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .eq, .operand = .{ .none = {} } });
+}
+
 /// Compile `pow(base; exp)`: two semicolon-separated args.
 fn compilePow(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
@@ -1328,6 +1436,26 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileDel(ctx);
                 } else if (std.mem.eql(u8, ident_name, "pow")) {
                     try compilePow(ctx);
+                } else if (std.mem.eql(u8, ident_name, "ltrimstr")) {
+                    try compileSimpleArgBuiltin(ctx, .ltrimstr);
+                } else if (std.mem.eql(u8, ident_name, "rtrimstr")) {
+                    try compileSimpleArgBuiltin(ctx, .rtrimstr);
+                } else if (std.mem.eql(u8, ident_name, "startswith")) {
+                    try compileSimpleArgBuiltin(ctx, .startswith);
+                } else if (std.mem.eql(u8, ident_name, "endswith")) {
+                    try compileSimpleArgBuiltin(ctx, .endswith);
+                } else if (std.mem.eql(u8, ident_name, "split")) {
+                    try compileSimpleArgBuiltin(ctx, .split_);
+                } else if (std.mem.eql(u8, ident_name, "join")) {
+                    try compileSimpleArgBuiltin(ctx, .join_);
+                } else if (std.mem.eql(u8, ident_name, "map_values")) {
+                    try compileMap(ctx);
+                } else if (std.mem.eql(u8, ident_name, "isempty")) {
+                    try compileIsempty(ctx);
+                } else if (std.mem.eql(u8, ident_name, "bsearch")) {
+                    try compileSimpleArgBuiltin(ctx, .bsearch);
+                } else if (std.mem.eql(u8, ident_name, "add")) {
+                    try compileAddWithArg(ctx);
                 }
                 return;
             }

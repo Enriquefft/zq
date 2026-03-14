@@ -214,6 +214,29 @@ pub const BuiltinId = enum(u16) {
     exponent_,
     logb_,
     abs,
+
+    // ── String builtins (Group C) ──
+    ascii_downcase,
+    ascii_upcase,
+    ltrimstr,
+    rtrimstr,
+    startswith,
+    endswith,
+    split_,
+    join_,
+    explode,
+    implode,
+    tojson,
+    fromjson,
+    toboolean,
+    ascii_val,
+
+    // ── Misc builtins (Group D) ──
+    utf8bytelength,
+    transpose,
+    builtins_list,
+    have_decnum,
+    bsearch,
 };
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────
