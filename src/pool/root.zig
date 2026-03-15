@@ -186,6 +186,8 @@ const Job = struct {
     opts: output_mod.SerializeOpts,
     /// When true, each line is treated as a raw string instead of being parsed as JSON.
     raw_input: bool,
+    /// External variable bindings, shared read-only across all workers.
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -487,6 +489,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                     &chunk_buf,
                     job.opts,
                     job.raw_input,
+                    job.external_bindings,
                 );
 
                 meta_list.append(aa, meta) catch {
@@ -536,6 +539,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                     ctx.allocator,
                     aa,
                     job.raw_input,
+                    job.external_bindings,
                 );
 
                 records.append(aa, outcome) catch {
@@ -583,6 +587,7 @@ fn process_line(
     worker_alloc: std.mem.Allocator,
     aa: std.mem.Allocator,
     raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordOutcome {
     // ── Parse ──────────────────────────────────────────────────────────────────
     var raw_entry_buf: [1]types.Tape.Entry = undefined;
@@ -603,7 +608,7 @@ fn process_line(
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
-        opt_it.* = query.execute(tape, worker_alloc) catch {
+        opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
             if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
@@ -612,7 +617,7 @@ fn process_line(
         current_query.* = query;
     } else {
         // Same query, new tape: zero-allocation rebind.
-        opt_it.*.?.reset(tape);
+        opt_it.*.?.reset(tape, external_bindings);
     }
 
     // ── Collect values into the chunk arena ────────────────────────────────────
@@ -642,6 +647,7 @@ fn process_line_serialized(
     chunk_buf: *std.ArrayList(u8),
     opts: output_mod.SerializeOpts,
     raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordMeta {
     const start: u32 = @intCast(chunk_buf.items.len);
 
@@ -674,7 +680,7 @@ fn process_line_serialized(
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
-        opt_it.* = query.execute(tape, worker_alloc) catch {
+        opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
             if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
@@ -687,7 +693,7 @@ fn process_line_serialized(
         };
         current_query.* = query;
     } else {
-        opt_it.*.?.reset(tape);
+        opt_it.*.?.reset(tape, external_bindings);
     }
 
     // ── Serialize values directly into the shared chunk buffer ────────────────
@@ -818,6 +824,7 @@ const IoCtx = struct {
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
@@ -908,6 +915,7 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
         .color = ctx.color,
         .opts = ctx.opts,
         .raw_input = ctx.raw_input,
+        .external_bindings = ctx.external_bindings,
     });
     chunk_id.* += 1;
     batch_buf.clearRetainingCapacity();
@@ -954,6 +962,7 @@ const FileFeedCtx = struct {
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
@@ -997,6 +1006,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .color = ctx.color,
             .opts = ctx.opts,
             .raw_input = ctx.raw_input,
+            .external_bindings = ctx.external_bindings,
         });
         chunk_id += 1;
     }
@@ -1211,6 +1221,7 @@ pub const Pool = struct {
         color: ?*const output_mod.Color,
         opts: output_mod.SerializeOpts,
         raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
     ) ZqError!void {
         p._format = format;
         const stat = file.stat() catch return error.IoError;
@@ -1246,6 +1257,7 @@ pub const Pool = struct {
             .color = color,
             .opts = opts,
             .raw_input = raw_input,
+            .external_bindings = external_bindings,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
@@ -1280,6 +1292,7 @@ pub const Pool = struct {
         color: ?*const output_mod.Color,
         opts: output_mod.SerializeOpts,
         raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
     ) void {
         p._format = format;
         const ctx_ptr = p.allocator.create(IoCtx) catch {
@@ -1298,6 +1311,7 @@ pub const Pool = struct {
             .color = color,
             .opts = opts,
             .raw_input = raw_input,
+            .external_bindings = external_bindings,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {

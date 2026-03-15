@@ -38,7 +38,7 @@ fn compileNull(src: []const u8) !CompiledQuery {
 }
 
 fn collectAll(q: *const CompiledQuery, t: Tape) ![]Value {
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     var out = std.ArrayList(Value){};
     while (try it.next()) |v| try out.append(alloc, v);
@@ -157,7 +157,7 @@ test ".foo: TypeError on non-object (array)" {
     var q = try compile(".foo");
     defer q.deinit();
 
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
 
     try std.testing.expectError(error.TypeError, it.next());
@@ -331,7 +331,7 @@ test ".[] on non-array: TypeError" {
     var q = try compile(".[]");
     defer q.deinit();
 
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
 
     try std.testing.expectError(error.TypeError, it.next());
@@ -545,7 +545,7 @@ test "empty tape: next() returns null immediately" {
     defer q.deinit();
 
     const t = Tape{ .entries = &.{}, .string_buf = "" };
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
 
     const v = try it.next();
@@ -594,14 +594,14 @@ test "reset: iterator reuses buffers across two integer tapes" {
     const tape_b = tape(&entries_b, "");
 
     // First run via execute().
-    var it = try q.execute(tape_a, alloc);
+    var it = try q.execute(tape_a, &.{}, alloc);
     defer it.deinit();
     const v1 = (try it.next()).?;
     try std.testing.expectEqual(@as(i64, 100), v1.int);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 
     // Reset to a new tape — must produce correct values with zero new allocations.
-    it.reset(tape_b);
+    it.reset(tape_b, &.{});
     const v2 = (try it.next()).?;
     try std.testing.expectEqual(@as(i64, 200), v2.int);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
@@ -622,10 +622,10 @@ test "reset: iterator reuses buffers across many records (JSONL simulation)" {
         const t = tape(&entries, "");
 
         if (first) {
-            it = try q.execute(t, alloc);
+            it = try q.execute(t, &.{}, alloc);
             first = false;
         } else {
-            it.reset(t);
+            it.reset(t, &.{});
         }
 
         const val = (try it.next()).?;
@@ -658,12 +658,12 @@ test "reset: iterator correctly re-evaluates field access on different objects" 
     };
     const tape_2 = tape(&entries_2, sb2);
 
-    var it = try q.execute(tape_1, alloc);
+    var it = try q.execute(tape_1, &.{}, alloc);
     defer it.deinit();
     try std.testing.expectEqual(@as(i64, 30), (try it.next()).?.int);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 
-    it.reset(tape_2);
+    it.reset(tape_2, &.{});
     try std.testing.expectEqual(@as(i64, 55), (try it.next()).?.int);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
@@ -776,7 +776,7 @@ test "unary negation: TypeError on non-numeric field" {
     var q = try compile("-.s");
     defer q.deinit();
 
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
 
     try std.testing.expectError(error.TypeError, it.next());
@@ -1847,7 +1847,7 @@ test "slice: .[1:3] extracts elements at index 1 and 2" {
     var q = try compile(".[1:3]");
     defer q.deinit();
     // Verify within iterator lifetime so runtime_tape is still valid.
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .array);
@@ -1891,7 +1891,7 @@ test "slice: .[:2] extracts first two elements" {
     const t = tape(&entries, "");
     var q = try compile(".[:2]");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .array);
@@ -1914,7 +1914,7 @@ test "slice: .[-2:] extracts last two elements" {
     const t = tape(&entries, "");
     var q = try compile(".[-2:]");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .array);
@@ -1988,7 +1988,7 @@ test "slice: string slice extracts byte range" {
     const t = tape(&entries, sb);
     var q = try compile(".[1:4]");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .string);
@@ -2001,7 +2001,7 @@ test "slice: TypeError on non-array non-string" {
     const t = tape(&entries, "");
     var q = try compile(".[1:2]");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     try std.testing.expectError(error.TypeError, it.next());
 }
@@ -2022,7 +2022,7 @@ test "update |=: replace object field" {
     const t = tape(&entries, sb);
     var q = try compile(".a |= . + 10");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .object);
@@ -2054,7 +2054,7 @@ test "update +=: increment field" {
     const t = tape(&entries, sb);
     var q = try compile(".n += 3");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .object);
@@ -2083,7 +2083,7 @@ test "update |=: replace array element" {
     const t = tape(&entries, "");
     var q = try compile(".[1] |= . * 10");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .array);
@@ -2114,7 +2114,7 @@ test "update //=: uses default when field is null" {
     const t = tape(&entries, sb);
     var q = try compile(".x //= 99");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .object);
@@ -2137,7 +2137,7 @@ test "update //=: keeps existing truthy value" {
     const t = tape(&entries, sb);
     var q = try compile(".x //= 99");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .object);
@@ -2161,7 +2161,7 @@ test "update |=: nested path .a.b" {
     const t = tape(&entries, sb);
     var q = try compile(".a.b |= . + 100");
     defer q.deinit();
-    var it = try q.execute(t, alloc);
+    var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
     try std.testing.expect(v == .object);

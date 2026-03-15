@@ -262,7 +262,7 @@ pub export fn zq_execute(
     };
 
     // Execute the compiled query against the tape.
-    var iterator = handle.query.execute(tape, allocator) catch return ERR_OOM;
+    var iterator = handle.query.execute(tape, &.{}, allocator) catch return ERR_OOM;
     defer iterator.deinit();
 
     // Accumulate all results into a temporary ArrayList, then move into the
