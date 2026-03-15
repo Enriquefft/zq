@@ -58,6 +58,7 @@ pub fn serialize(ctx: anytype, val: Value, format: Format, color: ?*const Color)
             try serializeValueCompact(ctx, val, color);
             try ctx.writeByte('\n');
         },
+        .join => try serializeValueRaw(ctx, val),
     }
 }
 

@@ -373,4 +373,6 @@ pub const Format = enum {
     raw,
     /// One JSON value per line (JSONL).
     jsonl,
+    /// Raw output with no trailing newline (--join-output / -j).
+    join,
 };

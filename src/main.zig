@@ -114,7 +114,7 @@ pub fn main() !u8 {
     defer writer.deinit();
 
     // Pick format: if stdout is TTY and no explicit format flag, use pretty.
-    const format = config.format;
+    const format: types.Format = if (config.join_output) .join else config.format;
 
     const color: ?*const output_mod.Color = switch (config.color) {
         .on => &output_mod.default_colors,

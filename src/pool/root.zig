@@ -456,7 +456,7 @@ fn worker_fn(ctx: WorkerCtx) void {
             var chunk_buf = std.ArrayList(u8){};
             const buf_estimate: usize = switch (fmt) {
                 .pretty => job.data.len * 6,
-                .compact, .jsonl, .raw => job.data.len,
+                .compact, .jsonl, .raw, .join => job.data.len,
             };
             chunk_buf.ensureTotalCapacity(aa, buf_estimate) catch {};
 
