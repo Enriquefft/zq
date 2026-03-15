@@ -347,8 +347,14 @@ fn writeRecord(
 }
 
 fn hasNoColor() bool {
-    const val = std.posix.getenv("NO_COLOR") orelse return false;
-    return val.len > 0;
+    if (comptime @import("builtin").os.tag == .windows) {
+        const key = std.unicode.utf8ToUtf16LeStringLiteral("NO_COLOR");
+        const val = std.process.getenvW(key) orelse return false;
+        return val.len > 0;
+    } else {
+        const val = std.posix.getenv("NO_COLOR") orelse return false;
+        return val.len > 0;
+    }
 }
 
 fn openFile(path: []const u8) !std.fs.File {
