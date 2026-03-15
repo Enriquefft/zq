@@ -893,6 +893,7 @@ pub const ResultIterator = struct {
                 return null;
             },
             .fork => {
+                if (it.fork_stack.items.len >= max_stack_depth) return error.DepthLimitExceeded;
                 it.fork_stack.appendAssumeCapacity(ForkFrame{
                     .right_ip = @intCast(instr.operand.index),
                     .saved_input = it.current,
@@ -2037,17 +2038,8 @@ pub const ResultIterator = struct {
                         .object => |rspan| try it.recursiveMerge(lspan, rspan),
                         else => error.TypeError,
                     },
-                    .null_val => left,
                     else => error.TypeError,
                 },
-                else => error.TypeError,
-            },
-            .null_val => switch (right) {
-                .tape_value => |rtv| switch (rtv) {
-                    .object => right,
-                    else => error.TypeError,
-                },
-                .null_val => .null_val,
                 else => error.TypeError,
             },
             else => error.TypeError,
@@ -4267,8 +4259,8 @@ pub const ResultIterator = struct {
                     .need_more => return error.TypeError,
                 }
             },
-            // If already not a string, pass through (jq semantics)
-            else => return try valueToStackValue(it.current),
+            // jq rejects non-string input: "only strings can be parsed"
+            else => return error.TypeError,
         }
     }
 
