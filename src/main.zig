@@ -647,7 +647,11 @@ fn collectJsonValues(
                         try rt.copyFrom(d.tape, allocator);
                         parser.reset();
                     },
-                    .need_more => {},
+                    .need_more => {
+                        printErr("zq: parse error (skipping malformed input)\n");
+                        had_errors.* = true;
+                        parser.reset();
+                    },
                 }
             }
             break;
@@ -953,6 +957,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 printErr("zq: --indent: value must be 0-8\n");
                 return error.UsageError;
             }
+            config.tab_indent = false;
             config.indent_width = n;
         } else if (std.mem.eql(u8, arg, "--arg")) {
             if (i + 2 >= args.len) {

@@ -470,7 +470,7 @@ fn worker_fn(ctx: WorkerCtx) void {
             while (remaining.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
                 const line = if (job.raw_input)
-                    std.mem.trimRight(u8, remaining[0..nl], "\r")
+                    stripTrailingCr(remaining[0..nl])
                 else
                     std.mem.trimRight(u8, remaining[0..nl], " \t\r");
                 remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
@@ -524,7 +524,7 @@ fn worker_fn(ctx: WorkerCtx) void {
             while (remaining.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
                 const line = if (job.raw_input)
-                    std.mem.trimRight(u8, remaining[0..nl], "\r")
+                    stripTrailingCr(remaining[0..nl])
                 else
                     std.mem.trimRight(u8, remaining[0..nl], " \t\r");
                 remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
@@ -930,7 +930,7 @@ fn flushPartialToBatch(
     raw_input: bool,
 ) error{OutOfMemory}!void {
     const trimmed = if (raw_input)
-        std.mem.trimRight(u8, partial_line.items, "\r")
+        stripTrailingCr(partial_line.items)
     else
         std.mem.trimRight(u8, partial_line.items, " \t\r");
     // In raw_input mode, an empty partial is valid (empty string) only if there
@@ -1035,6 +1035,11 @@ fn countNewlines(data: []const u8) usize {
     for (data[i..]) |b| total += @intFromBool(b == '\n');
 
     return total;
+}
+
+/// Strip at most one trailing '\r' (CRLF line ending).
+fn stripTrailingCr(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
 }
 
 fn hasNonEmptyLine(data: []const u8) bool {
