@@ -1339,7 +1339,7 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             }
         },
         .lparen => {
-            try parseLogical(ctx);
+            try parsePipe(ctx);
             const close = try ctx.lex.next();
             if (close.tag != .rparen) return error.QuerySyntaxError;
         },
@@ -1507,11 +1507,18 @@ fn parseArrayConstruct(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
     const peek = try ctx.lex.peek();
     if (peek.tag != .rbracket) {
-        // Parse the inner expression (generator).
+        // Save input so each comma-separated expression sees the original value.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
         try parsePipe(ctx);
-        // Emit an explicit output inside the collect scope. The VM intercepts
-        // this in collect mode: instead of yielding, it buffers the value.
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+        while ((try ctx.lex.peek()).tag == .comma) {
+            _ = try ctx.lex.next(); // consume comma
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+            try parsePipe(ctx);
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+        }
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
     }
 
     // Consume the closing `]`.

@@ -93,3 +93,80 @@ jobs:
           repository: Enriquefft/homebrew-zq
           event-type: release
           client-payload: '{"version": "${{ github.ref_name }}"}'
+
+  aur:
+    name: Update AUR
+    runs-on: ubuntu-latest
+    needs: [release]
+    if: "!contains(github.ref_name, '-')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare PKGBUILD
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/Enriquefft/zq/releases/download/v${VERSION}"
+
+          curl -fsSL "${BASE}/checksums-sha256.txt" -o checksums.txt
+
+          SHA_X86_64=$(grep "linux-amd64" checksums.txt | awk '{print $1}')
+          SHA_AARCH64=$(grep "linux-arm64" checksums.txt | awk '{print $1}')
+
+          cp dist/aur/PKGBUILD PKGBUILD
+          sed -i "s/PKGVER_PLACEHOLDER/${VERSION}/" PKGBUILD
+          sed -i "s/sha256sums_x86_64=('PLACEHOLDER')/sha256sums_x86_64=('${SHA_X86_64}')/" PKGBUILD
+          sed -i "s/sha256sums_aarch64=('PLACEHOLDER')/sha256sums_aarch64=('${SHA_AARCH64}')/" PKGBUILD
+
+          cat PKGBUILD
+
+      - name: Generate .SRCINFO
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA_X86_64=$(grep "linux-amd64" checksums.txt | awk '{print $1}')
+          SHA_AARCH64=$(grep "linux-arm64" checksums.txt | awk '{print $1}')
+
+          printf 'pkgbase = zq-bin\n' > .SRCINFO
+          printf '\tpkgdesc = A drop-in replacement for jq, 25x faster, written in Zig\n' >> .SRCINFO
+          printf '\tpkgver = %s\n' "$VERSION" >> .SRCINFO
+          printf '\tpkgrel = 1\n' >> .SRCINFO
+          printf '\turl = https://github.com/Enriquefft/zq\n' >> .SRCINFO
+          printf '\tarch = x86_64\n' >> .SRCINFO
+          printf '\tarch = aarch64\n' >> .SRCINFO
+          printf '\tlicense = MIT\n' >> .SRCINFO
+          printf '\tprovides = zq\n' >> .SRCINFO
+          printf '\tconflicts = zq\n' >> .SRCINFO
+          printf '\tsource_x86_64 = https://github.com/Enriquefft/zq/releases/download/v%s/zq-%s-linux-amd64.tar.gz\n' "$VERSION" "$VERSION" >> .SRCINFO
+          printf '\tsha256sums_x86_64 = %s\n' "$SHA_X86_64" >> .SRCINFO
+          printf '\tsource_aarch64 = https://github.com/Enriquefft/zq/releases/download/v%s/zq-%s-linux-arm64.tar.gz\n' "$VERSION" "$VERSION" >> .SRCINFO
+          printf '\tsha256sums_aarch64 = %s\n' "$SHA_AARCH64" >> .SRCINFO
+          printf '\n' >> .SRCINFO
+          printf 'pkgname = zq-bin\n' >> .SRCINFO
+
+          cat .SRCINFO
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat >> ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+            StrictHostKeyChecking accept-new
+          EOF
+
+          git clone ssh://aur@aur.archlinux.org/zq-bin.git aur-repo
+          cp PKGBUILD aur-repo/PKGBUILD
+          cp .SRCINFO aur-repo/.SRCINFO
+
+          cd aur-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && echo "No changes" && exit 0
+          VERSION="${GITHUB_REF_NAME#v}"
+          git commit -m "Update to ${VERSION}"
+          git push

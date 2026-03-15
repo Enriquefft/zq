@@ -131,6 +131,10 @@ while (defined(my $line = <$fh>)) {
         chomp $line;
         last if $line =~ /^\s*$/;
         next if $line =~ /^#/;
+        # Normalize to compact JSON: jq's test file sometimes has spaces
+        # after commas/colons but jq -c (our target format) never does.
+        $line =~ s/,\s+/,/g;
+        $line =~ s/:\s+/:/g;
         push @outputs, $line;
     }
 

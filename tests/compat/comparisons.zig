@@ -1,6 +1,13 @@
 // !! GENERATED FILE â do not edit by hand.
 // !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
 //
+// NOTE: Tests L1421-L1442 have expected outputs patched from the generated
+// values.  jq's test file (jq.test) inconsistently uses spaces after commas
+// in some expected outputs (e.g. "[true, true, false]"), but jq -c actually
+// produces compact JSON without spaces ("[true,true,false]").  Our serializer
+// matches jq -c, so the expectations are corrected here.  Verified against
+// jq 1.8.1.
+//
 // jq compat â comparisons (13 tests)
 // QuerySyntaxError â test FAILS  (filter not yet implemented â fix it)
 // Any other error  â test FAILS  (real compatibility gap)
@@ -109,7 +116,7 @@ test "jq:L1421 [(_foo_ | contains(_foo_)), (_foobar_ | contains(_foo_)),..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true, false]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,false]", results[0]);
 }
 
 test "jq:L1426 [contains(__), contains(__u0000_)]" {
@@ -122,7 +129,7 @@ test "jq:L1426 [contains(__), contains(__u0000_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true]", results[0]);
+    try std.testing.expectEqualStrings("[true,true]", results[0]);
 }
 
 test "jq:L1430 [contains(__), contains(_a_), contains(_ab_), contains(_c..." {
@@ -135,7 +142,7 @@ test "jq:L1430 [contains(__), contains(_a_), contains(_ab_), contains(_c..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true, true, true, true]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,true,true,true]", results[0]);
 }
 
 test "jq:L1434 [contains(_cd_), contains(_b_u0000_), contains(_ab_u0000_)]" {
@@ -148,7 +155,7 @@ test "jq:L1434 [contains(_cd_), contains(_b_u0000_), contains(_ab_u0000_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true, true]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,true]", results[0]);
 }
 
 test "jq:L1438 [contains(_b_u0000c_), contains(_b_u0000cd_), contains(_b..." {
@@ -161,7 +168,7 @@ test "jq:L1438 [contains(_b_u0000c_), contains(_b_u0000cd_), contains(_b..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true, true, true]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,true]", results[0]);
 }
 
 test "jq:L1442 [contains(_@_), contains(__u0000@_), contains(__u0000what_)]" {
@@ -174,5 +181,5 @@ test "jq:L1442 [contains(_@_), contains(__u0000@_), contains(__u0000what_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[false, false, false]", results[0]);
+    try std.testing.expectEqualStrings("[false,false,false]", results[0]);
 }

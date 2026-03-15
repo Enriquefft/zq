@@ -37,6 +37,10 @@ const CollectFrame = struct {
     /// Value stack depth when collection started.
     /// Used to trim leftover operands after each output.
     outer_value_depth: u32,
+    /// if_stack depth when collection started.
+    /// Used to clean up save_input entries when the iteration finalization
+    /// shortcut bypasses restore_input instructions.
+    outer_if_depth: u32,
     /// IP of the matching array_collect_end instruction.
     end_ip: u32,
 };
@@ -377,6 +381,10 @@ pub const ResultIterator = struct {
                             defer completed.buffer.deinit(it.alloc);
                             const arr_val = try it.buildCollectedArray(&completed);
                             it.pushValue(arr_val);
+                            // Clean up any save_input entries that were bypassed
+                            // when the iteration finalization shortcut skipped
+                            // restore_input instructions.
+                            it.if_stack.items.len = completed.outer_if_depth;
                             it.ip = completed.end_ip + 1; // skip past array_collect_end
                             continue;
                         }
@@ -510,8 +518,9 @@ pub const ResultIterator = struct {
                         // More inner iterations pending (iter frame or range frame): trigger advance.
                         it.ip = @intCast(it.instructions.len);
                     } else {
-                        // No more inner iterations: jump to array_collect_end.
-                        it.ip = cf.end_ip;
+                        // No more inner iterations: continue to next instruction
+                        // (handles sequential comma-separated expressions).
+                        it.ip += 1;
                     }
                     return null;
                 } else {
@@ -693,6 +702,7 @@ pub const ResultIterator = struct {
                     .outer_stack_depth = @intCast(it.stack.items.len),
                     .outer_range_depth = @intCast(it.range_stack.items.len),
                     .outer_value_depth = @intCast(it.value_stack.items.len),
+                    .outer_if_depth = @intCast(it.if_stack.items.len),
                     .end_ip = @intCast(instr.operand.index),
                 });
                 it.ip += 1;
@@ -3421,32 +3431,20 @@ pub const ResultIterator = struct {
         it: *ResultIterator,
         comptime op: fn (f64, f64) bool,
     ) ZqError!bool {
-        const right = try it.popValue();
-        const left = if (it.value_stack.items.len > 0)
+        const right_sv = try it.popValue();
+        const left_sv = if (it.value_stack.items.len > 0)
             try it.popValue()
         else
             try valueToStackValue(it.current);
 
-        return switch (left) {
-            .bool_val => |lb| switch (right) {
-                .bool_val => |rb| op(@as(f64, if (lb) 1 else 0), @as(f64, if (rb) 1 else 0)),
-                .int => |ri| op(@as(f64, if (lb) 1 else 0), @floatFromInt(ri)),
-                .float => |rf| op(@as(f64, if (lb) 1 else 0), rf),
-                else => error.TypeError,
-            },
-            .int => |li| switch (right) {
-                .bool_val => |rb| op(@floatFromInt(li), @as(f64, if (rb) 1 else 0)),
-                .int => |ri| op(@floatFromInt(li), @floatFromInt(ri)),
-                .float => |rf| op(@floatFromInt(li), rf),
-                else => error.TypeError,
-            },
-            .float => |lf| switch (right) {
-                .bool_val => |rb| op(lf, @as(f64, if (rb) 1 else 0)),
-                .int => |ri| op(lf, @floatFromInt(ri)),
-                .float => |rf| op(lf, rf),
-                else => error.TypeError,
-            },
-            else => error.TypeError,
+        const left = try stackValueToValue(left_sv);
+        const right = try stackValueToValue(right_sv);
+        const order = jqCompareValues(left, right);
+
+        return switch (order) {
+            .lt => op(-1.0, 0.0),
+            .eq => op(0.0, 0.0),
+            .gt => op(1.0, 0.0),
         };
     }
 
