@@ -112,6 +112,10 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [ ] | **`while`/`until`/`repeat`** | Loop constructs | Low |
 | [ ] | **`label`/`break`** | Non-local exit from generators | High |
 | [ ] | **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra | Medium |
+| [ ] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
+| [ ] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
+| [ ] | **Builtin overloads** (`any/all(gen;cond)`, `flatten(depth)`, `range(a;b;c)`) | Complete multi-arg signatures | Low |
+| [ ] | **`contains` on strings** | `"foobar" \| contains("foo")` | Low |
 | [ ] | **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings | Low |
 
 ### CLI
