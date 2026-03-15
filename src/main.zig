@@ -87,10 +87,6 @@ pub fn main() !u8 {
         };
     };
 
-    if (config.slurp) {
-        printErr("zq: --slurp not yet implemented\n");
-        return EXIT_USAGE;
-    }
     // Compile query.
     var cq = query_mod.CompiledQuery.compile(filter_src, .{}, allocator) catch |e| {
         printErr("zq: compile error: ");
@@ -125,6 +121,12 @@ pub fn main() !u8 {
 
     if (config.null_input) {
         last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, allocator) catch |e| {
+            printErr("zq: ");
+            printZqErr(e);
+            return EXIT_SYSTEM;
+        };
+    } else if (config.slurp) {
+        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -307,6 +309,269 @@ fn processFile(
     }
 
     return last_was_false_or_null;
+}
+
+// ── Slurp Processing ─────────────────────────────────────────────────────────
+
+fn processSlurp(
+    config: *const Config,
+    cq: *const query_mod.CompiledQuery,
+    writer: *output_mod.Writer,
+    format: types.Format,
+    color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
+    allocator: std.mem.Allocator,
+) !bool {
+    if (config.raw_input) {
+        return processSlurpRaw(config, cq, writer, format, color, opts, allocator);
+    }
+    return processSlurpJson(config, cq, writer, format, color, opts, allocator);
+}
+
+/// Collect all parsed JSON values into a single array, then run the query once.
+fn processSlurpJson(
+    config: *const Config,
+    cq: *const query_mod.CompiledQuery,
+    writer: *output_mod.Writer,
+    format: types.Format,
+    color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
+    allocator: std.mem.Allocator,
+) !bool {
+    var rt = try types.RuntimeTape.init(allocator);
+    defer rt.deinit(allocator);
+
+    // array_start with placeholder skip
+    const arr_start = try rt.appendEntry(allocator, .{
+        .tag = .array_start,
+        .payload = .{ .skip = 0 },
+    });
+
+    var parser = try parser_mod.Parser.init(allocator);
+    defer parser.deinit();
+
+    if (config.files.len == 0) {
+        try collectJsonValues(std.fs.File.stdin(), &rt, &parser, allocator);
+    } else {
+        for (config.files) |path| {
+            const file = openFile(path) catch {
+                printErr("zq: could not open ");
+                printErr(path);
+                printErr("\n");
+                return error.IoError;
+            };
+            defer file.close();
+            try collectJsonValues(file, &rt, &parser, allocator);
+        }
+    }
+
+    // array_end
+    const arr_end = try rt.appendEntry(allocator, .{
+        .tag = .array_end,
+        .payload = .{ .none = {} },
+    });
+
+    // Backfill skip pointer
+    rt.entries.items[arr_start].payload.skip = arr_end + 1;
+
+    const tape = rt.asTape();
+    var opt_it: ?query_mod.ResultIterator = null;
+    defer if (opt_it) |*it| it.deinit();
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, allocator);
+}
+
+/// Read all JSON values from a file/stdin using Source + Parser, copying each
+/// parsed value into the RuntimeTape.
+fn collectJsonValues(
+    file: std.fs.File,
+    rt: *types.RuntimeTape,
+    parser: *parser_mod.Parser,
+    allocator: std.mem.Allocator,
+) !void {
+    var src = try io_mod.Source.init(file, allocator);
+    defer src.deinit();
+
+    _ = try src.refill();
+
+    var fed_any = false;
+    while (true) {
+        const view = try src.peek();
+
+        if (view.bytes.len == 0 and view.is_eof) {
+            if (fed_any) {
+                const result = parser.feed("", true) catch return;
+                switch (result) {
+                    .done => |d| {
+                        try copyTapeToRuntimeTape(rt, d.tape, allocator);
+                    },
+                    .need_more => {},
+                }
+            }
+            break;
+        }
+
+        if (view.bytes.len == 0) {
+            _ = try src.refill();
+            continue;
+        }
+
+        fed_any = true;
+        const result = parser.feed(view.bytes, view.is_eof) catch {
+            const skip = std.mem.indexOfScalar(u8, view.bytes, '\n') orelse view.bytes.len - 1;
+            src.consume(skip + 1);
+            parser.reset();
+            fed_any = false;
+            if (view.is_eof and skip + 1 >= view.bytes.len) break;
+            continue;
+        };
+
+        switch (result) {
+            .done => |d| {
+                src.consume(d.consumed);
+                try copyTapeToRuntimeTape(rt, d.tape, allocator);
+                parser.reset();
+                fed_any = false;
+            },
+            .need_more => {
+                src.consume(view.bytes.len);
+                if (view.is_eof) break;
+                _ = try src.refill();
+            },
+        }
+    }
+}
+
+/// Copy a complete parsed tape into the RuntimeTape, re-interning strings and
+/// rebasing skip pointers. Follows the pattern from vm.zig copyTapeSpanToRuntimeTape.
+fn copyTapeToRuntimeTape(
+    rt: *types.RuntimeTape,
+    parsed: types.Tape,
+    allocator: std.mem.Allocator,
+) !void {
+    try copyTapeSpan(rt, parsed, 0, @intCast(parsed.entries.len), allocator);
+}
+
+fn copyTapeSpan(
+    rt: *types.RuntimeTape,
+    tape: types.Tape,
+    start: u32,
+    end: u32,
+    allocator: std.mem.Allocator,
+) !void {
+    var pos = start;
+    while (pos < end) {
+        const entry = tape.entries[pos];
+        switch (entry.tag) {
+            .object_start, .array_start => {
+                const container_start = try rt.appendEntry(allocator, entry);
+                const orig_skip = entry.payload.skip;
+                // Copy content (excluding end marker)
+                if (orig_skip > pos + 2) {
+                    try copyTapeSpan(rt, tape, pos + 1, orig_skip - 1, allocator);
+                }
+                // Append end marker
+                const new_end = try rt.appendEntry(allocator, .{
+                    .tag = if (entry.tag == .object_start) .object_end else .array_end,
+                    .payload = .{ .none = {} },
+                });
+                // Update skip pointer
+                rt.entries.items[container_start].payload.skip = new_end + 1;
+                pos = orig_skip;
+            },
+            .key, .string => {
+                const str = tape.getString(entry.payload.string);
+                const new_ref = try rt.internString(allocator, str);
+                _ = try rt.appendEntry(allocator, .{
+                    .tag = entry.tag,
+                    .payload = .{ .string = new_ref },
+                });
+                pos += 1;
+            },
+            .object_end, .array_end => {
+                // Skip end markers — handled by container start
+                pos += 1;
+            },
+            else => {
+                // Scalars: int, float, true_val, false_val, null_val
+                _ = try rt.appendEntry(allocator, entry);
+                pos += 1;
+            },
+        }
+    }
+}
+
+/// Collect all raw bytes into one string, trim trailing newline, then run query
+/// on a single string value (the -Rs path).
+fn processSlurpRaw(
+    config: *const Config,
+    cq: *const query_mod.CompiledQuery,
+    writer: *output_mod.Writer,
+    format: types.Format,
+    color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
+    allocator: std.mem.Allocator,
+) !bool {
+    var text_buf = std.ArrayList(u8){};
+    defer text_buf.deinit(allocator);
+
+    if (config.files.len == 0) {
+        try readAllBytes(std.fs.File.stdin(), &text_buf, allocator);
+    } else {
+        for (config.files) |path| {
+            const file = openFile(path) catch {
+                printErr("zq: could not open ");
+                printErr(path);
+                printErr("\n");
+                return error.IoError;
+            };
+            defer file.close();
+            try readAllBytes(file, &text_buf, allocator);
+        }
+    }
+
+    // Trim trailing newline (jq compat: -Rs strips final \n)
+    var len = text_buf.items.len;
+    if (len > 0 and text_buf.items[len - 1] == '\n') {
+        len -= 1;
+    }
+
+    // Build single-string tape
+    var entry_buf: [1]types.Tape.Entry = .{.{
+        .tag = .string,
+        .payload = .{ .string = .{ .offset = 0, .len = @intCast(len) } },
+    }};
+    const tape = types.Tape{
+        .entries = &entry_buf,
+        .string_buf = text_buf.items[0..len],
+    };
+
+    var opt_it: ?query_mod.ResultIterator = null;
+    defer if (opt_it) |*it| it.deinit();
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, allocator);
+}
+
+fn readAllBytes(
+    file: std.fs.File,
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    var src = try io_mod.Source.init(file, allocator);
+    defer src.deinit();
+
+    _ = try src.refill();
+
+    while (true) {
+        const view = try src.peek();
+        if (view.bytes.len == 0 and view.is_eof) break;
+        if (view.bytes.len == 0) {
+            _ = try src.refill();
+            continue;
+        }
+        try buf.appendSlice(allocator, view.bytes);
+        src.consume(view.bytes.len);
+        if (view.is_eof) break;
+        _ = try src.refill();
+    }
 }
 
 fn processNullInput(
