@@ -52,6 +52,8 @@ Streaming (cat | zq .id):
 
 **Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete.
 
+Compat test breakdown by file and feature: [COMPAT.md](COMPAT.md)
+
 ---
 
 ## v0.1.0 — Useful
@@ -72,84 +74,84 @@ Streaming (cat | zq .id):
 
 These are table-stakes. Without them, zq cannot process real-world filters.
 
-| Feature | Scope | What it unlocks |
-|---------|-------|-----------------|
-| [x] **Arithmetic** (`+`, `-`, `*`, `/`, `%`) | Compiler + VM | Object merge (`+`), string concat, array concat, numeric math. Unblocks ~40% of failing tests. |
-| [x] **Unary negation** (`-expr`) | Compiler + VM | `-1`, `-.foo` |
-| [x] **Comparisons** (`==`, `!=`, `<`, `>`, `<=`, `>=`) | Compiler + VM | Required for `select`, `if/then`, sorting |
-| [x] **Boolean operators** (`and`, `or`, `not`) | Compiler + VM | Required for any conditional logic |
-| [x] **Conditionals** (`if/then/elif/else/end`) | Compiler + VM | Control flow. ~20 blocked tests. |
-| [x] **Variables** (`expr as $x \| ...`) | Compiler + VM (scope stack) | Required for object construction, reduce, def, and most non-trivial filters |
-| [x] **Comma operator** (`a, b`) | Compiler + VM (generator stack) | Multiple outputs from a single expression. Required for array/object construction. |
-| [x] **Object construction** (`{a: .b, c: .d}`) | Compiler + VM | The #1 real-world use case. Shorthand `{a}` = `{a: .a}`. Computed keys `{(.k): .v}`. |
-| [x] **Array construction** (`[expr]`) | Compiler + VM | Collect generator outputs into array. `[.[] \| .name]`. |
-| [x] **String interpolation** (`"hello \(.name)"`) | Lexer + Compiler + VM | Very common in practice. Required for readable output. |
-| [x] **Recursive descent** (`..`) | Compiler + VM | Deep search. `.. \| .name?` |
-| [x] **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index |
+| | Feature | Scope | What it unlocks |
+|---|---------|-------|-----------------|
+| [x] | **Arithmetic** (`+`, `-`, `*`, `/`, `%`) | Compiler + VM | Object merge (`+`), string concat, array concat, numeric math |
+| [x] | **Unary negation** (`-expr`) | Compiler + VM | `-1`, `-.foo` |
+| [x] | **Comparisons** (`==`, `!=`, `<`, `>`, `<=`, `>=`) | Compiler + VM | Required for `select`, `if/then`, sorting |
+| [x] | **Boolean operators** (`and`, `or`, `not`) | Compiler + VM | Required for any conditional logic |
+| [x] | **Conditionals** (`if/then/elif/else/end`) | Compiler + VM | Control flow |
+| [x] | **Variables** (`expr as $x \| ...`) | Compiler + VM (scope stack) | Required for object construction, reduce, def, and most non-trivial filters |
+| [x] | **Comma operator** (`a, b`) | Compiler + VM (generator stack) | Multiple outputs. Required for array/object construction. |
+| [x] | **Object construction** (`{a: .b, c: .d}`) | Compiler + VM | Shorthand `{a}` = `{a: .a}`. Computed keys `{(.k): .v}`. |
+| [x] | **Array construction** (`[expr]`) | Compiler + VM | Collect generator outputs into array. `[.[] \| .name]`. |
+| [x] | **String interpolation** (`"hello \(.name)"`) | Lexer + Compiler + VM | Very common in practice. Required for readable output. |
+| [x] | **Recursive descent** (`..`) | Compiler + VM | Deep search. `.. \| .name?` |
+| [x] | **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index |
 
 ### Query language — P1
 
-| Feature | Scope | What it unlocks |
-|---------|-------|-----------------|
-| [x] **Alternative operator** (`//`) | Compiler + VM | Null coalescing. `(.foo // "default")` |
-| [x] **Try/catch** (`try expr catch expr`) | Compiler + VM | Error recovery. The LLM streaming use case. |
-| [x] **Optional operator** (`expr?`) | Compiler + VM | Suppress errors on missing keys. `.foo?` |
-| [x] **Slicing** (`.[2:4]`, `.[2:]`, `.[:4]`) | Compiler + VM | Array and string slicing |
-| [x] **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. `.foo \|= . + 1` |
-| [x] **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing. `resolveSliceBound()` wraps negative indices from end. |
-| [x] **Core builtins (tier 1)** | VM builtins table | `length`, `keys`, `values`, `has`, `in`, `type`, `empty`, `select`, `map`, `add`, `not`, `error`, `null`, `true`, `false`, `tostring`, `tonumber`, `range`, `keys_unsorted` — all implemented. |
-| [x] **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit` (partial — no early termination), `first`, `last`, `indices`, `index`, `rindex` — all implemented. |
+| | Feature | Scope | What it unlocks |
+|---|---------|-------|-----------------|
+| [x] | **Alternative operator** (`//`) | Compiler + VM | Null coalescing. `(.foo // "default")` |
+| [x] | **Try/catch** (`try expr catch expr`) | Compiler + VM | Error recovery. The LLM streaming use case. |
+| [x] | **Optional operator** (`expr?`) | Compiler + VM | Suppress errors on missing keys. `.foo?` |
+| [x] | **Slicing** (`.[2:4]`, `.[2:]`, `.[:4]`) | Compiler + VM | Array and string slicing |
+| [x] | **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. `.foo \|= . + 1` |
+| [x] | **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing |
+| [x] | **Core builtins (tier 1)** | VM builtins table | `length`, `keys`, `values`, `has`, `in`, `type`, `empty`, `select`, `map`, `add`, `not`, `error`, `null`, `true`, `false`, `tostring`, `tonumber`, `range`, `keys_unsorted` |
+| [x] | **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit`, `first`, `last`, `indices`, `index`, `rindex` |
 
 ### Query language — P2
 
-| Feature | Scope | Complexity |
-|---------|-------|------------|
-| [ ] **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
-| [x] **`def`** (user-defined functions, including recursion) | Composability | High |
-| [ ] **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
-| [ ] **`while`/`until`/`repeat`** | Loop constructs | Low |
-| [ ] **`label`/`break`** | Non-local exit from generators | High |
-| [ ] **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra | Medium |
-| [ ] **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings | Low |
+| | Feature | Scope | Complexity |
+|---|---------|-------|------------|
+| [ ] | **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
+| [x] | **`def`** (user-defined functions, including recursion) | Composability | High |
+| [ ] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
+| [ ] | **`while`/`until`/`repeat`** | Loop constructs | Low |
+| [ ] | **`label`/`break`** | Non-local exit from generators | High |
+| [ ] | **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra | Medium |
+| [ ] | **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings | Low |
 
 ### CLI
 
-| Feature | Priority | Complexity |
-|---------|----------|------------|
-| [ ] `-s` / `--slurp` | P0 — read all inputs into array | Medium |
-| [ ] `-S` / `--sort-keys` | P1 — alphabetical key ordering in output | Low |
-| [ ] `-R` / `--raw-input` | P1 — read lines as strings | Low |
-| [ ] `-j` / `--join-output` | P1 — raw output without trailing newline | Low |
-| [ ] `-f` / `--from-file` | P1 — read filter from file | Low |
-| [ ] `--arg NAME VALUE` | P1 — bind string variable | Medium |
-| [ ] `--argjson NAME VALUE` | P1 — bind JSON variable | Medium |
-| [ ] `--tab` / `--indent N` | P2 — indentation control | Low |
-| [ ] `--args` / `--jsonargs` | P2 — positional arguments via `$ARGS` | Medium |
+| | Feature | Priority | Complexity |
+|---|---------|----------|------------|
+| [ ] | `-s` / `--slurp` | P0 | Medium |
+| [ ] | `-S` / `--sort-keys` | P1 | Low |
+| [ ] | `-R` / `--raw-input` | P1 | Low |
+| [ ] | `-j` / `--join-output` | P1 | Low |
+| [ ] | `-f` / `--from-file` | P1 | Low |
+| [ ] | `--arg NAME VALUE` | P1 | Medium |
+| [ ] | `--argjson NAME VALUE` | P1 | Medium |
+| [ ] | `--tab` / `--indent N` | P2 | Low |
+| [ ] | `--args` / `--jsonargs` | P2 | Medium |
 
 ### Memory optimization — P0
 
 Current state: **715 MB RSS** for 648 MB JSONL `.id` query **(1.10x input)**. Target < 2x: **achieved**.
 Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 
-| Item | Detail |
-|------|--------|
-| [x] **Bounded chunk count** | InFlightLimiter caps in-flight chunks at `IN_FLIGHT_FACTOR × n_threads`. Feeder thread lazily enqueues chunks; collect() releases each slot after freeing the arena. Memory bounded to ~`chunk_size × n_threads`, not file size. **Result: 2998 MB → 1764 MB (-41%), 38s → 1.41s (27× faster).** |
-| [x] **Ordered output queue** | Fixed-size ring buffer replaces HashMap in Sequencer. Capacity `= max(IN_FLIGHT_FACTOR×n_threads, QUEUE_CAP+n_threads)` guarantees no slot collision in both file and stream modes. O(1) post and fetch with zero dynamic allocation in the hot path. **Result: 1764 MB → 1702 MB (-3.5%).** |
-| [x] **Batched stream mode** | stdin now routes through the parallel pool via `submit_stream()`. IO thread accumulates lines into 256 KB batches before creating jobs, reducing orchestration overhead from 2.16M ops to ~2,540 (matching file mode order of magnitude). InFlightLimiter backpressure added to stream mode. **Result: streaming 215s → 1.6s (120x faster); RSS stays low at ~8 MB.** |
-| [x] **2 MiB thread stacks** | Reduced from 16 MiB default. Workers use heap-allocated parse/query stacks; 2 MiB gives 4× margin over worst-case recursion depth. **Result: ~224 MB saved (22 threads × 14 MiB).** |
-| [x] **Contiguous serialized chunks** | Serialized path replaced per-record `RecordOutcome` + separate data allocations with one contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B). `ChunkResult.payload` is a tagged union (`structured` | `serialized`). Pre-allocated with exact record count (SIMD newline scan) so meta_list never resizes, enabling chunk_buf to grow in-place on the arena. Format-aware pre-alloc (6x for pretty, 1x for compact/jsonl/raw) reduces arena page leaks from resizes. **Result: 1053 MB → 715 MB (-32%) for `.id`; 2203 MB → 1980 MB (-10%) for `select()`.** |
+| | Item | Detail |
+|---|------|--------|
+| [x] | **Bounded chunk count** | InFlightLimiter caps in-flight chunks at `IN_FLIGHT_FACTOR × n_threads`. Memory bounded to ~`chunk_size × n_threads`, not file size. **Result: 2998 MB → 1764 MB (-41%), 38s → 1.41s (27x faster).** |
+| [x] | **Ordered output queue** | Fixed-size ring buffer replaces HashMap in Sequencer. O(1) post and fetch with zero dynamic allocation in the hot path. **Result: 1764 MB → 1702 MB (-3.5%).** |
+| [x] | **Batched stream mode** | stdin routes through parallel pool via `submit_stream()`. IO thread accumulates lines into 256 KB batches. InFlightLimiter backpressure added. **Result: streaming 215s → 1.6s (120x faster); RSS ~8 MB.** |
+| [x] | **2 MiB thread stacks** | Reduced from 16 MiB default. Workers use heap-allocated parse/query stacks. **Result: ~224 MB saved (22 threads × 14 MiB).** |
+| [x] | **Contiguous serialized chunks** | One contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B). Format-aware pre-alloc reduces arena page leaks. **Result: 1053 MB → 715 MB (-32%) for `.id`; 2203 MB → 1980 MB (-10%) for `select()`.** |
 
 **Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved for `.id` (1.10x).** `select()` at 3.1x due to pretty-format output expansion — acceptable since output size exceeds input size.
 
 ### Infrastructure
 
-| Item | Priority |
-|------|----------|
-| [x] jq compat test suite fully migrated (539 tests) | P0 |
-| [x] CI: `zig build test` on every commit | P0 |
-| [x] Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
-| [x] Basic `--help` text matching jq's structure | P1 |
-| [ ] Error messages include filter position and input context | P2 |
+| | Item | Priority |
+|---|------|----------|
+| [x] | jq compat test suite fully migrated (539 tests) | P0 |
+| [x] | CI: `zig build test` on every commit | P0 |
+| [x] | Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
+| [x] | Basic `--help` text matching jq's structure | P1 |
+| [ ] | Error messages include filter position and input context | P2 |
 
 ---
 
@@ -168,61 +170,61 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 
 ### Query language — remaining builtins
 
-| Category | Functions |
-|----------|-----------|
-| [ ] **String** | `split`, `join`, `test`, `match`, `capture`, `scan`, `sub`, `gsub`, `startswith`, `endswith`, `ltrimstr`, `rtrimstr`, `trim`, `ltrim`, `rtrim`, `trimstr`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tojson`, `fromjson` |
-| [ ] **Math** | `floor`, `ceil`, `round`, `sqrt`, `pow`, `log`, `log2`, `exp`, `exp2`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `abs`, `significand`, `exponent`, `logb`, `cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan/2`, `sinh`, `cosh`, `tanh`, `hypot`, `remainder`, `tgamma`, `lgamma` |
-| [ ] **Array** | `nth`, `combinations`, `transpose`, `bsearch`, `walk`, `recurse` |
-| [ ] **Object** | `pick`, `paths`, `leaf_paths`, `map_values` |
-| [ ] **I/O** | `input`, `inputs`, `debug`, `stderr`, `halt`, `halt_error` |
-| [ ] **Env** | `env`, `$ENV`, `builtins`, `$__loc__` |
-| [ ] **SQL-style** | `INDEX`, `IN`, `JOIN`, `GROUP_BY` |
-| [ ] **Date/time** | `now`, `gmtime`, `mktime`, `strftime`, `strptime`, `strflocaltime`, `todate`, `fromdate`, `todateiso8601`, `fromdateiso8601` |
-| [ ] **Type selectors** | `arrays`, `objects`, `iterables`, `booleans`, `numbers`, `strings`, `nulls`, `normals`, `finites`, `scalars`, `values` |
-| [ ] **Misc** | `isempty`, `utf8bytelength`, `ascii`, `splits`, `repeat`, `skip`, `until`, `while`, `limit/2` |
+| | Category | Functions |
+|---|----------|-----------|
+| [ ] | **String** | `split`, `join`, `test`, `match`, `capture`, `scan`, `sub`, `gsub`, `startswith`, `endswith`, `ltrimstr`, `rtrimstr`, `trim`, `ltrim`, `rtrim`, `trimstr`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tojson`, `fromjson` |
+| [ ] | **Math** | `floor`, `ceil`, `round`, `sqrt`, `pow`, `log`, `log2`, `exp`, `exp2`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `abs`, `significand`, `exponent`, `logb`, `cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan/2`, `sinh`, `cosh`, `tanh`, `hypot`, `remainder`, `tgamma`, `lgamma` |
+| [ ] | **Array** | `nth`, `combinations`, `transpose`, `bsearch`, `walk`, `recurse` |
+| [ ] | **Object** | `pick`, `paths`, `leaf_paths`, `map_values` |
+| [ ] | **I/O** | `input`, `inputs`, `debug`, `stderr`, `halt`, `halt_error` |
+| [ ] | **Env** | `env`, `$ENV`, `builtins`, `$__loc__` |
+| [ ] | **SQL-style** | `INDEX`, `IN`, `JOIN`, `GROUP_BY` |
+| [ ] | **Date/time** | `now`, `gmtime`, `mktime`, `strftime`, `strptime`, `strflocaltime`, `todate`, `fromdate`, `todateiso8601`, `fromdateiso8601` |
+| [ ] | **Type selectors** | `arrays`, `objects`, `iterables`, `booleans`, `numbers`, `strings`, `nulls`, `normals`, `finites`, `scalars`, `values` |
+| [ ] | **Misc** | `isempty`, `utf8bytelength`, `ascii`, `splits`, `repeat`, `skip`, `until`, `while`, `limit/2` |
 
 ### Performance
 
-| Item | Detail |
-|------|--------|
-| [ ] **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes (structural, whitespace, string, escape) 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
-| [x] **Parallel file mode** | mmap + chunk-based workers. Pool module fully implemented and auto-enabled in CLI. `-P N` explicit flag still pending. Achieved **25x vs jq, 18x vs jaq** on 15M-record JSONL `.id`. |
-| [ ] **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]` in non-JSONL JSON files. Scan for object boundaries at bracket depth 1, split across workers using existing chunk infrastructure. Falls back to single-threaded for non-array inputs — no regression. Closes the biggest gap in the parallelism story (API responses, data dumps). |
-| [ ] **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq vs gojq on: citylots.json (181MB), github events (JSONL), twitter sample (nested), synthetic 1M-line JSONL. |
-| [x] **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). Moved to v0.1 milestone criteria. |
-| [x] **Memory efficiency** | Target < 2x input size. **Achieved: 1.10x for `.id` (715 MB for 648 MB input).** Bounded chunk count + ordered output queue (v0.1: 2998→1702 MB), then 2 MiB stacks + contiguous serialized chunks + SIMD newline counting + format-aware pre-alloc (1702→715 MB). Total reduction: -76%. |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
+| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **25x vs jq, 18x vs jaq** on 15M-record JSONL `.id`. |
+| [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
+| [ ] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq vs gojq. |
+| [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
+| [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 1.10x for `.id`.** Total reduction: -76%. |
 
 ### CLI — remaining flags
 
-| Feature | Detail |
-|---------|--------|
-| [ ] `-P N` / `--parallel N` | **zq extension.** Process JSONL with N worker threads. Default: auto. `-P 0` = auto-detect CPU count. |
-| [ ] `--stream` | Streaming path-value event output |
-| [ ] `--seq` | RFC 7464 JSON Sequence support |
-| [x] `-C` / `--color-output` | ANSI color for TTY |
-| [x] `-M` / `--monochrome-output` | Disable color |
-| [ ] `--slurpfile NAME FILE` | Read file into variable as array |
-| [ ] `--rawfile NAME FILE` | Read file into variable as string |
-| [ ] `--unbuffered` | Flush after each value |
+| | Feature | Detail |
+|---|---------|--------|
+| [ ] | `-P N` / `--parallel N` | **zq extension.** Process JSONL with N worker threads. Default: auto. |
+| [ ] | `--stream` | Streaming path-value event output |
+| [ ] | `--seq` | RFC 7464 JSON Sequence support |
+| [x] | `-C` / `--color-output` | ANSI color for TTY |
+| [x] | `-M` / `--monochrome-output` | Disable color |
+| [ ] | `--slurpfile NAME FILE` | Read file into variable as array |
+| [ ] | `--rawfile NAME FILE` | Read file into variable as string |
+| [ ] | `--unbuffered` | Flush after each value |
 
 ### Module system
 
-| Item | Detail |
-|------|--------|
-| [ ] `import "path" as name;` | Load module definitions |
-| [ ] `include "path";` | Inline module definitions |
-| [ ] `-L dir` | Module search path |
-| [ ] `modulemeta` | Module metadata access |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | `import "path" as name;` | Load module definitions |
+| [ ] | `include "path";` | Inline module definitions |
+| [ ] | `-L dir` | Module search path |
+| [ ] | `modulemeta` | Module metadata access |
 
 ### Infrastructure
 
-| Item | Detail |
-|------|--------|
-| [ ] Man page (`zq.1`) | Generated from structured source |
-| [ ] Shell completions | bash, zsh, fish |
-| [ ] CI benchmark regression | Fail CI if throughput drops > 10% vs previous release |
-| [ ] Fuzz testing | AFL/libfuzzer on parser + query compiler |
-| [x] Release automation | GitHub Actions: tag → build 6 platforms → create release |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | Man page (`zq.1`) | Generated from structured source |
+| [ ] | Shell completions | bash, zsh, fish |
+| [ ] | CI benchmark regression | Fail CI if throughput drops > 10% vs previous release |
+| [ ] | Fuzz testing | AFL/libfuzzer on parser + query compiler |
+| [x] | Release automation | GitHub Actions: tag → build 6 platforms → create release |
 
 ---
 
@@ -245,63 +247,63 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 Bounded chunk count and ordered output queue moved to v0.1. Remaining optimizations here
 build on that foundation for tighter memory profiles.
 
-| Item | Detail |
-|------|--------|
-| [ ] **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. Preserves parallelism while respecting system limits. |
-| [ ] **Two-path execution** | Per-record queries (`.id`, `select()`) use streaming output — emit and free immediately. Aggregation queries (`group_by`, `sort_by`, `unique`) necessarily buffer — accept the memory cost, same as jq. |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
+| [ ] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
 
 **Target:** RSS < 3x thread count × chunk size for per-record queries. Aggregation queries remain proportional to output size.
 
 ### Conformance
 
-| Item | Detail |
-|------|--------|
-| [ ] **100% test pass rate** | All ~600 jq tests pass, or deviations documented in `DEVIATIONS.md` |
-| [ ] **Intentional deviations** | Documented improvements over jq (e.g., large integer handling). Each deviation has a rationale. |
-| [ ] **Edge case parity** | `nan`/`infinite` arithmetic, division by zero, negative zero, empty input, duplicate keys, deeply nested structures |
-| [ ] **Error message parity** | Error messages need not be identical but must convey the same information |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **100% test pass rate** | All ~600 jq tests pass, or deviations documented in `DEVIATIONS.md` |
+| [ ] | **Intentional deviations** | Documented improvements over jq (e.g., large integer handling). Each deviation has a rationale. |
+| [ ] | **Edge case parity** | `nan`/`infinite` arithmetic, division by zero, negative zero, empty input, duplicate keys, deeply nested structures |
+| [ ] | **Error message parity** | Error messages need not be identical but must convey the same information |
 
 ### Distribution
 
-| Channel | Detail |
-|---------|--------|
-| [x] **Static binaries** | All 6 platforms via GitHub Releases |
-| [x] **Homebrew** | `brew install Enriquefft/zq/zq` |
-| [ ] **APT/DEB** | PPA or direct .deb |
-| [x] **AUR** | `yay -S zq-bin` |
-| [x] **Nix** | `nix run github:Enriquefft/zq` + flake.nix |
-| [ ] **Scoop** | Windows package manager |
-| [ ] **Docker** | `docker run ghcr.io/Enriquefft/zq` |
-| [x] **GitHub Releases** | Automated via CI on tag push |
+| | Channel | Detail |
+|---|---------|--------|
+| [x] | **Static binaries** | All 6 platforms via GitHub Releases |
+| [x] | **Homebrew** | `brew install Enriquefft/zq/zq` |
+| [ ] | **APT/DEB** | PPA or direct .deb |
+| [x] | **AUR** | `yay -S zq-bin` |
+| [x] | **Nix** | `nix run github:Enriquefft/zq` + flake.nix |
+| [ ] | **Scoop** | Windows package manager |
+| [ ] | **Docker** | `docker run ghcr.io/Enriquefft/zq` |
+| [x] | **GitHub Releases** | Automated via CI on tag push |
 
 ### libzq (C ABI)
 
-| Item | Detail |
-|------|--------|
-| [ ] **Stable ABI** | Versioned symbols. ABI breaks only on major version. |
-| [ ] **pkg-config** | `pkg-config --libs libzq` |
-| [ ] **Header file** | `zq.h` with full documentation |
-| [ ] **Shared library** | `.so` / `.dylib` / `.dll` builds |
-| [ ] **Language bindings** | Python (cffi), Node (ffi-napi), Go (cgo). Community-maintained, not in-tree. |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **Stable ABI** | Versioned symbols. ABI breaks only on major version. |
+| [ ] | **pkg-config** | `pkg-config --libs libzq` |
+| [ ] | **Header file** | `zq.h` with full documentation |
+| [ ] | **Shared library** | `.so` / `.dylib` / `.dll` builds |
+| [ ] | **Language bindings** | Python (cffi), Node (ffi-napi), Go (cgo). Community-maintained, not in-tree. |
 
 ### Documentation
 
-| Item | Detail |
-|------|--------|
-| [ ] **Man page** | `man zq` — complete CLI reference |
-| [ ] **Website** | Landing page with benchmarks, examples, migration guide |
-| [ ] **Migration guide** | "Switching from jq to zq" — flag mapping, known deviations, FAQ |
-| [ ] **Filter cookbook** | Common recipes: API response parsing, log processing, LLM output handling |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **Man page** | `man zq` — complete CLI reference |
+| [ ] | **Website** | Landing page with benchmarks, examples, migration guide |
+| [ ] | **Migration guide** | "Switching from jq to zq" — flag mapping, known deviations, FAQ |
+| [ ] | **Filter cookbook** | Common recipes: API response parsing, log processing, LLM output handling |
 
 ### Quality
 
-| Item | Detail |
-|------|--------|
-| [ ] **Fuzz testing** | Continuous fuzzing via OSS-Fuzz or equivalent |
-| [ ] **No undefined behavior** | `zig build -Doptimize=ReleaseSafe` as default. Debug + ReleaseSafe + ReleaseFast all green. |
-| [ ] **Memory leak testing** | All tests pass under Zig's GPA leak detection |
-| [ ] **CI matrix** | Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64. Zig 0.15.x. |
-| [ ] **Reproducible builds** | Same source → same binary (bit-for-bit) |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **Fuzz testing** | Continuous fuzzing via OSS-Fuzz or equivalent |
+| [ ] | **No undefined behavior** | `zig build -Doptimize=ReleaseSafe` as default. Debug + ReleaseSafe + ReleaseFast all green. |
+| [ ] | **Memory leak testing** | All tests pass under Zig's GPA leak detection |
+| [ ] | **CI matrix** | Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64. Zig 0.15.x. |
+| [ ] | **Reproducible builds** | Same source → same binary (bit-for-bit) |
 
 ---
 
@@ -314,99 +316,99 @@ build on that foundation for tighter memory profiles.
 
 The killer feature. Pool module fully implemented; needs CLI surface.
 
-| Item | Detail |
-|------|--------|
-| [ ] `-P 0` / `--parallel auto` | CLI flag pending; parallelism is already auto-enabled in file mode (pool uses `getCpuCount()`). |
-| [x] **In-order output guarantee** | Chunk-level Sequencer delivers ChunkResults in submission order. collect() cursor walks records/values in order. |
-| [x] **Per-line error handling** | Parse/query errors become RecordOutcome.err; collect() surfaces them per-record without aborting the pipeline. |
-| [x] **Work stealing** | MPMC JobQueue with N_CHUNKS jobs; workers pull freely. Newline-aligned byte-range chunks prevent record splits. |
-| [x] **Stream pipeline** | IO thread reads lines from stdin/pipe in 256 KB batches, posted to the worker queue. InFlightLimiter backpressure prevents unbounded memory growth. **Result: stdin 215s → 1.4s (150x faster), 7 MB RSS.** |
-| [ ] **Scaling** | Near-linear scaling up to core count on JSONL. Measured: 11.6x jq at 11 cores (1103% CPU). |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | `-P 0` / `--parallel auto` | CLI flag pending; parallelism is already auto-enabled in file mode. |
+| [x] | **In-order output guarantee** | Chunk-level Sequencer delivers ChunkResults in submission order. |
+| [x] | **Per-line error handling** | Parse/query errors become RecordOutcome.err; surfaced per-record without aborting. |
+| [x] | **Work stealing** | MPMC JobQueue with N_CHUNKS jobs; workers pull freely. Newline-aligned byte-range chunks. |
+| [x] | **Stream pipeline** | IO thread reads stdin in 256 KB batches. InFlightLimiter backpressure. **Result: 215s → 1.4s (150x faster), 7 MB RSS.** |
+| [ ] | **Scaling** | Near-linear scaling up to core count on JSONL. |
 
 ### Streaming & incomplete JSON (LLM use case)
 
 zq's parser already auto-closes truncated containers. This section surfaces that
 capability and extends it for the LLM streaming workflow.
 
-| Item | Detail |
-|------|--------|
-| [ ] `--stream-recover` | Process incomplete JSON by auto-closing truncated containers. Already implemented in parser — needs CLI flag. |
-| [ ] `--follow` / `-f` | Like `tail -f` — keep reading as new data arrives. For watching LLM streaming endpoints. |
-| [x] **O(n) incremental parsing** | Parser maintains state across `feed()` calls. No re-parsing from position 0 on each chunk. |
-| [x] **Partial string completion** | `"hel` → `"hel"` (close the string). Auto-close implemented in parser for all containers. |
-| [ ] **SSE parsing** | Parse `data: {...}` lines from Server-Sent Events. Strip the `data: ` prefix automatically when detected. |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | `--stream-recover` | Process incomplete JSON by auto-closing truncated containers. Already implemented in parser — needs CLI flag. |
+| [ ] | `--follow` / `-f` | Like `tail -f` — keep reading as new data arrives. |
+| [x] | **O(n) incremental parsing** | Parser maintains state across `feed()` calls. No re-parsing from position 0. |
+| [x] | **Partial string completion** | `"hel` → `"hel"` (close the string). Auto-close implemented for all containers. |
+| [ ] | **SSE parsing** | Parse `data: {...}` lines from Server-Sent Events. Strip `data: ` prefix automatically. |
 
 ### Number precision
 
-| Item | Detail |
-|------|--------|
-| [x] **i64 integers** | Tape stores integers as i64. Integers up to 2^63 - 1 are exact. No silent float promotion. |
-| [ ] **Literal passthrough** | Numbers never modified by arithmetic output verbatim from source bytes. Requires storing original byte range in Tape entries. |
-| [ ] **i128 / bigint for arithmetic** | When i64 overflows during `+`/`-`/`*`, promote to i128 or arbitrary precision rather than silently wrapping. |
-| [ ] **Precision loss warning** | When a number must be converted to f64 and precision is lost, emit a warning to stderr (opt-in via `--warn-precision`). |
+| | Item | Detail |
+|---|------|--------|
+| [x] | **i64 integers** | Tape stores integers as i64. Exact to 2^63 - 1. No silent float promotion. |
+| [ ] | **Literal passthrough** | Numbers never modified by arithmetic output verbatim from source bytes. |
+| [ ] | **i128 / bigint for arithmetic** | When i64 overflows, promote to i128 or arbitrary precision rather than silently wrapping. |
+| [ ] | **Precision loss warning** | When precision is lost, emit a warning to stderr (opt-in via `--warn-precision`). |
 
 ### Extended input formats
 
-| Format | Detail |
-|--------|--------|
-| [x] **NDJSON / JSONL** | Newline-delimited JSON. Already the default multi-document mode. |
-| [ ] **JSONC** | JSON with `//` and `/* */` comments. Strip comments during parsing. Very common in config files. |
-| [ ] **YAML** | Read YAML input, apply jq filters, output JSON. Single-document and multi-document. |
-| [ ] **TOML** | Read TOML input, apply jq filters, output JSON. |
-| [ ] **CSV/TSV** | Read CSV/TSV with header row → array of objects. `--csv-input`, `--tsv-input`. |
-| [ ] **MessagePack** | Binary JSON. Read MessagePack, apply jq filters, output JSON or MessagePack. |
-| [ ] **CBOR** | Binary JSON (IETF standard). Similar to MessagePack support. |
+| | Format | Detail |
+|---|--------|--------|
+| [x] | **NDJSON / JSONL** | Newline-delimited JSON. Already the default multi-document mode. |
+| [ ] | **JSONC** | JSON with `//` and `/* */` comments. Very common in config files. |
+| [ ] | **YAML** | Read YAML input, apply jq filters, output JSON. |
+| [ ] | **TOML** | Read TOML input, apply jq filters, output JSON. |
+| [ ] | **CSV/TSV** | Read CSV/TSV with header row → array of objects. `--csv-input`, `--tsv-input`. |
+| [ ] | **MessagePack** | Binary JSON. Read MessagePack, apply jq filters, output JSON or MessagePack. |
+| [ ] | **CBOR** | Binary JSON (IETF standard). Similar to MessagePack support. |
 
 ### Extended output formats
 
-| Format | Flag | Detail |
-|--------|------|--------|
-| [ ] YAML | `--yaml-output` | Output as YAML instead of JSON |
-| [ ] CSV | `--csv-output` | Output as CSV (requires flat objects) |
-| [ ] TSV | `--tsv-output` | Output as TSV |
-| [ ] MessagePack | `--msgpack-output` | Binary JSON output |
-| [ ] Table | `--table` | ASCII table for terminal display |
+| | Format | Flag | Detail |
+|---|--------|------|--------|
+| [ ] | YAML | `--yaml-output` | Output as YAML instead of JSON |
+| [ ] | CSV | `--csv-output` | Output as CSV (requires flat objects) |
+| [ ] | TSV | `--tsv-output` | Output as TSV |
+| [ ] | MessagePack | `--msgpack-output` | Binary JSON output |
+| [ ] | Table | `--table` | ASCII table for terminal display |
 
 ### Better errors
 
-| Item | Detail |
-|------|--------|
-| [ ] **Filter position** | Error messages point to the exact character in the filter that failed. `error: TypeError at '.foo \| .bar': expected object, got array` with a `^~~~` underline. |
-| [ ] **Input context** | Show the JSON value that caused the error: `input value: [1, 2, 3]` |
-| [ ] **Suggestions** | "did you mean `;` instead of `,`?" for common jq syntax mistakes |
-| [ ] **Color errors** | Red/yellow ANSI coloring when stderr is a TTY |
-| [ ] **Stack trace** | For `def` recursion: show the call chain that led to the error |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **Filter position** | Point to the exact character in the filter that failed, with `^~~~` underline. |
+| [ ] | **Input context** | Show the JSON value that caused the error. |
+| [ ] | **Suggestions** | "did you mean `;` instead of `,`?" for common jq syntax mistakes |
+| [ ] | **Color errors** | Red/yellow ANSI coloring when stderr is a TTY |
+| [ ] | **Stack trace** | For `def` recursion: show the call chain that led to the error |
 
 ### Performance features
 
-| Item | Detail |
-|------|--------|
-| [x] **Query plan caching** | Query compiled once; ResultIterator reset() per record reuses eval stack — zero alloc/free in steady state. |
-| [x] **Tape arena allocator** | Per-chunk ArenaAllocator in pool: all OwnedValue copies arena-allocated, freed atomically on chunk exhaustion. Zero GPA calls in the hot path for scalars. |
-| [x] **Output batching** | 64 KB buffered writes in the output module. |
-| [x] **mmap for large files** | io module (zero-copy reads) + pool submit_file (mmap → byte-range chunks → workers). |
-| [ ] **Prefetch** | Issue `madvise(MADV_SEQUENTIAL)` for large file scans. |
+| | Item | Detail |
+|---|------|--------|
+| [x] | **Query plan caching** | Query compiled once; ResultIterator reset() per record reuses eval stack. |
+| [x] | **Tape arena allocator** | Per-chunk ArenaAllocator in pool. Zero GPA calls in the hot path for scalars. |
+| [x] | **Output batching** | 64 KB buffered writes in the output module. |
+| [x] | **mmap for large files** | io module (zero-copy reads) + pool submit_file (mmap → byte-range chunks → workers). |
+| [ ] | **Prefetch** | Issue `madvise(MADV_SEQUENTIAL)` for large file scans. |
 
 ### Developer experience
 
-| Item | Detail |
-|------|--------|
-| [ ] **REPL mode** | `zq --repl` — interactive filter development with instant feedback. Load a JSON file, type filters, see results. |
-| [ ] **`--explain`** | Print the compiled bytecode for a filter (for debugging/learning). |
-| [ ] **`--validate`** | Check filter syntax without executing. Exit 0 if valid, 2 if syntax error. |
-| [ ] **`--schema FILE`** | Validate input against JSON Schema. Exit 0 if valid, 1 if invalid. |
-| [ ] **Filter comments** | Allow `#` comments in filter files (stripped during compilation). |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **REPL mode** | `zq --repl` — interactive filter development with instant feedback. |
+| [ ] | **`--explain`** | Print the compiled bytecode for a filter. |
+| [ ] | **`--validate`** | Check filter syntax without executing. Exit 0 if valid, 2 if syntax error. |
+| [ ] | **`--schema FILE`** | Validate input against JSON Schema. |
+| [ ] | **Filter comments** | Allow `#` comments in filter files. |
 
 ### Ecosystem
 
-| Item | Detail |
-|------|--------|
-| [ ] **WASM build** | `zig build -Dtarget=wasm32-wasi`. zq in the browser, edge functions, Cloudflare Workers. |
-| [ ] **Language server** | LSP for jq filter syntax. Provides autocomplete, hover docs, error squiggles in VS Code / Neovim. |
-| [ ] **VS Code extension** | Syntax highlighting + LSP integration for `.jq` filter files. |
-| [ ] **Plugin system** | Custom builtins via shared library. Load with `--plugin path.so`. Uses the C ABI. |
-| [ ] **Python package** | `pip install zq` — Python bindings via cffi. `import zq; zq.first('.foo', '{"foo": 42}')`. |
-| [ ] **jq MCP server** | MCP tool that uses zq to pre-filter large JSON before passing to LLMs. Reduces context/cost. |
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **WASM build** | `zig build -Dtarget=wasm32-wasi`. zq in the browser, edge functions, Cloudflare Workers. |
+| [ ] | **Language server** | LSP for jq filter syntax. Autocomplete, hover docs, error squiggles. |
+| [ ] | **VS Code extension** | Syntax highlighting + LSP integration for `.jq` filter files. |
+| [ ] | **Plugin system** | Custom builtins via shared library. Load with `--plugin path.so`. Uses the C ABI. |
+| [ ] | **Python package** | `pip install zq` — Python bindings via cffi. |
+| [ ] | **jq MCP server** | MCP tool that uses zq to pre-filter large JSON before passing to LLMs. |
 
 ---
 
@@ -417,9 +419,9 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Behavior | jq | zq | Rationale |
 |----------|----|----|-----------|
-| Large integers | Silently converted to f64, losing precision above 2^53 | Stored as i64 (exact to 2^63). Arithmetic overflow returns error, not silent corruption. | Data integrity. Snowflake IDs, tweet IDs, nanosecond timestamps must not be silently mangled. |
-| Division by zero | Returns error or `nan` inconsistently | Returns `nan` for `0/0`, `infinite` for `n/0` (n>0), `-infinite` for `n/0` (n<0). Consistent IEEE 754. | Consistency. |
-| `input` with no remaining input | Error | Empty output (no values) | Composability with generators. Matches jaq behavior. |
+| Large integers | Silently converted to f64, losing precision above 2^53 | Stored as i64 (exact to 2^63). Arithmetic overflow returns error. | Data integrity. |
+| Division by zero | Returns error or `nan` inconsistently | `nan` for `0/0`, `infinite` for `n/0` (n>0), `-infinite` for `n/0` (n<0). IEEE 754. | Consistency. |
+| `input` with no remaining input | Error | Empty output (no values) | Composability with generators. Matches jaq. |
 | Duplicate object keys | Last value wins silently | Last value wins, but `--warn-duplicate-keys` emits stderr warning | Data integrity. |
 | Streaming incomplete JSON | Error | Auto-close truncated containers (opt-in via `--stream-recover`) | LLM streaming use case. |
 | Filter comments | Not supported | `#` comments in filter files | Developer experience. |
@@ -431,14 +433,14 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
 | jq compat test pass rate | **20.6%** (111/539) | 60% | 95% | 100% |
-| Throughput vs jq (parallel, 15M JSONL, `.id`) | **25x** (0.87s vs 21.4s) | > 1x ✓ | 5x | 10x |
-| Throughput vs jq (parallel, 15M JSONL, `select()`) | **15x** (2.9s vs 41.6s) | — | 15x ✓ | 20x |
-| Startup time | **~2ms** (2x faster than jq) | < 3ms ✓ | < 3ms | < 3ms |
-| Binary size (static, stripped) | **2.7 MB** | < 3 MB ✓ | < 3 MB | < 5 MB |
-| Memory (648 MB JSONL, `.id`, parallel) | **715 MB** (1.10x input) ✓ | < 2x input ✓ | < 2x input | < 2x input |
+| Throughput vs jq (parallel, `.id`) | **25x** (0.87s vs 21.4s) | > 1x | 5x | 10x |
+| Throughput vs jq (parallel, `select()`) | **15x** (2.9s vs 41.6s) | — | 15x | 20x |
+| Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
+| Binary size (static, stripped) | **2.7 MB** | < 3 MB | < 3 MB | < 5 MB |
+| Memory (648 MB JSONL, `.id`) | **715 MB** (1.10x) | < 2x | < 2x | < 2x |
 | Memory (streaming pipe) | **7 MB** | — | — | — |
-| Throughput vs jq (streaming, 15M JSONL, `.id`) | **16x** (1.4s vs 22.2s) | — | — | 10x |
-| Test count | **452** | 400+ ✓ | 800+ | 1000+ |
+| Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | — | — | 10x |
+| Test count | **452** | 400+ | 800+ | 1000+ |
 
 ---
 
