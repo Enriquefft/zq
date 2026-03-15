@@ -112,7 +112,7 @@ test "submit_file: single integer line" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -131,7 +131,7 @@ test "submit_file: three integer lines in order" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -152,7 +152,7 @@ test "submit_file: no trailing newline" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -171,7 +171,7 @@ test "submit_file: empty file returns no results" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -189,7 +189,7 @@ test "submit_file: blank lines are skipped" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -210,7 +210,7 @@ test "submit_file: .x field projection" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -231,7 +231,7 @@ test "submit_file: string value round-trip" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -260,7 +260,7 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
     var p = try Pool.init(4, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -283,7 +283,7 @@ test "submit_file: malformed JSON returns parse error" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const result = p.collect();
     try std.testing.expectError(error.UnexpectedToken, result);
@@ -300,7 +300,7 @@ test "submit_file: type error propagated from query" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const result = p.collect();
     try std.testing.expectError(error.TypeError, result);
@@ -318,7 +318,7 @@ test "submit_file: boolean values" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -338,7 +338,7 @@ test "submit_file: null value" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -357,7 +357,7 @@ test "submit_file: float value" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -390,7 +390,7 @@ test "submit_stream: three lines via pipe" {
     var p = try Pool.init(2, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, null, null);
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -416,7 +416,7 @@ test "submit_stream: empty stream returns no results" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, null, null);
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -440,7 +440,7 @@ test "submit_stream: no trailing newline" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, null, null);
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -461,7 +461,7 @@ test "collect returns null when called after drain" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     free_values(vals);
@@ -483,7 +483,7 @@ test "zero threads: submit_file processes records synchronously" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, null, null);
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
 
     const vals = try drain(&p);
     defer free_values(vals);
@@ -507,7 +507,7 @@ test "serialized: single integer" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -526,7 +526,7 @@ test "serialized: string value" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -544,7 +544,7 @@ test "serialized: multi-value query (.[])" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -562,7 +562,7 @@ test "serialized: error propagation" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = p.collect_bytes();
     try std.testing.expectError(error.UnexpectedToken, result);
@@ -584,7 +584,7 @@ test "serialized: ordering with 4 workers" {
     var p = try Pool.init(4, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -618,7 +618,7 @@ test "serialized stream: three lines via pipe" {
     var p = try Pool.init(2, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, .compact, null);
+    p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -636,7 +636,7 @@ test "serialized: empty select produces no bytes" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -654,7 +654,7 @@ test "serialized: false/null tracking for -e flag" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -673,7 +673,7 @@ test "serialized: null tracking for -e flag" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -692,7 +692,7 @@ test "serialized: collect_bytes returns null after drain" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null);
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     alloc.free(result.data);
@@ -711,7 +711,7 @@ test "serialized: jsonl format" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .jsonl, null);
+    try p.submit_file(file, &cq, .jsonl, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -730,11 +730,11 @@ test "serialized: raw format for string" {
     var p = try Pool.init(1, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .raw, null);
+    try p.submit_file(file, &cq, .raw, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
 
-    // raw format: no quotes for strings, no trailing newline
-    try std.testing.expectEqualStrings("hello", result.data);
+    // raw format: no quotes for strings, with trailing newline (matches jq -r)
+    try std.testing.expectEqualStrings("hello\n", result.data);
 }

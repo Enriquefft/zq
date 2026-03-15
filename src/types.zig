@@ -130,6 +130,52 @@ pub const RuntimeTape = struct {
             .string_buf = self.string_buf.items,
         };
     }
+
+    /// Copy all entries from a parsed tape into this runtime tape,
+    /// re-interning strings and rebasing skip pointers.
+    pub fn copyFrom(self: *RuntimeTape, tape: Tape, allocator: std.mem.Allocator) !void {
+        try self.copySpan(tape, 0, @intCast(tape.entries.len), allocator);
+    }
+
+    /// Copy a range of entries [start, end) from a tape into this runtime tape,
+    /// re-interning strings and rebasing skip pointers.
+    pub fn copySpan(self: *RuntimeTape, tape: Tape, start: u32, end: u32, allocator: std.mem.Allocator) !void {
+        var pos = start;
+        while (pos < end) {
+            const entry = tape.entries[pos];
+            switch (entry.tag) {
+                .object_start, .array_start => {
+                    const container_start = try self.appendEntry(allocator, entry);
+                    const orig_skip = entry.payload.skip;
+                    if (orig_skip > pos + 2) {
+                        try self.copySpan(tape, pos + 1, orig_skip - 1, allocator);
+                    }
+                    const new_end = try self.appendEntry(allocator, .{
+                        .tag = if (entry.tag == .object_start) .object_end else .array_end,
+                        .payload = .{ .none = {} },
+                    });
+                    self.entries.items[container_start].payload.skip = new_end + 1;
+                    pos = orig_skip;
+                },
+                .key, .string => {
+                    const str = tape.getString(entry.payload.string);
+                    const new_ref = try self.internString(allocator, str);
+                    _ = try self.appendEntry(allocator, .{
+                        .tag = entry.tag,
+                        .payload = .{ .string = new_ref },
+                    });
+                    pos += 1;
+                },
+                .object_end, .array_end => {
+                    pos += 1;
+                },
+                else => {
+                    _ = try self.appendEntry(allocator, entry);
+                    pos += 1;
+                },
+            }
+        }
+    }
 };
 
 // ─── Builtin IDs ─────────────────────────────────────────────────────────────
@@ -373,4 +419,6 @@ pub const Format = enum {
     raw,
     /// One JSON value per line (JSONL).
     jsonl,
+    /// Raw output with no trailing newline (--join-output / -j).
+    join,
 };

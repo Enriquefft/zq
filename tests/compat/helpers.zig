@@ -167,7 +167,7 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     var q = try CompiledQuery.compile(filter, .{}, alloc);
     defer q.deinit();
 
-    var it = try q.execute(tape, alloc);
+    var it = try q.execute(tape, &.{}, alloc);
     defer it.deinit();
 
     var result_list = std.ArrayList([]const u8){};

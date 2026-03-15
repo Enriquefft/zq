@@ -8,15 +8,22 @@ const Token = lx.Token;
 
 // ── Public output type ────────────────────────────────────────────────────────
 
+/// Declaration of an external variable to be pre-declared in the root scope.
+pub const ExternalVarDecl = struct {
+    name: []const u8,
+};
+
 /// Caller owns both slices; free via deinit().
 pub const Compiled = struct {
     instructions: []Instruction,
     function_table: []const types.FunctionDef,
     string_buf: []u8,
+    external_var_ids: []u32,
 
     pub fn deinit(c: *Compiled, alloc: std.mem.Allocator) void {
         alloc.free(c.instructions);
         alloc.free(c.string_buf);
+        if (c.external_var_ids.len > 0) alloc.free(c.external_var_ids);
         // function_table is part of string_buf, no need to free separately
     }
 };
@@ -223,7 +230,7 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutOfMemory})!Compiled {
+pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: std.mem.Allocator) (ZqError || error{OutOfMemory})!Compiled {
     const scope = try alloc.create(VariableScope);
     scope.* = VariableScope{
         .variables = std.ArrayList(VariableEntry){},
@@ -266,6 +273,14 @@ pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutO
     // which would otherwise invalidate StrRef offsets that reference live slices.
     try ctx.intern.ensureTotalCapacity(alloc, src.len * 2 + 16);
 
+    // Pre-declare external variables in root scope
+    var ext_var_ids = try alloc.alloc(u32, external_vars.len);
+    errdefer alloc.free(ext_var_ids);
+    for (external_vars, 0..) |ev, i| {
+        const name_ref = try internStr(&ctx.intern, alloc, ev.name);
+        ext_var_ids[i] = try declareVariable(&ctx, name_ref, alloc);
+    }
+
     try parseFilter(&ctx);
 
     const tail = try ctx.lex.next();
@@ -278,7 +293,9 @@ pub fn compile(src: []const u8, alloc: std.mem.Allocator) (ZqError || error{OutO
         try ctx.raw.append(alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
     }
 
-    return fuse(ctx.raw.items, &ctx.function_table, &ctx.intern, alloc);
+    var compiled = try fuse(ctx.raw.items, &ctx.function_table, &ctx.intern, alloc);
+    compiled.external_var_ids = ext_var_ids;
+    return compiled;
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -2138,5 +2155,5 @@ fn fuse(
         };
     }
 
-    return Compiled{ .instructions = instructions, .function_table = function_defs, .string_buf = string_buf };
+    return Compiled{ .instructions = instructions, .function_table = function_defs, .string_buf = string_buf, .external_var_ids = &.{} };
 }

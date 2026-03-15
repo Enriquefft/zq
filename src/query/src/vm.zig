@@ -98,13 +98,19 @@ fn errorToString(err: ZqError) []const u8 {
 }
 
 /// A value on the evaluation stack.
-const StackValue = union(enum) {
+pub const StackValue = union(enum) {
     null_val,
     bool_val: bool,
     int: i64,
     float: f64,
     /// A view into the Tape for objects/arrays/strings.
     tape_value: Value,
+};
+
+/// Binding of an external variable (by compiler-assigned ID) to a concrete value.
+pub const ExternalVarBinding = struct {
+    var_id: u32,
+    value: StackValue,
 };
 
 /// Lazy execution state. Not thread-safe. Must not be moved after creation:
@@ -159,6 +165,7 @@ pub const ResultIterator = struct {
         string_buf: []const u8,
         opts_allow_null: bool,
         tape: Tape,
+        external_bindings: []const ExternalVarBinding,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
         var stack = std.ArrayList(IterFrame){};
@@ -177,6 +184,13 @@ pub const ResultIterator = struct {
         // Initialize variable slots to null
         variable_store.items.len = 0;
         try variable_store.appendNTimes(allocator, null, max_value_stack);
+
+        // Inject external variable bindings
+        for (external_bindings) |b| {
+            if (b.var_id < variable_store.items.len) {
+                variable_store.items[b.var_id] = b.value;
+            }
+        }
 
         // Initialize object construction state
         var object_construct = std.ArrayList(ObjectField){};
@@ -261,7 +275,7 @@ pub const ResultIterator = struct {
     /// Must be called only when the previous run is complete: either next()
     /// returned null or an error, or the caller has decided to abandon it.
     /// Must NOT be called after deinit().
-    pub fn reset(it: *ResultIterator, tape: Tape) void {
+    pub fn reset(it: *ResultIterator, tape: Tape, external_bindings: []const ExternalVarBinding) void {
         it.tape = tape;
         it.ip = 0;
         it.done = false;
@@ -272,6 +286,12 @@ pub const ResultIterator = struct {
         // capacity >= max_value_stack is guaranteed by init()'s ensureTotalCapacity.
         it.variable_store.items.len = max_value_stack;
         @memset(it.variable_store.items, null);
+        // Re-inject external variable bindings
+        for (external_bindings) |b| {
+            if (b.var_id < it.variable_store.items.len) {
+                it.variable_store.items[b.var_id] = b.value;
+            }
+        }
         it.object_construct.clearRetainingCapacity();
         it.if_stack.clearRetainingCapacity();
         it.alt_null_depth = 0;

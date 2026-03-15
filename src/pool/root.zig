@@ -182,6 +182,12 @@ const Job = struct {
     format: ?types.Format,
     /// ANSI color configuration. Null means no color output.
     color: ?*const output_mod.Color,
+    /// Serialization options (sort_keys, indent).
+    opts: output_mod.SerializeOpts,
+    /// When true, each line is treated as a raw string instead of being parsed as JSON.
+    raw_input: bool,
+    /// External variable bindings, shared read-only across all workers.
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -456,16 +462,19 @@ fn worker_fn(ctx: WorkerCtx) void {
             var chunk_buf = std.ArrayList(u8){};
             const buf_estimate: usize = switch (fmt) {
                 .pretty => job.data.len * 6,
-                .compact, .jsonl, .raw => job.data.len,
+                .compact, .jsonl, .raw, .join => job.data.len,
             };
             chunk_buf.ensureTotalCapacity(aa, buf_estimate) catch {};
 
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-                const line = std.mem.trimRight(u8, remaining[0..nl], " \t\r");
+                const line = if (job.raw_input)
+                    stripTrailingCr(remaining[0..nl])
+                else
+                    std.mem.trimRight(u8, remaining[0..nl], " \t\r");
                 remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
-                if (line.len == 0) continue;
+                if (line.len == 0 and !job.raw_input) continue;
 
                 const meta = process_line_serialized(
                     line,
@@ -478,6 +487,9 @@ fn worker_fn(ctx: WorkerCtx) void {
                     fmt,
                     job.color,
                     &chunk_buf,
+                    job.opts,
+                    job.raw_input,
+                    job.external_bindings,
                 );
 
                 meta_list.append(aa, meta) catch {
@@ -511,9 +523,12 @@ fn worker_fn(ctx: WorkerCtx) void {
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-                const line = std.mem.trimRight(u8, remaining[0..nl], " \t\r");
+                const line = if (job.raw_input)
+                    stripTrailingCr(remaining[0..nl])
+                else
+                    std.mem.trimRight(u8, remaining[0..nl], " \t\r");
                 remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
-                if (line.len == 0) continue;
+                if (line.len == 0 and !job.raw_input) continue;
 
                 const outcome = process_line(
                     line,
@@ -523,6 +538,8 @@ fn worker_fn(ctx: WorkerCtx) void {
                     job.query,
                     ctx.allocator,
                     aa,
+                    job.raw_input,
+                    job.external_bindings,
                 );
 
                 records.append(aa, outcome) catch {
@@ -542,6 +559,19 @@ fn worker_fn(ctx: WorkerCtx) void {
     }
 }
 
+/// Construct a synthetic Tape with a single .string entry that borrows the
+/// line bytes directly.  Zero-copy, zero allocation — used for --raw-input.
+fn make_raw_tape(line: []const u8, entry_buf: *[1]types.Tape.Entry) types.Tape {
+    entry_buf[0] = .{
+        .tag = .string,
+        .payload = .{ .string = .{ .offset = 0, .len = @intCast(line.len) } },
+    };
+    return .{
+        .entries = entry_buf,
+        .string_buf = line,
+    };
+}
+
 /// Parse and execute the query for a single JSONL line (structured path).
 ///
 /// `worker_alloc` — used for the persistent ResultIterator's eval stack (GPA).
@@ -556,25 +586,30 @@ fn process_line(
     query: *const query_mod.CompiledQuery,
     worker_alloc: std.mem.Allocator,
     aa: std.mem.Allocator,
+    raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordOutcome {
     // ── Parse ──────────────────────────────────────────────────────────────────
-    const feed_result = parser.feed(line, true) catch |e| {
-        parser.reset();
-        return .{ .err = @as(ZqError, @errorCast(e)) };
-    };
-    const tape = switch (feed_result) {
-        .done => |d| d.tape,
-        .need_more => {
+    var raw_entry_buf: [1]types.Tape.Entry = undefined;
+    const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
+        const feed_result = parser.feed(line, true) catch |e| {
             parser.reset();
-            return .{ .err = error.UnexpectedEof };
-        },
+            return .{ .err = @as(ZqError, @errorCast(e)) };
+        };
+        break :blk switch (feed_result) {
+            .done => |d| d.tape,
+            .need_more => {
+                parser.reset();
+                return .{ .err = error.UnexpectedEof };
+            },
+        };
     };
 
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
-        opt_it.* = query.execute(tape, worker_alloc) catch {
-            parser.reset();
+        opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
+            if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
             return .{ .err = error.IoError };
@@ -582,7 +617,7 @@ fn process_line(
         current_query.* = query;
     } else {
         // Same query, new tape: zero-allocation rebind.
-        opt_it.*.?.reset(tape);
+        opt_it.*.?.reset(tape, external_bindings);
     }
 
     // ── Collect values into the chunk arena ────────────────────────────────────
@@ -590,7 +625,7 @@ fn process_line(
     // Parser.reset() is called AFTER collection so the tape remains valid during
     // the copy.
     const outcome = collect_record_values(&opt_it.*.?, aa);
-    parser.reset();
+    if (!raw_input) parser.reset();
     return outcome;
 }
 
@@ -610,37 +645,43 @@ fn process_line_serialized(
     format: types.Format,
     color: ?*const output_mod.Color,
     chunk_buf: *std.ArrayList(u8),
+    opts: output_mod.SerializeOpts,
+    raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordMeta {
     const start: u32 = @intCast(chunk_buf.items.len);
 
     // ── Parse ──────────────────────────────────────────────────────────────────
-    const feed_result = parser.feed(line, true) catch |e| {
-        parser.reset();
-        return .{
-            .end_offset = start,
-            .last_was_false_or_null = false,
-            .is_error = true,
-            .error_code = @intFromError(@as(ZqError, @errorCast(e))),
-        };
-    };
-    const tape = switch (feed_result) {
-        .done => |d| d.tape,
-        .need_more => {
+    var raw_entry_buf: [1]types.Tape.Entry = undefined;
+    const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
+        const feed_result = parser.feed(line, true) catch |e| {
             parser.reset();
             return .{
                 .end_offset = start,
                 .last_was_false_or_null = false,
                 .is_error = true,
-                .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
+                .error_code = @intFromError(@as(ZqError, @errorCast(e))),
             };
-        },
+        };
+        break :blk switch (feed_result) {
+            .done => |d| d.tape,
+            .need_more => {
+                parser.reset();
+                return .{
+                    .end_offset = start,
+                    .last_was_false_or_null = false,
+                    .is_error = true,
+                    .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
+                };
+            },
+        };
     };
 
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
-        opt_it.* = query.execute(tape, worker_alloc) catch {
-            parser.reset();
+        opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
+            if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
             return .{
@@ -652,7 +693,7 @@ fn process_line_serialized(
         };
         current_query.* = query;
     } else {
-        opt_it.*.?.reset(tape);
+        opt_it.*.?.reset(tape, external_bindings);
     }
 
     // ── Serialize values directly into the shared chunk buffer ────────────────
@@ -660,7 +701,7 @@ fn process_line_serialized(
     var last_was_false_or_null = false;
     while (true) {
         const maybe = opt_it.*.?.next() catch |e| {
-            parser.reset();
+            if (!raw_input) parser.reset();
             chunk_buf.shrinkRetainingCapacity(start);
             return .{
                 .end_offset = start,
@@ -672,8 +713,8 @@ fn process_line_serialized(
         const val = maybe orelse break;
 
         // Serialize the value using the output module's generic serialize.
-        output_mod.serialize(&sink, val, format, color) catch {
-            parser.reset();
+        output_mod.serialize(&sink, val, format, color, opts) catch {
+            if (!raw_input) parser.reset();
             chunk_buf.shrinkRetainingCapacity(start);
             return .{
                 .end_offset = start,
@@ -683,10 +724,10 @@ fn process_line_serialized(
             };
         };
 
-        // Append newline for pretty/compact formats (matches main.zig behavior).
-        if (format == .pretty or format == .compact) {
+        // Append newline for pretty/compact/raw formats (not jsonl/join which handle their own).
+        if (format != .jsonl and format != .join) {
             sink.writeByte('\n') catch {
-                parser.reset();
+                if (!raw_input) parser.reset();
                 chunk_buf.shrinkRetainingCapacity(start);
                 return .{
                     .end_offset = start,
@@ -704,7 +745,7 @@ fn process_line_serialized(
         };
     }
 
-    parser.reset();
+    if (!raw_input) parser.reset();
 
     return .{
         .end_offset = @intCast(chunk_buf.items.len),
@@ -781,6 +822,9 @@ const IoCtx = struct {
     allocator: std.mem.Allocator,
     format: ?types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
+    raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
@@ -800,13 +844,13 @@ fn io_thread_fn(ctx: IoCtx) void {
         if (view.bytes.len == 0) {
             if (view.is_eof) {
                 // EOF: flush partial line into batch, then flush batch.
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
                 flushBatch(&batch_buf, &chunk_id, ctx);
                 break :loop;
             }
             // No data available but not EOF (pipe stall): flush for latency.
             if (batch_buf.items.len > 0 or partial_line.items.len > 0) {
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
                 flushBatch(&batch_buf, &chunk_id, ctx);
             }
             _ = ctx.src.refill() catch break :loop;
@@ -843,7 +887,7 @@ fn io_thread_fn(ctx: IoCtx) void {
         ctx.src.consume(view.bytes.len);
 
         if (view.is_eof) {
-            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator) catch break :loop;
+            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
             flushBatch(&batch_buf, &chunk_id, ctx);
             break :loop;
         }
@@ -869,6 +913,9 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
         .allocator = ctx.allocator,
         .format = ctx.format,
         .color = ctx.color,
+        .opts = ctx.opts,
+        .raw_input = ctx.raw_input,
+        .external_bindings = ctx.external_bindings,
     });
     chunk_id.* += 1;
     batch_buf.clearRetainingCapacity();
@@ -880,9 +927,16 @@ fn flushPartialToBatch(
     partial_line: *std.ArrayList(u8),
     batch_buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    raw_input: bool,
 ) error{OutOfMemory}!void {
-    const trimmed = std.mem.trimRight(u8, partial_line.items, " \t\r");
-    if (trimmed.len > 0) {
+    const trimmed = if (raw_input)
+        stripTrailingCr(partial_line.items)
+    else
+        std.mem.trimRight(u8, partial_line.items, " \t\r");
+    // In raw_input mode, an empty partial is valid (empty string) only if there
+    // were actual bytes before trimming — an empty partial_line means no data
+    // was buffered (the previous line ended with \n), not an empty input line.
+    if (trimmed.len > 0 or (raw_input and partial_line.items.len > 0)) {
         try batch_buf.appendSlice(allocator, trimmed);
         try batch_buf.append(allocator, '\n');
     }
@@ -906,6 +960,9 @@ const FileFeedCtx = struct {
     allocator: std.mem.Allocator,
     format: ?types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
+    raw_input: bool,
+    external_bindings: []const query_mod.ExternalVarBinding,
 };
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
@@ -933,7 +990,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
         chunk_start = chunk_end;
 
         if (chunk.len == 0) continue;
-        if (!hasNonEmptyLine(chunk)) continue;
+        if (!ctx.raw_input and !hasNonEmptyLine(chunk)) continue;
 
         // Block until a slot is available.  Returns false on shutdown (deinit).
         if (!ctx.limiter.acquire()) break;
@@ -947,6 +1004,9 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .allocator = ctx.allocator,
             .format = ctx.format,
             .color = ctx.color,
+            .opts = ctx.opts,
+            .raw_input = ctx.raw_input,
+            .external_bindings = ctx.external_bindings,
         });
         chunk_id += 1;
     }
@@ -975,6 +1035,11 @@ fn countNewlines(data: []const u8) usize {
     for (data[i..]) |b| total += @intFromBool(b == '\n');
 
     return total;
+}
+
+/// Strip at most one trailing '\r' (CRLF line ending).
+fn stripTrailingCr(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
 }
 
 fn hasNonEmptyLine(data: []const u8) bool {
@@ -1159,6 +1224,9 @@ pub const Pool = struct {
         cq: *const query_mod.CompiledQuery,
         format: ?types.Format,
         color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
+        raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
     ) ZqError!void {
         p._format = format;
         const stat = file.stat() catch return error.IoError;
@@ -1192,6 +1260,9 @@ pub const Pool = struct {
             .allocator = p.allocator,
             .format = format,
             .color = color,
+            .opts = opts,
+            .raw_input = raw_input,
+            .external_bindings = external_bindings,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
@@ -1224,6 +1295,9 @@ pub const Pool = struct {
         cq: *const query_mod.CompiledQuery,
         format: ?types.Format,
         color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
+        raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
     ) void {
         p._format = format;
         const ctx_ptr = p.allocator.create(IoCtx) catch {
@@ -1240,6 +1314,9 @@ pub const Pool = struct {
             .allocator = p.allocator,
             .format = format,
             .color = color,
+            .opts = opts,
+            .raw_input = raw_input,
+            .external_bindings = external_bindings,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
