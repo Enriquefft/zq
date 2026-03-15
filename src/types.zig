@@ -387,6 +387,16 @@ pub const Instruction = struct {
         /// If falsy: discard val, continue — restore_input fires next to pop if_stack.
         alt_check,
 
+        // Comma (fork) operator
+        /// Fork execution: push a ForkFrame with the right-side IP and saved input.
+        /// The left side runs normally; when it's exhausted, the VM pops the fork frame,
+        /// restores the input, and jumps to the right side.
+        /// operand.index = IP of the right-side expression (fork_cleanup instruction).
+        fork,
+        /// Pop the top fork frame. Emitted at the start of the right side to consume
+        /// the fork frame when execution reaches the right side normally (non-exhaustion path).
+        fork_cleanup,
+
         // Try-catch error handling
         /// Begin a try block. operand.index = catch handler IP (0 = no catch;
         /// suppress error silently and terminate this output path).

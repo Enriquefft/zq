@@ -68,6 +68,20 @@ const RangeFrame = struct {
     resume_ip: u32,
 };
 
+/// State for a comma (fork) operator.
+/// When the left side is exhausted, the VM pops this frame,
+/// restores the saved input, and jumps to the right side.
+const ForkFrame = struct {
+    /// IP of the right-side expression.
+    right_ip: u32,
+    /// Saved input value to restore for the right side.
+    saved_input: Value,
+    /// Saved stack depths for proper unwinding.
+    saved_iter_len: u32,
+    saved_range_len: u32,
+    saved_value_len: u32,
+};
+
 /// State for one active `try` block.
 /// Pushed by try_begin, popped by try_end (normal path) or handleCaughtError (error path).
 const TryFrame = struct {
@@ -79,6 +93,7 @@ const TryFrame = struct {
     saved_if_len: u32,
     saved_collect_len: u32,
     saved_range_len: u32,
+    saved_fork_len: u32,
     /// Saved alt_null_depth so the counter is restored correctly on error.
     saved_alt_null_depth: u32,
 };
@@ -152,6 +167,8 @@ pub const ResultIterator = struct {
     try_stack: std.ArrayList(TryFrame),
     /// Active range generator frames. Pushed by range/range2/range3 builtins.
     range_stack: std.ArrayList(RangeFrame),
+    /// Fork frames for comma operator. Pushed by fork opcode.
+    fork_stack: std.ArrayList(ForkFrame),
     /// Value stored by the `error` builtin so the catch handler can retrieve it.
     user_error_msg: ?Value,
     alloc: std.mem.Allocator,
@@ -213,6 +230,11 @@ pub const ResultIterator = struct {
         errdefer range_stack.deinit(allocator);
         try range_stack.ensureTotalCapacity(allocator, max_stack_depth);
 
+        // Initialize fork frame stack for comma operator
+        var fork_stack = std.ArrayList(ForkFrame){};
+        errdefer fork_stack.deinit(allocator);
+        try fork_stack.ensureTotalCapacity(allocator, max_stack_depth);
+
         // Initialize runtime tape
         var runtime_tape = try types.RuntimeTape.init(allocator);
         errdefer runtime_tape.deinit(allocator);
@@ -242,6 +264,7 @@ pub const ResultIterator = struct {
             .collect_stack = collect_stack,
             .try_stack = try_stack,
             .range_stack = range_stack,
+            .fork_stack = fork_stack,
             .user_error_msg = null,
             .alloc = allocator,
             .done = false,
@@ -264,6 +287,7 @@ pub const ResultIterator = struct {
         it.collect_stack.deinit(it.alloc);
         it.try_stack.deinit(it.alloc);
         it.range_stack.deinit(it.alloc);
+        it.fork_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
     }
 
@@ -295,6 +319,7 @@ pub const ResultIterator = struct {
         it.collect_stack.clearRetainingCapacity();
         it.try_stack.clearRetainingCapacity();
         it.range_stack.clearRetainingCapacity();
+        it.fork_stack.clearRetainingCapacity();
         it.user_error_msg = null;
         it.runtime_tape.entries.clearRetainingCapacity();
         it.runtime_tape.string_buf.clearRetainingCapacity();
@@ -408,6 +433,26 @@ pub const ResultIterator = struct {
                             continue;
                         }
                     }
+                    // Check for fork frames (comma operator).
+                    // When the left side is exhausted, restore input and jump to the
+                    // right side. The fork_cleanup instruction at right_ip will pop
+                    // the fork frame.
+                    if (it.fork_stack.items.len > 0) {
+                        const ff = &it.fork_stack.items[it.fork_stack.items.len - 1];
+                        if (it.stack.items.len <= ff.saved_iter_len and
+                            it.range_stack.items.len <= ff.saved_range_len)
+                        {
+                            const saved = it.fork_stack.pop().?;
+                            it.current = saved.saved_input;
+                            it.stack.items.len = saved.saved_iter_len;
+                            it.range_stack.items.len = saved.saved_range_len;
+                            it.value_stack.items.len = saved.saved_value_len;
+                            // Jump to fork_cleanup which pops the fork frame
+                            // (already popped above, fork_cleanup will be a no-op)
+                            it.ip = saved.right_ip + 1; // skip fork_cleanup
+                            continue;
+                        }
+                    }
                     if (it.collect_stack.items.len == 0 and it.range_stack.items.len == 0) {
                         it.done = true;
                         return null;
@@ -462,6 +507,9 @@ pub const ResultIterator = struct {
 
         // Unwind range frames.
         it.range_stack.items.len = frame.saved_range_len;
+
+        // Unwind fork frames.
+        it.fork_stack.items.len = frame.saved_fork_len;
 
         // Restore null-propagation depth.
         it.alt_null_depth = frame.saved_alt_null_depth;
@@ -823,6 +871,38 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            // Comma (fork) operator
+            .fork_cleanup => {
+                // Pop the fork frame when the right side is reached normally
+                // (not via IP-exhaustion). Restore the saved input for the right side.
+                if (it.fork_stack.items.len > 0) {
+                    const ff = &it.fork_stack.items[it.fork_stack.items.len - 1];
+                    // If there are still iterate/range frames from the left side,
+                    // don't clean up yet — trigger exhaustion handler to advance them.
+                    if (it.stack.items.len > ff.saved_iter_len or
+                        it.range_stack.items.len > ff.saved_range_len)
+                    {
+                        it.ip = @intCast(it.instructions.len);
+                        return null;
+                    }
+                    const saved = it.fork_stack.pop().?;
+                    it.current = saved.saved_input;
+                }
+                it.ip += 1;
+                return null;
+            },
+            .fork => {
+                it.fork_stack.appendAssumeCapacity(ForkFrame{
+                    .right_ip = @intCast(instr.operand.index),
+                    .saved_input = it.current,
+                    .saved_iter_len = @intCast(it.stack.items.len),
+                    .saved_range_len = @intCast(it.range_stack.items.len),
+                    .saved_value_len = @intCast(it.value_stack.items.len),
+                });
+                it.ip += 1;
+                return null;
+            },
+
             // Try-catch error handling
             .try_begin => {
                 it.try_stack.appendAssumeCapacity(TryFrame{
@@ -832,6 +912,7 @@ pub const ResultIterator = struct {
                     .saved_if_len = @intCast(it.if_stack.items.len),
                     .saved_collect_len = @intCast(it.collect_stack.items.len),
                     .saved_range_len = @intCast(it.range_stack.items.len),
+                    .saved_fork_len = @intCast(it.fork_stack.items.len),
                     .saved_alt_null_depth = it.alt_null_depth,
                 });
                 it.ip += 1;

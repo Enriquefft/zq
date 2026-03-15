@@ -202,7 +202,7 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .map_values_start, .alt_check => {
+            .jump, .jump_if_false, .array_collect_start, .map_values_start, .alt_check, .fork => {
                 if (r.operand.index >= p) r.operand.index += 1;
             },
             // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
@@ -298,7 +298,42 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         }
     }
 
+    try parseComma(ctx);
+}
+
+/// parseComma: comma operator (lowest precedence generator).
+/// `a, b` produces all outputs of `a` followed by all outputs of `b`.
+///
+/// Compiled as:
+///   fork → right_side
+///   <left>
+///   jump → done
+///   right_side:
+///   <right>
+///   done:
+fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_start: usize = ctx.raw.items.len;
     try parsePipe(ctx);
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .comma) break;
+        _ = try ctx.lex.next();
+
+        // Insert fork BEFORE the left expression (adjusts all existing indices).
+        try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
+
+        // Emit output for the left side's result.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+        // Backpatch fork to point to fork_cleanup (current position).
+        ctx.raw.items[left_start].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+        // Emit fork_cleanup to consume the fork frame when reached normally.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .fork_cleanup, .operand = .{ .none = {} } });
+
+        // Parse right expression (may be another comma chain).
+        try parsePipe(ctx);
+    }
 }
 
 /// Lookahead: returns true if the token stream starts with a path expression
@@ -1550,7 +1585,7 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             }
         },
         .lparen => {
-            try parseLogical(ctx);
+            try parseComma(ctx);
             const close = try ctx.lex.next();
             if (close.tag != .rparen) return error.QuerySyntaxError;
         },
@@ -1718,8 +1753,8 @@ fn parseArrayConstruct(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
     const peek = try ctx.lex.peek();
     if (peek.tag != .rbracket) {
-        // Parse the inner expression (generator).
-        try parsePipe(ctx);
+        // Parse the inner expression (generator), supporting comma for multi-element arrays.
+        try parseComma(ctx);
         // Emit an explicit output inside the collect scope. The VM intercepts
         // this in collect mode: instead of yielding, it buffers the value.
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -2308,6 +2343,13 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .map_values_end => .{ .none = {} },
+                .fork_cleanup => .{ .none = {} },
+                // Fork (comma operator): remap right-side IP raw → fused index.
+                .fork => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 // Alternative operator: remap jump target raw → fused index.
                 .alt_start => .{ .none = {} },
                 .alt_check => blk: {
