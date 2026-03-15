@@ -1,6 +1,7 @@
 const std = @import("std");
 const ZqError = @import("error").ZqError;
 const types = @import("types");
+const Parser = @import("parser").Parser;
 const Tape = types.Tape;
 const Value = types.Value;
 const Instruction = types.Instruction;
@@ -26,6 +27,11 @@ const IterFrame = struct {
 
 /// State for one active `[expr]` array collection.
 /// Pushed by array_collect_start/map_values_start, popped by the matching end op.
+const MapValuesEntry = struct {
+    iter_pos: u32,
+    value: StackValue,
+};
+
 const CollectFrame = struct {
     /// Accumulated outputs from the inner expression.
     buffer: std.ArrayList(StackValue),
@@ -37,6 +43,11 @@ const CollectFrame = struct {
     /// Value stack depth when collection started.
     /// Used to trim leftover operands after each output.
     outer_value_depth: u32,
+    /// For map_values: stores (iter_pos, value) pairs for per-key tracking.
+    /// Uses |= semantics: only first output per key is kept.
+    map_values_entries: std.ArrayList(MapValuesEntry) = std.ArrayList(MapValuesEntry){},
+    /// For map_values: the iterate frame pos when the last output was captured.
+    map_values_last_iter_pos: u32 = std.math.maxInt(u32),
     /// IP of the matching array_collect_end/map_values_end instruction.
     end_ip: u32,
     /// Non-null for map_values: saves the original input so map_values_end can
@@ -246,7 +257,10 @@ pub const ResultIterator = struct {
         it.variable_store.deinit(it.alloc);
         it.object_construct.deinit(it.alloc);
         it.if_stack.deinit(it.alloc);
-        for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
+        for (it.collect_stack.items) |*frame| {
+            frame.buffer.deinit(it.alloc);
+            frame.map_values_entries.deinit(it.alloc);
+        }
         it.collect_stack.deinit(it.alloc);
         it.try_stack.deinit(it.alloc);
         it.range_stack.deinit(it.alloc);
@@ -274,7 +288,10 @@ pub const ResultIterator = struct {
         it.object_construct.clearRetainingCapacity();
         it.if_stack.clearRetainingCapacity();
         it.alt_null_depth = 0;
-        for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
+        for (it.collect_stack.items) |*frame| {
+            frame.buffer.deinit(it.alloc);
+            frame.map_values_entries.deinit(it.alloc);
+        }
         it.collect_stack.clearRetainingCapacity();
         it.try_stack.clearRetainingCapacity();
         it.range_stack.clearRetainingCapacity();
@@ -378,10 +395,11 @@ pub const ResultIterator = struct {
                         {
                             var completed = it.collect_stack.pop().?;
                             defer completed.buffer.deinit(it.alloc);
+                            defer completed.map_values_entries.deinit(it.alloc);
                             const result = if (completed.map_values_input) |input|
                                 switch (input) {
                                     .object => try it.buildCollectedObject(&completed, input),
-                                    else => try it.buildCollectedArray(&completed),
+                                    else => try it.buildCollectedArrayFromEntries(&completed),
                                 }
                             else
                                 try it.buildCollectedArray(&completed);
@@ -508,7 +526,28 @@ pub const ResultIterator = struct {
                 if (it.collect_stack.items.len > 0) {
                     // Collect mode: buffer value instead of yielding.
                     const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                    try cf.buffer.append(it.alloc, try valueToStackValue(val));
+
+                    if (cf.map_values_input != null) {
+                        // map_values uses |= semantics: only first output per iteration element.
+                        // Detect current iterate position from the innermost iter frame.
+                        const cur_iter_pos = if (it.stack.items.len > cf.outer_stack_depth)
+                            it.stack.items[cf.outer_stack_depth].pos
+                        else
+                            std.math.maxInt(u32);
+
+                        if (cur_iter_pos != cf.map_values_last_iter_pos) {
+                            // New key/element: accept this output and record its iter position
+                            cf.map_values_last_iter_pos = cur_iter_pos;
+                            try cf.map_values_entries.append(it.alloc, .{
+                                .iter_pos = cur_iter_pos,
+                                .value = try valueToStackValue(val),
+                            });
+                        }
+                        // else: duplicate output for same key, drop it (|= semantics)
+                    } else {
+                        try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                    }
+
                     // Trim value_stack back to the depth at collect_start.
                     // This prevents operand leftovers from one iteration contaminating
                     // the next iteration's pipeline input via the pipe opcode.
@@ -713,6 +752,7 @@ pub const ResultIterator = struct {
                 // jumped here after the last (non-iterating) element.
                 var completed = it.collect_stack.pop().?;
                 defer completed.buffer.deinit(it.alloc);
+                defer completed.map_values_entries.deinit(it.alloc);
                 const arr_val = try it.buildCollectedArray(&completed);
                 it.pushValue(arr_val);
                 it.ip += 1;
@@ -739,10 +779,11 @@ pub const ResultIterator = struct {
             .map_values_end => {
                 var completed = it.collect_stack.pop().?;
                 defer completed.buffer.deinit(it.alloc);
+                defer completed.map_values_entries.deinit(it.alloc);
                 const result = if (completed.map_values_input) |input|
                     switch (input) {
                         .object => try it.buildCollectedObject(&completed, input),
-                        else => try it.buildCollectedArray(&completed),
+                        else => try it.buildCollectedArrayFromEntries(&completed),
                     }
                 else
                     try it.buildCollectedArray(&completed);
@@ -1065,29 +1106,77 @@ pub const ResultIterator = struct {
         } } };
     }
 
-    /// Build an object from collected values paired with original object keys.
-    /// Used by map_values_end when the input was an object.
+    /// Build an array from map_values entries (for arrays with |= semantics).
+    fn buildCollectedArrayFromEntries(it: *ResultIterator, frame: *const CollectFrame) ZqError!StackValue {
+        const entries = frame.map_values_entries.items;
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        for (entries) |entry| {
+            try it.stackValueToRuntimeTapeEntry(entry.value);
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
+    }
+
+    /// Build an object from map_values entries paired with original object keys.
+    /// Uses iter_pos to match entries with keys, implementing |= semantics:
+    /// keys with no output are deleted, only first output per key is kept.
     fn buildCollectedObject(it: *ResultIterator, frame: *const CollectFrame, input: Value) ZqError!StackValue {
         const span = input.object;
+        const entries = frame.map_values_entries.items;
+
+        // Pre-reserve capacity to prevent reallocation during the loop,
+        // which would invalidate span.tape pointers if it references runtime_tape_view.
+        const n_entries_est = entries.len;
+        const estimated_tape_entries = 2 + n_entries_est * 2;
+        var n_string_bytes: usize = 0;
+        {
+            var p = span.start + 1;
+            const e = span.end - 1;
+            while (p < e) {
+                n_string_bytes += span.tape.entries[p].payload.string.len;
+                p = skipEntry(span.tape.*, p + 1);
+            }
+        }
+        try it.runtime_tape.entries.ensureUnusedCapacity(it.alloc, estimated_tape_entries);
+        try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, n_string_bytes);
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
 
         const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .object_start,
             .payload = .{ .skip = 0 },
         });
 
-        // Iterate original object keys and pair with collected values
+        // Iterate original object keys and match with map_values_entries by iter_pos.
+        // For objects, iterate yields values at pos+1 where pos is the key position.
+        // The iter_pos stored in entries is the key position in the original tape.
         var pos = span.start + 1;
         const end = span.end - 1;
-        var val_idx: usize = 0;
+        var entry_idx: usize = 0;
         while (pos < end) {
-            const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
-            if (val_idx < frame.buffer.items.len) {
+            // Check if this key position has a matching entry
+            if (entry_idx < entries.len and entries[entry_idx].iter_pos == pos) {
+                const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
                 const key_ref = try it.runtime_tape.internString(it.alloc, key_str);
                 _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = key_ref } });
-                try it.stackValueToRuntimeTapeEntry(frame.buffer.items[val_idx]);
-                val_idx += 1;
+                try it.stackValueToRuntimeTapeEntry(entries[entry_idx].value);
+                entry_idx += 1;
             }
-            pos = skipEntry(span.tape.*, pos + 1); // skip past value
+            // Skip to next key (skip past value)
+            pos = skipEntry(span.tape.*, pos + 1);
         }
 
         const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -1992,17 +2081,19 @@ pub const ResultIterator = struct {
                         // string / string = split
                         .string => |rs| blk: {
                             // string / string = split (jq semantics)
-                            var parts = std.ArrayList(Value){};
-                            defer parts.deinit(it.alloc);
+                            // Store StringRefs to avoid invalidation during interning
+                            var refs = std.ArrayList(Tape.StringRef){};
+                            defer refs.deinit(it.alloc);
+                            // Pre-reserve string_buf so ls/rs slices stay valid
+                            try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, ls.len);
+                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                             if (rs.len == 0) {
-                                // Split into individual characters
                                 var ci: usize = 0;
                                 while (ci < ls.len) {
                                     const seq_len = std.unicode.utf8ByteSequenceLength(ls[ci]) catch 1;
                                     const cp_end = @min(ci + seq_len, ls.len);
                                     const sr = try it.runtime_tape.internString(it.alloc, ls[ci..cp_end]);
-                                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                                    try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                    try refs.append(it.alloc, sr);
                                     ci = cp_end;
                                 }
                             } else {
@@ -2010,18 +2101,16 @@ pub const ResultIterator = struct {
                                 while (true) {
                                     if (std.mem.indexOf(u8, rest, rs)) |idx| {
                                         const sr = try it.runtime_tape.internString(it.alloc, rest[0..idx]);
-                                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                        try refs.append(it.alloc, sr);
                                         rest = rest[idx + rs.len ..];
                                     } else {
                                         const sr = try it.runtime_tape.internString(it.alloc, rest);
-                                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[sr.offset..][0..sr.len] });
+                                        try refs.append(it.alloc, sr);
                                         break;
                                     }
                                 }
                             }
-                            break :blk try it.buildRuntimeArray(parts.items);
+                            break :blk try it.buildRuntimeArrayFromRefs(refs.items);
                         },
                         else => error.TypeError,
                     },
@@ -2195,7 +2284,7 @@ pub const ResultIterator = struct {
         return switch (val) {
             .null_val => .{ .int = 0 },
             .bool_val => return error.TypeError,
-            .int => |i| .{ .int = if (i < 0) -i else i },
+            .int => |i| .{ .int = safeAbsInt(i) },
             .float => |f| .{ .float = @abs(f) },
             .string => |s| blk: {
                 // Count Unicode codepoints, not bytes.
@@ -3548,7 +3637,7 @@ pub const ResultIterator = struct {
                 if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
                 const floored = @floor(f);
                 if (floored < @as(f64, @floatFromInt(std.math.minInt(i64))) or
-                    floored > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    floored >= 0x1p63)
                     return .{ .float = floored };
                 return .{ .int = @intFromFloat(floored) };
             },
@@ -3563,7 +3652,7 @@ pub const ResultIterator = struct {
                 if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
                 const ceiled = @ceil(f);
                 if (ceiled < @as(f64, @floatFromInt(std.math.minInt(i64))) or
-                    ceiled > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    ceiled >= 0x1p63)
                     return .{ .float = ceiled };
                 return .{ .int = @intFromFloat(ceiled) };
             },
@@ -3578,7 +3667,7 @@ pub const ResultIterator = struct {
                 if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
                 const rounded = @round(f);
                 if (rounded < @as(f64, @floatFromInt(std.math.minInt(i64))) or
-                    rounded > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    rounded >= 0x1p63)
                     return .{ .float = rounded };
                 return .{ .int = @intFromFloat(rounded) };
             },
@@ -3613,9 +3702,14 @@ pub const ResultIterator = struct {
         return .{ .float = result };
     }
 
+    fn safeAbsInt(n: i64) i64 {
+        if (n == std.math.minInt(i64)) return std.math.minInt(i64);
+        return if (n < 0) -n else n;
+    }
+
     fn builtinFabs(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .int => |n| return .{ .int = if (n < 0) -n else n },
+            .int => |n| return .{ .int = safeAbsInt(n) },
             .float => |f| return .{ .float = @abs(f) },
             else => return error.TypeError,
         }
@@ -3623,7 +3717,7 @@ pub const ResultIterator = struct {
 
     fn builtinAbs(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .int => |n| return .{ .int = if (n < 0) -n else n },
+            .int => |n| return .{ .int = safeAbsInt(n) },
             .float => |f| return .{ .float = @abs(f) },
             else => return error.TypeError,
         }
@@ -3648,8 +3742,12 @@ pub const ResultIterator = struct {
     fn builtinIsnormal(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .float => |f| {
-                const is_normal = !std.math.isNan(f) and !std.math.isInf(f) and f != 0.0;
-                return .{ .bool_val = is_normal };
+                if (f == 0.0 or std.math.isNan(f) or std.math.isInf(f))
+                    return .{ .bool_val = false };
+                // Exclude subnormals: biased exponent == 0 means subnormal
+                const bits = @as(u64, @bitCast(f));
+                const biased_exp = (bits >> 52) & 0x7FF;
+                return .{ .bool_val = biased_exp != 0 };
             },
             .int => |n| return .{ .bool_val = n != 0 },
             else => return .{ .bool_val = false },
@@ -3679,7 +3777,7 @@ pub const ResultIterator = struct {
             const mantissa = bits & 0x000FFFFFFFFFFFFF;
             if (mantissa == 0) return std.math.minInt(i32);
             const leading_zeros = @clz(mantissa) - 12; // 64 - 52 = 12 implicit bits
-            return -1022 - @as(i32, @intCast(leading_zeros));
+            return -1023 - @as(i32, @intCast(leading_zeros));
         }
         return @as(i32, @intCast(biased_exp)) - 1023;
     }
@@ -3845,37 +3943,36 @@ pub const ResultIterator = struct {
         };
         switch (it.current) {
             .string => |s| {
-                var parts = std.ArrayList(Value){};
-                defer parts.deinit(it.alloc);
+                // Store StringRefs to avoid invalidation during interning
+                var refs = std.ArrayList(Tape.StringRef){};
+                defer refs.deinit(it.alloc);
+                // Pre-reserve string_buf so s/sep slices stay valid
+                try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, s.len);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 if (sep.len == 0) {
-                    // Split into individual characters (codepoints)
                     var i: usize = 0;
                     while (i < s.len) {
                         const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
                         const cp_end = @min(i + seq_len, s.len);
                         const str_ref = try it.runtime_tape.internString(it.alloc, s[i..cp_end]);
-                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                        try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                        try refs.append(it.alloc, str_ref);
                         i = cp_end;
                     }
                 } else {
                     var rest: []const u8 = s;
                     while (true) {
                         if (std.mem.indexOf(u8, rest, sep)) |idx| {
-                            const part = rest[0..idx];
-                            const str_ref = try it.runtime_tape.internString(it.alloc, part);
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                            try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                            const str_ref = try it.runtime_tape.internString(it.alloc, rest[0..idx]);
+                            try refs.append(it.alloc, str_ref);
                             rest = rest[idx + sep.len ..];
                         } else {
                             const str_ref = try it.runtime_tape.internString(it.alloc, rest);
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                            try parts.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+                            try refs.append(it.alloc, str_ref);
                             break;
                         }
                     }
                 }
-                return try it.buildRuntimeArray(parts.items);
+                return try it.buildRuntimeArrayFromRefs(refs.items);
             },
             else => return error.TypeError,
         }
@@ -3994,79 +4091,62 @@ pub const ResultIterator = struct {
     fn builtinFromjson(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .string => |s| {
-                // Try to parse simple JSON values inline
-                const trimmed = std.mem.trim(u8, s, " \t\n\r");
-                if (std.mem.eql(u8, trimmed, "null")) return .null_val;
-                if (std.mem.eql(u8, trimmed, "true")) return .{ .bool_val = true };
-                if (std.mem.eql(u8, trimmed, "false")) return .{ .bool_val = false };
-                // Try integer
-                if (std.fmt.parseInt(i64, trimmed, 10)) |n| {
-                    return .{ .int = n };
-                } else |_| {}
-                // Try float
-                if (std.fmt.parseFloat(f64, trimmed)) |f| {
-                    return .{ .float = f };
-                } else |_| {}
-                // Try quoted string
-                if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') {
-                    // Decode the inner string (handle escape sequences)
-                    const inner = trimmed[1 .. trimmed.len - 1];
-                    var buf = std.ArrayList(u8){};
-                    defer buf.deinit(it.alloc);
-                    var i: usize = 0;
-                    while (i < inner.len) {
-                        if (inner[i] == '\\' and i + 1 < inner.len) {
-                            switch (inner[i + 1]) {
-                                '"' => {
-                                    try buf.append(it.alloc, '"');
-                                    i += 2;
-                                },
-                                '\\' => {
-                                    try buf.append(it.alloc, '\\');
-                                    i += 2;
-                                },
-                                '/' => {
-                                    try buf.append(it.alloc, '/');
-                                    i += 2;
-                                },
-                                'n' => {
-                                    try buf.append(it.alloc, '\n');
-                                    i += 2;
-                                },
-                                'r' => {
-                                    try buf.append(it.alloc, '\r');
-                                    i += 2;
-                                },
-                                't' => {
-                                    try buf.append(it.alloc, '\t');
-                                    i += 2;
-                                },
-                                'b' => {
-                                    try buf.append(it.alloc, '\x08');
-                                    i += 2;
-                                },
-                                'f' => {
-                                    try buf.append(it.alloc, '\x0C');
-                                    i += 2;
-                                },
-                                else => {
-                                    try buf.append(it.alloc, inner[i]);
-                                    i += 1;
-                                },
-                            }
-                        } else {
-                            try buf.append(it.alloc, inner[i]);
-                            i += 1;
+                // Use the real JSON parser to handle all valid JSON
+                var json_parser = Parser.init(it.alloc) catch return error.OutOfMemory;
+                defer json_parser.deinit();
+                const feed_result = json_parser.feed(s, true) catch return error.TypeError;
+                switch (feed_result) {
+                    .done => |result| {
+                        const parsed_tape = result.tape;
+                        const val = tapeEntryToValue(&parsed_tape, 0);
+                        switch (val) {
+                            .null_val => return .null_val,
+                            .bool_val => |b| return .{ .bool_val = b },
+                            .int => |n| return .{ .int = n },
+                            .float => |f| return .{ .float = f },
+                            .string => |str| {
+                                const str_ref = try it.runtime_tape.internString(it.alloc, str);
+                                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                            },
+                            .array => {
+                                const span = Value.TapeSpan{
+                                    .tape = &parsed_tape,
+                                    .start = 0,
+                                    .end = @intCast(parsed_tape.entries.len),
+                                };
+                                const start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                                try it.copyTapeSpanToRuntimeTape(span);
+                                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                const end_idx: u32 = @intCast(it.runtime_tape.entries.items.len);
+                                return .{ .tape_value = .{ .array = .{
+                                    .tape = &it.runtime_tape_view,
+                                    .start = start,
+                                    .end = end_idx,
+                                } } };
+                            },
+                            .object => {
+                                const span = Value.TapeSpan{
+                                    .tape = &parsed_tape,
+                                    .start = 0,
+                                    .end = @intCast(parsed_tape.entries.len),
+                                };
+                                const start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                                try it.copyTapeSpanToRuntimeTape(span);
+                                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                                const end_idx: u32 = @intCast(it.runtime_tape.entries.items.len);
+                                return .{ .tape_value = .{ .object = .{
+                                    .tape = &it.runtime_tape_view,
+                                    .start = start,
+                                    .end = end_idx,
+                                } } };
+                            },
                         }
-                    }
-                    const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-                    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                    return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                    },
+                    .need_more => return error.TypeError,
                 }
-                // Cannot parse complex JSON (arrays/objects) without importing the
-                // parser module (which would create a circular dependency).
-                // Return TypeError — full JSON parsing support is a future enhancement.
-                return error.TypeError;
             },
             // If already not a string, pass through (jq semantics)
             else => return try valueToStackValue(it.current),
@@ -4212,56 +4292,63 @@ pub const ResultIterator = struct {
 
     fn builtinBuiltinsList(it: *ResultIterator) ZqError!?StackValue {
         const builtin_names = [_][]const u8{
-            "length/0",         "keys/0",          "keys_unsorted/0",
-            "values/0",         "has/1",           "in/1",
-            "type/0",           "empty/0",         "tostring/0",
-            "tonumber/0",       "error/0",         "add/0",
-            "range/1",          "range/2",         "range/3",
-            "sort/0",           "sort_by/1",       "group_by/1",
-            "reverse/0",        "flatten/0",       "flatten/1",
-            "min/0",            "max/0",           "min_by/1",
-            "max_by/1",         "to_entries/0",    "from_entries/0",
-            "any/0",            "any/1",           "all/0",
-            "all/1",            "contains/1",      "inside/1",
-            "del/1",            "indices/1",       "index/1",
-            "rindex/1",         "unique/0",        "unique_by/1",
-            "map/1",            "select/1",        "with_entries/1",
-            "first/0",          "first/1",         "last/0",
-            "last/1",           "limit/2",
+            "length/0",       "keys/0",           "keys_unsorted/0",
+            "values/0",       "has/1",            "in/1",
+            "type/0",         "empty/0",          "tostring/0",
+            "tonumber/0",     "error/0",          "add/0",
+            "range/1",        "range/2",          "range/3",
+            "sort/0",         "sort_by/1",        "group_by/1",
+            "reverse/0",      "flatten/0",        "flatten/1",
+            "min/0",          "max/0",            "min_by/1",
+            "max_by/1",       "to_entries/0",     "from_entries/0",
+            "any/0",          "any/1",            "all/0",
+            "all/1",          "contains/1",       "inside/1",
+            "del/1",          "indices/1",        "index/1",
+            "rindex/1",       "unique/0",         "unique_by/1",
+            "map/1",          "select/1",         "with_entries/1",
+            "first/0",        "first/1",          "last/0",
+            "last/1",         "limit/2",
             // Type selectors
-            "arrays/0",         "objects/0",       "strings/0",
-            "numbers/0",        "booleans/0",      "nulls/0",
-            "scalars/0",        "iterables/0",
+                     "arrays/0",
+            "objects/0",      "strings/0",        "numbers/0",
+            "booleans/0",     "nulls/0",          "scalars/0",
+            "iterables/0",
             // Math
-            "floor/0",          "ceil/0",          "round/0",
-            "sqrt/0",           "fabs/0",          "nan/0",
-            "infinite/0",       "isnan/0",         "isinfinite/0",
-            "isnormal/0",       "pow/2",           "log2/0",
-            "log/0",            "exp/0",           "exp2/0",
-            "sin/0",            "cos/0",           "atan/0",
-            "tan/0",            "asin/0",          "acos/0",
-            "sinh/0",           "cosh/0",          "tanh/0",
-            "significand/0",    "exponent/0",      "logb/0",
-            "abs/0",
+               "floor/0",          "ceil/0",
+            "round/0",        "sqrt/0",           "fabs/0",
+            "nan/0",          "infinite/0",       "isnan/0",
+            "isinfinite/0",   "isnormal/0",       "pow/2",
+            "log2/0",         "log/0",            "exp/0",
+            "exp2/0",         "sin/0",            "cos/0",
+            "atan/0",         "tan/0",            "asin/0",
+            "acos/0",         "sinh/0",           "cosh/0",
+            "tanh/0",         "significand/0",    "exponent/0",
+            "logb/0",         "abs/0",
             // String
-            "ascii_downcase/0", "ascii_upcase/0",  "ltrimstr/1",
-            "rtrimstr/1",       "startswith/1",    "endswith/1",
-            "split/1",          "join/1",          "explode/0",
-            "implode/0",        "tojson/0",        "fromjson/0",
-            "toboolean/0",      "ascii/0",
+                       "ascii_downcase/0",
+            "ascii_upcase/0", "ltrimstr/1",       "rtrimstr/1",
+            "startswith/1",   "endswith/1",       "split/1",
+            "join/1",         "explode/0",        "implode/0",
+            "tojson/0",       "fromjson/0",       "toboolean/0",
+            "ascii/0",
             // Misc
-            "utf8bytelength/0", "transpose/0",     "builtins/0",
-            "have_decnum/0",    "bsearch/1",       "isempty/1",
-            "map_values/1",
+                   "utf8bytelength/0", "transpose/0",
+            "builtins/0",     "have_decnum/0",    "bsearch/1",
+            "isempty/1",      "map_values/1",
         };
-        var names = std.ArrayList(Value){};
-        defer names.deinit(it.alloc);
+        // Store StringRefs to avoid invalidation during interning
+        var refs = std.ArrayList(Tape.StringRef){};
+        defer refs.deinit(it.alloc);
+        // Pre-reserve for all builtin name strings
+        var total_bytes: usize = 0;
+        for (builtin_names) |name| total_bytes += name.len;
+        try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, total_bytes);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         for (builtin_names) |name| {
             const str_ref = try it.runtime_tape.internString(it.alloc, name);
-            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-            try names.append(it.alloc, .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] });
+            try refs.append(it.alloc, str_ref);
         }
-        return try it.buildRuntimeArray(names.items);
+        return try it.buildRuntimeArrayFromRefs(refs.items);
     }
 
     /// `bsearch(x)`: binary search for x in a sorted array.
@@ -4328,6 +4415,33 @@ pub const ResultIterator = struct {
         for (elems) |elem| {
             const sv = try valueToStackValue(elem);
             try it.stackValueToRuntimeTapeEntry(sv);
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
+    }
+
+    /// Build a runtime array from an array of StringRefs.
+    /// Safe against invalidation since refs are offsets, not pointers.
+    fn buildRuntimeArrayFromRefs(it: *ResultIterator, refs: []const Tape.StringRef) ZqError!StackValue {
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        for (refs) |ref| {
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .string,
+                .payload = .{ .string = ref },
+            });
         }
         const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .array_end,

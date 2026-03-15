@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
     });
     query_module.addImport("error", error_module);
     query_module.addImport("types", types_module);
+    query_module.addImport("parser", parser_module);
 
     const output_module = b.createModule(.{
         .root_source_file = b.path("src/output/root.zig"),

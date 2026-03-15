@@ -33,7 +33,7 @@ Read `src/<module>/INTERFACE.md` before modifying any module.
 error  (no deps)          types  (no deps)
   ↓                         ↓
 io → error              parser → error, types
-                        query  → error, types
+                        query  → error, types, parser
                         output → error, types
 pool   → error, types, io, parser, query, output
 c_abi  → error, types, parser, query
