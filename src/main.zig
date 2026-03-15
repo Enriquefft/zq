@@ -166,7 +166,15 @@ pub fn main() !u8 {
                     return EXIT_USAGE;
                 };
                 const tape = switch (parse_result) {
-                    .done => |d| d.tape,
+                    .done => |d| blk: {
+                        if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
+                            printErr("zq: --argjson: trailing garbage for $");
+                            printErr(ev.name);
+                            printErr("\n");
+                            return EXIT_USAGE;
+                        }
+                        break :blk d.tape;
+                    },
                     .need_more => {
                         printErr("zq: --argjson: incomplete JSON for $");
                         printErr(ev.name);
@@ -194,7 +202,7 @@ pub fn main() !u8 {
                     else => {
                         // String, array, or object: copy into RuntimeTape.
                         const rt_start: u32 = @intCast(argjson_rt.entries.items.len);
-                        copyTapeToRuntimeTape(&argjson_rt, tape, allocator) catch {
+                        argjson_rt.copyFrom(tape, allocator) catch {
                             printErr("zq: out of memory\n");
                             return EXIT_SYSTEM;
                         };
@@ -253,7 +261,15 @@ pub fn main() !u8 {
                         return EXIT_USAGE;
                     };
                     const tape = switch (parse_result) {
-                        .done => |d| d.tape,
+                        .done => |d| blk: {
+                            if (std.mem.trim(u8, pa[d.consumed..], " \t\r\n").len != 0) {
+                                printErr("zq: --jsonargs: trailing garbage: ");
+                                printErr(pa);
+                                printErr("\n");
+                                return EXIT_USAGE;
+                            }
+                            break :blk d.tape;
+                        },
                         .need_more => {
                             printErr("zq: --jsonargs: incomplete JSON: ");
                             printErr(pa);
@@ -262,7 +278,7 @@ pub fn main() !u8 {
                         },
                     };
                     // Copy parsed value into argjson_rt
-                    copyTapeToRuntimeTape(&argjson_rt, tape, allocator) catch {
+                    argjson_rt.copyFrom(tape, allocator) catch {
                         printErr("zq: out of memory\n");
                         return EXIT_SYSTEM;
                     };
@@ -324,13 +340,20 @@ pub fn main() !u8 {
                         continue;
                     };
                     const tape = switch (parse_result) {
-                        .done => |d| d.tape,
+                        .done => |d| blk: {
+                            if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
+                                _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                                argjson_parser.reset();
+                                continue;
+                            }
+                            break :blk d.tape;
+                        },
                         .need_more => {
                             _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
                             continue;
                         },
                     };
-                    copyTapeToRuntimeTape(&argjson_rt, tape, allocator) catch {
+                    argjson_rt.copyFrom(tape, allocator) catch {
                         printErr("zq: out of memory\n");
                         return EXIT_SYSTEM;
                     };
@@ -406,6 +429,7 @@ pub fn main() !u8 {
     const serialize_opts = output_mod.SerializeOpts{
         .sort_keys = config.sort_keys,
         .indent = if (config.tab_indent) .tab else .{ .spaces = config.indent_width },
+        .allocator = allocator,
     };
 
     const color: ?*const output_mod.Color = switch (config.color) {
@@ -424,7 +448,7 @@ pub fn main() !u8 {
             return EXIT_SYSTEM;
         };
     } else if (config.slurp) {
-        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator) catch |e| {
+        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -492,97 +516,6 @@ pub fn main() !u8 {
     return EXIT_OK;
 }
 
-/// Process a streaming source (stdin, pipe) single-threaded with a persistent
-/// iterator that is reset() per JSONL record — zero allocations after the first.
-fn processSource(
-    file: std.fs.File,
-    cq: *const query_mod.CompiledQuery,
-    writer: *output_mod.Writer,
-    format: types.Format,
-    color: ?*const output_mod.Color,
-    opts: output_mod.SerializeOpts,
-    ext_bindings: []const query_mod.ExternalVarBinding,
-    allocator: std.mem.Allocator,
-    had_errors: *bool,
-    raw_input: bool,
-) !bool {
-    _ = raw_input;
-    var src = try io_mod.Source.init(file, allocator);
-    defer src.deinit();
-
-    var parser = try parser_mod.Parser.init(allocator);
-    defer parser.deinit();
-
-    // Persistent iterator: allocated once, reset() per JSONL record.
-    var opt_it: ?query_mod.ResultIterator = null;
-    defer if (opt_it) |*it| it.deinit();
-
-    var last_was_false_or_null = false;
-
-    // Initial refill for stream sources (ring buffer starts empty).
-    _ = try src.refill();
-
-    var fed_any = false;
-    while (true) {
-        const view = try src.peek();
-
-        if (view.bytes.len == 0 and view.is_eof) {
-            // If parser has pending state, finalize with empty eof feed.
-            if (fed_any) {
-                const result = parser.feed("", true) catch |e| {
-                    printErr("zq: ");
-                    printZqErr(e);
-                    had_errors.* = true;
-                    break;
-                };
-                switch (result) {
-                    .done => |d| {
-                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, opts, ext_bindings, allocator);
-                    },
-                    .need_more => {},
-                }
-            }
-            break;
-        }
-
-        if (view.bytes.len == 0) {
-            _ = try src.refill();
-            continue;
-        }
-
-        fed_any = true;
-        const result = parser.feed(view.bytes, view.is_eof) catch |e| {
-            // Parse error: report, skip to next record boundary (\n), and continue.
-            printErr("zq: ");
-            printZqErr(e);
-            had_errors.* = true;
-            // Skip past the next newline to re-sync on the next JSONL record.
-            const skip = std.mem.indexOfScalar(u8, view.bytes, '\n') orelse view.bytes.len - 1;
-            src.consume(skip + 1);
-            parser.reset();
-            fed_any = false;
-            if (view.is_eof and skip + 1 >= view.bytes.len) break;
-            continue;
-        };
-
-        switch (result) {
-            .done => |d| {
-                src.consume(d.consumed);
-                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, opts, ext_bindings, allocator);
-                parser.reset();
-                fed_any = false;
-            },
-            .need_more => {
-                src.consume(view.bytes.len);
-                if (view.is_eof) break;
-                _ = try src.refill();
-            },
-        }
-    }
-
-    return last_was_false_or_null;
-}
-
 /// Process a regular file in parallel using the worker Pool.
 /// Uses all available CPU cores. Results are delivered in submission order.
 fn processFile(
@@ -622,11 +555,12 @@ fn processSlurp(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    had_errors: *bool,
 ) !bool {
     if (config.raw_input) {
         return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator);
     }
-    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator);
+    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors);
 }
 
 /// Collect all parsed JSON values into a single array, then run the query once.
@@ -639,6 +573,7 @@ fn processSlurpJson(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    had_errors: *bool,
 ) !bool {
     var rt = try types.RuntimeTape.init(allocator);
     defer rt.deinit(allocator);
@@ -653,7 +588,7 @@ fn processSlurpJson(
     defer parser.deinit();
 
     if (config.files.len == 0) {
-        try collectJsonValues(std.fs.File.stdin(), &rt, &parser, allocator);
+        try collectJsonValues(std.fs.File.stdin(), &rt, &parser, allocator, had_errors);
     } else {
         for (config.files) |path| {
             const file = openFile(path) catch {
@@ -663,7 +598,7 @@ fn processSlurpJson(
                 return error.IoError;
             };
             defer file.close();
-            try collectJsonValues(file, &rt, &parser, allocator);
+            try collectJsonValues(file, &rt, &parser, allocator, had_errors);
         }
     }
 
@@ -689,6 +624,7 @@ fn collectJsonValues(
     rt: *types.RuntimeTape,
     parser: *parser_mod.Parser,
     allocator: std.mem.Allocator,
+    had_errors: *bool,
 ) !void {
     var src = try io_mod.Source.init(file, allocator);
     defer src.deinit();
@@ -701,10 +637,15 @@ fn collectJsonValues(
 
         if (view.bytes.len == 0 and view.is_eof) {
             if (fed_any) {
-                const result = parser.feed("", true) catch return;
+                const result = parser.feed("", true) catch {
+                    printErr("zq: parse error (skipping malformed input)\n");
+                    had_errors.* = true;
+                    return;
+                };
                 switch (result) {
                     .done => |d| {
-                        try copyTapeToRuntimeTape(rt, d.tape, allocator);
+                        try rt.copyFrom(d.tape, allocator);
+                        parser.reset();
                     },
                     .need_more => {},
                 }
@@ -719,6 +660,8 @@ fn collectJsonValues(
 
         fed_any = true;
         const result = parser.feed(view.bytes, view.is_eof) catch {
+            printErr("zq: parse error (skipping malformed input)\n");
+            had_errors.* = true;
             const skip = std.mem.indexOfScalar(u8, view.bytes, '\n') orelse view.bytes.len - 1;
             src.consume(skip + 1);
             parser.reset();
@@ -730,7 +673,7 @@ fn collectJsonValues(
         switch (result) {
             .done => |d| {
                 src.consume(d.consumed);
-                try copyTapeToRuntimeTape(rt, d.tape, allocator);
+                try rt.copyFrom(d.tape, allocator);
                 parser.reset();
                 fed_any = false;
             },
@@ -738,65 +681,6 @@ fn collectJsonValues(
                 src.consume(view.bytes.len);
                 if (view.is_eof) break;
                 _ = try src.refill();
-            },
-        }
-    }
-}
-
-/// Copy a complete parsed tape into the RuntimeTape, re-interning strings and
-/// rebasing skip pointers. Follows the pattern from vm.zig copyTapeSpanToRuntimeTape.
-fn copyTapeToRuntimeTape(
-    rt: *types.RuntimeTape,
-    parsed: types.Tape,
-    allocator: std.mem.Allocator,
-) !void {
-    try copyTapeSpan(rt, parsed, 0, @intCast(parsed.entries.len), allocator);
-}
-
-fn copyTapeSpan(
-    rt: *types.RuntimeTape,
-    tape: types.Tape,
-    start: u32,
-    end: u32,
-    allocator: std.mem.Allocator,
-) !void {
-    var pos = start;
-    while (pos < end) {
-        const entry = tape.entries[pos];
-        switch (entry.tag) {
-            .object_start, .array_start => {
-                const container_start = try rt.appendEntry(allocator, entry);
-                const orig_skip = entry.payload.skip;
-                // Copy content (excluding end marker)
-                if (orig_skip > pos + 2) {
-                    try copyTapeSpan(rt, tape, pos + 1, orig_skip - 1, allocator);
-                }
-                // Append end marker
-                const new_end = try rt.appendEntry(allocator, .{
-                    .tag = if (entry.tag == .object_start) .object_end else .array_end,
-                    .payload = .{ .none = {} },
-                });
-                // Update skip pointer
-                rt.entries.items[container_start].payload.skip = new_end + 1;
-                pos = orig_skip;
-            },
-            .key, .string => {
-                const str = tape.getString(entry.payload.string);
-                const new_ref = try rt.internString(allocator, str);
-                _ = try rt.appendEntry(allocator, .{
-                    .tag = entry.tag,
-                    .payload = .{ .string = new_ref },
-                });
-                pos += 1;
-            },
-            .object_end, .array_end => {
-                // Skip end markers — handled by container start
-                pos += 1;
-            },
-            else => {
-                // Scalars: int, float, true_val, false_val, null_val
-                _ = try rt.appendEntry(allocator, entry);
-                pos += 1;
             },
         }
     }
@@ -925,7 +809,7 @@ fn writeRecord(
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
         try writer.write_value(val, format, color, opts);
-        if (format == .pretty or format == .compact) {
+        if (format != .jsonl and format != .join) {
             try writer.write_value(.{ .string = "\n" }, .raw, null, .{});
         }
         last_was_false_or_null = switch (val) {

@@ -735,6 +735,6 @@ test "serialized: raw format for string" {
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
 
-    // raw format: no quotes for strings, no trailing newline
-    try std.testing.expectEqualStrings("hello", result.data);
+    // raw format: no quotes for strings, with trailing newline (matches jq -r)
+    try std.testing.expectEqualStrings("hello\n", result.data);
 }

@@ -27,6 +27,7 @@ pub const default_colors = Color{
 pub const SerializeOpts = struct {
     sort_keys: bool = false,
     indent: Indent = .{ .spaces = 2 },
+    allocator: ?std.mem.Allocator = null,
 
     pub const Indent = union(enum) {
         spaces: u8,
@@ -138,56 +139,61 @@ fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan, color: ?*const Col
 
     if (opts.sort_keys) {
         const KV = struct { key: []const u8, val_idx: u32 };
-        var buf: [256]KV = undefined;
-        var count: usize = 0;
-        var idx = span.start + 1;
-        while (idx < span.end - 1) {
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            idx += 1;
-            if (count < buf.len) {
+
+        // Count keys to decide buffer strategy
+        var key_count: usize = 0;
+        {
+            var ci = span.start + 1;
+            while (ci < span.end - 1) {
+                ci += 1;
+                ci = skipEntry(tape, ci);
+                key_count += 1;
+            }
+        }
+
+        var stack_buf: [256]KV = undefined;
+        var heap_buf: ?[]KV = null;
+        const kvs: ?[]KV = if (key_count <= 256)
+            stack_buf[0..key_count]
+        else if (opts.allocator) |a| blk: {
+            heap_buf = a.alloc(KV, key_count) catch break :blk null;
+            break :blk heap_buf.?;
+        } else null;
+        defer if (heap_buf) |h| (opts.allocator.?).free(h);
+
+        if (kvs) |buf| {
+            var count: usize = 0;
+            var idx = span.start + 1;
+            while (idx < span.end - 1) {
+                const key_ref = tape.entries[idx].payload.string;
+                const key_str = tape.getString(key_ref);
+                idx += 1;
                 buf[count] = .{ .key = key_str, .val_idx = idx };
                 count += 1;
+                idx = skipEntry(tape, idx);
             }
-            idx = skipEntry(tape, idx);
-        }
-        std.mem.sortUnstable(KV, buf[0..count], {}, struct {
-            fn lessThan(_: void, a: KV, b: KV) bool {
-                return std.mem.order(u8, a.key, b.key) == .lt;
+            std.mem.sortUnstable(KV, buf[0..count], {}, struct {
+                fn lessThan(_: void, a: KV, b: KV) bool {
+                    return std.mem.order(u8, a.key, b.key) == .lt;
+                }
+            }.lessThan);
+            for (buf[0..count], 0..) |kv, i| {
+                if (i > 0) try ctx.writeByte(',');
+                if (color) |c| try ctx.writeSlice(c.key_color);
+                try ctx.writeByte('"');
+                try serializeEscaped(ctx, kv.key);
+                try ctx.writeByte('"');
+                if (color) |c| try ctx.writeSlice(c.reset);
+                try ctx.writeByte(':');
+                const val_entry = tape.entries[kv.val_idx];
+                const child_val = entryToValue(tape, kv.val_idx, val_entry);
+                try serializeValueCompact(ctx, child_val, color, opts);
             }
-        }.lessThan);
-        for (buf[0..count], 0..) |kv, i| {
-            if (i > 0) try ctx.writeByte(',');
-            if (color) |c| try ctx.writeSlice(c.key_color);
-            try ctx.writeByte('"');
-            try serializeEscaped(ctx, kv.key);
-            try ctx.writeByte('"');
-            if (color) |c| try ctx.writeSlice(c.reset);
-            try ctx.writeByte(':');
-            const val_entry = tape.entries[kv.val_idx];
-            const child_val = entryToValue(tape, kv.val_idx, val_entry);
-            try serializeValueCompact(ctx, child_val, color, opts);
+        } else {
+            try serializeObjectUnsorted(ctx, tape, span, color, opts, false, 0);
         }
     } else {
-        var idx = span.start + 1;
-        var first = true;
-        while (idx < span.end - 1) {
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            if (!first) try ctx.writeByte(',');
-            first = false;
-            if (color) |c| try ctx.writeSlice(c.key_color);
-            try ctx.writeByte('"');
-            try serializeEscaped(ctx, key_str);
-            try ctx.writeByte('"');
-            if (color) |c| try ctx.writeSlice(c.reset);
-            try ctx.writeByte(':');
-            idx += 1;
-            const val_entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, val_entry);
-            try serializeValueCompact(ctx, child_val, color, opts);
-            idx = skipEntry(tape, idx);
-        }
+        try serializeObjectUnsorted(ctx, tape, span, color, opts, false, 0);
     }
     try ctx.writeByte('}');
 }
@@ -235,62 +241,95 @@ fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32, color: 
 
     if (opts.sort_keys) {
         const KV = struct { key: []const u8, val_idx: u32 };
-        var buf: [256]KV = undefined;
-        var count: usize = 0;
-        var idx = span.start + 1;
-        while (idx < span.end - 1) {
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            idx += 1;
-            if (count < buf.len) {
+
+        var key_count: usize = 0;
+        {
+            var ci = span.start + 1;
+            while (ci < span.end - 1) {
+                ci += 1;
+                ci = skipEntry(tape, ci);
+                key_count += 1;
+            }
+        }
+
+        var stack_buf: [256]KV = undefined;
+        var heap_buf: ?[]KV = null;
+        const kvs: ?[]KV = if (key_count <= 256)
+            stack_buf[0..key_count]
+        else if (opts.allocator) |a| blk: {
+            heap_buf = a.alloc(KV, key_count) catch break :blk null;
+            break :blk heap_buf.?;
+        } else null;
+        defer if (heap_buf) |h| (opts.allocator.?).free(h);
+
+        if (kvs) |buf| {
+            var count: usize = 0;
+            var idx = span.start + 1;
+            while (idx < span.end - 1) {
+                const key_ref = tape.entries[idx].payload.string;
+                const key_str = tape.getString(key_ref);
+                idx += 1;
                 buf[count] = .{ .key = key_str, .val_idx = idx };
                 count += 1;
+                idx = skipEntry(tape, idx);
             }
-            idx = skipEntry(tape, idx);
-        }
-        std.mem.sortUnstable(KV, buf[0..count], {}, struct {
-            fn lessThan(_: void, a: KV, b: KV) bool {
-                return std.mem.order(u8, a.key, b.key) == .lt;
+            std.mem.sortUnstable(KV, buf[0..count], {}, struct {
+                fn lessThan(_: void, a: KV, b: KV) bool {
+                    return std.mem.order(u8, a.key, b.key) == .lt;
+                }
+            }.lessThan);
+            for (buf[0..count], 0..) |kv, i| {
+                if (i > 0) try ctx.writeSlice(",\n");
+                try serializeIndent(ctx, depth + 1, opts.indent);
+                if (color) |c| try ctx.writeSlice(c.key_color);
+                try ctx.writeByte('"');
+                try serializeEscaped(ctx, kv.key);
+                try ctx.writeByte('"');
+                if (color) |c| try ctx.writeSlice(c.reset);
+                try ctx.writeSlice(": ");
+                const val_entry = tape.entries[kv.val_idx];
+                const child_val = entryToValue(tape, kv.val_idx, val_entry);
+                try serializeValuePretty(ctx, child_val, depth + 1, color, opts);
             }
-        }.lessThan);
-        for (buf[0..count], 0..) |kv, i| {
-            if (i > 0) try ctx.writeSlice(",\n");
-            try serializeIndent(ctx, depth + 1, opts.indent);
-            if (color) |c| try ctx.writeSlice(c.key_color);
-            try ctx.writeByte('"');
-            try serializeEscaped(ctx, kv.key);
-            try ctx.writeByte('"');
-            if (color) |c| try ctx.writeSlice(c.reset);
-            try ctx.writeSlice(": ");
-            const val_entry = tape.entries[kv.val_idx];
-            const child_val = entryToValue(tape, kv.val_idx, val_entry);
-            try serializeValuePretty(ctx, child_val, depth + 1, color, opts);
+        } else {
+            try serializeObjectUnsorted(ctx, tape, span, color, opts, true, depth);
         }
     } else {
-        var idx = span.start + 1;
-        var first = true;
-        while (idx < span.end - 1) {
-            const key_ref = tape.entries[idx].payload.string;
-            const key_str = tape.getString(key_ref);
-            if (!first) try ctx.writeSlice(",\n");
-            first = false;
-            try serializeIndent(ctx, depth + 1, opts.indent);
-            if (color) |c| try ctx.writeSlice(c.key_color);
-            try ctx.writeByte('"');
-            try serializeEscaped(ctx, key_str);
-            try ctx.writeByte('"');
-            if (color) |c| try ctx.writeSlice(c.reset);
-            try ctx.writeSlice(": ");
-            idx += 1;
-            const val_entry = tape.entries[idx];
-            const child_val = entryToValue(tape, idx, val_entry);
-            try serializeValuePretty(ctx, child_val, depth + 1, color, opts);
-            idx = skipEntry(tape, idx);
-        }
+        try serializeObjectUnsorted(ctx, tape, span, color, opts, true, depth);
     }
     try ctx.writeByte('\n');
     try serializeIndent(ctx, depth, opts.indent);
     try ctx.writeByte('}');
+}
+
+/// Emit object key-value pairs in tape order (unsorted).
+/// When `pretty` is true, emits indented output with newlines between entries.
+fn serializeObjectUnsorted(ctx: anytype, tape: *const types.Tape, span: Value.TapeSpan, color: ?*const Color, opts: SerializeOpts, comptime pretty: bool, depth: u32) anyerror!void {
+    var idx = span.start + 1;
+    var first = true;
+    while (idx < span.end - 1) {
+        const key_ref = tape.entries[idx].payload.string;
+        const key_str = tape.getString(key_ref);
+        if (!first) {
+            if (pretty) try ctx.writeSlice(",\n") else try ctx.writeByte(',');
+        }
+        first = false;
+        if (pretty) try serializeIndent(ctx, depth + 1, opts.indent);
+        if (color) |c| try ctx.writeSlice(c.key_color);
+        try ctx.writeByte('"');
+        try serializeEscaped(ctx, key_str);
+        try ctx.writeByte('"');
+        if (color) |c| try ctx.writeSlice(c.reset);
+        if (pretty) try ctx.writeSlice(": ") else try ctx.writeByte(':');
+        idx += 1;
+        const val_entry = tape.entries[idx];
+        const child_val = entryToValue(tape, idx, val_entry);
+        if (pretty)
+            try serializeValuePretty(ctx, child_val, depth + 1, color, opts)
+        else
+            try serializeValueCompact(ctx, child_val, color, opts);
+        idx = skipEntry(tape, idx);
+    }
 }
 
 fn serializeValueRaw(ctx: anytype, val: Value, opts: SerializeOpts) anyerror!void {

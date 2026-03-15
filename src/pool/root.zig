@@ -724,8 +724,8 @@ fn process_line_serialized(
             };
         };
 
-        // Append newline for pretty/compact formats (matches main.zig behavior).
-        if (format == .pretty or format == .compact) {
+        // Append newline for pretty/compact/raw formats (not jsonl/join which handle their own).
+        if (format != .jsonl and format != .join) {
             sink.writeByte('\n') catch {
                 if (!raw_input) parser.reset();
                 chunk_buf.shrinkRetainingCapacity(start);
