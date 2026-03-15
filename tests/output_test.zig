@@ -40,7 +40,7 @@ fn renderValue(val: Value, format: Format) ![]u8 {
             std.posix.close(fds[1]);
             std.posix.close(fds[0]);
         }
-        try w.write_value(val, format);
+        try w.write_value(val, format, null);
         // flush is called by deinit; call it explicitly here and close write end.
         try w.flush();
         w.deinit();
@@ -521,9 +521,9 @@ test "multiple writes: compact values accumulate in buffer" {
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
-    try w.write_value(.{ .int = 1 }, .compact);
-    try w.write_value(.{ .int = 2 }, .compact);
-    try w.write_value(.{ .int = 3 }, .compact);
+    try w.write_value(.{ .int = 1 }, .compact, null);
+    try w.write_value(.{ .int = 2 }, .compact, null);
+    try w.write_value(.{ .int = 3 }, .compact, null);
     try w.flush();
     w.deinit();
     std.posix.close(fds[1]);
@@ -545,8 +545,8 @@ test "multiple writes: jsonl values each have their own newline" {
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
-    try w.write_value(.{ .int = 10 }, .jsonl);
-    try w.write_value(.{ .int = 20 }, .jsonl);
+    try w.write_value(.{ .int = 10 }, .jsonl, null);
+    try w.write_value(.{ .int = 20 }, .jsonl, null);
     try w.flush();
     w.deinit();
     std.posix.close(fds[1]);

@@ -6,6 +6,24 @@ pub const ZqError = err_mod.ZqError;
 pub const Value = types.Value;
 pub const Format = types.Format;
 
+pub const Color = struct {
+    null_color: []const u8,
+    bool_color: []const u8,
+    number_color: []const u8,
+    string_color: []const u8,
+    key_color: []const u8,
+    reset: []const u8,
+};
+
+pub const default_colors = Color{
+    .null_color = "\x1b[1;30m",
+    .bool_color = "\x1b[35m",
+    .number_color = "\x1b[36m",
+    .string_color = "\x1b[32m",
+    .key_color = "\x1b[1;34m",
+    .reset = "\x1b[0m",
+};
+
 /// Internal buffer capacity: 64 KB.
 const BUF_CAP: usize = 64 * 1024;
 
@@ -31,13 +49,13 @@ pub const BufferSink = struct {
 
 /// Serialize `val` into any sink supporting `writeByte`/`writeSlice`.
 /// Format semantics match `Writer.write_value`.
-pub fn serialize(ctx: anytype, val: Value, format: Format) !void {
+pub fn serialize(ctx: anytype, val: Value, format: Format, color: ?*const Color) !void {
     switch (format) {
-        .pretty => try serializeValuePretty(ctx, val, 0),
-        .compact => try serializeValueCompact(ctx, val),
+        .pretty => try serializeValuePretty(ctx, val, 0, color),
+        .compact => try serializeValueCompact(ctx, val, color),
         .raw => try serializeValueRaw(ctx, val),
         .jsonl => {
-            try serializeValueCompact(ctx, val);
+            try serializeValueCompact(ctx, val, color);
             try ctx.writeByte('\n');
         },
     }
@@ -49,31 +67,45 @@ pub fn serialize(ctx: anytype, val: Value, format: Format) !void {
 //   fn writeByte(*@TypeOf(ctx), u8) !void
 //   fn writeSlice(*@TypeOf(ctx), []const u8) !void
 
-fn serializeValueCompact(ctx: anytype, val: Value) anyerror!void {
+fn serializeValueCompact(ctx: anytype, val: Value, color: ?*const Color) anyerror!void {
     switch (val) {
-        .null_val => try ctx.writeSlice("null"),
-        .bool_val => |b| try ctx.writeSlice(if (b) "true" else "false"),
+        .null_val => {
+            if (color) |c| try ctx.writeSlice(c.null_color);
+            try ctx.writeSlice("null");
+            if (color) |c| try ctx.writeSlice(c.reset);
+        },
+        .bool_val => |b| {
+            if (color) |c| try ctx.writeSlice(c.bool_color);
+            try ctx.writeSlice(if (b) "true" else "false");
+            if (color) |c| try ctx.writeSlice(c.reset);
+        },
         .int => |n| {
+            if (color) |c| try ctx.writeSlice(c.number_color);
             var tmp: [32]u8 = undefined;
             const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
             try ctx.writeSlice(s);
+            if (color) |c| try ctx.writeSlice(c.reset);
         },
         .float => |f| {
+            if (color) |c| try ctx.writeSlice(c.number_color);
             var tmp: [64]u8 = undefined;
             const s = formatFloat(&tmp, f);
             try ctx.writeSlice(s);
+            if (color) |c| try ctx.writeSlice(c.reset);
         },
         .string => |s| {
+            if (color) |c| try ctx.writeSlice(c.string_color);
             try ctx.writeByte('"');
             try serializeEscaped(ctx, s);
             try ctx.writeByte('"');
+            if (color) |c| try ctx.writeSlice(c.reset);
         },
-        .array => |span| try serializeArrayCompact(ctx, span),
-        .object => |span| try serializeObjectCompact(ctx, span),
+        .array => |span| try serializeArrayCompact(ctx, span, color),
+        .object => |span| try serializeObjectCompact(ctx, span, color),
     }
 }
 
-fn serializeArrayCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
+fn serializeArrayCompact(ctx: anytype, span: Value.TapeSpan, color: ?*const Color) anyerror!void {
     try ctx.writeByte('[');
     const tape = span.tape;
     var idx = span.start + 1;
@@ -83,13 +115,13 @@ fn serializeArrayCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
         first = false;
         const entry = tape.entries[idx];
         const child_val = entryToValue(tape, idx, entry);
-        try serializeValueCompact(ctx, child_val);
+        try serializeValueCompact(ctx, child_val, color);
         idx = skipEntry(tape, idx);
     }
     try ctx.writeByte(']');
 }
 
-fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
+fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan, color: ?*const Color) anyerror!void {
     try ctx.writeByte('{');
     const tape = span.tape;
     var idx = span.start + 1;
@@ -99,29 +131,32 @@ fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan) anyerror!void {
         const key_str = tape.getString(key_ref);
         if (!first) try ctx.writeByte(',');
         first = false;
+        if (color) |c| try ctx.writeSlice(c.key_color);
         try ctx.writeByte('"');
         try serializeEscaped(ctx, key_str);
-        try ctx.writeSlice("\":");
+        try ctx.writeByte('"');
+        if (color) |c| try ctx.writeSlice(c.reset);
+        try ctx.writeByte(':');
         idx += 1;
         const val_entry = tape.entries[idx];
         const child_val = entryToValue(tape, idx, val_entry);
-        try serializeValueCompact(ctx, child_val);
+        try serializeValueCompact(ctx, child_val, color);
         idx = skipEntry(tape, idx);
     }
     try ctx.writeByte('}');
 }
 
-fn serializeValuePretty(ctx: anytype, val: Value, depth: u32) anyerror!void {
+fn serializeValuePretty(ctx: anytype, val: Value, depth: u32, color: ?*const Color) anyerror!void {
     switch (val) {
         .null_val, .bool_val, .int, .float, .string => {
-            try serializeValueCompact(ctx, val);
+            try serializeValueCompact(ctx, val, color);
         },
-        .array => |span| try serializeArrayPretty(ctx, span, depth),
-        .object => |span| try serializeObjectPretty(ctx, span, depth),
+        .array => |span| try serializeArrayPretty(ctx, span, depth, color),
+        .object => |span| try serializeObjectPretty(ctx, span, depth, color),
     }
 }
 
-fn serializeArrayPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror!void {
+fn serializeArrayPretty(ctx: anytype, span: Value.TapeSpan, depth: u32, color: ?*const Color) anyerror!void {
     const tape = span.tape;
     if (span.end - span.start == 2) {
         try ctx.writeSlice("[]");
@@ -136,7 +171,7 @@ fn serializeArrayPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror
         try serializeIndent(ctx, depth + 1);
         const entry = tape.entries[idx];
         const child_val = entryToValue(tape, idx, entry);
-        try serializeValuePretty(ctx, child_val, depth + 1);
+        try serializeValuePretty(ctx, child_val, depth + 1, color);
         idx = skipEntry(tape, idx);
     }
     try ctx.writeByte('\n');
@@ -144,7 +179,7 @@ fn serializeArrayPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror
     try ctx.writeByte(']');
 }
 
-fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerror!void {
+fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32, color: ?*const Color) anyerror!void {
     const tape = span.tape;
     if (span.end - span.start == 2) {
         try ctx.writeSlice("{}");
@@ -159,13 +194,16 @@ fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerro
         if (!first) try ctx.writeSlice(",\n");
         first = false;
         try serializeIndent(ctx, depth + 1);
+        if (color) |c| try ctx.writeSlice(c.key_color);
         try ctx.writeByte('"');
         try serializeEscaped(ctx, key_str);
-        try ctx.writeSlice("\": ");
+        try ctx.writeByte('"');
+        if (color) |c| try ctx.writeSlice(c.reset);
+        try ctx.writeSlice(": ");
         idx += 1;
         const val_entry = tape.entries[idx];
         const child_val = entryToValue(tape, idx, val_entry);
-        try serializeValuePretty(ctx, child_val, depth + 1);
+        try serializeValuePretty(ctx, child_val, depth + 1, color);
         idx = skipEntry(tape, idx);
     }
     try ctx.writeByte('\n');
@@ -176,7 +214,7 @@ fn serializeObjectPretty(ctx: anytype, span: Value.TapeSpan, depth: u32) anyerro
 fn serializeValueRaw(ctx: anytype, val: Value) anyerror!void {
     switch (val) {
         .string => |s| try ctx.writeSlice(s),
-        else => try serializeValueCompact(ctx, val),
+        else => try serializeValueCompact(ctx, val, null),
     }
 }
 
@@ -259,13 +297,13 @@ pub const Writer = struct {
     /// Auto-flushes before serializing if the buffer cannot hold a single
     /// worst-case value (64 KB flush boundary). Returns `error.IoError` if
     /// any underlying `writeAll()` call fails.
-    pub fn write_value(w: *Writer, val: Value, format: Format) ZqError!void {
+    pub fn write_value(w: *Writer, val: Value, format: Format, color: ?*const Color) ZqError!void {
         if (w.len > BUF_CAP / 2) {
             try w.flush();
         }
         // Generic serialize functions return anyerror (needed for recursive generics);
         // Writer's writeByte/writeSlice only produce ZqError, so @errorCast is safe.
-        serialize(w, val, format) catch |e| return @as(ZqError, @errorCast(e));
+        serialize(w, val, format, color) catch |e| return @as(ZqError, @errorCast(e));
     }
 
     /// Write all buffered bytes to the OS and reset the buffer cursor.

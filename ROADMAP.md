@@ -199,8 +199,8 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 | [ ] `-P N` / `--parallel N` | **zq extension.** Process JSONL with N worker threads. Default: auto. `-P 0` = auto-detect CPU count. |
 | [ ] `--stream` | Streaming path-value event output |
 | [ ] `--seq` | RFC 7464 JSON Sequence support |
-| [ ] `-C` / `--color-output` | ANSI color for TTY |
-| [ ] `-M` / `--monochrome-output` | Disable color |
+| [x] `-C` / `--color-output` | ANSI color for TTY |
+| [x] `-M` / `--monochrome-output` | Disable color |
 | [ ] `--slurpfile NAME FILE` | Read file into variable as array |
 | [ ] `--rawfile NAME FILE` | Read file into variable as string |
 | [ ] `--unbuffered` | Flush after each value |

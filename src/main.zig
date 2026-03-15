@@ -22,6 +22,7 @@ const Config = struct {
     slurp: bool = false,
     sort_keys: bool = false,
     join_output: bool = false,
+    color: enum { auto, on, off } = .auto,
     filter_file: ?[]const u8 = null,
     // --arg/--argjson deferred until query VM supports variables
 
@@ -98,11 +99,17 @@ pub fn main() !u8 {
     // Pick format: if stdout is TTY and no explicit format flag, use pretty.
     const format = config.format;
 
+    const color: ?*const output_mod.Color = switch (config.color) {
+        .on => &output_mod.default_colors,
+        .off => null,
+        .auto => if (writer.is_tty() and !hasNoColor()) &output_mod.default_colors else null,
+    };
+
     var last_was_false_or_null = false;
     var had_parse_errors = false;
 
     if (config.null_input) {
-        last_was_false_or_null = processNullInput(&cq, &writer, format, allocator) catch |e| {
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -124,7 +131,7 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq, format);
+        pool.submit_stream(&src, &cq, format, color);
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
@@ -150,7 +157,7 @@ pub fn main() !u8 {
             };
             defer file.close();
 
-            last_was_false_or_null = processFile(file, &cq, &writer, format, allocator) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, allocator) catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 return EXIT_SYSTEM;
@@ -177,6 +184,7 @@ fn processSource(
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
+    color: ?*const output_mod.Color,
     allocator: std.mem.Allocator,
     had_errors: *bool,
 ) !bool {
@@ -210,7 +218,7 @@ fn processSource(
                 };
                 switch (result) {
                     .done => |d| {
-                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, allocator);
+                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, allocator);
                     },
                     .need_more => {},
                 }
@@ -241,7 +249,7 @@ fn processSource(
         switch (result) {
             .done => |d| {
                 src.consume(d.consumed);
-                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, allocator);
+                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, allocator);
                 parser.reset();
                 fed_any = false;
             },
@@ -263,13 +271,14 @@ fn processFile(
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
+    color: ?*const output_mod.Color,
     allocator: std.mem.Allocator,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
     var pool = try pool_mod.Pool.init(n_threads, allocator);
     defer pool.deinit();
 
-    try pool.submit_file(file, cq, format);
+    try pool.submit_file(file, cq, format, color);
 
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
@@ -284,6 +293,7 @@ fn processNullInput(
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
     format: types.Format,
+    color: ?*const output_mod.Color,
     allocator: std.mem.Allocator,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
@@ -297,7 +307,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, allocator);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, allocator);
 }
 
 /// Execute the query against `tape` and write all output values.
@@ -310,6 +320,7 @@ fn writeRecord(
     opt_it: *?query_mod.ResultIterator,
     writer: *output_mod.Writer,
     format: types.Format,
+    color: ?*const output_mod.Color,
     allocator: std.mem.Allocator,
 ) !bool {
     if (opt_it.*) |*it| {
@@ -321,9 +332,9 @@ fn writeRecord(
 
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
-        try writer.write_value(val, format);
+        try writer.write_value(val, format, color);
         if (format == .pretty or format == .compact) {
-            try writer.write_value(.{ .string = "\n" }, .raw);
+            try writer.write_value(.{ .string = "\n" }, .raw, null);
         }
         last_was_false_or_null = switch (val) {
             .null_val => true,
@@ -333,6 +344,11 @@ fn writeRecord(
     }
 
     return last_was_false_or_null;
+}
+
+fn hasNoColor() bool {
+    const val = std.posix.getenv("NO_COLOR") orelse return false;
+    return val.len > 0;
 }
 
 fn openFile(path: []const u8) !std.fs.File {
@@ -377,6 +393,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     's' => config.slurp = true,
                     'S' => config.sort_keys = true,
                     'j' => config.join_output = true,
+                    'C' => config.color = .on,
+                    'M' => config.color = .off,
                     'R' => config.raw_input = true,
                     'f' => {
                         i += 1;
@@ -410,6 +428,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             config.format = .raw;
         } else if (std.mem.eql(u8, arg, "--compact-output")) {
             config.format = .compact;
+        } else if (std.mem.eql(u8, arg, "--color-output")) {
+            config.color = .on;
+        } else if (std.mem.eql(u8, arg, "--monochrome-output")) {
+            config.color = .off;
         } else if (std.mem.eql(u8, arg, "--exit-status")) {
             config.exit_status = true;
         } else if (std.mem.eql(u8, arg, "--null-input")) {
@@ -572,6 +594,8 @@ fn printUsage() void {
         \\  -s, --slurp           Read all inputs into array
         \\  -S, --sort-keys       Sort object keys
         \\  -j, --join-output     No newline after each output
+        \\  -C, --color-output    Force colorized output
+        \\  -M, --monochrome-output  Disable colorized output
         \\  -f, --from-file FILE  Read filter from file
         \\  --tab                 Use tab for indentation
         \\  --indent N            Use N spaces for indentation
