@@ -320,19 +320,25 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         _ = try ctx.lex.next();
 
         // Insert fork BEFORE the left expression (adjusts all existing indices).
+        // fork → right_side: saves input, runs left. When left exhausts via
+        // IP-exhaustion, pops fork and jumps to right_side.
         try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
 
-        // Emit output for the left side's result.
-        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+        // Emit jump to skip past the right side (continuation after left completes).
+        const jump_pos = ctx.raw.items.len;
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = 0 } });
 
-        // Backpatch fork to point to fork_cleanup (current position).
+        // Backpatch fork to point to fork_cleanup (right side entry).
         ctx.raw.items[left_start].operand = .{ .index = @intCast(ctx.raw.items.len) };
 
-        // Emit fork_cleanup to consume the fork frame when reached normally.
+        // Emit fork_cleanup to consume the fork frame when reached via exhaustion.
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .fork_cleanup, .operand = .{ .none = {} } });
 
         // Parse right expression (may be another comma chain).
         try parsePipe(ctx);
+
+        // Backpatch jump to skip past right side (done label).
+        ctx.raw.items[jump_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
     }
 }
 
@@ -806,8 +812,8 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit iterate: iterates over current value
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the mapping expression (full filter to support pipes/alternatives)
-    try parsePipe(ctx);
+    // Parse the mapping expression (full filter with comma support)
+    try parseComma(ctx);
 
     // Emit output to collect each element
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -833,8 +839,8 @@ fn compileMapValues(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Iterate over elements/values
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the mapping expression (full filter)
-    try parsePipe(ctx);
+    // Parse the mapping expression (full filter with comma support)
+    try parseComma(ctx);
 
     // Collect each output
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -1300,7 +1306,7 @@ fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Parses `(expr)`, then emits `call_builtin(bid)`.
 fn compileSimpleArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
-    try parsePipe(ctx);
+    try parseComma(ctx);
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
     try ctx.raw.append(ctx.alloc, RawInstr{
@@ -1319,7 +1325,7 @@ fn compileAddWithArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
 
     // Parse the generator expression (handles comma-separated generators)
-    try parsePipe(ctx);
+    try parseComma(ctx);
 
     // Consume closing paren
     const rparen = try ctx.lex.next();
@@ -1350,8 +1356,8 @@ fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const collect_start_pos = ctx.raw.items.len;
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
 
-    // Parse the inner filter f
-    try parsePipe(ctx);
+    // Parse the inner filter f (with comma support)
+    try parseComma(ctx);
 
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
@@ -1379,10 +1385,10 @@ fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Compile `pow(base; exp)`: two semicolon-separated args.
 fn compilePow(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
-    try parsePipe(ctx); // parse base
+    try parseComma(ctx); // parse base
     const semi = try ctx.lex.next();
     if (semi.tag != .semicolon) return error.QuerySyntaxError;
-    try parsePipe(ctx); // parse exponent
+    try parseComma(ctx); // parse exponent
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
     try ctx.raw.append(ctx.alloc, RawInstr{

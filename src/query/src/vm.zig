@@ -1221,14 +1221,40 @@ pub const ResultIterator = struct {
     /// Build an object from map_values entries paired with original object keys.
     /// Uses iter_pos to match entries with keys, implementing |= semantics:
     /// keys with no output are deleted, only first output per key is kept.
+    /// Estimate tape entries and string bytes needed for a StackValue.
+    fn estimateStackValueFootprint(sv: StackValue, n_entries: *usize, n_str_bytes: *usize) void {
+        switch (sv) {
+            .null_val, .bool_val, .int, .float => n_entries.* += 1,
+            .tape_value => |tv| switch (tv) {
+                .string => |s| {
+                    n_entries.* += 1;
+                    n_str_bytes.* += s.len;
+                },
+                .array => |span| {
+                    n_entries.* += span.end - span.start;
+                    for (span.tape.entries[span.start..span.end]) |e| {
+                        if (e.tag == .string or e.tag == .key) n_str_bytes.* += e.payload.string.len;
+                    }
+                },
+                .object => |span| {
+                    n_entries.* += span.end - span.start;
+                    for (span.tape.entries[span.start..span.end]) |e| {
+                        if (e.tag == .string or e.tag == .key) n_str_bytes.* += e.payload.string.len;
+                    }
+                },
+                else => n_entries.* += 1,
+            },
+        }
+    }
+
     fn buildCollectedObject(it: *ResultIterator, frame: *const CollectFrame, input: Value) ZqError!StackValue {
         const span = input.object;
         const entries = frame.map_values_entries.items;
 
         // Pre-reserve capacity to prevent reallocation during the loop,
         // which would invalidate span.tape pointers if it references runtime_tape_view.
-        const n_entries_est = entries.len;
-        const estimated_tape_entries = 2 + n_entries_est * 2;
+        // Include value footprint estimates for nested objects/arrays.
+        var estimated_tape_entries: usize = 2; // obj_start + obj_end
         var n_string_bytes: usize = 0;
         {
             var p = span.start + 1;
@@ -1237,6 +1263,10 @@ pub const ResultIterator = struct {
                 n_string_bytes += span.tape.entries[p].payload.string.len;
                 p = skipEntry(span.tape.*, p + 1);
             }
+        }
+        for (entries) |entry| {
+            estimated_tape_entries += 2; // key + value shell
+            estimateStackValueFootprint(entry.value, &estimated_tape_entries, &n_string_bytes);
         }
         try it.runtime_tape.entries.ensureUnusedCapacity(it.alloc, estimated_tape_entries);
         try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, n_string_bytes);
