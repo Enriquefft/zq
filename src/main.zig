@@ -33,8 +33,12 @@ const Config = struct {
     color: enum { auto, on, off } = .auto,
     filter_file: ?[]const u8 = null,
     external_vars: []const ExternalVar = &.{},
+    positional_args: []const []const u8 = &.{},
+    positional_is_json: bool = false,
 
     // Owned allocations to free on cleanup.
+    _owned_positional_strs: [][]u8 = &.{},
+    _owned_positional_list: ?[]const []const u8 = null,
     _owned_filter: ?[]u8 = null,
     _owned_filter_file_path: ?[]u8 = null,
     _owned_file_strs: [][]u8 = &.{},
@@ -53,6 +57,9 @@ const Config = struct {
         for (self._owned_ext_var_strs) |s| alloc.free(s);
         if (self._owned_ext_var_strs.len > 0) alloc.free(self._owned_ext_var_strs);
         if (self._owned_ext_vars) |v| alloc.free(v);
+        for (self._owned_positional_strs) |s| alloc.free(s);
+        if (self._owned_positional_strs.len > 0) alloc.free(self._owned_positional_strs);
+        if (self._owned_positional_list) |l| alloc.free(l);
     }
 };
 
@@ -99,7 +106,7 @@ pub fn main() !u8 {
     };
 
     // Build external variable declarations for compile.
-    var ext_decls_buf = allocator.alloc(query_mod.ExternalVarDecl, config.external_vars.len) catch {
+    var ext_decls_buf = allocator.alloc(query_mod.ExternalVarDecl, config.external_vars.len + 1) catch {
         printErr("zq: out of memory\n");
         return EXIT_SYSTEM;
     };
@@ -107,6 +114,7 @@ pub fn main() !u8 {
     for (config.external_vars, 0..) |ev, i| {
         ext_decls_buf[i] = .{ .name = ev.name };
     }
+    ext_decls_buf[config.external_vars.len] = .{ .name = "ARGS" };
 
     // Compile query.
     var cq = query_mod.CompiledQuery.compile(filter_src, .{
@@ -119,7 +127,7 @@ pub fn main() !u8 {
     defer cq.deinit();
 
     // Build external variable bindings after compile (var_ids are now known).
-    var ext_bindings_buf = allocator.alloc(query_mod.ExternalVarBinding, config.external_vars.len) catch {
+    var ext_bindings_buf = allocator.alloc(query_mod.ExternalVarBinding, config.external_vars.len + 1) catch {
         printErr("zq: out of memory\n");
         return EXIT_SYSTEM;
     };
@@ -137,6 +145,8 @@ pub fn main() !u8 {
     const CompoundRef = struct { idx: usize, rt_start: u32 };
     var compound_refs = std.ArrayList(CompoundRef){};
     defer compound_refs.deinit(allocator);
+
+    var args_obj_start: u32 = 0;
 
     {
         // Temporary parser for --argjson values.
@@ -205,6 +215,155 @@ pub fn main() !u8 {
                 };
             }
         }
+
+        // Build $ARGS = {"positional": [...], "named": {...}} into argjson_rt.
+        args_obj_start = @intCast(argjson_rt.entries.items.len);
+        {
+            // outer object_start
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_start, .payload = .{ .skip = 0 } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+
+            // key "positional"
+            const pos_key_ref = argjson_rt.internString(allocator, "positional") catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = pos_key_ref } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+
+            // array_start for positional
+            const pos_arr_start: u32 = @intCast(argjson_rt.entries.items.len);
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .array_start, .payload = .{ .skip = 0 } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+
+            // Populate positional args
+            for (config.positional_args) |pa| {
+                if (config.positional_is_json) {
+                    // --jsonargs: parse each positional arg as JSON
+                    const parse_result = argjson_parser.feed(pa, true) catch {
+                        printErr("zq: --jsonargs: invalid JSON: ");
+                        printErr(pa);
+                        printErr("\n");
+                        return EXIT_USAGE;
+                    };
+                    const tape = switch (parse_result) {
+                        .done => |d| d.tape,
+                        .need_more => {
+                            printErr("zq: --jsonargs: incomplete JSON: ");
+                            printErr(pa);
+                            printErr("\n");
+                            return EXIT_USAGE;
+                        },
+                    };
+                    // Copy parsed value into argjson_rt
+                    copyTapeToRuntimeTape(&argjson_rt, tape, allocator) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                    argjson_parser.reset();
+                } else {
+                    // --args: store as string
+                    const str_ref = argjson_rt.internString(allocator, pa) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                    _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = str_ref } }) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                }
+            }
+
+            // array_end for positional
+            const pos_arr_end: u32 = @intCast(argjson_rt.entries.items.len);
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .array_end, .payload = .{ .none = {} } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+            argjson_rt.entries.items[pos_arr_start].payload.skip = pos_arr_end + 1;
+
+            // key "named"
+            const named_key_ref = argjson_rt.internString(allocator, "named") catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = named_key_ref } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+
+            // object_start for named
+            const named_obj_start: u32 = @intCast(argjson_rt.entries.items.len);
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_start, .payload = .{ .skip = 0 } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+
+            // Populate named args from --arg/--argjson
+            for (config.external_vars) |ev| {
+                // key
+                const k_ref = argjson_rt.internString(allocator, ev.name) catch {
+                    printErr("zq: out of memory\n");
+                    return EXIT_SYSTEM;
+                };
+                _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = k_ref } }) catch {
+                    printErr("zq: out of memory\n");
+                    return EXIT_SYSTEM;
+                };
+                if (ev.is_json) {
+                    // Parse and copy into RT
+                    const parse_result = argjson_parser.feed(ev.value, true) catch {
+                        // Already validated during binding construction, but handle gracefully
+                        _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                        continue;
+                    };
+                    const tape = switch (parse_result) {
+                        .done => |d| d.tape,
+                        .need_more => {
+                            _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                            continue;
+                        },
+                    };
+                    copyTapeToRuntimeTape(&argjson_rt, tape, allocator) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                    argjson_parser.reset();
+                } else {
+                    // String value
+                    const v_ref = argjson_rt.internString(allocator, ev.value) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                    _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = v_ref } }) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                }
+            }
+
+            // object_end for named
+            const named_obj_end: u32 = @intCast(argjson_rt.entries.items.len);
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_end, .payload = .{ .none = {} } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+            argjson_rt.entries.items[named_obj_start].payload.skip = named_obj_end + 1;
+
+            // outer object_end
+            const args_obj_end: u32 = @intCast(argjson_rt.entries.items.len);
+            _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_end, .payload = .{ .none = {} } }) catch {
+                printErr("zq: out of memory\n");
+                return EXIT_SYSTEM;
+            };
+            argjson_rt.entries.items[args_obj_start].payload.skip = args_obj_end + 1;
+        }
     }
 
     // Build the stable tape view from the RuntimeTape and resolve compound bindings.
@@ -216,6 +375,20 @@ pub fn main() !u8 {
             .array_start => .{ .tape_value = .{ .array = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
             .object_start => .{ .tape_value = .{ .object = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
             else => .null_val,
+        };
+    }
+
+    // Bind $ARGS to the object we just built.
+    {
+        const args_var_id = cq.external_var_ids[config.external_vars.len];
+        const args_entry = argjson_tape_view.entries[args_obj_start];
+        ext_bindings_buf[config.external_vars.len] = .{
+            .var_id = args_var_id,
+            .value = .{ .tape_value = .{ .object = .{
+                .tape = &argjson_tape_view,
+                .start = args_obj_start,
+                .end = args_entry.payload.skip,
+            } } },
         };
     }
     const ext_bindings: []const query_mod.ExternalVarBinding = ext_bindings_buf;
@@ -796,6 +969,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var owned_files = std.ArrayList([]u8){};
     var ext_vars = std.ArrayList(ExternalVar){};
     var ext_var_strs = std.ArrayList([]u8){};
+    var positional_args = std.ArrayList([]u8){};
     errdefer {
         for (owned_files.items) |f| allocator.free(f);
         owned_files.deinit(allocator);
@@ -804,6 +978,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         for (ext_var_strs.items) |s| allocator.free(s);
         ext_var_strs.deinit(allocator);
         ext_vars.deinit(allocator);
+        for (positional_args.items) |s| allocator.free(s);
+        positional_args.deinit(allocator);
     }
 
     var i: usize = 1; // skip argv[0]
@@ -929,11 +1105,14 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             owned_ff_path = duped;
             config.filter_file = duped;
             filter_set = true;
-        } else if (std.mem.eql(u8, arg, "--jsonargs") or std.mem.eql(u8, arg, "--args")) {
-            printErr("zq: ");
-            printErr(arg);
-            printErr(" not yet implemented\n");
-            return error.UsageError;
+        } else if (std.mem.eql(u8, arg, "--args") or std.mem.eql(u8, arg, "--jsonargs")) {
+            config.positional_is_json = std.mem.eql(u8, arg, "--jsonargs");
+            i += 1;
+            while (i < args.len) : (i += 1) {
+                const duped = try allocator.dupe(u8, args[i]);
+                try positional_args.append(allocator, duped);
+            }
+            break;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             std.process.exit(EXIT_OK);
@@ -998,6 +1177,15 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     } else {
         ext_vars.deinit(allocator);
         ext_var_strs.deinit(allocator);
+    }
+    if (positional_args.items.len > 0) {
+        config._owned_positional_strs = try positional_args.toOwnedSlice(allocator);
+        const pa_list = try allocator.alloc([]const u8, config._owned_positional_strs.len);
+        for (config._owned_positional_strs, 0..) |s, idx| pa_list[idx] = s;
+        config.positional_args = pa_list;
+        config._owned_positional_list = pa_list;
+    } else {
+        positional_args.deinit(allocator);
     }
 
     return config;
