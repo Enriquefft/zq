@@ -22,6 +22,8 @@ const Config = struct {
     slurp: bool = false,
     sort_keys: bool = false,
     join_output: bool = false,
+    tab_indent: bool = false,
+    indent_width: u8 = 2,
     color: enum { auto, on, off } = .auto,
     filter_file: ?[]const u8 = null,
     // --arg/--argjson deferred until query VM supports variables
@@ -93,11 +95,6 @@ pub fn main() !u8 {
         printErr("zq: --slurp not yet implemented\n");
         return EXIT_USAGE;
     }
-    if (config.sort_keys) {
-        printErr("zq: --sort-keys not yet implemented\n");
-        return EXIT_USAGE;
-    }
-
     // Compile query.
     var cq = query_mod.CompiledQuery.compile(filter_src, .{}, allocator) catch |e| {
         printErr("zq: compile error: ");
@@ -116,6 +113,11 @@ pub fn main() !u8 {
     // Pick format: if stdout is TTY and no explicit format flag, use pretty.
     const format: types.Format = if (config.join_output) .join else config.format;
 
+    const serialize_opts = output_mod.SerializeOpts{
+        .sort_keys = config.sort_keys,
+        .indent = if (config.tab_indent) .tab else .{ .spaces = config.indent_width },
+    };
+
     const color: ?*const output_mod.Color = switch (config.color) {
         .on => &output_mod.default_colors,
         .off => null,
@@ -126,7 +128,7 @@ pub fn main() !u8 {
     var had_parse_errors = false;
 
     if (config.null_input) {
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, allocator) catch |e| {
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -148,7 +150,7 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq, format, color);
+        pool.submit_stream(&src, &cq, format, color, serialize_opts);
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
@@ -174,7 +176,7 @@ pub fn main() !u8 {
             };
             defer file.close();
 
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, allocator) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, allocator) catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 return EXIT_SYSTEM;
@@ -202,6 +204,7 @@ fn processSource(
     writer: *output_mod.Writer,
     format: types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
     had_errors: *bool,
 ) !bool {
@@ -235,7 +238,7 @@ fn processSource(
                 };
                 switch (result) {
                     .done => |d| {
-                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, allocator);
+                        last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, opts, allocator);
                     },
                     .need_more => {},
                 }
@@ -266,7 +269,7 @@ fn processSource(
         switch (result) {
             .done => |d| {
                 src.consume(d.consumed);
-                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, allocator);
+                last_was_false_or_null = try writeRecord(cq, d.tape, &opt_it, writer, format, color, opts, allocator);
                 parser.reset();
                 fed_any = false;
             },
@@ -289,13 +292,14 @@ fn processFile(
     writer: *output_mod.Writer,
     format: types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
     var pool = try pool_mod.Pool.init(n_threads, allocator);
     defer pool.deinit();
 
-    try pool.submit_file(file, cq, format, color);
+    try pool.submit_file(file, cq, format, color, opts);
 
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
@@ -311,6 +315,7 @@ fn processNullInput(
     writer: *output_mod.Writer,
     format: types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
@@ -324,7 +329,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, allocator);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, allocator);
 }
 
 /// Execute the query against `tape` and write all output values.
@@ -338,6 +343,7 @@ fn writeRecord(
     writer: *output_mod.Writer,
     format: types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
 ) !bool {
     if (opt_it.*) |*it| {
@@ -349,9 +355,9 @@ fn writeRecord(
 
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
-        try writer.write_value(val, format, color);
+        try writer.write_value(val, format, color, opts);
         if (format == .pretty or format == .compact) {
-            try writer.write_value(.{ .string = "\n" }, .raw, null);
+            try writer.write_value(.{ .string = "\n" }, .raw, null, .{});
         }
         last_was_false_or_null = switch (val) {
             .null_val => true,
@@ -471,17 +477,22 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--join-output")) {
             config.join_output = true;
         } else if (std.mem.eql(u8, arg, "--tab")) {
-            // Store as format hint; output module doesn't support tab yet.
-            printErr("zq: --tab not yet implemented\n");
-            return error.UsageError;
+            config.tab_indent = true;
         } else if (std.mem.eql(u8, arg, "--indent")) {
             i += 1;
             if (i >= args.len) {
                 printErr("zq: --indent requires a number\n");
                 return error.UsageError;
             }
-            printErr("zq: --indent not yet implemented\n");
-            return error.UsageError;
+            const n = std.fmt.parseInt(u8, args[i], 10) catch {
+                printErr("zq: --indent: invalid number\n");
+                return error.UsageError;
+            };
+            if (n > 8) {
+                printErr("zq: --indent: value must be 0-8\n");
+                return error.UsageError;
+            }
+            config.indent_width = n;
         } else if (std.mem.eql(u8, arg, "--arg")) {
             i += 2; // skip name and value
             if (i >= args.len) {

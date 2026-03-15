@@ -40,6 +40,17 @@ pub const Color = struct {
 /// magenta booleans, bold dark gray nulls. Structural chars uncolored.
 pub const default_colors: Color;
 
+/// Serialization options controlling key ordering and indentation.
+pub const SerializeOpts = struct {
+    sort_keys: bool = false,
+    indent: Indent = .{ .spaces = 2 },
+
+    pub const Indent = union(enum) {
+        spaces: u8,
+        tab,
+    };
+};
+
 /// Adapts an std.ArrayList(u8) to the writeByte/writeSlice interface
 /// used by the generic serialization functions.  Used by pool workers to
 /// serialize values directly into arena-backed byte buffers.
@@ -63,7 +74,7 @@ pub const Writer = struct {
     /// Serialize `val` into the internal buffer in the requested format.
     /// Flushes automatically when the buffer reaches 64 KB.
     /// Returns `error.IoError` if an underlying `write()` syscall fails.
-    pub fn write_value(w: *Writer, val: Value, format: Format, color: ?*const Color) ZqError!void;
+    pub fn write_value(w: *Writer, val: Value, format: Format, color: ?*const Color, opts: SerializeOpts) ZqError!void;
 
     /// Append pre-serialized bytes directly to the internal buffer.
     /// Used by main.zig to write output from the serialized pool path.
@@ -83,10 +94,10 @@ pub const Writer = struct {
 
 | Function          | Signature                                              | Description                                                                       |
 |-------------------|--------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `serialize`       | `anytype, Value, Format, ?*const Color → !void`       | Serialize `val` into any sink with `writeByte`/`writeSlice` methods.              |
+| `serialize`       | `anytype, Value, Format, ?*const Color, SerializeOpts → !void` | Serialize `val` into any sink with `writeByte`/`writeSlice` methods.      |
 | `Writer.init`     | `fd, Allocator → error{OutOfMemory}!Writer`           | Allocate 64 KB internal buffer; detect TTY via `isatty`.                          |
 | `Writer.deinit`   | `*Writer → void`                                       | Flush buffered output and free the internal buffer.                               |
-| `Writer.write_value` | `*Writer, Value, Format, ?*const Color → ZqError!void` | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB.       |
+| `Writer.write_value` | `*Writer, Value, Format, ?*const Color, SerializeOpts → ZqError!void` | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB. |
 | `Writer.writeSlice`  | `*Writer, []const u8 → ZqError!void`              | Append pre-serialized bytes to the buffer; auto-flush as needed.                  |
 | `Writer.flush`    | `*Writer → ZqError!void`                               | Write all buffered bytes to the OS; reset buffer cursor to zero.                  |
 | `Writer.is_tty`   | `*const Writer → bool`                                 | Return TTY detection result cached at `init` time.                                |
@@ -95,7 +106,7 @@ pub const Writer = struct {
 
 | Format    | Output                                             |
 |-----------|----------------------------------------------------|
-| `pretty`  | Indented JSON with 2-space indent and newlines.    |
+| `pretty`  | Indented JSON (default 2-space; configurable via `SerializeOpts.indent`). |
 | `compact` | Single-line JSON with no extra whitespace.         |
 | `raw`     | Strings without quotes; all other types as compact JSON. |
 | `jsonl`   | Compact JSON followed by a single newline (`\n`). |

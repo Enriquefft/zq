@@ -182,6 +182,8 @@ const Job = struct {
     format: ?types.Format,
     /// ANSI color configuration. Null means no color output.
     color: ?*const output_mod.Color,
+    /// Serialization options (sort_keys, indent).
+    opts: output_mod.SerializeOpts,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -478,6 +480,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                     fmt,
                     job.color,
                     &chunk_buf,
+                    job.opts,
                 );
 
                 meta_list.append(aa, meta) catch {
@@ -610,6 +613,7 @@ fn process_line_serialized(
     format: types.Format,
     color: ?*const output_mod.Color,
     chunk_buf: *std.ArrayList(u8),
+    opts: output_mod.SerializeOpts,
 ) RecordMeta {
     const start: u32 = @intCast(chunk_buf.items.len);
 
@@ -672,7 +676,7 @@ fn process_line_serialized(
         const val = maybe orelse break;
 
         // Serialize the value using the output module's generic serialize.
-        output_mod.serialize(&sink, val, format, color) catch {
+        output_mod.serialize(&sink, val, format, color, opts) catch {
             parser.reset();
             chunk_buf.shrinkRetainingCapacity(start);
             return .{
@@ -781,6 +785,7 @@ const IoCtx = struct {
     allocator: std.mem.Allocator,
     format: ?types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
@@ -869,6 +874,7 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
         .allocator = ctx.allocator,
         .format = ctx.format,
         .color = ctx.color,
+        .opts = ctx.opts,
     });
     chunk_id.* += 1;
     batch_buf.clearRetainingCapacity();
@@ -906,6 +912,7 @@ const FileFeedCtx = struct {
     allocator: std.mem.Allocator,
     format: ?types.Format,
     color: ?*const output_mod.Color,
+    opts: output_mod.SerializeOpts,
 };
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
@@ -947,6 +954,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .allocator = ctx.allocator,
             .format = ctx.format,
             .color = ctx.color,
+            .opts = ctx.opts,
         });
         chunk_id += 1;
     }
@@ -1159,6 +1167,7 @@ pub const Pool = struct {
         cq: *const query_mod.CompiledQuery,
         format: ?types.Format,
         color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
     ) ZqError!void {
         p._format = format;
         const stat = file.stat() catch return error.IoError;
@@ -1192,6 +1201,7 @@ pub const Pool = struct {
             .allocator = p.allocator,
             .format = format,
             .color = color,
+            .opts = opts,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
@@ -1224,6 +1234,7 @@ pub const Pool = struct {
         cq: *const query_mod.CompiledQuery,
         format: ?types.Format,
         color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
     ) void {
         p._format = format;
         const ctx_ptr = p.allocator.create(IoCtx) catch {
@@ -1240,6 +1251,7 @@ pub const Pool = struct {
             .allocator = p.allocator,
             .format = format,
             .color = color,
+            .opts = opts,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
