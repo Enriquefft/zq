@@ -87,10 +87,6 @@ pub fn main() !u8 {
         };
     };
 
-    if (config.raw_input) {
-        printErr("zq: --raw-input not yet implemented\n");
-        return EXIT_USAGE;
-    }
     if (config.slurp) {
         printErr("zq: --slurp not yet implemented\n");
         return EXIT_USAGE;
@@ -150,7 +146,7 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq, format, color, serialize_opts);
+        pool.submit_stream(&src, &cq, format, color, serialize_opts, config.raw_input);
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
@@ -176,7 +172,7 @@ pub fn main() !u8 {
             };
             defer file.close();
 
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, allocator) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, allocator, config.raw_input) catch |e| {
                 printErr("zq: ");
                 printZqErr(e);
                 return EXIT_SYSTEM;
@@ -207,7 +203,9 @@ fn processSource(
     opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
     had_errors: *bool,
+    raw_input: bool,
 ) !bool {
+    _ = raw_input;
     var src = try io_mod.Source.init(file, allocator);
     defer src.deinit();
 
@@ -294,12 +292,13 @@ fn processFile(
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     allocator: std.mem.Allocator,
+    raw_input: bool,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
     var pool = try pool_mod.Pool.init(n_threads, allocator);
     defer pool.deinit();
 
-    try pool.submit_file(file, cq, format, color, opts);
+    try pool.submit_file(file, cq, format, color, opts, raw_input);
 
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
