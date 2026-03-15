@@ -2395,7 +2395,7 @@ pub const ResultIterator = struct {
         return switch (val) {
             .null_val => .{ .int = 0 },
             .bool_val => return error.TypeError,
-            .int => |i| .{ .int = safeAbsInt(i) },
+            .int => |i| absIntStackValue(i),
             .float => |f| .{ .float = @abs(f) },
             .string => |s| blk: {
                 // Count Unicode codepoints, not bytes.
@@ -3813,14 +3813,17 @@ pub const ResultIterator = struct {
         return .{ .float = result };
     }
 
-    fn safeAbsInt(n: i64) i64 {
-        if (n == std.math.minInt(i64)) return std.math.minInt(i64);
-        return if (n < 0) -n else n;
+    /// Absolute value for integers. Promotes to float when the result
+    /// would overflow (minInt(i64)), matching jq behavior.
+    fn absIntStackValue(n: i64) StackValue {
+        if (n == std.math.minInt(i64))
+            return .{ .float = @abs(@as(f64, @floatFromInt(n))) };
+        return .{ .int = if (n < 0) -n else n };
     }
 
     fn builtinFabs(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .int => |n| return .{ .int = safeAbsInt(n) },
+            .int => |n| return absIntStackValue(n),
             .float => |f| return .{ .float = @abs(f) },
             else => return error.TypeError,
         }
@@ -3828,7 +3831,7 @@ pub const ResultIterator = struct {
 
     fn builtinAbs(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .int => |n| return .{ .int = safeAbsInt(n) },
+            .int => |n| return absIntStackValue(n),
             .float => |f| return .{ .float = @abs(f) },
             else => return error.TypeError,
         }
