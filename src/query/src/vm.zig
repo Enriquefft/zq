@@ -25,7 +25,7 @@ const IterFrame = struct {
 };
 
 /// State for one active `[expr]` array collection.
-/// Pushed by array_collect_start, popped by array_collect_end or ip-exhaustion.
+/// Pushed by array_collect_start/map_values_start, popped by the matching end op.
 const CollectFrame = struct {
     /// Accumulated outputs from the inner expression.
     buffer: std.ArrayList(StackValue),
@@ -37,8 +37,11 @@ const CollectFrame = struct {
     /// Value stack depth when collection started.
     /// Used to trim leftover operands after each output.
     outer_value_depth: u32,
-    /// IP of the matching array_collect_end instruction.
+    /// IP of the matching array_collect_end/map_values_end instruction.
     end_ip: u32,
+    /// Non-null for map_values: saves the original input so map_values_end can
+    /// reconstruct an object with original keys paired with collected values.
+    map_values_input: ?Value = null,
 };
 
 /// State for an active `range` generator.
@@ -375,9 +378,15 @@ pub const ResultIterator = struct {
                         {
                             var completed = it.collect_stack.pop().?;
                             defer completed.buffer.deinit(it.alloc);
-                            const arr_val = try it.buildCollectedArray(&completed);
-                            it.pushValue(arr_val);
-                            it.ip = completed.end_ip + 1; // skip past array_collect_end
+                            const result = if (completed.map_values_input) |input|
+                                switch (input) {
+                                    .object => try it.buildCollectedObject(&completed, input),
+                                    else => try it.buildCollectedArray(&completed),
+                                }
+                            else
+                                try it.buildCollectedArray(&completed);
+                            it.pushValue(result);
+                            it.ip = completed.end_ip + 1; // skip past collect_end
                             continue;
                         }
                     }
@@ -710,6 +719,38 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            // map_values construction
+            .map_values_start => {
+                var buf = std.ArrayList(StackValue){};
+                errdefer buf.deinit(it.alloc);
+                try buf.ensureTotalCapacity(it.alloc, 32);
+                try it.collect_stack.append(it.alloc, CollectFrame{
+                    .buffer = buf,
+                    .outer_stack_depth = @intCast(it.stack.items.len),
+                    .outer_range_depth = @intCast(it.range_stack.items.len),
+                    .outer_value_depth = @intCast(it.value_stack.items.len),
+                    .end_ip = @intCast(instr.operand.index),
+                    .map_values_input = it.current,
+                });
+                it.ip += 1;
+                return null;
+            },
+
+            .map_values_end => {
+                var completed = it.collect_stack.pop().?;
+                defer completed.buffer.deinit(it.alloc);
+                const result = if (completed.map_values_input) |input|
+                    switch (input) {
+                        .object => try it.buildCollectedObject(&completed, input),
+                        else => try it.buildCollectedArray(&completed),
+                    }
+                else
+                    try it.buildCollectedArray(&completed);
+                it.pushValue(result);
+                it.ip += 1;
+                return null;
+            },
+
             // Alternative operator (//)
             .alt_start => {
                 it.if_stack.appendAssumeCapacity(it.current);
@@ -1021,6 +1062,47 @@ pub const ResultIterator = struct {
             .tape = &it.runtime_tape_view,
             .start = arr_start,
             .end = arr_end_idx + 1,
+        } } };
+    }
+
+    /// Build an object from collected values paired with original object keys.
+    /// Used by map_values_end when the input was an object.
+    fn buildCollectedObject(it: *ResultIterator, frame: *const CollectFrame, input: Value) ZqError!StackValue {
+        const span = input.object;
+
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        // Iterate original object keys and pair with collected values
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var val_idx: usize = 0;
+        while (pos < end) {
+            const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
+            if (val_idx < frame.buffer.items.len) {
+                const key_ref = try it.runtime_tape.internString(it.alloc, key_str);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = key_ref } });
+                try it.stackValueToRuntimeTapeEntry(frame.buffer.items[val_idx]);
+                val_idx += 1;
+            }
+            pos = skipEntry(span.tape.*, pos + 1); // skip past value
+        }
+
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape_view,
+            .start = obj_start,
+            .end = obj_end_idx + 1,
         } } };
     }
 
@@ -1769,6 +1851,22 @@ pub const ResultIterator = struct {
     /// When both left and right have the same key and both values are objects,
     /// recursively merge them. Otherwise, right's value wins.
     fn recursiveMerge(it: *ResultIterator, lspan: Value.TapeSpan, rspan: Value.TapeSpan) ZqError!StackValue {
+        // Pre-reserve capacity to avoid reallocation invalidating span pointers
+        // when spans reference runtime_tape_view (e.g. chained merges).
+        const estimated_entries = (lspan.end - lspan.start) + (rspan.end - rspan.start) + 2;
+        try it.runtime_tape.entries.ensureUnusedCapacity(it.alloc, estimated_entries);
+        var lstring_bytes: usize = 0;
+        for (lspan.tape.entries[lspan.start..lspan.end]) |e| {
+            if (e.tag == .key or e.tag == .string) lstring_bytes += e.payload.string.len;
+        }
+        var rstring_bytes: usize = 0;
+        for (rspan.tape.entries[rspan.start..rspan.end]) |e| {
+            if (e.tag == .key or e.tag == .string) rstring_bytes += e.payload.string.len;
+        }
+        try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, lstring_bytes + rstring_bytes);
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+
         const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .object_start,
             .payload = .{ .skip = 0 },
@@ -3446,7 +3544,14 @@ pub const ResultIterator = struct {
     fn builtinFloor(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .int => |n| return .{ .int = n },
-            .float => |f| return .{ .int = @intFromFloat(@floor(f)) },
+            .float => |f| {
+                if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
+                const floored = @floor(f);
+                if (floored < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                    floored > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    return .{ .float = floored };
+                return .{ .int = @intFromFloat(floored) };
+            },
             else => return error.TypeError,
         }
     }
@@ -3454,7 +3559,14 @@ pub const ResultIterator = struct {
     fn builtinCeil(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .int => |n| return .{ .int = n },
-            .float => |f| return .{ .int = @intFromFloat(@ceil(f)) },
+            .float => |f| {
+                if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
+                const ceiled = @ceil(f);
+                if (ceiled < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                    ceiled > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    return .{ .float = ceiled };
+                return .{ .int = @intFromFloat(ceiled) };
+            },
             else => return error.TypeError,
         }
     }
@@ -3462,7 +3574,14 @@ pub const ResultIterator = struct {
     fn builtinRound(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .int => |n| return .{ .int = n },
-            .float => |f| return .{ .int = @intFromFloat(@round(f)) },
+            .float => |f| {
+                if (std.math.isNan(f) or std.math.isInf(f)) return .{ .float = f };
+                const rounded = @round(f);
+                if (rounded < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                    rounded > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                    return .{ .float = rounded };
+                return .{ .int = @intFromFloat(rounded) };
+            },
             else => return error.TypeError,
         }
     }
@@ -3549,10 +3668,20 @@ pub const ResultIterator = struct {
     }
 
     /// Compute the base-2 exponent of f (like C's ilogb).
+    /// Handles subnormals, zero, and Inf/NaN per IEEE 754.
     fn ilogb64(f: f64) i32 {
+        if (f == 0.0) return std.math.minInt(i32); // FP_ILOGB0
         const bits = @as(u64, @bitCast(f));
-        const biased_exp = @as(i32, @intCast((bits >> 52) & 0x7FF));
-        return biased_exp - 1023;
+        const biased_exp = @as(u32, @intCast((bits >> 52) & 0x7FF));
+        if (biased_exp == 0x7FF) return std.math.maxInt(i32); // Inf/NaN
+        if (biased_exp == 0) {
+            // Subnormal: find position of leading 1 in mantissa
+            const mantissa = bits & 0x000FFFFFFFFFFFFF;
+            if (mantissa == 0) return std.math.minInt(i32);
+            const leading_zeros = @clz(mantissa) - 12; // 64 - 52 = 12 implicit bits
+            return -1022 - @as(i32, @intCast(leading_zeros));
+        }
+        return @as(i32, @intCast(biased_exp)) - 1023;
     }
 
     fn builtinSignificand(it: *ResultIterator) ZqError!?StackValue {
@@ -3934,7 +4063,9 @@ pub const ResultIterator = struct {
                     it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                     return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
                 }
-                // Cannot parse complex JSON (arrays/objects) without the parser module
+                // Cannot parse complex JSON (arrays/objects) without importing the
+                // parser module (which would create a circular dependency).
+                // Return TypeError — full JSON parsing support is a future enhancement.
                 return error.TypeError;
             },
             // If already not a string, pass through (jq semantics)
@@ -4100,7 +4231,7 @@ pub const ResultIterator = struct {
             // Type selectors
             "arrays/0",         "objects/0",       "strings/0",
             "numbers/0",        "booleans/0",      "nulls/0",
-            "values/0",         "scalars/0",       "iterables/0",
+            "scalars/0",        "iterables/0",
             // Math
             "floor/0",          "ceil/0",          "round/0",
             "sqrt/0",           "fabs/0",          "nan/0",

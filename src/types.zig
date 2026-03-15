@@ -370,6 +370,14 @@ pub const Instruction = struct {
         /// onto the value stack.
         array_collect_end,
 
+        /// Begin map_values collection: like array_collect_start but saves the
+        /// original input so map_values_end can reconstruct objects.
+        /// operand.index = IP of the matching map_values_end instruction.
+        map_values_start,
+        /// Finalize map_values: if original input was an object, build an object
+        /// with original keys and collected values; otherwise build an array.
+        map_values_end,
+
         // Alternative operator (//) — null coalescing
         /// Begin alternative evaluation: push current to if_stack; increment alt_null_depth
         /// so that field accesses on the left side propagate null instead of TypeError.

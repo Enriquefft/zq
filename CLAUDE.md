@@ -29,7 +29,7 @@ There is no way to run a single test file independently — `zig build test` com
 Read `src/<module>/INTERFACE.md` before modifying any module.
 
 **Dependency graph:**
-```
+```text
 error  (no deps)          types  (no deps)
   ↓                         ↓
 io → error              parser → error, types

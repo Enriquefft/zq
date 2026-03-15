@@ -130,7 +130,7 @@ pub const ResultIterator = struct {
 ## Supported Builtins
 
 ### Type Selectors (zero-arg, act as `select(type == ...)`)
-`arrays`, `objects`, `strings`, `numbers`, `booleans`, `nulls`, `values`, `scalars`, `iterables`
+`arrays`, `objects`, `strings`, `numbers`, `booleans`, `nulls`, `scalars`, `iterables`
 
 ### Math (zero-arg unless noted)
 `floor`, `ceil`, `round`, `sqrt`, `fabs`, `abs`, `nan`, `infinite`, `isnan`, `isinfinite`, `isnormal`, `log2`, `log`, `exp`, `exp2`, `sin`, `cos`, `atan`, `tan`, `asin`, `acos`, `sinh`, `cosh`, `tanh`, `significand`, `exponent`, `logb`, `pow(base; exp)`

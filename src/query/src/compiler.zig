@@ -202,7 +202,7 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .alt_check => {
+            .jump, .jump_if_false, .array_collect_start, .map_values_start, .alt_check => {
                 if (r.operand.index >= p) r.operand.index += 1;
             },
             // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
@@ -641,7 +641,7 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "length")) return .length;
     if (std.mem.eql(u8, name, "keys")) return .keys;
     if (std.mem.eql(u8, name, "keys_unsorted")) return .keys_unsorted;
-    if (std.mem.eql(u8, name, "values")) return .values;
+    if (std.mem.eql(u8, name, "values")) return .values_sel;
     if (std.mem.eql(u8, name, "type")) return .type_;
     if (std.mem.eql(u8, name, "empty")) return .empty;
     if (std.mem.eql(u8, name, "tostring")) return .tostring;
@@ -667,7 +667,6 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "numbers")) return .numbers_sel;
     if (std.mem.eql(u8, name, "booleans")) return .booleans_sel;
     if (std.mem.eql(u8, name, "nulls")) return .nulls_sel;
-    if (std.mem.eql(u8, name, "values")) return .values_sel;
     if (std.mem.eql(u8, name, "scalars")) return .scalars_sel;
     if (std.mem.eql(u8, name, "iterables")) return .iterables_sel;
 
@@ -772,8 +771,8 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit iterate: iterates over current value
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the mapping expression
-    try parseLogical(ctx);
+    // Parse the mapping expression (full filter to support pipes/alternatives)
+    try parsePipe(ctx);
 
     // Emit output to collect each element
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -785,6 +784,31 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit array_collect_end and backpatch start
     const end_pos: u32 = @intCast(ctx.raw.items.len);
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Compile `map_values(f)`: apply f to each value, preserving object keys.
+/// Uses map_values_start/end opcodes so the VM can reconstruct objects at runtime.
+fn compileMapValues(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .map_values_start, .operand = .{ .index = 0 } });
+
+    // Iterate over elements/values
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+
+    // Parse the mapping expression (full filter)
+    try parsePipe(ctx);
+
+    // Collect each output
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .map_values_end, .operand = .{ .none = {} } });
     ctx.raw.items[start_pos].operand = .{ .index = end_pos };
 }
 
@@ -1241,7 +1265,7 @@ fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Parses `(expr)`, then emits `call_builtin(bid)`.
 fn compileSimpleArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
+    try parsePipe(ctx);
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
     try ctx.raw.append(ctx.alloc, RawInstr{
@@ -1292,7 +1316,7 @@ fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
 
     // Parse the inner filter f
-    try parseLogical(ctx);
+    try parsePipe(ctx);
 
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
@@ -1320,10 +1344,10 @@ fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Compile `pow(base; exp)`: two semicolon-separated args.
 fn compilePow(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx); // parse base
+    try parsePipe(ctx); // parse base
     const semi = try ctx.lex.next();
     if (semi.tag != .semicolon) return error.QuerySyntaxError;
-    try parseLogical(ctx); // parse exponent
+    try parsePipe(ctx); // parse exponent
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
     try ctx.raw.append(ctx.alloc, RawInstr{
@@ -1449,7 +1473,7 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 } else if (std.mem.eql(u8, ident_name, "join")) {
                     try compileSimpleArgBuiltin(ctx, .join_);
                 } else if (std.mem.eql(u8, ident_name, "map_values")) {
-                    try compileMap(ctx);
+                    try compileMapValues(ctx);
                 } else if (std.mem.eql(u8, ident_name, "isempty")) {
                     try compileIsempty(ctx);
                 } else if (std.mem.eql(u8, ident_name, "bsearch")) {
@@ -2277,6 +2301,13 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .array_collect_end => .{ .none = {} },
+                // map_values construction: remap end_ip raw → fused index.
+                .map_values_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .map_values_end => .{ .none = {} },
                 // Alternative operator: remap jump target raw → fused index.
                 .alt_start => .{ .none = {} },
                 .alt_check => blk: {
