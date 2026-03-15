@@ -28,12 +28,14 @@ const Config = struct {
 
     // Owned allocations to free on cleanup.
     _owned_filter: ?[]u8 = null,
+    _owned_filter_file_path: ?[]u8 = null,
     _owned_file_strs: [][]u8 = &.{},
     _owned_file_list: ?[]const []const u8 = null,
     _allocator: ?std.mem.Allocator = null,
 
     fn deinit(self: *Config) void {
         const alloc = self._allocator orelse return;
+        if (self._owned_filter_file_path) |f| alloc.free(f);
         if (self._owned_filter) |f| alloc.free(f);
         for (self._owned_file_strs) |f| alloc.free(f);
         if (self._owned_file_strs.len > 0) alloc.free(self._owned_file_strs);
@@ -57,9 +59,24 @@ pub fn main() !u8 {
     // Determine filter source.
     const filter_src: []const u8 = blk: {
         if (config.filter_file) |path| {
-            _ = path;
-            printErr("zq: --from-file not yet implemented\n");
-            return EXIT_USAGE;
+            const file = std.fs.cwd().openFile(path, .{}) catch {
+                printErr("zq: could not open filter file: ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+            defer file.close();
+
+            const contents = file.readToEndAlloc(allocator, 1 * 1024 * 1024) catch {
+                printErr("zq: could not read filter file: ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+            if (config._owned_filter) |old| allocator.free(old);
+            config._owned_filter = contents;
+
+            break :blk std.mem.trimRight(u8, contents, "\r\n");
         }
         break :blk config.filter orelse {
             printErr("zq: no filter provided\n");
@@ -373,11 +390,13 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     defer files.deinit(allocator);
 
     var owned_filter: ?[]u8 = null;
+    var owned_ff_path: ?[]u8 = null;
     var owned_files = std.ArrayList([]u8){};
     errdefer {
         for (owned_files.items) |f| allocator.free(f);
         owned_files.deinit(allocator);
         if (owned_filter) |f| allocator.free(f);
+        if (owned_ff_path) |f| allocator.free(f);
     }
 
     var i: usize = 1; // skip argv[0]
@@ -409,9 +428,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                             return error.UsageError;
                         }
                         const duped = try allocator.dupe(u8, args[i]);
-                        if (owned_filter) |old| allocator.free(old);
-                        owned_filter = duped;
+                        if (owned_ff_path) |old| allocator.free(old);
+                        owned_ff_path = duped;
                         config.filter_file = duped;
+                        filter_set = true;
                         break; // -f consumes rest of flag group
                     },
                     'h' => {
@@ -485,9 +505,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 return error.UsageError;
             }
             const duped = try allocator.dupe(u8, args[i]);
-            if (owned_filter) |old| allocator.free(old);
-            owned_filter = duped;
+            if (owned_ff_path) |old| allocator.free(old);
+            owned_ff_path = duped;
             config.filter_file = duped;
+            filter_set = true;
         } else if (std.mem.eql(u8, arg, "--jsonargs") or std.mem.eql(u8, arg, "--args")) {
             printErr("zq: ");
             printErr(arg);
@@ -539,6 +560,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 
     // Transfer ownership to config.
     config._owned_filter = owned_filter;
+    config._owned_filter_file_path = owned_ff_path;
     if (owned_files.items.len > 0) {
         config._owned_file_strs = try owned_files.toOwnedSlice(allocator);
     } else {
