@@ -503,6 +503,7 @@ pub const ResultIterator = struct {
         while (it.collect_stack.items.len > frame.saved_collect_len) {
             var cf = it.collect_stack.pop().?;
             cf.buffer.deinit(it.alloc);
+            cf.map_values_entries.deinit(it.alloc);
         }
 
         // Unwind range frames.
@@ -1194,8 +1195,14 @@ pub const ResultIterator = struct {
             .tag = .array_start,
             .payload = .{ .skip = 0 },
         });
+        // Refresh view after appendEntry may have reallocated
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         for (entries) |entry| {
             try it.stackValueToRuntimeTapeEntry(entry.value);
+            // Refresh after each append since entry.value may reference runtime_tape_view
+            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         }
         const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .array_end,
@@ -2070,8 +2077,9 @@ pub const ResultIterator = struct {
                 switch (lval) {
                     .object => |linner| switch (rv) {
                         .object => |rinner| {
-                            const merged = try it.recursiveMerge(linner, rinner);
-                            try it.stackValueToRuntimeTapeEntry(merged);
+                            // recursiveMerge already materializes the merged object
+                            // into runtime_tape — don't copy it again.
+                            _ = try it.recursiveMerge(linner, rinner);
                             // Update views after recursion may have grown the tape
                             it.runtime_tape_view.entries = it.runtime_tape.entries.items;
                             it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
