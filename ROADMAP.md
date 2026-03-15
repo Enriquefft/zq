@@ -122,15 +122,15 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 | | Feature | Priority | Complexity |
 |---|---------|----------|------------|
-| [ ] | `-s` / `--slurp` | P0 | Medium |
-| [ ] | `-S` / `--sort-keys` | P1 | Low |
-| [ ] | `-R` / `--raw-input` | P1 | Low |
-| [ ] | `-j` / `--join-output` | P1 | Low |
-| [ ] | `-f` / `--from-file` | P1 | Low |
-| [ ] | `--arg NAME VALUE` | P1 | Medium |
-| [ ] | `--argjson NAME VALUE` | P1 | Medium |
-| [ ] | `--tab` / `--indent N` | P2 | Low |
-| [ ] | `--args` / `--jsonargs` | P2 | Medium |
+| [x] | `-s` / `--slurp` | P0 | Medium |
+| [x] | `-S` / `--sort-keys` | P1 | Low |
+| [x] | `-R` / `--raw-input` | P1 | Low |
+| [x] | `-j` / `--join-output` | P1 | Low |
+| [x] | `-f` / `--from-file` | P1 | Low |
+| [x] | `--arg NAME VALUE` | P1 | Medium |
+| [x] | `--argjson NAME VALUE` | P1 | Medium |
+| [x] | `--tab` / `--indent N` | P2 | Low |
+| [x] | `--args` / `--jsonargs` | P2 | Medium |
 
 ### Memory optimization — P0
 

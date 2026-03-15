@@ -18,6 +18,17 @@ Single-threaded (interactive / small input):
                                                           output.Writer.write_value() → stdout
 
 
+Slurp mode (-s):
+
+  stdin/file → io.Source → parser.feed() (loop) → RuntimeTape (accumulate array)
+                                                       ↓
+                                        query.execute() once → ResultIterator → stdout
+
+  Raw slurp (-Rs):
+
+  stdin/file → readAllBytes() → single string tape → query.execute() once → stdout
+
+
 Parallel — file mode:
 
   file → mmap → split into ~64 newline-aligned byte-range chunks
@@ -47,7 +58,7 @@ Parallel — stream mode:
 
 ```
 error   (no deps)          Zig error set, lazy line/col resolution
-types   (no deps)          Tape, Value, Format, Instruction, Op
+types   (no deps)          Tape, Value, Format, Instruction, Op, RuntimeTape
 io      → error            mmap (files) / ring buffer (pipes)
 parser  → error, types     Streaming state machine → flat Tape
 query   → error, types     Compiler + bytecode VM + ResultIterator
@@ -74,6 +85,7 @@ Shared definitions used across all modules:
 - `Format` — output format enum: pretty, compact, raw, jsonl, join
 - `Instruction` / `Op` / `Operand` — bytecode format for the query VM
 - `StringRef` — offset+length into tape's string buffer
+- `RuntimeTape` — growable tape for constructing new JSON values at runtime. Provides `appendEntry()`, `internString()`, `copyFrom()`, `copySpan()`, and `asTape()` (immutable view). Used by the query VM for object/array construction and by main for external variable binding and `$ARGS` assembly.
 
 ### io
 
@@ -109,6 +121,8 @@ Three phases:
 
 `ResultIterator.reset(tape)` rebinds to a new tape with zero allocations. Mirrors `Parser.reset()`.
 
+**External variables**: Two-phase binding system. At compile time, `ExternalVarDecl` names are pre-declared in the root scope so `$NAME` references resolve during compilation. `CompiledQuery.external_var_ids` maps declaration order to compiler-assigned variable IDs. At execution time, `ExternalVarBinding` pairs each variable ID with a concrete `StackValue` (null, bool, int, float, or tape_value for strings/arrays/objects). Bindings are injected into the VM's `variable_store` at `execute()` and refreshed on each `reset()`.
+
 Implemented operators: field access, pipes, iteration, arithmetic, comparisons, boolean logic, conditionals, variables, user-defined functions, string interpolation, recursive descent, alternative (`//`), try/catch, optional (`?`), slicing, update assignment (`|=`, `+=`, etc.), comma (generators), array/object construction, bracket expressions.
 
 Builtins: length, keys, values, has, in, type, empty, select, map, add, not, error, tostring, tonumber, range, sort, sort_by, group_by, unique, unique_by, reverse, flatten, min, max, min_by, max_by, to_entries, from_entries, with_entries, del, contains, inside, any, all, limit, first, last, indices, index, rindex.
@@ -120,6 +134,8 @@ Builtins: length, keys, values, has, in, type, empty, select, map, add, not, err
 64 KB buffered writes to file descriptors. Formats: pretty (2-space indent), compact, raw (unquoted strings), jsonl, join (raw, no trailing newline).
 
 Serialization is generic via Zig's `anytype` — parameterized on `writeByte`/`writeSlice` methods. Same code powers `Writer` (fd-backed, used by main thread) and `BufferSink` (ArrayList-backed, used by pool workers).
+
+`SerializeOpts` controls formatting: `sort_keys` (sort object keys before output, dual-path — stack buffer for ≤256 keys, heap fallback for larger), `indent` (spaces with configurable width 0–8, or tab character). Threaded through all serialization paths including pool workers.
 
 ANSI color output when stdout is a TTY. `-C` forces color, `-M` disables, `NO_COLOR` env var respected. Color state shared via `*const Color` pointer across main thread and workers.
 
@@ -139,6 +155,10 @@ Fixed-size worker pool. Orchestrates io → parser → query → output in paral
 
 **InFlightLimiter**: feeder thread acquires a slot before enqueuing each chunk, blocks when `IN_FLIGHT_FACTOR × n_threads` chunks are live. `collect()` releases slots on arena free. Caps peak RSS to a bounded function of thread count, not file size.
 
+**Raw input mode**: when `raw_input=true`, workers skip JSON parsing and construct a synthetic tape from each raw line via `make_raw_tape()` — zero-copy, zero-allocation. Each line becomes a string value in the tape.
+
+**External bindings**: `submit_file()` and `submit_stream()` accept `external_bindings` and `SerializeOpts`, threaded to all workers. Workers pass bindings to `ResultIterator.reset()` on each record.
+
 **Memory model**: arena-per-chunk, freed atomically when chunk is fully consumed. Workers own persistent `Parser` + `ResultIterator` — init once, `reset()` per record. 2 MiB thread stacks (reduced from 16 MiB default).
 
 `n_threads = 0` is valid — calling thread executes all work inline.
@@ -154,11 +174,15 @@ Not thread-safe per handle. Each concurrent caller needs its own handle.
 ### main
 
 CLI entry point. Parses jq-compatible flags into `Config` struct. Routes to:
-- Pool serialized path when input is a file and format is known
-- Pool stream path when input is stdin
-- Single-threaded path as fallback
+- Null input mode (`-n`) — execute filter once on `null`, no input read
+- Slurp mode (`-s`) — single-threaded collection of all inputs into an array, then one filter execution. Two sub-paths: JSON slurp (parse each value, accumulate via `RuntimeTape`) and raw slurp (`-Rs`, concatenate all bytes into a single string)
+- Pool file path — parallel `submit_file()` when input is a regular file
+- Pool stream path — parallel `submit_stream()` when input is stdin
+- Single-threaded fallback
 
-Flags: `-r` (raw), `-c` (compact), `-e` (exit status), `-n` (null input), `-j` (join output), `-f` (filter from file), `-C`/`-M` (color), `--tab`, `--indent`.
+**External variable binding**: after compilation, main constructs bindings for `--arg`/`--argjson` values. Scalars (null, bool, int, float) bind directly. Compound types (string, array, object) are copied into a persistent `RuntimeTape` that outlives all query executions. The `$ARGS` variable is assembled as `{"positional": [...], "named": {...}}` in the same `RuntimeTape`.
+
+Flags: `-r` (raw), `-c` (compact), `-e` (exit status), `-n` (null input), `-s` (slurp), `-R` (raw input), `-S` (sort keys), `-j` (join output), `-f` (filter from file), `-C`/`-M` (color), `--tab`, `--indent N`, `--arg NAME VALUE`, `--argjson NAME VALUE`, `--args`, `--jsonargs`.
 
 ## Design Decisions
 
@@ -281,6 +305,10 @@ Same serialization code powers both `Writer` (fd-backed, 64 KB buffered, used by
 Reduced worker thread stack size from 16 MiB default to 2 MiB.
 
 Workers use heap-allocated buffers for parse/query work. 2 MiB gives 4x margin over measured worst-case stack recursion. On 16 threads: 224 MB saved.
+
+### Slurp bypasses pool
+
+Slurp mode (`-s`) collects all inputs into a single array, then executes the filter once. This is inherently single-threaded — the array must be fully assembled before the query runs. Bypassing the pool avoids unnecessary worker/sequencer overhead and simplifies the implementation. JSON slurp accumulates parsed values into a `RuntimeTape`; raw slurp (`-Rs`) reads all bytes into a buffer and wraps them as a single string tape entry.
 
 ### Single source of truth for version
 
