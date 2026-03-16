@@ -158,6 +158,8 @@ pub const ResultIterator = struct {
     /// decremented by alt_check). When > 0, missing key lookups return null instead of TypeError,
     /// matching jq's left-side semantics for the // operator.
     alt_null_depth: u32,
+    source_map: []const u32,
+    last_error_ip: u32,
 
     pub fn init(
         instructions: []const Instruction,
@@ -166,6 +168,7 @@ pub const ResultIterator = struct {
         opts_allow_null: bool,
         tape: Tape,
         external_bindings: []const ExternalVarBinding,
+        source_map: []const u32,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
         var stack = std.ArrayList(IterFrame){};
@@ -251,6 +254,8 @@ pub const ResultIterator = struct {
             .done = false,
             .initialized = false,
             .alt_null_depth = 0,
+            .source_map = source_map,
+            .last_error_ip = 0,
         };
     }
 
@@ -425,6 +430,7 @@ pub const ResultIterator = struct {
                 continue;
             }
 
+            const saved_ip = it.ip;
             const instr = it.instructions[it.ip];
             if (it.execOne(instr)) |maybe_val| {
                 if (maybe_val) |v| return v;
@@ -435,6 +441,7 @@ pub const ResultIterator = struct {
                     if (it.done) return null;
                     // Continue executing at catch handler (or done path handled above).
                 } else {
+                    it.last_error_ip = saved_ip;
                     return err;
                 }
             }
@@ -1670,8 +1677,9 @@ pub const ResultIterator = struct {
     /// reallocation during the loop would move the backing memory and invalidate the
     /// slice pointers we are reading from.  Pre-reserving guarantees zero reallocations
     /// inside the loop, making the self-copy safe.
+    /// Copy a tape span into the runtime tape. Two-pass linear approach:
+    /// no recursion, no auxiliary allocations. O(n) in span size.
     fn copyTapeSpanToRuntimeTape(it: *ResultIterator, span: types.Value.TapeSpan) ZqError!void {
-        // Count exact resources needed by this span.
         const n_entries = span.end - span.start;
         var n_string_bytes: usize = 0;
         for (span.tape.entries[span.start..span.end]) |e| {
@@ -1681,77 +1689,50 @@ pub const ResultIterator = struct {
             }
         }
 
-        // Reserve without reallocating during the copy.  ensureUnusedCapacity may
-        // itself reallocate the backing arrays, so refresh the view afterwards so
-        // that span.tape (which may point to &runtime_tape_view) sees the new pointers.
+        // Reserve capacity up front so the view stays valid.
         try it.runtime_tape.entries.ensureUnusedCapacity(it.alloc, n_entries);
         try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, n_string_bytes);
         it.runtime_tape_view.entries = it.runtime_tape.entries.items;
         it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
 
-        var pos = span.start;
+        const base: u32 = @intCast(it.runtime_tape.entries.items.len);
 
-        // Copy all entries in the span.  No allocation happens below this point.
+        // Pass 1: copy all entries linearly, re-interning strings.
+        var pos = span.start;
         while (pos < span.end) {
             const entry = span.tape.entries[pos];
-
             switch (entry.tag) {
-                .object_start, .array_start => {
-                    // For container start, we need to copy the container recursively
-                    // and track the skip pointer
-                    const container_start_idx = try it.runtime_tape.appendEntry(it.alloc, entry);
-                    const container_end_idx = entry.payload.skip;
-                    // Recursively copy container content (excluding end marker)
-                    // Check if there's content to copy (empty container case)
-                    if (container_end_idx > pos + 1) {
-                        const nested_span = types.Value.TapeSpan{
-                            .tape = span.tape,
-                            .start = pos + 1,
-                            .end = container_end_idx - 1, // Exclude end marker from recursive copy
-                        };
-                        try it.copyTapeSpanToRuntimeTape(nested_span);
-                    }
-
-                    // Append end marker
-                    const new_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                        .tag = if (entry.tag == .object_start) .object_end else .array_end,
-                        .payload = .{ .none = {} },
-                    });
-
-                    // Update skip pointer to point past the new end
-                    it.runtime_tape.entries.items[container_start_idx].payload.skip = new_end_idx + 1;
-
-                    // Skip to after the container in the source tape.
-                    // container_end_idx (the skip value) already points past the end marker.
-                    pos = container_end_idx;
-                },
-                .key => {
-                    // Intern the key string into runtime_tape.string_buf so that the
-                    // copied entry's StringRef is valid within the runtime tape.
-                    const key_str = span.tape.getString(entry.payload.string);
-                    const new_ref = try it.runtime_tape.internString(it.alloc, key_str);
-                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
-                        .tag = .key,
-                        .payload = .{ .string = new_ref },
-                    });
-                    pos += 1;
-                },
-                .string => {
-                    // Intern the string value into runtime_tape.string_buf.
+                .key, .string => {
                     const str = span.tape.getString(entry.payload.string);
                     const new_ref = try it.runtime_tape.internString(it.alloc, str);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
-                        .tag = .string,
+                        .tag = entry.tag,
                         .payload = .{ .string = new_ref },
                     });
-                    pos += 1;
                 },
                 else => {
                     _ = try it.runtime_tape.appendEntry(it.alloc, entry);
-                    pos += 1;
                 },
             }
+            pos += 1;
         }
+
+        // Pass 2: fix up container skip pointers (translate from source to runtime indices).
+        const items = it.runtime_tape.entries.items;
+        var i: u32 = base;
+        while (i < base + n_entries) : (i += 1) {
+            switch (items[i].tag) {
+                .object_start, .array_start => {
+                    const orig_skip = items[i].payload.skip;
+                    items[i].payload.skip = base + (orig_skip - span.start);
+                },
+                else => {},
+            }
+        }
+
+        // Refresh the view after modifications.
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
     }
 
     fn doMul(it: *ResultIterator) ZqError!StackValue {

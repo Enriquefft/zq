@@ -32,6 +32,14 @@ Two execution modes are supported:
 In both modes, the **sequencer** holds results out-of-order in a reorder buffer and
 releases them to `collect()`/`collect_bytes()` only in submission order.
 
+### Adaptive chunk sizing
+
+`MemoryBudget` detects available system memory (+ Linux cgroup limits) and adapts
+chunk count, in-flight limit, and stream batch size so peak RSS stays within a memory
+budget. On >=4 GB machines with typical files, parameters are identical to the previous
+hardcoded defaults (no regression). On constrained systems (containers, small VMs),
+it gracefully reduces concurrency to avoid OOM.
+
 ---
 
 ## Public Interface
@@ -61,10 +69,32 @@ pub const BytesResult = struct {
     last_was_false_or_null: bool,
 };
 
+/// Adaptive memory budget for chunk sizing.
+/// Detects system memory or accepts an explicit limit.
+pub const MemoryBudget = struct {
+    budget_bytes: u64,
+
+    /// Detect available system memory and apply cgroup limits.
+    /// Falls back to 1 GiB if detection fails.
+    pub fn detect() MemoryBudget;
+
+    /// Create a budget with an explicit byte limit (for tests / --memory-limit).
+    pub fn explicit(bytes: u64) MemoryBudget;
+
+    pub const ChunkParams = struct {
+        chunk_factor: usize,
+        in_flight_factor: usize,
+        stream_batch_size: usize,
+    };
+
+    /// Compute chunk parameters given file size, thread count, and output format.
+    pub fn computeParams(self, file_size: u64, n_threads: usize, format: ?types.Format) ChunkParams;
+};
+
 /// A fixed-size worker pool.  Create once, submit work, drain with collect()
 /// or collect_bytes().
 pub const Pool = struct {
-    pub fn init(n_threads: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Pool;
+    pub fn init(n_threads: usize, budget: MemoryBudget, allocator: std.mem.Allocator) error{OutOfMemory}!Pool;
     pub fn deinit(p: *Pool) void;
 
     /// Submit a regular file for parallel processing.
@@ -96,14 +126,17 @@ pub const Pool = struct {
 
 ### Functions
 
-| Function              | Signature                                                              | Description                                                                             |
-|-----------------------|------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
-| `Pool.init`           | `usize, Allocator → error{OutOfMemory}!Pool`                          | Allocate all internal state and spawn N worker threads.                                 |
-| `Pool.deinit`         | `*Pool → void`                                                         | Stop all workers, join threads, free memory.                                            |
-| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format → ZqError!void`           | Read file, split into newline-aligned chunks, enqueue for parallel processing.          |
-| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format → void`                 | Attach stream; IO thread reads lines and feeds workers in pipeline mode.                |
-| `Pool.collect`        | `*Pool → ZqError!?Result`                                              | Return next in-order result; null when exhausted; error on per-record failure.          |
-| `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                         | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
+| Function              | Signature                                                                        | Description                                                                             |
+|-----------------------|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| `MemoryBudget.detect` | `→ MemoryBudget`                                                                 | Detect system memory + cgroup limits; budget = min(total, cgroup) / 2.                 |
+| `MemoryBudget.explicit`| `u64 → MemoryBudget`                                                            | Explicit budget for tests and future `--memory-limit` flag.                            |
+| `MemoryBudget.computeParams` | `MemoryBudget, u64, usize, ?Format → ChunkParams`                         | Compute adaptive chunk_factor, in_flight_factor, stream_batch_size.                    |
+| `Pool.init`           | `usize, MemoryBudget, Allocator → error{OutOfMemory}!Pool`                      | Allocate all internal state and spawn N worker threads.                                 |
+| `Pool.deinit`         | `*Pool → void`                                                                   | Stop all workers, join threads, free memory.                                            |
+| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format → ZqError!void`                     | Read file, split into adaptive chunks, enqueue for parallel processing.                |
+| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format → void`                           | Attach stream; IO thread reads lines and feeds workers in pipeline mode.                |
+| `Pool.collect`        | `*Pool → ZqError!?Result`                                                        | Return next in-order result; null when exhausted; error on per-record failure.          |
+| `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                                   | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
 
 ### Errors
 
@@ -158,3 +191,6 @@ pub const Pool = struct {
 - **Serialized path memory savings**: For per-record scalar queries, arena holds only
   serialized bytes (e.g. "42\n" = 3 bytes) instead of OwnedValue structs + tape copies.
   With 32 in-flight chunks: ~50 MB vs ~700 MB for a 648 MB file.
+- **Adaptive sizing is transparent.** On >=4 GB machines with files that fit in budget,
+  parameters are identical to the previous hardcoded defaults (chunk_factor=4,
+  in_flight_factor=2, stream_batch_size=256K). Only constrained environments see changes.

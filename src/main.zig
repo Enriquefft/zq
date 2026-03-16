@@ -6,6 +6,7 @@ const query_mod = @import("query");
 const output_mod = @import("output");
 const pool_mod = @import("pool");
 const types = @import("types");
+const err_mod = @import("error");
 
 const EXIT_OK = 0;
 const EXIT_FALSE = 1; // -e: last output was false/null
@@ -117,12 +118,19 @@ pub fn main() !u8 {
     ext_decls_buf[config.external_vars.len] = .{ .name = "ARGS" };
 
     // Compile query.
-    var cq = query_mod.CompiledQuery.compile(filter_src, .{
+    const stderr_writer = StderrWriter{};
+    const compile_result = query_mod.CompiledQuery.compile(filter_src, .{
         .external_vars = ext_decls_buf,
-    }, allocator) catch |e| {
-        printErr("zq: compile error: ");
-        printZqErr(e);
-        return EXIT_USAGE;
+    }, allocator) catch {
+        printErr("zq: out of memory\n");
+        return EXIT_SYSTEM;
+    };
+    var cq = switch (compile_result) {
+        .ok => |compiled| compiled,
+        .err => |ce| {
+            err_mod.formatDiagnostic(stderr_writer, filter_src, ce.kind, ce.offset, ce.len, null, allocator);
+            return EXIT_USAGE;
+        },
     };
     defer cq.deinit();
 
@@ -442,15 +450,17 @@ pub fn main() !u8 {
     var had_parse_errors = false;
 
     if (config.null_input) {
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator) catch |e| {
-            printErr("zq: ");
-            printZqErr(e);
+        var last_error_ip: u32 = 0;
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &last_error_ip) catch |e| {
+            const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
+            err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
             return EXIT_SYSTEM;
         };
     } else if (config.slurp) {
-        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors) catch |e| {
-            printErr("zq: ");
-            printZqErr(e);
+        var last_error_ip: u32 = 0;
+        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &last_error_ip) catch |e| {
+            const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
+            err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
             return EXIT_SYSTEM;
         };
     } else if (config.files.len == 0) {
@@ -463,7 +473,8 @@ pub fn main() !u8 {
         defer src.deinit();
 
         const n_threads = std.Thread.getCpuCount() catch 4;
-        var pool = pool_mod.Pool.init(n_threads, allocator) catch |e| {
+        const budget = pool_mod.MemoryBudget.detect();
+        var pool = pool_mod.Pool.init(n_threads, budget, allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
             return EXIT_SYSTEM;
@@ -474,8 +485,8 @@ pub fn main() !u8 {
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
-                printErr("zq: ");
-                printZqErr(e);
+                const src_offset = if (pool.last_error_ip < cq.source_map.len) cq.source_map[pool.last_error_ip] else 0;
+                err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
                 had_parse_errors = true;
                 continue;
             };
@@ -496,9 +507,10 @@ pub fn main() !u8 {
             };
             defer file.close();
 
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input) catch |e| {
-                printErr("zq: ");
-                printZqErr(e);
+            var last_error_ip: u32 = 0;
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &last_error_ip) catch |e| {
+                const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
+                err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
                 return EXIT_SYSTEM;
             };
         }
@@ -528,10 +540,13 @@ fn processFile(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     raw_input: bool,
+    error_ip_out: *u32,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
-    var pool = try pool_mod.Pool.init(n_threads, allocator);
+    const budget = pool_mod.MemoryBudget.detect();
+    var pool = try pool_mod.Pool.init(n_threads, budget, allocator);
     defer pool.deinit();
+    errdefer error_ip_out.* = pool.last_error_ip;
 
     try pool.submit_file(file, cq, format, color, opts, raw_input, ext_bindings);
 
@@ -556,11 +571,12 @@ fn processSlurp(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     had_errors: *bool,
+    error_ip_out: *u32,
 ) !bool {
     if (config.raw_input) {
-        return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator);
+        return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
     }
-    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors);
+    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors, error_ip_out);
 }
 
 /// Collect all parsed JSON values into a single array, then run the query once.
@@ -574,6 +590,7 @@ fn processSlurpJson(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     had_errors: *bool,
+    error_ip_out: *u32,
 ) !bool {
     var rt = try types.RuntimeTape.init(allocator);
     defer rt.deinit(allocator);
@@ -614,7 +631,7 @@ fn processSlurpJson(
     const tape = rt.asTape();
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
 }
 
 /// Read all JSON values from a file/stdin using Source + Parser, copying each
@@ -701,6 +718,7 @@ fn processSlurpRaw(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    error_ip_out: *u32,
 ) !bool {
     var text_buf = std.ArrayList(u8){};
     defer text_buf.deinit(allocator);
@@ -738,7 +756,7 @@ fn processSlurpRaw(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
 }
 
 fn readAllBytes(
@@ -773,6 +791,7 @@ fn processNullInput(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    error_ip_out: *u32,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
     defer parser.deinit();
@@ -785,7 +804,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
 }
 
 /// Execute the query against `tape` and write all output values.
@@ -802,6 +821,7 @@ fn writeRecord(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    error_ip_out: *u32,
 ) !bool {
     if (opt_it.*) |*it| {
         it.reset(tape, ext_bindings);
@@ -809,6 +829,7 @@ fn writeRecord(
         opt_it.* = try cq.execute(tape, ext_bindings, allocator);
     }
     const it = &opt_it.*.?;
+    errdefer error_ip_out.* = it.last_error_ip;
 
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
@@ -1085,6 +1106,29 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 fn printVersion() void {
     printErr("zq " ++ build_options.version ++ "\n");
 }
+
+/// Minimal writer adapter for formatDiagnostic over stderr.
+const StderrWriter = struct {
+    pub fn print(_: StderrWriter, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [4096]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch {
+            printErr("zq: format error\n");
+            return;
+        };
+        printErr(msg);
+    }
+
+    pub fn writeByteNTimes(_: StderrWriter, byte: u8, n: usize) !void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            printErrByte(byte);
+        }
+    }
+
+    pub fn writeByte(_: StderrWriter, byte: u8) !void {
+        printErrByte(byte);
+    }
+};
 
 fn printErr(msg: []const u8) void {
     std.fs.File.stderr().writeAll(msg) catch {};

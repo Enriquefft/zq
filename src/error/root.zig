@@ -106,3 +106,86 @@ pub fn deinit(table: LineTable, alloc: std.mem.Allocator) void {
 pub fn raise(kind: ErrorKind, ctx: Context) Error {
     return Error{ .kind = kind, .ctx = ctx };
 }
+
+/// Structured compile-time error with source location.
+pub const CompileError = struct {
+    kind: ErrorKind,
+    offset: u32,
+    len: u32,
+};
+
+/// Convert an ErrorKind to a human-readable string.
+pub fn kindToString(kind: ErrorKind) []const u8 {
+    return switch (kind) {
+        .unexpected_token => "unexpected token",
+        .unexpected_eof => "unexpected end of input",
+        .invalid_utf8 => "invalid UTF-8",
+        .invalid_number => "invalid number",
+        .unterminated_string => "unterminated string",
+        .depth_limit_exceeded => "depth limit exceeded",
+        .io_error => "I/O error",
+        .query_syntax_error => "query syntax error",
+        .type_error => "type error",
+        .index_out_of_bounds => "index out of bounds",
+        .out_of_memory => "out of memory",
+        .user_error => "user error",
+    };
+}
+
+/// Extract the source line containing the given byte offset.
+fn extractLine(source: []const u8, offset: u32) []const u8 {
+    if (source.len == 0) return "";
+    const off: usize = @min(offset, source.len - 1);
+
+    // Find line start (byte after previous '\n', or 0).
+    var start: usize = off;
+    while (start > 0 and source[start - 1] != '\n') start -= 1;
+
+    // Find line end (next '\n' or end of source).
+    var end: usize = off;
+    while (end < source.len and source[end] != '\n') end += 1;
+
+    return source[start..end];
+}
+
+/// Format a diagnostic message with source context and caret underline.
+/// Only called on the error path — allocates a LineTable then frees it.
+pub fn formatDiagnostic(
+    writer: anytype,
+    filter_src: []const u8,
+    kind: ErrorKind,
+    offset: u32,
+    len: u32,
+    input_preview: ?[]const u8,
+    alloc: std.mem.Allocator,
+) void {
+    const table = buildLineTable(filter_src, alloc) catch {
+        // Fallback: bare error message if OOM
+        writer.print("zq: {s}\n", .{kindToString(kind)}) catch {};
+        return;
+    };
+    defer deinit(table, alloc);
+    const loc = resolve(table, offset);
+
+    // Header: "zq: type error at line 1, col 8"
+    writer.print("zq: {s} at line {d}, col {d}\n", .{ kindToString(kind), loc.line, loc.col }) catch {};
+
+    // Source line
+    const line_content = extractLine(filter_src, offset);
+    writer.print("  {s}\n", .{line_content}) catch {};
+
+    // Caret/tilde underline
+    const col_spaces = if (loc.col > 0) @as(usize, @intCast(loc.col - 1)) else 0;
+    writer.writeByteNTimes(' ', 2 + col_spaces) catch {};
+    writer.writeByte('^') catch {};
+    if (len > 1) writer.writeByteNTimes('~', len - 1) catch {};
+    writer.writeByte('\n') catch {};
+
+    // Error kind description
+    writer.print("  {s}\n", .{kindToString(kind)}) catch {};
+
+    // Input context if available
+    if (input_preview) |preview| {
+        writer.print("  input was: {s}\n", .{preview}) catch {};
+    }
+}

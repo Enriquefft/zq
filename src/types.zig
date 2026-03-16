@@ -116,8 +116,13 @@ pub const RuntimeTape = struct {
         };
     }
 
+    /// Max entries in a runtime tape. Prevents quadratic blowup from deeply
+    /// nested constructions like `reduce range(N) as $_ ([];[.])`.
+    pub const max_entries = 4 * 1024 * 1024; // ~4M entries ≈ ~64 MB
+
     /// Append an entry and return its index.
     pub fn appendEntry(self: *RuntimeTape, allocator: std.mem.Allocator, entry: Tape.Entry) error{OutOfMemory}!u32 {
+        if (self.entries.items.len >= max_entries) return error.OutOfMemory;
         const idx = @as(u32, @intCast(self.entries.items.len));
         try self.entries.append(allocator, entry);
         return idx;
@@ -139,24 +144,20 @@ pub const RuntimeTape = struct {
 
     /// Copy a range of entries [start, end) from a tape into this runtime tape,
     /// re-interning strings and rebasing skip pointers.
+    ///
+    /// Two-pass approach: first pass copies all entries linearly (O(n), no
+    /// recursion, no auxiliary allocations). Second pass fixes up container
+    /// skip pointers by scanning backwards from each end marker.
     pub fn copySpan(self: *RuntimeTape, tape: Tape, start: u32, end: u32, allocator: std.mem.Allocator) !void {
+        const base: u32 = @intCast(self.entries.items.len);
+        const count = end - start;
+
+        // Pass 1: copy every entry, re-interning strings. Container skips are
+        // left as their original source-relative values (fixed up in pass 2).
         var pos = start;
         while (pos < end) {
             const entry = tape.entries[pos];
             switch (entry.tag) {
-                .object_start, .array_start => {
-                    const container_start = try self.appendEntry(allocator, entry);
-                    const orig_skip = entry.payload.skip;
-                    if (orig_skip > pos + 2) {
-                        try self.copySpan(tape, pos + 1, orig_skip - 1, allocator);
-                    }
-                    const new_end = try self.appendEntry(allocator, .{
-                        .tag = if (entry.tag == .object_start) .object_end else .array_end,
-                        .payload = .{ .none = {} },
-                    });
-                    self.entries.items[container_start].payload.skip = new_end + 1;
-                    pos = orig_skip;
-                },
                 .key, .string => {
                     const str = tape.getString(entry.payload.string);
                     const new_ref = try self.internString(allocator, str);
@@ -164,15 +165,27 @@ pub const RuntimeTape = struct {
                         .tag = entry.tag,
                         .payload = .{ .string = new_ref },
                     });
-                    pos += 1;
-                },
-                .object_end, .array_end => {
-                    pos += 1;
                 },
                 else => {
                     _ = try self.appendEntry(allocator, entry);
-                    pos += 1;
                 },
+            }
+            pos += 1;
+        }
+
+        // Pass 2: fix up container skip pointers. For each entry in the copied
+        // range, translate the source-tape skip to a runtime-tape skip.
+        const items = self.entries.items;
+        var i: u32 = base;
+        while (i < base + count) : (i += 1) {
+            switch (items[i].tag) {
+                .object_start, .array_start => {
+                    // Original skip pointed into source tape; translate to
+                    // runtime tape: new_skip = base + (orig_skip - start).
+                    const orig_skip = items[i].payload.skip;
+                    items[i].payload.skip = base + (orig_skip - start);
+                },
+                else => {},
             }
         }
     }

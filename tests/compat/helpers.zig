@@ -162,7 +162,11 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         .need_more => return error.ParseIncomplete,
     };
 
-    var q = try CompiledQuery.compile(filter, .{}, alloc);
+    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    var q = switch (result) {
+        .ok => |cq| cq,
+        .err => return error.QuerySyntaxError,
+    };
     defer q.deinit();
 
     var it = try q.execute(tape, &.{}, alloc);
@@ -184,12 +188,15 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     return result_list.toOwnedSlice(alloc);
 }
 
-/// Verify that compiling `filter` returns QuerySyntaxError (%%FAIL tests).
+/// Verify that compiling `filter` returns a compile error (%%FAIL tests).
 pub fn expectCompileError(filter: []const u8) !void {
-    var q = CompiledQuery.compile(filter, .{}, alloc) catch |e| {
-        if (e == error.QuerySyntaxError) return;
-        return e;
-    };
-    q.deinit();
-    return error.ExpectedCompileError;
+    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => return,
+    }
 }

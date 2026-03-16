@@ -16,6 +16,13 @@ pub const ExternalVarDecl = compiler.ExternalVarDecl;
 pub const ExternalVarBinding = vm.ExternalVarBinding;
 pub const StackValue = vm.StackValue;
 
+/// Compile result: either a ready-to-execute CompiledQuery, or a structured
+/// compile error with source location.
+pub const CompileResult = union(enum) {
+    ok: CompiledQuery,
+    err: err_mod.CompileError,
+};
+
 /// Compilation options. All fields have safe defaults.
 pub const Opts = struct {
     /// When true, two specific conditions yield null instead of TypeError:
@@ -40,33 +47,37 @@ pub const CompiledQuery = struct {
     function_table: []const types.FunctionDef,
     string_buf: []u8,
     external_var_ids: []u32,
+    source_map: []u32,
     opts: Opts,
 
-    /// Compile `src` into bytecode.
-    ///
-    /// The allocator is stored internally and used by deinit().
-    /// Returns QuerySyntaxError for malformed filters; OutOfMemory if buffers
-    /// cannot be allocated.
+    /// Compile `src` into bytecode. Returns a CompileResult union:
+    /// `.ok` on success, `.err` with source location on compile error.
+    /// Only returns error.OutOfMemory as a Zig error.
     pub fn compile(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,
-    ) (ZqError || error{OutOfMemory})!CompiledQuery {
-        const compiled = try compiler.compile(src, opts.external_vars, allocator);
-        return CompiledQuery{
-            .allocator = allocator,
-            .instructions = compiled.instructions,
-            .function_table = compiled.function_table,
-            .string_buf = compiled.string_buf,
-            .external_var_ids = compiled.external_var_ids,
-            .opts = opts,
-        };
+    ) error{OutOfMemory}!CompileResult {
+        const result = try compiler.compile(src, opts.external_vars, allocator);
+        switch (result) {
+            .ok => |compiled| return .{ .ok = CompiledQuery{
+                .allocator = allocator,
+                .instructions = compiled.instructions,
+                .function_table = compiled.function_table,
+                .string_buf = compiled.string_buf,
+                .external_var_ids = compiled.external_var_ids,
+                .source_map = compiled.source_map,
+                .opts = opts,
+            } },
+            .err => |ce| return .{ .err = ce },
+        }
     }
 
     /// Free bytecode and string-intern buffer.
     pub fn deinit(q: *CompiledQuery) void {
         q.allocator.free(q.instructions);
         q.allocator.free(q.string_buf);
+        q.allocator.free(q.source_map);
         if (q.external_var_ids.len > 0) q.allocator.free(q.external_var_ids);
     }
 
@@ -86,6 +97,7 @@ pub const CompiledQuery = struct {
             q.opts.allow_null_propagation,
             tape,
             external_bindings,
+            q.source_map,
             allocator,
         );
     }

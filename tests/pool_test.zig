@@ -13,10 +13,14 @@ const query_mod = @import("query");
 const types = @import("types");
 
 const Pool = pool_mod.Pool;
+const MemoryBudget = pool_mod.MemoryBudget;
 const Result = pool_mod.Result;
 const BytesResult = pool_mod.BytesResult;
 const CompiledQuery = query_mod.CompiledQuery;
 const alloc = std.testing.allocator;
+
+/// 1 GiB budget — reproduces current defaults for all test files (tiny).
+const test_budget = MemoryBudget.explicit(1024 * 1024 * 1024);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -80,23 +84,27 @@ fn free_values(values: []types.Value) void {
 
 /// Compile a query; panic on failure (tests are responsible for valid queries).
 fn compile(src: []const u8) !CompiledQuery {
-    return CompiledQuery.compile(src, .{}, alloc);
+    const result = try CompiledQuery.compile(src, .{}, alloc);
+    return switch (result) {
+        .ok => |cq| cq,
+        .err => unreachable, // tests must use valid queries
+    };
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 test "init and deinit — zero threads" {
-    var p = try Pool.init(0, alloc);
+    var p = try Pool.init(0, test_budget, alloc);
     p.deinit();
 }
 
 test "init and deinit — one thread" {
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     p.deinit();
 }
 
 test "init and deinit — four threads" {
-    var p = try Pool.init(4, alloc);
+    var p = try Pool.init(4, test_budget, alloc);
     p.deinit();
 }
 
@@ -109,7 +117,7 @@ test "submit_file: single integer line" {
     const file = try tmp_file_fd("42\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -128,7 +136,7 @@ test "submit_file: three integer lines in order" {
     const file = try tmp_file_fd("1\n2\n3\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -149,7 +157,7 @@ test "submit_file: no trailing newline" {
     const file = try tmp_file_fd("99");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -168,7 +176,7 @@ test "submit_file: empty file returns no results" {
     const file = try tmp_file_fd("");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -186,7 +194,7 @@ test "submit_file: blank lines are skipped" {
     const file = try tmp_file_fd("\n\n7\n\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -207,7 +215,7 @@ test "submit_file: .x field projection" {
     const file = try tmp_file_fd("{\"x\":10}\n{\"x\":20}\n{\"x\":30}\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -228,7 +236,7 @@ test "submit_file: string value round-trip" {
     const file = try tmp_file_fd("{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -257,7 +265,7 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
     const file = try tmp_file_fd(file_buf.items);
     defer file.close();
 
-    var p = try Pool.init(4, alloc);
+    var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -280,7 +288,7 @@ test "submit_file: malformed JSON returns parse error" {
     const file = try tmp_file_fd("not-json\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -297,7 +305,7 @@ test "submit_file: type error propagated from query" {
     const file = try tmp_file_fd("42\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -315,7 +323,7 @@ test "submit_file: boolean values" {
     const file = try tmp_file_fd("true\nfalse\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -335,7 +343,7 @@ test "submit_file: null value" {
     const file = try tmp_file_fd("null\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -354,7 +362,7 @@ test "submit_file: float value" {
     const file = try tmp_file_fd("3.14\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -387,7 +395,7 @@ test "submit_stream: three lines via pipe" {
     defer src.deinit();
     defer std.posix.close(read_fd);
 
-    var p = try Pool.init(2, alloc);
+    var p = try Pool.init(2, test_budget, alloc);
     defer p.deinit();
 
     p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
@@ -413,7 +421,7 @@ test "submit_stream: empty stream returns no results" {
     defer src.deinit();
     defer std.posix.close(pipe_fds[0]);
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
@@ -437,7 +445,7 @@ test "submit_stream: no trailing newline" {
     defer src.deinit();
     defer std.posix.close(pipe_fds[0]);
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
@@ -458,7 +466,7 @@ test "collect returns null when called after drain" {
     const file = try tmp_file_fd("1\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -480,7 +488,7 @@ test "zero threads: submit_file processes records synchronously" {
     const file = try tmp_file_fd("7\n8\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, null, null, .{}, false, &.{});
@@ -504,7 +512,7 @@ test "serialized: single integer" {
     const file = try tmp_file_fd("42\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -523,7 +531,7 @@ test "serialized: string value" {
     const file = try tmp_file_fd("{\"name\":\"alice\"}\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -541,7 +549,7 @@ test "serialized: multi-value query (.[])" {
     const file = try tmp_file_fd("[1,2,3]\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -559,7 +567,7 @@ test "serialized: error propagation" {
     const file = try tmp_file_fd("not-json\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -581,7 +589,7 @@ test "serialized: ordering with 4 workers" {
     const file = try tmp_file_fd(file_buf.items);
     defer file.close();
 
-    var p = try Pool.init(4, alloc);
+    var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -615,7 +623,7 @@ test "serialized stream: three lines via pipe" {
     defer src.deinit();
     defer std.posix.close(read_fd);
 
-    var p = try Pool.init(2, alloc);
+    var p = try Pool.init(2, test_budget, alloc);
     defer p.deinit();
 
     p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
@@ -633,7 +641,7 @@ test "serialized: empty select produces no bytes" {
     const file = try tmp_file_fd("1\n2\n3\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -651,7 +659,7 @@ test "serialized: false/null tracking for -e flag" {
     const file = try tmp_file_fd("false\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -670,7 +678,7 @@ test "serialized: null tracking for -e flag" {
     const file = try tmp_file_fd("null\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -689,7 +697,7 @@ test "serialized: collect_bytes returns null after drain" {
     const file = try tmp_file_fd("1\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
@@ -708,7 +716,7 @@ test "serialized: jsonl format" {
     const file = try tmp_file_fd("42\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .jsonl, null, .{}, false, &.{});
@@ -727,7 +735,7 @@ test "serialized: raw format for string" {
     const file = try tmp_file_fd("{\"name\":\"hello\"}\n");
     defer file.close();
 
-    var p = try Pool.init(1, alloc);
+    var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
     try p.submit_file(file, &cq, .raw, null, .{}, false, &.{});
@@ -737,4 +745,91 @@ test "serialized: raw format for string" {
 
     // raw format: no quotes for strings, with trailing newline (matches jq -r)
     try std.testing.expectEqualStrings("hello\n", result.data);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── MemoryBudget / computeParams tests ────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+test "computeParams: small file returns defaults" {
+    const budget = MemoryBudget.explicit(8 * 1024 * 1024 * 1024); // 8 GiB
+    const params = budget.computeParams(1 * 1024 * 1024, 16, .compact); // 1 MB file
+    try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
+    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+}
+
+test "computeParams: large file increases chunk_factor" {
+    const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024); // 2 GiB
+    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 8, .compact); // 10 GB file
+    try std.testing.expect(params.chunk_factor > 4);
+    try std.testing.expect(params.chunk_factor <= 64);
+    try std.testing.expect(params.in_flight_factor <= 2);
+}
+
+test "computeParams: constrained budget reduces in_flight_factor" {
+    const budget = MemoryBudget.explicit(256 * 1024 * 1024); // 256 MiB
+    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 4, .compact); // 10 GB file
+    try std.testing.expectEqual(@as(usize, 64), params.chunk_factor);
+    try std.testing.expectEqual(@as(usize, 1), params.in_flight_factor);
+}
+
+test "computeParams: stream mode returns defaults with adapted batch_size" {
+    const budget = MemoryBudget.explicit(1024 * 1024 * 1024); // 1 GiB
+    const params = budget.computeParams(0, 8, .compact); // stream mode
+    try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
+    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+    try std.testing.expect(params.stream_batch_size >= 64 * 1024);
+    try std.testing.expect(params.stream_batch_size <= 256 * 1024);
+}
+
+test "computeParams: huge budget returns defaults" {
+    const budget = MemoryBudget.explicit(64 * 1024 * 1024 * 1024); // 64 GiB
+    const params = budget.computeParams(1 * 1024 * 1024 * 1024, 32, .compact); // 1 GB file
+    try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
+    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+}
+
+test "computeParams: deterministic — same inputs same outputs" {
+    const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024);
+    const p1 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .pretty);
+    const p2 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .pretty);
+    try std.testing.expectEqual(p1.chunk_factor, p2.chunk_factor);
+    try std.testing.expectEqual(p1.in_flight_factor, p2.in_flight_factor);
+    try std.testing.expectEqual(p1.stream_batch_size, p2.stream_batch_size);
+}
+
+test "computeParams: pretty format uses higher expansion" {
+    const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024); // 2 GiB
+    const compact = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .compact);
+    const pretty = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .pretty);
+    // Pretty has 6x expansion vs compact's 2x, so it should need more chunks
+    try std.testing.expect(pretty.chunk_factor >= compact.chunk_factor);
+}
+
+test "readCgroupFile: nonexistent path returns null" {
+    const result = pool_mod.readCgroupFile("/nonexistent/path/that/does/not/exist");
+    try std.testing.expectEqual(@as(?u64, null), result);
+}
+
+test "readCgroupFile: numeric value parsed correctly" {
+    // Write a temp file with a numeric value
+    const path = "/tmp/_zq_cgroup_test";
+    const f = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    try f.writeAll("536870912\n");
+    f.close();
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const result = pool_mod.readCgroupFile(path);
+    try std.testing.expectEqual(@as(?u64, 536870912), result);
+}
+
+test "readCgroupFile: max string returns null" {
+    const path = "/tmp/_zq_cgroup_test_max";
+    const f = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    try f.writeAll("max\n");
+    f.close();
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    const result = pool_mod.readCgroupFile(path);
+    try std.testing.expectEqual(@as(?u64, null), result);
 }

@@ -25,12 +25,12 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-16)
 
-**Last updated:** Format strings, builtin overloads, loop constructs
+**Last updated:** reduce, foreach, iterative tape copy, structured compile errors
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
 Module tests:       486/880 passing
-Compat tests:       181/539 passing (33.6%)
+Compat tests:       191/539 passing (35.4%)
   ├─ 394 skipped/failing
 Startup:            ~2 ms (2x faster than jq)
 Cold start:         ✓ sub-3ms
@@ -104,11 +104,11 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 | | Feature | Scope | Complexity |
 |---|---------|-------|------------|
-| [ ] | **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
 | [x] | **`def`** (user-defined functions, including recursion) | Composability | High |
-| [ ] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
 | [x] | **`while`/`until`/`repeat`** | Loop constructs | Low |
 | [ ] | **`label`/`break`** | Non-local exit from generators | High |
+| [x] | **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
+| [x] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
 | [ ] | **`path`/`getpath`/`setpath`/`delpaths`** | Path algebra | Medium |
 | [ ] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
 | [ ] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
@@ -153,7 +153,7 @@ Progress: 2998 MB → 1702 MB → 701 MB (-77% total).
 | [x] | CI: `zig build test` on every commit | P0 |
 | [x] | Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
 | [x] | Basic `--help` text matching jq's structure | P1 |
-| [ ] | Error messages include filter position and input context | P2 |
+| [x] | Error messages include filter position and input context | P2 |
 
 ---
 
@@ -252,7 +252,7 @@ build on that foundation for tighter memory profiles.
 | | Item | Detail |
 |---|------|--------|
 | [ ] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
-| [ ] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
+| [x] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
 
 **Target:** RSS < 3x thread count × chunk size for per-record queries. Aggregation queries remain proportional to output size.
 
@@ -434,7 +434,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **33.6%** (181/539) | 60% | 95% | 100% |
+| jq compat test pass rate | **35.4%** (191/539) | 60% | 95% | 100% |
 | Throughput vs jq (parallel, `.id`) | **25x** (0.87s vs 21.4s) | > 1x | 5x | 10x |
 | Throughput vs jq (parallel, `select()`) | **15x** (2.9s vs 41.6s) | — | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |

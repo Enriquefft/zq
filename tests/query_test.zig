@@ -30,11 +30,32 @@ fn tape(entries: []const Entry, string_buf: []const u8) Tape {
 // ── Compile helpers ───────────────────────────────────────────────────────────
 
 fn compile(src: []const u8) !CompiledQuery {
-    return CompiledQuery.compile(src, .{}, alloc);
+    const result = try CompiledQuery.compile(src, .{}, alloc);
+    return switch (result) {
+        .ok => |q| q,
+        .err => return error.QuerySyntaxError,
+    };
 }
 
 fn compileNull(src: []const u8) !CompiledQuery {
-    return CompiledQuery.compile(src, .{ .allow_null_propagation = true }, alloc);
+    const result = try CompiledQuery.compile(src, .{ .allow_null_propagation = true }, alloc);
+    return switch (result) {
+        .ok => |q| q,
+        .err => return error.QuerySyntaxError,
+    };
+}
+
+/// Expect a compile error for the given filter source.
+fn expectCompileError(src: []const u8) !void {
+    const result = try CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => return,
+    }
 }
 
 fn collectAll(q: *const CompiledQuery, t: Tape) ![]Value {
@@ -502,34 +523,22 @@ test "key on integer returns null (jq-compatible)" {
 // ── Syntax errors ─────────────────────────────────────────────────────────────
 
 test "compile: bare pipe returns QuerySyntaxError" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile("|", .{}, alloc),
-    );
+    try expectCompileError("|");
 }
 
 test "compile: trailing dot returns QuerySyntaxError" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile(".foo.", .{}, alloc),
-    );
+    try expectCompileError(".foo.");
 }
 
 test "compile: unbalanced bracket returns QuerySyntaxError" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile(".[", .{}, alloc),
-    );
+    try expectCompileError(".[");
 }
 
 test "compile: empty filter is valid (identity)" {
     // An empty filter compiles to [identity, output].
     // Actually an empty string hits the EOF check before a leading dot.
     // Per grammar, a filter must start with '.', so empty string fails.
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile("", .{}, alloc),
-    );
+    try expectCompileError("");
 }
 
 test "compile: . is valid" {
@@ -971,17 +980,11 @@ test "nested if: if inside then-branch" {
 }
 
 test "if: syntax error — missing then" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile("if . else . end", .{}, alloc),
-    );
+    try expectCompileError("if . else . end");
 }
 
 test "if: syntax error — missing end" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile("if . then . else .", .{}, alloc),
-    );
+    try expectCompileError("if . then . else .");
 }
 
 // ── Array construction ────────────────────────────────────────────────────────
@@ -1114,10 +1117,7 @@ test "array construction: [.[]] on empty array yields empty array" {
 }
 
 test "array construction: syntax error — unclosed bracket" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile("[.", .{}, alloc),
-    );
+    try expectCompileError("[.");
 }
 
 // ── Bracket pipe expressions ──────────────────────────────────────────────────
@@ -1233,10 +1233,7 @@ test ".[expr]: allow_null_propagation on missing key" {
 }
 
 test ".['key']: syntax error on unterminated string" {
-    try std.testing.expectError(
-        error.QuerySyntaxError,
-        CompiledQuery.compile(".[\"unterminated]", .{}, alloc),
-    );
+    try expectCompileError(".[\"unterminated]");
 }
 
 // ── Alternative operator (//) ─────────────────────────────────────────────────

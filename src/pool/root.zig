@@ -12,11 +12,12 @@
 ///
 /// File mode
 /// ---------
-/// submit_file() mmap's the entire file and splits it into n_threads × CHUNK_FACTOR
-/// byte-range chunks aligned to newline boundaries.  A dedicated feeder thread lazily
-/// pushes chunks to the worker queue one at a time, blocking when too many are in-flight.
-/// Workers dequeue one chunk, process every record in it, and post a ChunkResult to the
-/// Sequencer.  Total Sequencer operations: N_CHUNKS (≤ 64 for 16 threads), not 15M.
+/// submit_file() mmap's the entire file and splits it into newline-aligned chunks.
+/// Chunk count and in-flight limit are computed adaptively from a MemoryBudget
+/// (defaults match the old hardcoded values on >=4 GB systems with typical files).
+/// A dedicated feeder thread lazily pushes chunks to the worker queue one at a time,
+/// blocking when the in-flight limit is reached.  Workers dequeue one chunk, process
+/// every record in it, and post a ChunkResult to the Sequencer.
 ///
 /// Stream mode
 /// -----------
@@ -35,10 +36,10 @@
 /// Backpressure (file mode)
 /// ------------------------
 /// An InFlightLimiter caps the number of simultaneously live ChunkResults to
-/// IN_FLIGHT_FACTOR × n_threads.  The feeder acquires a slot before pushing each
-/// chunk to the queue; collect()/collect_bytes() releases the slot after freeing
-/// the chunk's arena.
-/// Peak RSS ≈ IN_FLIGHT_FACTOR × chunk_size × n_threads, not the full file size.
+/// in_flight_factor × n_threads (computed from the memory budget).  The feeder
+/// acquires a slot before pushing each chunk to the queue; collect()/collect_bytes()
+/// releases the slot after freeing the chunk's arena.
+/// Peak RSS is proportional to the in-flight limit, not the full file size.
 ///
 /// Ordering
 /// --------
@@ -49,7 +50,7 @@
 /// hot path.
 ///
 /// Capacity is sized to the maximum spread of simultaneously live chunk IDs for
-/// both modes (file: IN_FLIGHT_FACTOR×n_threads; stream: QUEUE_CAP+n_threads).
+/// both modes (file: MAX_IN_FLIGHT_FACTOR×n_threads; stream: QUEUE_CAP+n_threads).
 /// The ring invariant — no two live chunks share a slot — is enforced by the
 /// InFlightLimiter (file) and JobQueue capacity (stream).
 /// collect() maintains a (rec_idx, val_idx) cursor so multi-value queries (e.g.
@@ -119,6 +120,8 @@ const RecordMeta = struct {
     is_error: bool,
     /// @intFromError(ZqError), valid when is_error is true.
     error_code: u16,
+    /// Instruction pointer when the error occurred (for diagnostics).
+    error_ip: u16 = 0,
 };
 
 /// All serialized output for one chunk — one contiguous buffer, no per-record allocations.
@@ -273,7 +276,7 @@ const JobQueue = struct {
 // Caps how many ChunkResults are simultaneously alive (either being processed by
 // a worker or sitting in the Sequencer awaiting collect()).  The feeder calls
 // acquire() before enqueuing each chunk; collect() calls release() after freeing
-// the chunk's arena.  This bounds peak RSS to IN_FLIGHT_FACTOR × chunk_size ×
+// the chunk's arena.  This bounds peak RSS to in_flight_factor × chunk_size ×
 // n_threads instead of the full file size.
 
 const InFlightLimiter = struct {
@@ -320,6 +323,15 @@ const InFlightLimiter = struct {
         self.shutdown = true;
         self.cond.broadcast();
     }
+
+    /// Update the maximum number of in-flight slots.
+    /// Called before the feeder starts, so no concurrent acquire() is active.
+    fn set_max(self: *InFlightLimiter, new_max: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.max = new_max;
+        self.cond.broadcast();
+    }
 };
 
 // ── Sequencer — ring-buffer reorder buffer ────────────────────────────────────
@@ -329,7 +341,7 @@ const InFlightLimiter = struct {
 //
 // Capacity = QUEUE_CAP + n_threads, which upper-bounds the spread of live chunk
 // IDs in both modes:
-//   • File mode:   IN_FLIGHT_FACTOR × n_threads (enforced by InFlightLimiter)
+//   • File mode:   MAX_IN_FLIGHT_FACTOR × n_threads (upper bound for InFlightLimiter)
 //   • Stream mode: QUEUE_CAP + n_threads (jobs queued + jobs being processed)
 //
 // Because the spread is always < capacity, no two live chunks share the same
@@ -708,6 +720,7 @@ fn process_line_serialized(
                 .last_was_false_or_null = false,
                 .is_error = true,
                 .error_code = @intFromError(e),
+                .error_ip = @intCast(opt_it.*.?.last_error_ip),
             };
         };
         const val = maybe orelse break;
@@ -825,6 +838,7 @@ const IoCtx = struct {
     opts: output_mod.SerializeOpts,
     raw_input: bool,
     external_bindings: []const query_mod.ExternalVarBinding,
+    batch_size: usize,
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
@@ -834,7 +848,7 @@ fn io_thread_fn(ctx: IoCtx) void {
     var partial_line = std.ArrayList(u8){};
     defer partial_line.deinit(ctx.allocator);
 
-    // batch_buf: accumulates complete newline-terminated lines until STREAM_BATCH_SIZE.
+    // batch_buf: accumulates complete newline-terminated lines until batch_size threshold.
     var batch_buf = std.ArrayList(u8){};
     defer batch_buf.deinit(ctx.allocator);
 
@@ -874,7 +888,7 @@ fn io_thread_fn(ctx: IoCtx) void {
                 consumed_offset = scan + 1;
 
                 // Flush when batch reaches threshold.
-                if (batch_buf.items.len >= STREAM_BATCH_SIZE) {
+                if (batch_buf.items.len >= ctx.batch_size) {
                     flushBatch(&batch_buf, &chunk_id, ctx);
                 }
             }
@@ -1094,31 +1108,177 @@ fn release_shared(shared: *SharedCtx, allocator: std.mem.Allocator) void {
 /// providing natural backpressure for streaming workloads.
 const QUEUE_CAP: usize = 256;
 
-/// Chunks per thread — more chunks than threads allows the OS scheduler to
-/// balance load when records have uneven parse/query cost.
-const CHUNK_FACTOR: usize = 4;
+/// Default chunks per thread — more chunks than threads allows the OS scheduler
+/// to balance load when records have uneven parse/query cost.
+const DEFAULT_CHUNK_FACTOR: usize = 4;
 
-/// Stream-mode batch size in bytes.  The IO thread accumulates complete lines
-/// until this threshold is reached, then pushes the batch as a single Job.
+/// Default stream-mode batch size in bytes.  The IO thread accumulates complete
+/// lines until this threshold is reached, then pushes the batch as a single Job.
 /// At ~300 B/record this yields ~850 records/batch, reducing millions of jobs
 /// to a few thousand — same order of magnitude as file mode's chunk count.
-const STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
+const DEFAULT_STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
 
-/// File-mode backpressure: max simultaneously-live ChunkResults per thread.
-/// With 2× n_threads slots, each worker can have one chunk being processed and
-/// one buffered in the Sequencer, keeping all cores busy while bounding RSS.
-const IN_FLIGHT_FACTOR: usize = 2;
+/// Default file-mode backpressure: max simultaneously-live ChunkResults per
+/// thread.  With 2× n_threads slots, each worker can have one chunk being
+/// processed and one buffered in the Sequencer, keeping all cores busy while
+/// bounding RSS.
+const DEFAULT_IN_FLIGHT_FACTOR: usize = 2;
+
+/// Upper bound for in_flight_factor.  The Sequencer ring is sized for this
+/// value so that reducing in_flight_factor at runtime never exceeds capacity.
+const MAX_IN_FLIGHT_FACTOR: usize = 2;
 
 /// Thread stack size. Workers need at most ~512 KB (parser depth 512 ×
 /// ~200 B per frame for serialize recursion); 2 MiB provides 4× safety margin.
 /// Default Zig stack is 16 MiB; with 16 threads that wastes ~224 MiB.
 const THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
 
+// ── MemoryBudget — adaptive chunk sizing ──────────────────────────────────────
+//
+// Detects available system memory (or accepts an explicit limit) and computes
+// chunk_factor / in_flight_factor / stream_batch_size so that peak RSS stays
+// within a memory budget.  On >=4 GB machines with typical files, all parameters
+// match the current hardcoded defaults (no regression).
+
+pub const MemoryBudget = struct {
+    budget_bytes: u64,
+
+    const DEFAULT_BUDGET: u64 = 1024 * 1024 * 1024; // 1 GiB fallback
+    const MIN_CHUNK_BYTES: u64 = 64 * 1024; // 64 KiB minimum chunk size
+    const MIN_STREAM_BATCH: u64 = 64 * 1024; // 64 KiB
+    const MAX_STREAM_BATCH: u64 = 256 * 1024; // 256 KiB
+
+    /// Detect available system memory and apply cgroup limits (Linux).
+    /// Falls back to DEFAULT_BUDGET (1 GiB) if detection fails.
+    pub fn detect() MemoryBudget {
+        var total: u64 = std.process.totalSystemMemory() catch DEFAULT_BUDGET * 2;
+
+        if (comptime @import("builtin").os.tag == .linux) {
+            if (detectCgroupLimit()) |cgroup_limit| {
+                total = @min(total, cgroup_limit);
+            }
+        }
+
+        return .{ .budget_bytes = total / 2 };
+    }
+
+    /// Create a budget with an explicit byte limit (for tests and --memory-limit).
+    pub fn explicit(bytes: u64) MemoryBudget {
+        return .{ .budget_bytes = bytes };
+    }
+
+    pub const ChunkParams = struct {
+        chunk_factor: usize,
+        in_flight_factor: usize,
+        stream_batch_size: usize,
+    };
+
+    /// Compute chunk parameters given file size, thread count, and output format.
+    ///
+    /// For files that fit in budget after expansion, returns the current defaults.
+    /// For larger files or constrained budgets, increases chunk_factor (smaller
+    /// chunks, fewer in-flight bytes) and may reduce in_flight_factor to 1.
+    /// For streams (file_size == 0), computes an appropriate batch size.
+    pub fn computeParams(self: MemoryBudget, file_size: u64, n_threads: usize, format: ?types.Format) ChunkParams {
+        const n_eff: u64 = @max(1, n_threads);
+
+        // Stream mode: compute batch size from budget
+        if (file_size == 0) {
+            const expansion = formatExpansion(format);
+            const batch = std.math.clamp(
+                self.budget_bytes / (n_eff * 2 * expansion),
+                MIN_STREAM_BATCH,
+                MAX_STREAM_BATCH,
+            );
+            return .{
+                .chunk_factor = DEFAULT_CHUNK_FACTOR,
+                .in_flight_factor = DEFAULT_IN_FLIGHT_FACTOR,
+                .stream_batch_size = @intCast(batch),
+            };
+        }
+
+        // File mode: check if expanded file fits in budget
+        const expansion = formatExpansion(format);
+        const file_expanded = file_size *| expansion; // saturating multiply
+
+        if (file_expanded <= self.budget_bytes) {
+            return .{
+                .chunk_factor = DEFAULT_CHUNK_FACTOR,
+                .in_flight_factor = DEFAULT_IN_FLIGHT_FACTOR,
+                .stream_batch_size = DEFAULT_STREAM_BATCH_SIZE,
+            };
+        }
+
+        // Over budget: increase chunk_factor to reduce in-flight bytes
+        // chunk_factor = ceil(2 * file_expanded / budget)
+        const numerator = 2 *| file_expanded;
+        var chunk_factor: u64 = (numerator + self.budget_bytes - 1) / self.budget_bytes;
+        chunk_factor = std.math.clamp(chunk_factor, DEFAULT_CHUNK_FACTOR, 64);
+
+        // Enforce minimum chunk size to avoid scheduling overhead
+        const chunk_bytes = file_size / (n_eff * chunk_factor);
+        if (chunk_bytes < MIN_CHUNK_BYTES and chunk_factor > DEFAULT_CHUNK_FACTOR) {
+            // Reduce chunk_factor so chunks stay above MIN_CHUNK_BYTES
+            const max_chunks = file_size / (n_eff * MIN_CHUNK_BYTES);
+            chunk_factor = std.math.clamp(max_chunks, DEFAULT_CHUNK_FACTOR, 64);
+        }
+
+        // Check if in_flight_factor=2 still fits
+        var in_flight: u64 = DEFAULT_IN_FLIGHT_FACTOR;
+        const in_flight_bytes = (DEFAULT_IN_FLIGHT_FACTOR * n_eff * file_expanded) / (n_eff * chunk_factor);
+        if (in_flight_bytes > self.budget_bytes) {
+            in_flight = 1;
+        }
+
+        return .{
+            .chunk_factor = @intCast(chunk_factor),
+            .in_flight_factor = @intCast(in_flight),
+            .stream_batch_size = DEFAULT_STREAM_BATCH_SIZE,
+        };
+    }
+
+    /// Estimate output expansion factor for a given format.
+    fn formatExpansion(format: ?types.Format) u64 {
+        const fmt = format orelse return 3; // structured path
+        return switch (fmt) {
+            .pretty => 6,
+            .compact, .raw, .jsonl, .join => 2,
+        };
+    }
+};
+
+/// Read a cgroup memory limit file.  Returns null if the file doesn't exist,
+/// contains "max", or can't be parsed.  Uses a stack buffer — no allocation.
+pub fn readCgroupFile(path: []const u8) ?u64 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    var buf: [32]u8 = undefined;
+    const n = file.read(&buf) catch return null;
+    if (n == 0) return null;
+    // Trim trailing whitespace/newline
+    var end = n;
+    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == ' ')) end -= 1;
+    const content = buf[0..end];
+    // "max" means unlimited
+    if (std.mem.eql(u8, content, "max")) return null;
+    return std.fmt.parseInt(u64, content, 10) catch null;
+}
+
+/// Detect the effective cgroup memory limit (Linux only).
+/// Checks cgroup v2 first, then falls back to cgroup v1.
+fn detectCgroupLimit() ?u64 {
+    // cgroup v2
+    if (readCgroupFile("/sys/fs/cgroup/memory.max")) |limit| return limit;
+    // cgroup v1 fallback
+    return readCgroupFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+}
+
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     threads: []std.Thread,
     io_thread: ?std.Thread,
     _shared: *SharedCtx,
+    _budget: MemoryBudget,
 
     // File-mode mmap lifetime management.
     // Non-null between submit_file() and the point in deinit() where threads join.
@@ -1134,7 +1294,10 @@ pub const Pool = struct {
     /// Output format for this pool run. null = structured path, non-null = serialized path.
     _format: ?types.Format,
 
-    pub fn init(n_threads: usize, allocator: std.mem.Allocator) error{OutOfMemory}!Pool {
+    /// Instruction pointer of the last error (for diagnostics).
+    last_error_ip: u32 = 0,
+
+    pub fn init(n_threads: usize, budget: MemoryBudget, allocator: std.mem.Allocator) error{OutOfMemory}!Pool {
         const shared = try allocator.create(SharedCtx);
         errdefer allocator.destroy(shared);
 
@@ -1143,15 +1306,17 @@ pub const Pool = struct {
 
         // Ring capacity must exceed the maximum spread of simultaneously live
         // chunk IDs across both operating modes:
-        //   • File mode:   IN_FLIGHT_FACTOR × n_threads  (capped by InFlightLimiter)
-        //   • Stream mode: QUEUE_CAP + n_threads          (queue depth + workers)
+        //   • File mode:   MAX_IN_FLIGHT_FACTOR × n_threads  (upper bound for limiter)
+        //   • Stream mode: QUEUE_CAP + n_threads              (queue depth + workers)
         // Taking the max covers both; the allocation is at most a few KB.
         const n_eff = @max(1, n_threads);
-        const seq_capacity = @max(IN_FLIGHT_FACTOR * n_eff, QUEUE_CAP + n_eff);
+        const seq_capacity = @max(MAX_IN_FLIGHT_FACTOR * n_eff, QUEUE_CAP + n_eff);
         var sequencer = try Sequencer.init(seq_capacity, allocator);
         errdefer sequencer.deinit();
 
-        const max_in_flight = IN_FLIGHT_FACTOR * @max(1, n_threads);
+        // Init limiter with upper bound; submit_file/submit_stream will set_max
+        // to the actual computed in_flight_factor before starting the feeder.
+        const max_in_flight = MAX_IN_FLIGHT_FACTOR * @max(1, n_threads);
         shared.* = .{
             .queue = queue,
             .sequencer = sequencer,
@@ -1181,6 +1346,7 @@ pub const Pool = struct {
             .threads = threads,
             .io_thread = null,
             ._shared = shared,
+            ._budget = budget,
             ._mmap = null,
             ._delivering = null,
             ._rec_idx = 0,
@@ -1209,11 +1375,11 @@ pub const Pool = struct {
     /// Submit a regular file for parallel processing.
     ///
     /// The file is memory-mapped once.  A dedicated feeder thread lazily splits
-    /// the mapping into at most n_threads × CHUNK_FACTOR newline-aligned chunks
-    /// and enqueues them one at a time, blocking when IN_FLIGHT_FACTOR × n_threads
-    /// chunks are already in-flight.  collect()/collect_bytes() releases each slot
-    /// when it frees a chunk's arena, so peak RSS is proportional to the in-flight
-    /// limit, not the full file size.
+    /// the mapping into newline-aligned chunks and enqueues them one at a time,
+    /// blocking when the in-flight limit is reached.  Chunk count and in-flight
+    /// limit are computed adaptively from the memory budget.
+    /// collect()/collect_bytes() releases each slot when it frees a chunk's arena,
+    /// so peak RSS is proportional to the in-flight limit, not the full file size.
     ///
     /// When `format` is non-null, workers use the serialized path: values are
     /// serialized directly into byte buffers. Use collect_bytes() to consume.
@@ -1240,7 +1406,9 @@ pub const Pool = struct {
 
         p._mmap = io_mod.MappedFile.init(file, file_size) catch return error.IoError;
         const n_threads = @max(1, p.threads.len);
-        const n_chunks = n_threads * CHUNK_FACTOR;
+        const params = p._budget.computeParams(file_size, n_threads, format);
+        const n_chunks = n_threads * params.chunk_factor;
+        p._shared.limiter.set_max(params.in_flight_factor * @max(1, n_threads));
 
         const ctx_ptr = p.allocator.create(FileFeedCtx) catch {
             // Unmap before returning so _mmap doesn't dangle.
@@ -1300,6 +1468,8 @@ pub const Pool = struct {
         external_bindings: []const query_mod.ExternalVarBinding,
     ) void {
         p._format = format;
+        const params = p._budget.computeParams(0, p.threads.len, format);
+        p._shared.limiter.set_max(params.in_flight_factor * @max(1, p.threads.len));
         const ctx_ptr = p.allocator.create(IoCtx) catch {
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
@@ -1317,6 +1487,7 @@ pub const Pool = struct {
             .opts = opts,
             .raw_input = raw_input,
             .external_bindings = external_bindings,
+            .batch_size = params.stream_batch_size,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
@@ -1432,8 +1603,10 @@ pub const Pool = struct {
                     p._rec_idx += 1;
                     p._val_idx = 0;
 
-                    if (meta.is_error)
+                    if (meta.is_error) {
+                        p.last_error_ip = meta.error_ip;
                         return @as(ZqError, @errorCast(@errorFromInt(meta.error_code)));
+                    }
 
                     const data = ser.data[rec_start..meta.end_offset];
                     // Skip empty records (e.g. select(false) produces no output).

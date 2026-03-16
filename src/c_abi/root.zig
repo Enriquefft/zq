@@ -191,8 +191,11 @@ pub export fn zq_compile(query_str: [*:0]const u8) ?*QueryHandle {
     const src = std.mem.sliceTo(query_str, 0);
 
     // Compile first; avoids allocating the handle on syntax errors.
-    const compiled = CompiledQuery.compile(src, .{}, allocator) catch return null;
-    var compiled_mut = compiled;
+    const compile_result = CompiledQuery.compile(src, .{}, allocator) catch return null;
+    var compiled_mut = switch (compile_result) {
+        .ok => |cq| cq,
+        .err => return null,
+    };
 
     const parser = Parser.init(allocator) catch {
         compiled_mut.deinit();
