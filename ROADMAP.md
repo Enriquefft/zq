@@ -23,15 +23,15 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-14)
+## Quick Status (Updated 2026-03-16)
 
-**Last updated:** SIMD newline counting + format-aware chunk pre-allocation
+**Last updated:** Comparison fixes, CLI flags
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Module tests:       452/880 passing
-Compat tests:       111/539 passing (20.6%)
-  ├─ 428 skipped/failing
+Module tests:       486/880 passing
+Compat tests:       145/539 passing (26.9%)
+  ├─ 394 skipped/failing
 Startup:            ~2 ms (2x faster than jq)
 Cold start:         ✓ sub-3ms
 
@@ -51,8 +51,6 @@ Streaming (cat | zq .id):
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete.
-
-Compat test breakdown by file and feature: [COMPAT.md](COMPAT.md)
 
 ---
 
@@ -436,7 +434,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **20.6%** (111/539) | 60% | 95% | 100% |
+| jq compat test pass rate | **26.9%** (145/539) | 60% | 95% | 100% |
 | Throughput vs jq (parallel, `.id`) | **25x** (0.87s vs 21.4s) | > 1x | 5x | 10x |
 | Throughput vs jq (parallel, `select()`) | **15x** (2.9s vs 41.6s) | — | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
@@ -444,7 +442,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (648 MB JSONL, `.id`) | **715 MB** (1.10x) | < 2x | < 2x | < 2x |
 | Memory (streaming pipe) | **7 MB** | — | — | — |
 | Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | — | — | 10x |
-| Test count | **452** | 400+ | 800+ | 1000+ |
+| Test count | **486** | 400+ | 800+ | 1000+ |
 
 ---
 
