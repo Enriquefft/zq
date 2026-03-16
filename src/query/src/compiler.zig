@@ -209,7 +209,7 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .alt_check => {
+            .jump, .jump_if_false, .array_collect_start, .map_values_start, .alt_check, .fork => {
                 if (r.operand.index >= p) r.operand.index += 1;
             },
             // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
@@ -307,7 +307,7 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     while (true) {
         const peek = try ctx.lex.peek();
         if (peek.tag == .def_kw) {
-            // Parse function definition
+            _ = try ctx.lex.next(); // consume 'def' keyword
             try parseFunctionDef(ctx);
         } else {
             // Not a function definition, start parsing the main expression
@@ -315,7 +315,48 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         }
     }
 
+    try parseComma(ctx);
+}
+
+/// parseComma: comma operator (lowest precedence generator).
+/// `a, b` produces all outputs of `a` followed by all outputs of `b`.
+///
+/// Compiled as:
+///   fork → right_side
+///   <left>
+///   jump → done
+///   right_side:
+///   <right>
+///   done:
+fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_start: usize = ctx.raw.items.len;
     try parsePipe(ctx);
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .comma) break;
+        _ = try ctx.lex.next();
+
+        // Insert fork BEFORE the left expression (adjusts all existing indices).
+        // fork → right_side: saves input, runs left. When left exhausts via
+        // IP-exhaustion, pops fork and jumps to right_side.
+        try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
+
+        // Emit jump to skip past the right side (continuation after left completes).
+        const jump_pos = ctx.raw.items.len;
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = 0 } });
+
+        // Backpatch fork to point to fork_cleanup (right side entry).
+        ctx.raw.items[left_start].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+        // Emit fork_cleanup to consume the fork frame when reached via exhaustion.
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .fork_cleanup, .operand = .{ .none = {} } });
+
+        // Parse right expression (may be another comma chain).
+        try parsePipe(ctx);
+
+        // Backpatch jump to skip past right side (done label).
+        ctx.raw.items[jump_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    }
 }
 
 /// Lookahead: returns true if the token stream starts with a path expression
@@ -658,7 +699,7 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "length")) return .length;
     if (std.mem.eql(u8, name, "keys")) return .keys;
     if (std.mem.eql(u8, name, "keys_unsorted")) return .keys_unsorted;
-    if (std.mem.eql(u8, name, "values")) return .values;
+    if (std.mem.eql(u8, name, "values")) return .values_sel;
     if (std.mem.eql(u8, name, "type")) return .type_;
     if (std.mem.eql(u8, name, "empty")) return .empty;
     if (std.mem.eql(u8, name, "tostring")) return .tostring;
@@ -676,6 +717,62 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "any")) return .any;
     if (std.mem.eql(u8, name, "all")) return .all;
     if (std.mem.eql(u8, name, "unique")) return .unique;
+
+    // Type selectors (Group A)
+    if (std.mem.eql(u8, name, "arrays")) return .arrays;
+    if (std.mem.eql(u8, name, "objects")) return .objects_sel;
+    if (std.mem.eql(u8, name, "strings")) return .strings_sel;
+    if (std.mem.eql(u8, name, "numbers")) return .numbers_sel;
+    if (std.mem.eql(u8, name, "booleans")) return .booleans_sel;
+    if (std.mem.eql(u8, name, "nulls")) return .nulls_sel;
+    if (std.mem.eql(u8, name, "scalars")) return .scalars_sel;
+    if (std.mem.eql(u8, name, "iterables")) return .iterables_sel;
+
+    // Math builtins (Group B)
+    if (std.mem.eql(u8, name, "floor")) return .floor;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil;
+    if (std.mem.eql(u8, name, "round")) return .round;
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, name, "fabs")) return .fabs;
+    if (std.mem.eql(u8, name, "nan")) return .nan_val;
+    if (std.mem.eql(u8, name, "infinite")) return .infinite_val;
+    if (std.mem.eql(u8, name, "isnan")) return .isnan_val;
+    if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_val;
+    if (std.mem.eql(u8, name, "isnormal")) return .isnormal_val;
+    if (std.mem.eql(u8, name, "log2")) return .log2_;
+    if (std.mem.eql(u8, name, "log")) return .log_;
+    if (std.mem.eql(u8, name, "exp")) return .exp_;
+    if (std.mem.eql(u8, name, "exp2")) return .exp2_;
+    if (std.mem.eql(u8, name, "sin")) return .sin_;
+    if (std.mem.eql(u8, name, "cos")) return .cos_;
+    if (std.mem.eql(u8, name, "atan")) return .atan_;
+    if (std.mem.eql(u8, name, "tan")) return .tan_;
+    if (std.mem.eql(u8, name, "asin")) return .asin_;
+    if (std.mem.eql(u8, name, "acos")) return .acos_;
+    if (std.mem.eql(u8, name, "sinh")) return .sinh_;
+    if (std.mem.eql(u8, name, "cosh")) return .cosh_;
+    if (std.mem.eql(u8, name, "tanh")) return .tanh_;
+    if (std.mem.eql(u8, name, "significand")) return .significand;
+    if (std.mem.eql(u8, name, "exponent")) return .exponent_;
+    if (std.mem.eql(u8, name, "logb")) return .logb_;
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+
+    // String builtins (Group C) — zero-arg
+    if (std.mem.eql(u8, name, "ascii_downcase")) return .ascii_downcase;
+    if (std.mem.eql(u8, name, "ascii_upcase")) return .ascii_upcase;
+    if (std.mem.eql(u8, name, "explode")) return .explode;
+    if (std.mem.eql(u8, name, "implode")) return .implode;
+    if (std.mem.eql(u8, name, "tojson")) return .tojson;
+    if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
+    if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+    if (std.mem.eql(u8, name, "ascii")) return .ascii_val;
+
+    // Misc builtins (Group D) — zero-arg
+    if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+    if (std.mem.eql(u8, name, "transpose")) return .transpose;
+    if (std.mem.eql(u8, name, "builtins")) return .builtins_list;
+    if (std.mem.eql(u8, name, "have_decnum")) return .have_decnum;
+
     return null;
 }
 
@@ -703,7 +800,20 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "first") or
         std.mem.eql(u8, name, "last") or
         std.mem.eql(u8, name, "limit") or
-        std.mem.eql(u8, name, "del");
+        std.mem.eql(u8, name, "del") or
+        std.mem.eql(u8, name, "pow") or
+        // String arg builtins (Group C)
+        std.mem.eql(u8, name, "ltrimstr") or
+        std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "startswith") or
+        std.mem.eql(u8, name, "endswith") or
+        std.mem.eql(u8, name, "split") or
+        std.mem.eql(u8, name, "join") or
+        // Misc arg builtins (Group D)
+        std.mem.eql(u8, name, "map_values") or
+        std.mem.eql(u8, name, "isempty") or
+        std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "add");
 }
 
 /// Compile a `map(f)` expression.
@@ -719,8 +829,8 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit iterate: iterates over current value
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the mapping expression
-    try parseLogical(ctx);
+    // Parse the mapping expression (full filter with comma support)
+    try parseComma(ctx);
 
     // Emit output to collect each element
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -732,6 +842,31 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit array_collect_end and backpatch start
     const end_pos: u32 = @intCast(ctx.raw.items.len);
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Compile `map_values(f)`: apply f to each value, preserving object keys.
+/// Uses map_values_start/end opcodes so the VM can reconstruct objects at runtime.
+fn compileMapValues(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .map_values_start, .operand = .{ .index = 0 } });
+
+    // Iterate over elements/values
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+
+    // Parse the mapping expression (full filter with comma support)
+    try parseComma(ctx);
+
+    // Collect each output
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .map_values_end, .operand = .{ .none = {} } });
     ctx.raw.items[start_pos].operand = .{ .index = end_pos };
 }
 
@@ -1184,6 +1319,101 @@ fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     });
 }
 
+/// Compile a simple arg-taking builtin: `name(expr)`.
+/// Parses `(expr)`, then emits `call_builtin(bid)`.
+fn compileSimpleArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseComma(ctx);
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(bid) },
+    });
+}
+
+/// Compile `add(f)`: collect all outputs of f into an array, then add.
+/// Desugars to: [f] | add
+fn compileAddWithArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Emit array_collect_start with placeholder end_ip
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse the generator expression (handles comma-separated generators)
+    try parseComma(ctx);
+
+    // Consume closing paren
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit output to collect each element
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // Emit array_collect_end and backpatch start
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // Pipe to add
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.add) },
+    });
+}
+
+/// Compile `isempty(f)`: true if f produces no output, false otherwise.
+/// Desugars to: [f | false] | length == 0
+fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Emit array_collect_start
+    const collect_start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse the inner filter f (with comma support)
+    try parseComma(ctx);
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit: pipe, push_bool(false), output — produces false for each output of f
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_bool, .operand = .{ .bool = false } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // Emit array_collect_end
+    const collect_end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[collect_start_pos].operand = .{ .index = collect_end_pos };
+
+    // Pipe to check: length == 0
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.length) },
+    });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_int, .operand = .{ .int = 0 } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .eq, .operand = .{ .none = {} } });
+}
+
+/// Compile `pow(base; exp)`: two semicolon-separated args.
+fn compilePow(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+    try parseComma(ctx); // parse base
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
+    try parseComma(ctx); // parse exponent
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.pow_) },
+    });
+}
+
 /// parsePrimary: literals, identifiers (with .field, [index]), `(` expr `)`, `$var`, `def name:`, `func(...)`
 fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.next();
@@ -1286,6 +1516,28 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileLimit(ctx);
                 } else if (std.mem.eql(u8, ident_name, "del")) {
                     try compileDel(ctx);
+                } else if (std.mem.eql(u8, ident_name, "pow")) {
+                    try compilePow(ctx);
+                } else if (std.mem.eql(u8, ident_name, "ltrimstr")) {
+                    try compileSimpleArgBuiltin(ctx, .ltrimstr);
+                } else if (std.mem.eql(u8, ident_name, "rtrimstr")) {
+                    try compileSimpleArgBuiltin(ctx, .rtrimstr);
+                } else if (std.mem.eql(u8, ident_name, "startswith")) {
+                    try compileSimpleArgBuiltin(ctx, .startswith);
+                } else if (std.mem.eql(u8, ident_name, "endswith")) {
+                    try compileSimpleArgBuiltin(ctx, .endswith);
+                } else if (std.mem.eql(u8, ident_name, "split")) {
+                    try compileSimpleArgBuiltin(ctx, .split_);
+                } else if (std.mem.eql(u8, ident_name, "join")) {
+                    try compileSimpleArgBuiltin(ctx, .join_);
+                } else if (std.mem.eql(u8, ident_name, "map_values")) {
+                    try compileMapValues(ctx);
+                } else if (std.mem.eql(u8, ident_name, "isempty")) {
+                    try compileIsempty(ctx);
+                } else if (std.mem.eql(u8, ident_name, "bsearch")) {
+                    try compileSimpleArgBuiltin(ctx, .bsearch);
+                } else if (std.mem.eql(u8, ident_name, "add")) {
+                    try compileAddWithArg(ctx);
                 }
                 return;
             }
@@ -1356,7 +1608,7 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             }
         },
         .lparen => {
-            try parsePipe(ctx);
+            try parseComma(ctx);
             const close = try ctx.lex.next();
             if (close.tag != .rparen) return error.QuerySyntaxError;
         },
@@ -1566,34 +1818,37 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     if (name_tok.tag != .ident) return error.QuerySyntaxError;
     const name_ref = try internStr(&ctx.intern, ctx.alloc, name_tok.slice(ctx.src));
 
-    // Parameters: (param1; param2; ...)
-    const lparen = try ctx.lex.next();
-    if (lparen.tag != .lparen) return error.QuerySyntaxError;
-
-    // First pass: collect parameter names
+    // Parameters: optional (param1; param2; ...)
+    // Zero-arg defs: `def f: body;`  — next token is ':'
+    // With params:   `def f(a; b): body;` — next token is '('
     var param_names = std.ArrayList(StrRef){};
     defer param_names.deinit(ctx.alloc);
 
-    while (true) {
-        const param_tok = try ctx.lex.peek();
-        if (param_tok.tag == .rparen) {
-            _ = try ctx.lex.next();
-            break;
-        }
+    const after_name = try ctx.lex.peek();
+    if (after_name.tag == .lparen) {
+        _ = try ctx.lex.next(); // consume '('
 
-        // Parse parameter name
-        const param_name = try ctx.lex.next();
-        if (param_name.tag != .ident) return error.QuerySyntaxError;
+        while (true) {
+            const param_tok = try ctx.lex.peek();
+            if (param_tok.tag == .rparen) {
+                _ = try ctx.lex.next();
+                break;
+            }
 
-        const param_ref = try internStr(&ctx.intern, ctx.alloc, param_name.slice(ctx.src));
-        try param_names.append(ctx.alloc, param_ref);
+            // Parse parameter name
+            const param_name = try ctx.lex.next();
+            if (param_name.tag != .ident) return error.QuerySyntaxError;
 
-        // Check for more parameters or end of list
-        const next_tok = try ctx.lex.peek();
-        if (next_tok.tag == .semicolon) {
-            _ = try ctx.lex.next();
-        } else if (next_tok.tag != .rparen) {
-            return error.QuerySyntaxError;
+            const param_ref = try internStr(&ctx.intern, ctx.alloc, param_name.slice(ctx.src));
+            try param_names.append(ctx.alloc, param_ref);
+
+            // Check for more parameters or end of list
+            const next_tok = try ctx.lex.peek();
+            if (next_tok.tag == .semicolon) {
+                _ = try ctx.lex.next();
+            } else if (next_tok.tag != .rparen) {
+                return error.QuerySyntaxError;
+            }
         }
     }
 
@@ -1616,8 +1871,12 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Track where function body starts
     const body_start = @as(u32, @intCast(ctx.raw.items.len));
 
-    // Parse function body
-    try parseLogical(ctx);
+    // Parse function body (supports pipe operator inside body)
+    try parsePipe(ctx);
+
+    // Consume terminating semicolon
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
 
     // Define the function with body_start (position of def_function, will be resolved later)
     const def_func_pos = @as(u32, @intCast(ctx.raw.items.len));
@@ -2114,6 +2373,20 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .array_collect_end => .{ .none = {} },
+                // map_values construction: remap end_ip raw → fused index.
+                .map_values_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .map_values_end => .{ .none = {} },
+                .fork_cleanup => .{ .none = {} },
+                // Fork (comma operator): remap right-side IP raw → fused index.
+                .fork => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 // Alternative operator: remap jump target raw → fused index.
                 .alt_start => .{ .none = {} },
                 .alt_check => blk: {

@@ -127,6 +127,26 @@ pub const ResultIterator = struct {
 
 ---
 
+## Supported Builtins
+
+### Type Selectors (zero-arg, act as `select(type == ...)`)
+`arrays`, `objects`, `strings`, `numbers`, `booleans`, `nulls`, `scalars`, `iterables`
+
+### Math (zero-arg unless noted)
+`floor`, `ceil`, `round`, `sqrt`, `fabs`, `abs`, `nan`, `infinite`, `isnan`, `isinfinite`, `isnormal`, `log2`, `log`, `exp`, `exp2`, `sin`, `cos`, `atan`, `tan`, `asin`, `acos`, `sinh`, `cosh`, `tanh`, `significand`, `exponent`, `logb`, `pow(base; exp)`
+
+### String
+**Zero-arg:** `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tojson`, `fromjson`, `toboolean`, `ascii`
+**One-arg:** `ltrimstr(s)`, `rtrimstr(s)`, `startswith(s)`, `endswith(s)`, `split(sep)`, `join(sep)`
+
+### Collection / Iteration
+`length`, `keys`, `keys_unsorted`, `values`, `has(k)`, `in(obj)`, `type`, `empty`, `tostring`, `tonumber`, `error`, `add`, `add(f)`, `range(n)`, `range(a;b)`, `range(a;b;step)`, `sort`, `sort_by(f)`, `group_by(f)`, `reverse`, `flatten`, `flatten(n)`, `min`, `max`, `min_by(f)`, `max_by(f)`, `to_entries`, `from_entries`, `any`, `any(f)`, `all`, `all(f)`, `contains(v)`, `inside(v)`, `del(path)`, `indices(v)`, `index(v)`, `rindex(v)`, `unique`, `unique_by(f)`, `map(f)`, `select(f)`, `with_entries(f)`, `first`, `first(f)`, `last`, `last(f)`, `limit(n; f)`, `map_values(f)`, `isempty(f)`, `bsearch(x)`, `transpose`, `utf8bytelength`, `builtins`, `have_decnum`
+
+### Arithmetic Operators
+`+` (add/concat), `-` (sub/array-diff), `*` (mul/object-recursive-merge), `/` (div/string-split), `%` (mod, float-aware)
+
+---
+
 ## Dependencies
 
 - `src/error/root.zig` — `ZqError` (`QuerySyntaxError`, `TypeError`, `IndexOutOfBounds`)

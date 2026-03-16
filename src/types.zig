@@ -219,6 +219,70 @@ pub const BuiltinId = enum(u16) {
     rindex,
     unique,
     unique_by,
+
+    // ── Type selectors (Group A) ──
+    arrays,
+    objects_sel,
+    strings_sel,
+    numbers_sel,
+    booleans_sel,
+    nulls_sel,
+    values_sel,
+    scalars_sel,
+    iterables_sel,
+
+    // ── Math builtins (Group B) ──
+    floor,
+    ceil,
+    round,
+    sqrt,
+    fabs,
+    nan_val,
+    infinite_val,
+    isnan_val,
+    isinfinite_val,
+    isnormal_val,
+    pow_,
+    log2_,
+    log_,
+    exp_,
+    exp2_,
+    sin_,
+    cos_,
+    atan_,
+    tan_,
+    asin_,
+    acos_,
+    sinh_,
+    cosh_,
+    tanh_,
+    significand,
+    exponent_,
+    logb_,
+    abs,
+
+    // ── String builtins (Group C) ──
+    ascii_downcase,
+    ascii_upcase,
+    ltrimstr,
+    rtrimstr,
+    startswith,
+    endswith,
+    split_,
+    join_,
+    explode,
+    implode,
+    tojson,
+    fromjson,
+    toboolean,
+    ascii_val,
+
+    // ── Misc builtins (Group D) ──
+    utf8bytelength,
+    transpose,
+    builtins_list,
+    have_decnum,
+    bsearch,
 };
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────
@@ -352,6 +416,14 @@ pub const Instruction = struct {
         /// onto the value stack.
         array_collect_end,
 
+        /// Begin map_values collection: like array_collect_start but saves the
+        /// original input so map_values_end can reconstruct objects.
+        /// operand.index = IP of the matching map_values_end instruction.
+        map_values_start,
+        /// Finalize map_values: if original input was an object, build an object
+        /// with original keys and collected values; otherwise build an array.
+        map_values_end,
+
         // Alternative operator (//) — null coalescing
         /// Begin alternative evaluation: push current to if_stack; increment alt_null_depth
         /// so that field accesses on the left side propagate null instead of TypeError.
@@ -360,6 +432,16 @@ pub const Instruction = struct {
         /// If truthy: pop one entry from if_stack, push val back, jump to operand.index.
         /// If falsy: discard val, continue — restore_input fires next to pop if_stack.
         alt_check,
+
+        // Comma (fork) operator
+        /// Fork execution: push a ForkFrame with the right-side IP and saved input.
+        /// The left side runs normally; when it's exhausted, the VM pops the fork frame,
+        /// restores the input, and jumps to the right side.
+        /// operand.index = IP of the right-side expression (fork_cleanup instruction).
+        fork,
+        /// Pop the top fork frame. Emitted at the start of the right side to consume
+        /// the fork frame when execution reaches the right side normally (non-exhaustion path).
+        fork_cleanup,
 
         // Try-catch error handling
         /// Begin a try block. operand.index = catch handler IP (0 = no catch;
