@@ -741,7 +741,10 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "first") or
         std.mem.eql(u8, name, "last") or
         std.mem.eql(u8, name, "limit") or
-        std.mem.eql(u8, name, "del");
+        std.mem.eql(u8, name, "del") or
+        std.mem.eql(u8, name, "while") or
+        std.mem.eql(u8, name, "until") or
+        std.mem.eql(u8, name, "repeat");
 }
 
 /// Compile a single-arg value builtin that must support generator expressions (commas)
@@ -890,6 +893,179 @@ fn compileSelect(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // done:
     const done_ip: u32 = @intCast(ctx.raw.items.len);
     ctx.raw.items[jmp_pos].operand = .{ .index = done_ip };
+}
+
+/// Compile `while(cond; update)` — output current value while cond is true,
+/// apply update each iteration.
+///
+/// Bytecode layout:
+/// loop_top:
+///   save_input                    ; save current for condition evaluation
+///   <cond>                        ; evaluate condition, result on stack
+///   jump_if_false -> loop_exit    ; if false, exit loop
+///   restore_input                 ; true path: restore original value
+///   output                        ; emit current value as output
+///   <update>                      ; apply update to current value
+///   pipe                          ; transfer update result to current
+///   jump -> loop_top              ; loop back to re-check condition
+/// loop_exit:
+///   restore_input                 ; false path: clean up save_input from if_stack
+///   call_builtin(empty)           ; produce no output on exit (stop the generator)
+fn compileWhile(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // loop_top:
+    const loop_top: u32 = @intCast(ctx.raw.items.len);
+
+    // save_input
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // <cond>
+    try parsePipe(ctx);
+
+    // expect ';'
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
+
+    // jump_if_false -> loop_exit (placeholder)
+    const jif_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump_if_false, .operand = .{ .index = 0 } });
+
+    // restore_input (true path)
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // output — emit current value
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // <update>
+    try parsePipe(ctx);
+
+    // expect ')'
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // pipe — transfer update result to current
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // jump -> loop_top
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = loop_top } });
+
+    // loop_exit:
+    const loop_exit: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[jif_pos].operand = .{ .index = loop_exit };
+
+    // restore_input (false path — balance the save_input)
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // call_builtin(empty) — produce no output on exit
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.empty) },
+    });
+}
+
+/// Compile `until(cond; update)` — apply update until cond is true, output
+/// only the final value.
+///
+/// Bytecode layout:
+/// loop_top:
+///   save_input                    ; save current for condition evaluation
+///   <cond>                        ; evaluate condition
+///   jump_if_false -> loop_body    ; if false (not done yet), continue looping
+///   restore_input                 ; true path: condition met, exit with current value
+///   jump -> loop_done             ; skip to done
+/// loop_body:
+///   restore_input                 ; false path: restore value for update
+///   <update>                      ; apply update
+///   pipe                          ; transfer result to current
+///   jump -> loop_top              ; loop back
+/// loop_done:
+///   push_current                  ; put final value on stack for downstream use
+fn compileUntil(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // loop_top:
+    const loop_top: u32 = @intCast(ctx.raw.items.len);
+
+    // save_input
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // <cond>
+    try parsePipe(ctx);
+
+    // expect ';'
+    const semi = try ctx.lex.next();
+    if (semi.tag != .semicolon) return error.QuerySyntaxError;
+
+    // jump_if_false -> loop_body (placeholder)
+    const jif_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump_if_false, .operand = .{ .index = 0 } });
+
+    // True path: condition met — restore and exit
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // jump -> loop_done (placeholder)
+    const jmp_done_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = 0 } });
+
+    // loop_body:
+    const loop_body: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[jif_pos].operand = .{ .index = loop_body };
+
+    // restore_input (false path)
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+    // <update>
+    try parsePipe(ctx);
+
+    // expect ')'
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // pipe — transfer result to current
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // jump -> loop_top
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = loop_top } });
+
+    // loop_done:
+    const loop_done: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[jmp_done_pos].operand = .{ .index = loop_done };
+
+    // push_current — make the final value available on the value stack
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .push_current, .operand = .{ .none = {} } });
+}
+
+/// Compile `repeat(f)` — apply f infinitely, outputting each result.
+/// The loop is infinite; callers terminate it with `limit`, `first`, or `try-catch`.
+///
+/// Bytecode layout:
+/// loop_top:
+///   output                        ; emit current value
+///   <f>                           ; apply f to current value
+///   pipe                          ; transfer result to current
+///   jump -> loop_top              ; infinite loop
+fn compileRepeat(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // loop_top:
+    const loop_top: u32 = @intCast(ctx.raw.items.len);
+
+    // output — emit current value
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // <f>
+    try parsePipe(ctx);
+
+    // expect ')'
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // pipe — transfer result to current
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // jump -> loop_top
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .jump, .operand = .{ .index = loop_top } });
 }
 
 /// Compile `has(expr)`: supports generator expressions (commas) in arg.
@@ -1558,6 +1734,12 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileLimit(ctx);
                 } else if (std.mem.eql(u8, ident_name, "del")) {
                     try compileDel(ctx);
+                } else if (std.mem.eql(u8, ident_name, "while")) {
+                    try compileWhile(ctx);
+                } else if (std.mem.eql(u8, ident_name, "until")) {
+                    try compileUntil(ctx);
+                } else if (std.mem.eql(u8, ident_name, "repeat")) {
+                    try compileRepeat(ctx);
                 }
                 return;
             }
