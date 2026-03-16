@@ -2176,3 +2176,144 @@ test "update |=: nested path .a.b" {
     }
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
+
+// ── Tape copy through query (exercises copyTapeSpanToRuntimeTape) ────────────
+
+test "tape copy: . on object passes through unchanged" {
+    // {"a":1,"b":"hello"}
+    const sb = "abhello";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } },
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 2, .len = 5 } } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile(".");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const val = (try it.next()).?;
+    try std.testing.expect(val == .object);
+    const span = val.object;
+    try std.testing.expectEqual(Tag.object_start, span.tape.entries[span.start].tag);
+    try std.testing.expectEqual(@as(u32, 6), span.end - span.start);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "tape copy: [.a, .b] with nested containers" {
+    // Input: {"a":{"x":1},"b":[2,3]}
+    const sb = "axb";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 12 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } }, // {"x":1}
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "x"
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 2, .len = 1 } } }, // "b"
+        .{ .tag = .array_start, .payload = .{ .skip = 11 } }, // [2,3]
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("[.a, .b]");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const val = (try it.next()).?;
+    try std.testing.expect(val == .array);
+    const span = val.array;
+    const rt = span.tape;
+
+    // Result: [{"x":1},[2,3]]
+    try std.testing.expectEqual(Tag.array_start, rt.entries[span.start].tag);
+
+    // First element: object {"x":1}
+    const obj_idx = span.start + 1;
+    try std.testing.expectEqual(Tag.object_start, rt.entries[obj_idx].tag);
+    try std.testing.expectEqualStrings("x", rt.getString(rt.entries[obj_idx + 1].payload.string));
+    try std.testing.expectEqual(@as(i64, 1), rt.entries[obj_idx + 2].payload.int);
+
+    // Skip past object to find second element
+    const second_idx = rt.entries[obj_idx].payload.skip;
+    try std.testing.expectEqual(Tag.array_start, rt.entries[second_idx].tag);
+    try std.testing.expectEqual(@as(i64, 2), rt.entries[second_idx + 1].payload.int);
+    try std.testing.expectEqual(@as(i64, 3), rt.entries[second_idx + 2].payload.int);
+
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "tape copy: object construction {x: .a, y: .b} with nested values" {
+    // Input: {"a":[1,2],"b":{"c":3}}
+    const sb = "abc";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 12 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .array_start, .payload = .{ .skip = 6 } }, // [1,2]
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .object_start, .payload = .{ .skip = 11 } }, // {"c":3}
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 2, .len = 1 } } }, // "c"
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("{x: .a, y: .b}");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const val = (try it.next()).?;
+    try std.testing.expect(val == .object);
+    const span = val.object;
+    const rt = span.tape;
+
+    // Result: {"x":[1,2],"y":{"c":3}}
+    try std.testing.expectEqual(Tag.object_start, rt.entries[span.start].tag);
+
+    // Key "x", value [1,2]
+    try std.testing.expectEqualStrings("x", rt.getString(rt.entries[span.start + 1].payload.string));
+    const arr_idx = span.start + 2;
+    try std.testing.expectEqual(Tag.array_start, rt.entries[arr_idx].tag);
+    try std.testing.expectEqual(@as(i64, 1), rt.entries[arr_idx + 1].payload.int);
+    try std.testing.expectEqual(@as(i64, 2), rt.entries[arr_idx + 2].payload.int);
+
+    // Skip past array to find key "y"
+    const next_kv = rt.entries[arr_idx].payload.skip;
+    try std.testing.expectEqualStrings("y", rt.getString(rt.entries[next_kv].payload.string));
+    const obj_idx = next_kv + 1;
+    try std.testing.expectEqual(Tag.object_start, rt.entries[obj_idx].tag);
+    try std.testing.expectEqualStrings("c", rt.getString(rt.entries[obj_idx + 1].payload.string));
+    try std.testing.expectEqual(@as(i64, 3), rt.entries[obj_idx + 2].payload.int);
+
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+test "tape copy: reduce range(100) builds deeply nested array without crash" {
+    const null_entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&null_entries, "");
+
+    var q = try compile("reduce range(100) as $_ ([];[.])");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const val = (try it.next()).?;
+    try std.testing.expect(val == .array);
+    // 101 nesting levels (initial [] + 100 wrappings) = 202 tape entries
+    try std.testing.expectEqual(@as(u32, 202), val.array.end - val.array.start);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
