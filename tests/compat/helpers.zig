@@ -178,7 +178,7 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         result_list.deinit(alloc);
     }
 
-    while (try it.next()) |val| {
+    while (it.next() catch return error.QueryRuntimeError) |val| {
         var buf = std.ArrayList(u8){};
         errdefer buf.deinit(alloc);
         try serializeValue(&buf, val);
