@@ -674,14 +674,12 @@ fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     }
 }
 
-/// parseUnary: `not`, unary `-`
+/// parseUnary: unary `-`
+/// Note: `not` is handled as a zero-arg builtin in parsePrimary, not as a prefix operator.
+/// In jq, `not` is always a postfix filter: `expr | not`, not a prefix `not expr`.
 fn parseUnary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.peek();
-    if (t.tag == .not_kw) {
-        _ = try ctx.lex.next();
-        try parseUnary(ctx);
-        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .not, .operand = .{ .none = {} } });
-    } else if (t.tag == .minus) {
+    if (t.tag == .minus) {
         _ = try ctx.lex.next();
         // Recursively parse the operand, then emit negate.
         // Note: `-1` (no space) is handled by the lexer as a single int_lit token,
@@ -746,6 +744,75 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "del");
 }
 
+/// Compile a single-arg value builtin that must support generator expressions (commas)
+/// in its argument. For `builtin(a,b,c)`, emits:
+///   save_input; <a>; call_builtin(bid); output; restore_input;
+///   save_input; <b>; call_builtin(bid); output; restore_input;
+///   <c>; call_builtin(bid)
+/// The final alternative does NOT get save/output/restore because the result
+/// flows naturally into whatever follows.
+///
+/// Each comma-separated alternative is parsed with `parseAlternative` (handles `//`
+/// but not `,`). The `call_builtin` is emitted per-alternative so that each value
+/// independently drives the builtin (e.g. `range(3,5)` → range(3) then range(5)).
+fn compileValueArgBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.lex.next(); // consume '('
+
+    // Parse first alternative
+    const chain_start: usize = ctx.raw.items.len;
+    try parseAlternative(ctx);
+
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .comma) break;
+        _ = try ctx.lex.next(); // consume ','
+
+        // Insert save_input before the entire left subtree
+        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+        // Emit call_builtin for the left side
+        try ctx.raw.append(ctx.alloc, RawInstr{
+            .op = .call_builtin,
+            .operand = .{ .index = @intFromEnum(bid) },
+        });
+        // Emit output for the left side, then restore_input
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+        // Parse next alternative
+        try parseAlternative(ctx);
+    }
+
+    const rparen = try ctx.lex.next();
+    if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // Emit call_builtin for the last (or only) alternative
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(bid) },
+    });
+}
+
+/// Parse a single semicolon-delimited argument that may contain commas (generators).
+/// Collects the generator outputs into an array using array_collect_start/end.
+/// This is used for multi-arg builtins like `range(a;b)` where each arg may be
+/// a generator expression (e.g. `range(0,1;3,4)` for Cartesian product).
+fn parseArgToArray(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const start_pos = ctx.raw.items.len;
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
+
+    // Parse the full pipe expression (includes commas which generate multiple values)
+    try parsePipe(ctx);
+
+    // Each generated value needs to be collected
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+
+    // End collection
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+}
+
 /// Compile a `map(f)` expression.
 /// Desugars to: array_collect_start | iterate | <f> | output | array_collect_end
 fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
@@ -759,8 +826,8 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Emit iterate: iterates over current value
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the mapping expression
-    try parseLogical(ctx);
+    // Parse the mapping expression (use parsePipe to support commas/pipes in filter args)
+    try parsePipe(ctx);
 
     // Emit output to collect each element
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
@@ -793,8 +860,8 @@ fn compileSelect(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // save_input so we can restore the original for output
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
 
-    // Parse the predicate expression
-    try parseLogical(ctx);
+    // Parse the predicate expression (use parsePipe to support commas/pipes in filter args)
+    try parsePipe(ctx);
 
     // Consume closing paren
     const rparen = try ctx.lex.next();
@@ -825,23 +892,41 @@ fn compileSelect(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     ctx.raw.items[jmp_pos].operand = .{ .index = done_ip };
 }
 
-/// Compile `has(expr)`: compile expr (pushes key), then call_builtin(has).
+/// Compile `has(expr)`: supports generator expressions (commas) in arg.
 fn compileHas(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.has) },
-    });
+    try compileValueArgBuiltin1(ctx, .has);
 }
 
 /// Compile `in(expr)`: save_input, compile expr (pushes object), call_builtin(in_).
 fn compileIn(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
+
+    // in(expr) needs save_input before arg, so handle commas manually
+    const chain_start: usize = ctx.raw.items.len;
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
-    try parseLogical(ctx);
+    try parseAlternative(ctx);
+
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .comma) break;
+        _ = try ctx.lex.next(); // consume ','
+
+        // Insert save_input before the entire left subtree
+        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+        // Emit call_builtin for the left side
+        try ctx.raw.append(ctx.alloc, RawInstr{
+            .op = .call_builtin,
+            .operand = .{ .index = @intFromEnum(types.BuiltinId.in_) },
+        });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .restore_input, .operand = .{ .none = {} } });
+
+        // For next alternative, save_input again
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+        try parseAlternative(ctx);
+    }
+
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
     try ctx.raw.append(ctx.alloc, RawInstr{
@@ -851,123 +936,160 @@ fn compileIn(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// Compile `range(n)`, `range(from;to)`, or `range(from;to;by)`.
+/// Supports generator expressions (commas) in all argument positions.
+/// - range(3,5) → range(3), then range(5) → outputs 0,1,2,0,1,2,3,4
+/// - range(0,1;3,4) → Cartesian product: range(0;3), range(0;4), range(1;3), range(1;4)
 fn compileRange(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Don't consume '(' here — dispatch handles it
+
+    // Peek ahead to check if this is single-arg (no semicolons)
+    // We need to speculatively parse the first arg, then check for ';' or ')'
+    // For single-arg, use compileValueArgBuiltin1 which handles commas manually
+    // For multi-arg, use parseArgToArray for Cartesian product
+
+    // Save lexer state to detect form
+    const saved_lex = ctx.lex;
+    const saved_raw_len = ctx.raw.items.len;
+
+    // Parse with a simple lookahead: skip tokens until we find ';' or ')' at depth 0
+    var depth: u32 = 1; // We consumed '(' already by the caller... wait, no
+    // Actually the caller dispatches here and we consume '(' below
     _ = try ctx.lex.next(); // consume '('
+    depth = 1;
 
-    // Parse first argument
-    try parseLogical(ctx);
+    // Lookahead: scan to find whether first arg ends with ';' or ')'
+    const lex_after_lparen = ctx.lex;
+    var has_semicolon = false;
+    blk: while (true) {
+        const tok = try ctx.lex.next();
+        switch (tok.tag) {
+            .lparen, .lbracket, .lbrace => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) break :blk;
+            },
+            .rbracket, .rbrace => {
+                if (depth > 1) depth -= 1;
+            },
+            .semicolon => {
+                if (depth == 1) {
+                    has_semicolon = true;
+                    break :blk;
+                }
+            },
+            .eof => return error.QuerySyntaxError,
+            else => {},
+        }
+    }
 
-    // Check for semicolons
-    const t1 = try ctx.lex.peek();
-    if (t1.tag == .rparen) {
-        _ = try ctx.lex.next();
+    // Restore lexer to just after '('
+    ctx.lex = lex_after_lparen;
+    ctx.raw.items.len = saved_raw_len;
+    _ = saved_lex; // unused but documents intent
+
+    if (!has_semicolon) {
+        // Single-arg form: range(n)
+        // Use parseArgToArray to collect all generator values, then range1_gen processes them.
+        // This handles both simple range(5) and generator range(3,5).
+        try parseArgToArray(ctx);
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+        const rparen = try ctx.lex.next();
+        if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+        // range1_gen returns a flat array of all range outputs; iterate to produce individual values
         try ctx.raw.append(ctx.alloc, RawInstr{
             .op = .call_builtin,
-            .operand = .{ .index = @intFromEnum(types.BuiltinId.range) },
+            .operand = .{ .index = @intFromEnum(types.BuiltinId.range1_gen) },
         });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
         return;
     }
-    if (t1.tag != .semicolon) return error.QuerySyntaxError;
-    _ = try ctx.lex.next(); // consume ';'
 
-    // Parse second argument
-    try parseLogical(ctx);
+    // Multi-arg form: collect each arg into an array for Cartesian product
+    // Parse first arg into array
+    try parseArgToArray(ctx);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
 
+    // Save first array
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    const s1 = try ctx.lex.next(); // consume ';'
+    if (s1.tag != .semicolon) return error.QuerySyntaxError;
+
+    // Parse second arg into array
+    try parseArgToArray(ctx);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // Check for third arg
     const t2 = try ctx.lex.peek();
     if (t2.tag == .rparen) {
         _ = try ctx.lex.next();
+        // 2-arg form: call_builtin(range2_gen) with [from_array] on if_stack, [to_array] as current
+        // Returns a flat array of all results; iterate to produce individual values
         try ctx.raw.append(ctx.alloc, RawInstr{
             .op = .call_builtin,
-            .operand = .{ .index = @intFromEnum(types.BuiltinId.range2) },
+            .operand = .{ .index = @intFromEnum(types.BuiltinId.range2_gen) },
         });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+        try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
         return;
     }
     if (t2.tag != .semicolon) return error.QuerySyntaxError;
     _ = try ctx.lex.next(); // consume ';'
 
-    // Parse third argument
-    try parseLogical(ctx);
+    // Save second array
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+
+    // Parse third arg into array
+    try parseArgToArray(ctx);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
 
     const rparen = try ctx.lex.next();
     if (rparen.tag != .rparen) return error.QuerySyntaxError;
+
+    // 3-arg form: call_builtin(range3_gen) with [from_array, to_array] on if_stack, [by_array] as current
+    // Returns a flat array of all results; iterate to produce individual values
     try ctx.raw.append(ctx.alloc, RawInstr{
         .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.range3) },
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.range3_gen) },
     });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 }
 
 // ── Tier 2 arg-taking builtins ──────────────────────────────────────────────
 
-/// Compile `flatten(n)`: compile arg (pushes depth), then call_builtin(flatten_n).
+/// Compile `flatten(n)`: supports generator expressions (commas) in arg.
+/// `flatten(3,2,1)` → flatten(3), then flatten(2), then flatten(1) → three outputs
 fn compileFlattenN(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.flatten_n) },
-    });
+    try compileValueArgBuiltin1(ctx, .flatten_n);
 }
 
-/// Compile `contains(b)`: compile arg (pushes b), then call_builtin(contains).
+/// Compile `contains(b)`: supports generator expressions (commas) in arg.
 fn compileContains(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.contains) },
-    });
+    try compileValueArgBuiltin1(ctx, .contains);
 }
 
-/// Compile `inside(b)`: compile arg (pushes b), then call_builtin(inside).
+/// Compile `inside(b)`: supports generator expressions (commas) in arg.
 fn compileInside(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.inside) },
-    });
+    try compileValueArgBuiltin1(ctx, .inside);
 }
 
-/// Compile `indices(s)`: compile arg, then call_builtin(indices).
+/// Compile `indices(s)`: supports generator expressions (commas) in arg.
 fn compileIndices(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.indices) },
-    });
+    try compileValueArgBuiltin1(ctx, .indices);
 }
 
-/// Compile `index(s)`: compile arg, then call_builtin(index_).
+/// Compile `index(s)`: supports generator expressions (commas) in arg.
 fn compileIndex(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.index_) },
-    });
+    try compileValueArgBuiltin1(ctx, .index_);
 }
 
-/// Compile `rindex(s)`: compile arg, then call_builtin(rindex).
+/// Compile `rindex(s)`: supports generator expressions (commas) in arg.
 fn compileRindex(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    _ = try ctx.lex.next(); // consume '('
-    try parseLogical(ctx);
-    const rparen = try ctx.lex.next();
-    if (rparen.tag != .rparen) return error.QuerySyntaxError;
-    try ctx.raw.append(ctx.alloc, RawInstr{
-        .op = .call_builtin,
-        .operand = .{ .index = @intFromEnum(types.BuiltinId.rindex) },
-    });
+    try compileValueArgBuiltin1(ctx, .rindex);
 }
 
 /// Compile filter-arg builtins (sort_by, group_by, min_by, max_by, unique_by).
@@ -983,8 +1105,8 @@ fn compileFilterArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{Ou
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the filter expression
-    try parseLogical(ctx);
+    // Parse the filter expression (use parsePipe to support commas/pipes in filter args)
+    try parsePipe(ctx);
 
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
 
@@ -1019,8 +1141,8 @@ fn compileWithEntries(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 
-    // Parse the filter expression
-    try parseLogical(ctx);
+    // Parse the filter expression (use parsePipe to support commas/pipes in filter args)
+    try parsePipe(ctx);
 
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .output, .operand = .{ .none = {} } });
 
@@ -1049,8 +1171,8 @@ fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory}
     const start_pos = ctx.raw.items.len;
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
 
-    // Parse first arg (either the filter f, or the generator gen)
-    try parseLogical(ctx);
+    // Parse first arg using parsePipe (supports commas/pipes, e.g., $dot[])
+    try parsePipe(ctx);
 
     // Check for semicolon (2-arg form: any(gen;cond))
     const semi = try ctx.lex.peek();
@@ -1058,7 +1180,7 @@ fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory}
         _ = try ctx.lex.next(); // consume ';'
         // First arg was the generator. Pipe into it, then parse cond.
         try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
-        try parseLogical(ctx);
+        try parsePipe(ctx);
     } else {
         // 1-arg form: desugar to [.[] | f]
         // We need to insert iterate before the filter. Use insertRawInstr.
@@ -1134,24 +1256,24 @@ fn compileLast(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .load_index, .operand = .{ .index = -1 } });
 }
 
-/// Compile `limit(n;f)`: currently collects all outputs of f into an array.
-/// TODO: Implement proper early termination via limit_start/limit_end opcodes.
-/// Without dynamic slicing or early-termination opcodes, this collects all outputs
-/// of f and returns them as an array. Callers like `first(f)` desugar to
-/// `[f] | .[0]` which avoids needing limit entirely.
+/// Compile `limit(n;f)`: supports generator expressions (commas) in first arg.
+/// `limit(5,7; range(9))` → first 5 of range(9), then first 7 of range(9)
+/// Collects n's generator outputs into [n_values], collects f's outputs into [f_outputs],
+/// then calls limit_gen which produces first n_values[i] elements of f_outputs for each i.
 fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.lex.next(); // consume '('
 
-    // Parse n (currently unused — full limit needs dynamic slicing or new opcodes)
-    try parseLogical(ctx);
+    // Collect n values into array (supports generators like 5,7)
+    try parseArgToArray(ctx);
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // Save n-values array
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
 
     const semi = try ctx.lex.next();
     if (semi.tag != .semicolon) return error.QuerySyntaxError;
 
-    // Discard n from the value stack
-    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
-
-    // Collect [f]
+    // Collect [f] outputs into array
     const start_pos = ctx.raw.items.len;
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_start, .operand = .{ .index = 0 } });
 
@@ -1165,6 +1287,17 @@ fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const end_pos: u32 = @intCast(ctx.raw.items.len);
     try ctx.raw.append(ctx.alloc, RawInstr{ .op = .array_collect_end, .operand = .{ .none = {} } });
     ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+
+    // Call limit_gen: current is [f_outputs], [n_values] on if_stack
+    // Returns a flat array of results; iterate to produce individual values
+    try ctx.raw.append(ctx.alloc, RawInstr{
+        .op = .call_builtin,
+        .operand = .{ .index = @intFromEnum(types.BuiltinId.limit_gen) },
+    });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .pipe, .operand = .{ .none = {} } });
+    try ctx.raw.append(ctx.alloc, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
 }
 
 /// Compile `del(.key)` or `del(.[n])`: static single-level path deletion.
@@ -1500,8 +1633,10 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             if (close.tag != .rparen) return error.QuerySyntaxError;
         },
         .dollar => {
-            // Variable reference: $var
+            // Variable reference: $var, possibly followed by suffixes like [], .field, [0]
+            const var_start = ctx.raw.items.len;
             try parseVariableReference(ctx);
+            try parseSuffixes(ctx, var_start);
         },
         .lbrace => {
             // Object literal
@@ -1552,6 +1687,11 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             // String interpolation without format: "hello \(.name)"
             const raw_content = ctx.src[t.offset..][0..t.len];
             try compileStringInterpolation(ctx, raw_content, null);
+        },
+        .not_kw => {
+            // `not` is a zero-arg builtin filter in jq (always postfix: `expr | not`)
+            // When used as a standalone expression, it negates the current input.
+            try ctx.raw.append(ctx.alloc, RawInstr{ .op = .not, .operand = .{ .none = {} } });
         },
         else => return error.QuerySyntaxError,
     }

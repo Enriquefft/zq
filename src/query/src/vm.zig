@@ -1884,6 +1884,10 @@ pub const ResultIterator = struct {
             .format_sh => return try it.builtinFormatSh(),
             .format_base64 => return try it.builtinFormatBase64(),
             .format_base64d => return try it.builtinFormatBase64d(),
+            .range1_gen => return try it.builtinRange1Gen(),
+            .range2_gen => return try it.builtinRange2Gen(),
+            .range3_gen => return try it.builtinRange3Gen(),
+            .limit_gen => return try it.builtinLimitGen(),
         }
     }
 
@@ -3622,6 +3626,228 @@ pub const ResultIterator = struct {
         }
         it.ip = resume_ip;
         return null;
+    }
+
+    /// Helper: extract all elements from an array Value into a slice of Values.
+    fn extractArrayElements(it: *ResultIterator, arr: Value) ZqError![]Value {
+        const span = switch (arr) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+        const len = arrayLength(span.tape, span);
+        var elems = try it.alloc.alloc(Value, len);
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var i: u32 = 0;
+        while (pos < end) : (i += 1) {
+            elems[i] = tapeEntryToValue(span.tape, pos);
+            pos = skipEntry(span.tape.*, pos);
+        }
+        return elems;
+    }
+
+    /// Helper: generate range values from start to end (exclusive) by step, appending to results.
+    fn generateRangeValues(it: *ResultIterator, results: *std.ArrayList(Value), from_i: i64, to_i: i64, step_i: i64) !void {
+        if (step_i > 0) {
+            var cur = from_i;
+            while (cur < to_i) : (cur += step_i) {
+                try results.append(it.alloc, .{ .int = cur });
+            }
+        } else if (step_i < 0) {
+            var cur = from_i;
+            while (cur > to_i) : (cur += step_i) {
+                try results.append(it.alloc, .{ .int = cur });
+            }
+        }
+        // step_i == 0: produce nothing
+    }
+
+    /// Helper: generate float range values, appending to results.
+    fn generateRangeValuesFloat(it: *ResultIterator, results: *std.ArrayList(Value), from_f: f64, to_f: f64, step_f: f64) !void {
+        if (step_f > 0) {
+            var cur = from_f;
+            while (cur < to_f) : (cur += step_f) {
+                try results.append(it.alloc, .{ .float = cur });
+            }
+        } else if (step_f < 0) {
+            var cur = from_f;
+            while (cur > to_f) : (cur += step_f) {
+                try results.append(it.alloc, .{ .float = cur });
+            }
+        }
+    }
+
+    /// `range1_gen`: apply range(n) for each n in the input array, concatenate all results.
+    /// Current is [n_values]. Returns a flat array of all range outputs.
+    fn builtinRange1Gen(it: *ResultIterator) ZqError!?StackValue {
+        const n_arr = it.current;
+        const n_elems = try it.extractArrayElements(n_arr);
+        defer it.alloc.free(n_elems);
+
+        var results = std.ArrayList(Value){};
+        defer results.deinit(it.alloc);
+
+        for (n_elems) |n_v| {
+            switch (n_v) {
+                .int => |end_n| {
+                    if (end_n > 0) {
+                        try it.generateRangeValues(&results, 0, end_n, 1);
+                    }
+                },
+                .float => |end_f| {
+                    if (end_f > 0) {
+                        try it.generateRangeValuesFloat(&results, 0, end_f, 1);
+                    }
+                },
+                else => return error.TypeError,
+            }
+        }
+
+        return try it.buildRuntimeArray(results.items);
+    }
+
+    /// `range2_gen`: Cartesian product of from_array x to_array applied to range(from;to).
+    /// if_stack has [from_values], current is [to_values].
+    /// Returns a flat array of all range outputs.
+    fn builtinRange2Gen(it: *ResultIterator) ZqError!?StackValue {
+        const to_arr = it.current;
+        const from_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
+
+        const from_elems = try it.extractArrayElements(from_val);
+        defer it.alloc.free(from_elems);
+        const to_elems = try it.extractArrayElements(to_arr);
+        defer it.alloc.free(to_elems);
+
+        var results = std.ArrayList(Value){};
+        defer results.deinit(it.alloc);
+
+        for (from_elems) |from_v| {
+            for (to_elems) |to_v| {
+                const is_float = (from_v == .float or to_v == .float);
+                if (is_float) {
+                    const from_f: f64 = switch (from_v) {
+                        .float => |f| f,
+                        .int => |i| @floatFromInt(i),
+                        else => return error.TypeError,
+                    };
+                    const to_f: f64 = switch (to_v) {
+                        .float => |f| f,
+                        .int => |i| @floatFromInt(i),
+                        else => return error.TypeError,
+                    };
+                    try it.generateRangeValuesFloat(&results, from_f, to_f, 1.0);
+                } else {
+                    const from_i: i64 = switch (from_v) {
+                        .int => |i| i,
+                        else => return error.TypeError,
+                    };
+                    const to_i: i64 = switch (to_v) {
+                        .int => |i| i,
+                        else => return error.TypeError,
+                    };
+                    try it.generateRangeValues(&results, from_i, to_i, 1);
+                }
+            }
+        }
+
+        return try it.buildRuntimeArray(results.items);
+    }
+
+    /// `range3_gen`: Cartesian product of from_array x to_array x by_array applied to range(from;to;by).
+    /// if_stack has [from_values] then [to_values] (from pushed first, then to),
+    /// current is [by_values].
+    /// Returns a flat array of all range outputs.
+    fn builtinRange3Gen(it: *ResultIterator) ZqError!?StackValue {
+        const by_arr = it.current;
+        // Pop in reverse order: to was pushed second, from was pushed first
+        const to_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
+        const from_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
+
+        const from_elems = try it.extractArrayElements(from_val);
+        defer it.alloc.free(from_elems);
+        const to_elems = try it.extractArrayElements(to_val);
+        defer it.alloc.free(to_elems);
+        const by_elems = try it.extractArrayElements(by_arr);
+        defer it.alloc.free(by_elems);
+
+        var results = std.ArrayList(Value){};
+        defer results.deinit(it.alloc);
+
+        for (from_elems) |from_v| {
+            for (to_elems) |to_v| {
+                for (by_elems) |by_v| {
+                    const is_float = (from_v == .float or to_v == .float or by_v == .float);
+                    if (is_float) {
+                        const from_f: f64 = switch (from_v) {
+                            .float => |f| f,
+                            .int => |i| @floatFromInt(i),
+                            else => return error.TypeError,
+                        };
+                        const to_f: f64 = switch (to_v) {
+                            .float => |f| f,
+                            .int => |i| @floatFromInt(i),
+                            else => return error.TypeError,
+                        };
+                        const by_f: f64 = switch (by_v) {
+                            .float => |f| f,
+                            .int => |i| @floatFromInt(i),
+                            else => return error.TypeError,
+                        };
+                        if (by_f != 0 and !((by_f > 0 and from_f >= to_f) or (by_f < 0 and from_f <= to_f))) {
+                            try it.generateRangeValuesFloat(&results, from_f, to_f, by_f);
+                        }
+                    } else {
+                        const from_i: i64 = switch (from_v) {
+                            .int => |i| i,
+                            else => return error.TypeError,
+                        };
+                        const to_i: i64 = switch (to_v) {
+                            .int => |i| i,
+                            else => return error.TypeError,
+                        };
+                        const by_i: i64 = switch (by_v) {
+                            .int => |i| i,
+                            else => return error.TypeError,
+                        };
+                        if (by_i != 0 and !((by_i > 0 and from_i >= to_i) or (by_i < 0 and from_i <= to_i))) {
+                            try it.generateRangeValues(&results, from_i, to_i, by_i);
+                        }
+                    }
+                }
+            }
+        }
+
+        return try it.buildRuntimeArray(results.items);
+    }
+
+    /// `limit_gen`: for each n in [n_values], take first n elements from [f_outputs].
+    /// if_stack has [n_values], current is [f_outputs].
+    /// Returns a flat array of all results concatenated.
+    fn builtinLimitGen(it: *ResultIterator) ZqError!?StackValue {
+        const f_arr = it.current;
+        const n_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
+
+        const n_elems = try it.extractArrayElements(n_val);
+        defer it.alloc.free(n_elems);
+        const f_elems = try it.extractArrayElements(f_arr);
+        defer it.alloc.free(f_elems);
+
+        var results = std.ArrayList(Value){};
+        defer results.deinit(it.alloc);
+
+        for (n_elems) |n_v| {
+            const n: usize = switch (n_v) {
+                .int => |i| if (i < 0) 0 else @intCast(i),
+                .float => |f| if (f < 0) 0 else @intFromFloat(@round(f)),
+                else => return error.TypeError,
+            };
+            const take = @min(n, f_elems.len);
+            for (f_elems[0..take]) |elem| {
+                try results.append(it.alloc, elem);
+            }
+        }
+
+        return try it.buildRuntimeArray(results.items);
     }
 
     fn toInt(val: StackValue) ZqError!i64 {

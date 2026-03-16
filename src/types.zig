@@ -229,6 +229,11 @@ pub const BuiltinId = enum(u16) {
     format_sh,
     format_base64,
     format_base64d,
+    // Generator variants: take arrays of values and produce flat result arrays
+    range1_gen, // range([n1,n2,...]) — apply range to each, concatenate results
+    range2_gen, // range([from1,from2,...];[to1,to2,...]) — Cartesian product
+    range3_gen, // range([from1,...];[to1,...];[by1,...]) — Cartesian product
+    limit_gen, // limit([n1,n2,...]; f_collected_array)
 };
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────

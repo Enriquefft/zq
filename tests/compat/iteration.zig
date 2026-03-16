@@ -180,7 +180,7 @@ test "jq:L291 [range(0,1;3,4)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2, 0,1,2,3, 1,2, 1,2,3]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,0,1,2,3,1,2,1,2,3]", results[0]);
 }
 
 test "jq:L295 [range(0;10;3)]" {
@@ -232,7 +232,7 @@ test "jq:L307 [range(0,1;4,5;1,2)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,0,2, 0,1,2,3,4,0,2,4, 1,2,3,1,3, 1,2,3,4,1,3]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,3,0,2,0,1,2,3,4,0,2,4,1,2,3,1,3,1,2,3,4,1,3]", results[0]);
 }
 
 test "jq:L311 [while(.<100; .*2)]" {
