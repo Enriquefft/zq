@@ -251,7 +251,7 @@ build on that foundation for tighter memory profiles.
 
 | | Item | Detail |
 |---|------|--------|
-| [ ] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
+| [x] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
 | [x] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
 
 **Target:** RSS < 3x thread count × chunk size for per-record queries. Aggregation queries remain proportional to output size.
