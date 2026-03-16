@@ -219,6 +219,16 @@ pub const BuiltinId = enum(u16) {
     rindex,
     unique,
     unique_by,
+    format_text,
+    format_json,
+    format_csv,
+    format_tsv,
+    format_html,
+    format_uri,
+    format_urid,
+    format_sh,
+    format_base64,
+    format_base64d,
 };
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────

@@ -65,6 +65,11 @@ pub const Token = struct {
         // String literal
         string_lit, // "..."
 
+        // Format string support
+        at, // @
+        string_part, // string segment ending at \( interpolation
+        string_end, // final string segment after last ) of interpolation
+
         // Alternative operator
         double_slash, // //
 
@@ -252,16 +257,28 @@ pub const Lexer = struct {
             },
             '"' => {
                 l.pos += 1; // skip opening quote
+                const content_start = l.pos;
                 while (l.pos < l.src.len and l.src[l.pos] != '"') {
                     if (l.src[l.pos] == '\\') {
                         l.pos += 1; // skip backslash
                         if (l.pos >= l.src.len) return error.QuerySyntaxError;
+                        if (l.src[l.pos] == '(') {
+                            // String interpolation: return string_part for content before \(
+                            // Content is from after opening " to before the backslash
+                            const content_len = l.pos - 1 - content_start;
+                            l.pos += 1; // skip past '('
+                            return .{ .tag = .string_part, .offset = content_start, .len = content_len };
+                        }
                     }
                     l.pos += 1;
                 }
                 if (l.pos >= l.src.len) return error.QuerySyntaxError; // unterminated string
                 l.pos += 1; // skip closing quote
                 return .{ .tag = .string_lit, .offset = start, .len = l.pos - start };
+            },
+            '@' => {
+                l.pos += 1;
+                return .{ .tag = .at, .offset = start, .len = 1 };
             },
             'a'...'z', 'A'...'Z', '_' => {
                 l.pos += 1;
@@ -344,6 +361,31 @@ pub const Lexer = struct {
             .ident;
 
         return .{ .tag = tag, .offset = start, .len = len };
+    }
+
+    /// Called by the compiler after consuming `)` of a string interpolation.
+    /// Scans from current position for more string content until either
+    /// another \( (returns string_part) or closing " (returns string_end).
+    pub fn scanStringTail(l: *Lexer) ZqError!Token {
+        const content_start = l.pos;
+        while (l.pos < l.src.len and l.src[l.pos] != '"') {
+            if (l.src[l.pos] == '\\') {
+                l.pos += 1; // skip backslash
+                if (l.pos >= l.src.len) return error.QuerySyntaxError;
+                if (l.src[l.pos] == '(') {
+                    // Another interpolation: return string_part for content before \(
+                    const content_len = l.pos - 1 - content_start;
+                    l.pos += 1; // skip past '('
+                    return .{ .tag = .string_part, .offset = content_start, .len = content_len };
+                }
+            }
+            l.pos += 1;
+        }
+        if (l.pos >= l.src.len) return error.QuerySyntaxError; // unterminated string
+        // Found closing quote
+        const content_len = l.pos - content_start;
+        l.pos += 1; // skip closing quote
+        return .{ .tag = .string_end, .offset = content_start, .len = content_len };
     }
 
     fn skipWs(l: *Lexer) void {

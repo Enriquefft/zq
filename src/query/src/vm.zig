@@ -1874,6 +1874,16 @@ pub const ResultIterator = struct {
             .max_by => return try it.builtinMaxBy(),
             .unique_by => return try it.builtinUniqueBy(),
             .del => return try it.builtinDel(),
+            .format_text => return try it.builtinTostring(),
+            .format_json => return try it.builtinFormatJson(),
+            .format_csv => return try it.builtinFormatCsv(),
+            .format_tsv => return try it.builtinFormatTsv(),
+            .format_html => return try it.builtinFormatHtml(),
+            .format_uri => return try it.builtinFormatUri(),
+            .format_urid => return try it.builtinFormatUrid(),
+            .format_sh => return try it.builtinFormatSh(),
+            .format_base64 => return try it.builtinFormatBase64(),
+            .format_base64d => return try it.builtinFormatBase64d(),
         }
     }
 
@@ -3174,6 +3184,241 @@ pub const ResultIterator = struct {
         }
     }
 
+    // ── Format string builtins ─────────────────────────────────────────────
+
+    /// @json: serialize current value as compact JSON string (like tojson)
+    fn builtinFormatJson(it: *ResultIterator) ZqError!?StackValue {
+        var json_buf = std.ArrayList(u8){};
+        defer json_buf.deinit(it.alloc);
+        try serializeValueCompact(&json_buf, it.alloc, it.current);
+        const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @html: HTML-escape: & → &amp;, < → &lt;, > → &gt;, ' → &apos;, " → &quot;
+    fn builtinFormatHtml(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        for (s) |c| {
+            switch (c) {
+                '&' => try buf.appendSlice(it.alloc, "&amp;"),
+                '<' => try buf.appendSlice(it.alloc, "&lt;"),
+                '>' => try buf.appendSlice(it.alloc, "&gt;"),
+                '\'' => try buf.appendSlice(it.alloc, "&apos;"),
+                '"' => try buf.appendSlice(it.alloc, "&quot;"),
+                else => try buf.append(it.alloc, c),
+            }
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @uri: Percent-encode all bytes except A-Za-z0-9-._~, uppercase hex (%XX)
+    fn builtinFormatUri(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        for (s) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~') {
+                try buf.append(it.alloc, c);
+            } else {
+                var tmp: [3]u8 = undefined;
+                const hex = std.fmt.bufPrint(&tmp, "%{X:0>2}", .{c}) catch unreachable;
+                try buf.appendSlice(it.alloc, hex);
+            }
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @urid: Decode %XX sequences in a string
+    fn builtinFormatUrid(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        var i: usize = 0;
+        while (i < s.len) {
+            if (s[i] == '%' and i + 2 < s.len) {
+                const high = hexDigitVal(s[i + 1]);
+                const low = hexDigitVal(s[i + 2]);
+                if (high != null and low != null) {
+                    try buf.append(it.alloc, (high.? << 4) | low.?);
+                    i += 3;
+                    continue;
+                }
+            }
+            try buf.append(it.alloc, s[i]);
+            i += 1;
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @sh: Wrap in single quotes, escape ' as '\''
+    fn builtinFormatSh(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        try buf.append(it.alloc, '\'');
+        for (s) |c| {
+            if (c == '\'') {
+                try buf.appendSlice(it.alloc, "'\\''");
+            } else {
+                try buf.append(it.alloc, c);
+            }
+        }
+        try buf.append(it.alloc, '\'');
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @base64: Base64 encode the string
+    fn builtinFormatBase64(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        const encoder = std.base64.standard.Encoder;
+        const encoded_len = encoder.calcSize(s.len);
+        const buf = try it.alloc.alloc(u8, encoded_len);
+        defer it.alloc.free(buf);
+        const encoded = encoder.encode(buf, s);
+        const str_ref = try it.runtime_tape.internString(it.alloc, encoded);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @base64d: Base64 decode the string
+    fn builtinFormatBase64d(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(s) catch return error.TypeError;
+        var buf = try it.alloc.alloc(u8, decoded_len);
+        defer it.alloc.free(buf);
+        decoder.decode(buf, s) catch return error.TypeError;
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf[0..decoded_len]);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @csv: Array → CSV row. Strings double-quoted (internal " doubled to ""),
+    /// numbers/bools/null unquoted
+    fn builtinFormatCsv(it: *ResultIterator) ZqError!?StackValue {
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var first = true;
+        while (pos < end) {
+            if (!first) try buf.append(it.alloc, ',');
+            first = false;
+            const elem = tapeEntryToValue(span.tape, pos);
+            switch (elem) {
+                .string => |s| {
+                    try buf.append(it.alloc, '"');
+                    for (s) |c| {
+                        if (c == '"') {
+                            try buf.appendSlice(it.alloc, "\"\"");
+                        } else {
+                            try buf.append(it.alloc, c);
+                        }
+                    }
+                    try buf.append(it.alloc, '"');
+                },
+                .int => |n| {
+                    var tmp: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .float => |f| {
+                    var tmp: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .bool_val => |b| try buf.appendSlice(it.alloc, if (b) "true" else "false"),
+                .null_val => try buf.appendSlice(it.alloc, "null"),
+                else => return error.TypeError,
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// @tsv: Array → TSV row. Tab-separated, strings escape \t→\\t, \n→\\n, \r→\\r, \\→\\\\
+    fn builtinFormatTsv(it: *ResultIterator) ZqError!?StackValue {
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var first = true;
+        while (pos < end) {
+            if (!first) try buf.append(it.alloc, '\t');
+            first = false;
+            const elem = tapeEntryToValue(span.tape, pos);
+            switch (elem) {
+                .string => |s| {
+                    for (s) |c| {
+                        switch (c) {
+                            '\t' => try buf.appendSlice(it.alloc, "\\t"),
+                            '\n' => try buf.appendSlice(it.alloc, "\\n"),
+                            '\r' => try buf.appendSlice(it.alloc, "\\r"),
+                            '\\' => try buf.appendSlice(it.alloc, "\\\\"),
+                            else => try buf.append(it.alloc, c),
+                        }
+                    }
+                },
+                .int => |n| {
+                    var tmp: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .float => |f| {
+                    var tmp: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .bool_val => |b| try buf.appendSlice(it.alloc, if (b) "true" else "false"),
+                .null_val => try buf.appendSlice(it.alloc, "null"),
+                else => return error.TypeError,
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
     /// Helper: build a runtime tape array from a slice of Values.
     fn buildRuntimeArray(it: *ResultIterator, elems: []const Value) ZqError!StackValue {
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -3933,6 +4178,14 @@ fn jqContains(a: Value, b: Value) bool {
 }
 
 /// Recursively flatten nested arrays, appending non-array elements to `out`.
+/// Convert a hex digit character to its numeric value (0-15), or null if invalid.
+fn hexDigitVal(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
 fn flattenRecursive(span: Value.TapeSpan, out: *std.ArrayList(Value), alloc: std.mem.Allocator) error{OutOfMemory}!void {
     var pos = span.start + 1;
     const end = span.end - 1;
@@ -3952,14 +4205,29 @@ fn flattenRecursive(span: Value.TapeSpan, out: *std.ArrayList(Value), alloc: std
 
 /// Compact JSON serialization of a Value into a buffer (for tostring builtin).
 /// Append a JSON-encoded string (with surrounding quotes) to buf.
+/// Uses standard JSON escape sequences (\n, \t, \r, \b, \f) for common
+/// control characters, matching jq's output format.
 fn appendJsonString(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) error{OutOfMemory}!void {
     try buf.append(alloc, '"');
     for (s) |c| {
-        if (c == '"') try buf.appendSlice(alloc, "\\\"") else if (c == '\\') try buf.appendSlice(alloc, "\\\\") else if (c < 0x20) {
-            var tmp: [6]u8 = undefined;
-            const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(alloc, seq);
-        } else try buf.append(alloc, c);
+        switch (c) {
+            '"' => try buf.appendSlice(alloc, "\\\""),
+            '\\' => try buf.appendSlice(alloc, "\\\\"),
+            '\n' => try buf.appendSlice(alloc, "\\n"),
+            '\t' => try buf.appendSlice(alloc, "\\t"),
+            '\r' => try buf.appendSlice(alloc, "\\r"),
+            0x08 => try buf.appendSlice(alloc, "\\b"),
+            0x0C => try buf.appendSlice(alloc, "\\f"),
+            else => {
+                if (c < 0x20) {
+                    var tmp: [6]u8 = undefined;
+                    const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try buf.appendSlice(alloc, seq);
+                } else {
+                    try buf.append(alloc, c);
+                }
+            },
+        }
     }
     try buf.append(alloc, '"');
 }

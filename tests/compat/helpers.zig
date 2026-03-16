@@ -101,7 +101,9 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
     }
 }
 
-/// jq-compatible escaping.
+/// jq-compatible escaping: uses standard JSON escape sequences (\n, \t, \r, \b, \f)
+/// for common control characters, \uXXXX for other control characters, and outputs
+/// valid multi-byte UTF-8 sequences as literal bytes (matching jq's output format).
 pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
@@ -110,6 +112,11 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
             switch (byte) {
                 '"' => try buf.appendSlice(alloc, "\\\""),
                 '\\' => try buf.appendSlice(alloc, "\\\\"),
+                '\n' => try buf.appendSlice(alloc, "\\n"),
+                '\t' => try buf.appendSlice(alloc, "\\t"),
+                '\r' => try buf.appendSlice(alloc, "\\r"),
+                0x08 => try buf.appendSlice(alloc, "\\b"),
+                0x0C => try buf.appendSlice(alloc, "\\f"),
                 0x20, 0x21, 0x23...0x5B, 0x5D...0x7E => try buf.append(alloc, byte),
                 else => {
                     var tmp: [6]u8 = undefined;
@@ -119,6 +126,7 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
             }
             i += 1;
         } else {
+            // Non-ASCII: output valid UTF-8 sequences as literal bytes (jq behavior).
             const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
                 try buf.appendSlice(alloc, "\\ufffd");
                 i += 1;
@@ -129,23 +137,13 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
                 i += 1;
                 continue;
             }
-            const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
+            _ = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
                 try buf.appendSlice(alloc, "\\ufffd");
                 i += seq_len;
                 continue;
             };
-            if (cp <= 0xFFFF) {
-                var tmp: [6]u8 = undefined;
-                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{cp}) catch unreachable;
-                try buf.appendSlice(alloc, seq);
-            } else {
-                const adjusted = cp - 0x10000;
-                const high: u32 = 0xD800 + (adjusted >> 10);
-                const low: u32 = 0xDC00 + (adjusted & 0x3FF);
-                var tmp: [12]u8 = undefined;
-                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}\\u{x:0>4}", .{ high, low }) catch unreachable;
-                try buf.appendSlice(alloc, seq);
-            }
+            // Valid UTF-8 sequence: output as literal bytes
+            try buf.appendSlice(alloc, s[i..][0..seq_len]);
             i += seq_len;
         }
     }
