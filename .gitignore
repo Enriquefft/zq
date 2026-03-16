@@ -1,6 +1,8 @@
 .zig-cache/
 zig-out/
 *.o
+*.a
+/root
 
 # Generated outputs
 benchmarks/results/
