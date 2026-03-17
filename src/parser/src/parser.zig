@@ -17,7 +17,6 @@ pub const FeedResult = union(enum) {
 };
 
 const DEPTH_LIMIT: u32 = 512;
-const NUM_BUF_LEN: usize = 64;
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
@@ -88,8 +87,7 @@ pub const Parser = struct {
 
     // ── Number-parsing fields ─────────────────────────────────────────────
     num_sub: NumSubState,
-    num_buf: [NUM_BUF_LEN]u8,
-    num_len: u8,
+    num_buf: std.ArrayListUnmanaged(u8),
     num_is_float: bool,
 
     // ── Keyword-parsing fields ────────────────────────────────────────────
@@ -106,6 +104,8 @@ pub const Parser = struct {
         errdefer string_buf.deinit(allocator);
         var stack = try std.ArrayListUnmanaged(StackEntry).initCapacity(allocator, 64);
         errdefer stack.deinit(allocator);
+        var num_buf = try std.ArrayListUnmanaged(u8).initCapacity(allocator, 64);
+        errdefer num_buf.deinit(allocator);
 
         return Parser{
             .allocator = allocator,
@@ -121,8 +121,7 @@ pub const Parser = struct {
             .unicode_accum = 0,
             .unicode_surrogate = 0,
             .num_sub = .int,
-            .num_buf = undefined,
-            .num_len = 0,
+            .num_buf = num_buf,
             .num_is_float = false,
             .kw_kind = .kw_null,
             .kw_pos = 0,
@@ -133,6 +132,7 @@ pub const Parser = struct {
         p.tape_buf.deinit(p.allocator);
         p.string_buf.deinit(p.allocator);
         p.stack.deinit(p.allocator);
+        p.num_buf.deinit(p.allocator);
     }
 
     pub fn reset(p: *Parser) void {
@@ -147,7 +147,7 @@ pub const Parser = struct {
         p.unicode_count = 0;
         p.unicode_accum = 0;
         p.unicode_surrogate = 0;
-        p.num_len = 0;
+        p.num_buf.clearRetainingCapacity();
         p.num_is_float = false;
         p.kw_pos = 0;
     }
@@ -236,22 +236,22 @@ pub const Parser = struct {
                 p.state = .in_string;
             },
             '-' => {
-                p.num_buf[0] = '-';
-                p.num_len = 1;
+                p.num_buf.clearRetainingCapacity();
+                try p.num_buf.append(p.allocator, '-');
                 p.num_is_float = false;
                 p.num_sub = .neg;
                 p.state = .in_number;
             },
             '0' => {
-                p.num_buf[0] = '0';
-                p.num_len = 1;
+                p.num_buf.clearRetainingCapacity();
+                try p.num_buf.append(p.allocator, '0');
                 p.num_is_float = false;
                 p.num_sub = .leading_zero;
                 p.state = .in_number;
             },
             '1'...'9' => {
-                p.num_buf[0] = byte;
-                p.num_len = 1;
+                p.num_buf.clearRetainingCapacity();
+                try p.num_buf.append(p.allocator, byte);
                 p.num_is_float = false;
                 p.num_sub = .int;
                 p.state = .in_number;
@@ -621,10 +621,8 @@ pub const Parser = struct {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    fn numAppend(p: *Parser, byte: u8) error{InvalidNumber}!void {
-        if (p.num_len >= NUM_BUF_LEN) return error.InvalidNumber;
-        p.num_buf[p.num_len] = byte;
-        p.num_len += 1;
+    fn numAppend(p: *Parser, byte: u8) error{OutOfMemory}!void {
+        try p.num_buf.append(p.allocator, byte);
     }
 
     /// Finalize number on seeing a non-number byte; re-dispatch the byte.
@@ -638,7 +636,7 @@ pub const Parser = struct {
     }
 
     fn finalizeNumber(p: *Parser) (ZqError || error{OutOfMemory})!void {
-        const num_str = p.num_buf[0..p.num_len];
+        const num_str = p.num_buf.items;
         if (p.num_is_float) {
             const val = std.fmt.parseFloat(f64, num_str) catch return error.InvalidNumber;
             try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = val } });
