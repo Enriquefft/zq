@@ -181,7 +181,7 @@ test "jq:L2126 (.. | select(type == _object_ and has(_b_) and (.b | type..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\": {\"b\": 1}}", results[0]);
+    try std.testing.expectEqualStrings("{\"a\":{\"b\":1}}", results[0]);
 }
 
 test "jq:L2130 isempty(empty)" {

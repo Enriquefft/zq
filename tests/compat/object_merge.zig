@@ -72,12 +72,12 @@ test "jq:L2315 .[] | try (fromjson | isnan) catch ." {
     try std.testing.expectEqual(@as(usize, 8), results.len);
     try std.testing.expectEqualStrings("true", results[0]);
     try std.testing.expectEqualStrings("true", results[1]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 4 (while parsing 'NaN1')\"", results[2]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 5 (while parsing 'NaN10')\"", results[3]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 6 (while parsing 'NaN100')\"", results[4]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 7 (while parsing 'NaN1000')\"", results[5]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 8 (while parsing 'NaN10000')\"", results[6]);
-    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1, column 9 (while parsing 'NaN100000')\"", results[7]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 4 (while parsing 'NaN1')\"", results[2]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 5 (while parsing 'NaN10')\"", results[3]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 6 (while parsing 'NaN100')\"", results[4]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 7 (while parsing 'NaN1000')\"", results[5]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 8 (while parsing 'NaN10000')\"", results[6]);
+    try std.testing.expectEqualStrings("\"Invalid numeric literal at EOF at line 1,column 9 (while parsing 'NaN100000')\"", results[7]);
 }
 
 test "jq:L2328 try input catch ." {
@@ -208,7 +208,7 @@ test "jq:L2368 {foo: _bar_} | .foo |= .?" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"foo\": \"bar\"}", results[0]);
+    try std.testing.expectEqualStrings("{\"foo\":\"bar\"}", results[0]);
 }
 
 test "jq:L2373 . |= try 2" {
@@ -247,7 +247,7 @@ test "jq:L2381 .[] |= try tonumber" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1, 3, 6.7, 0.89, -876, 5.43, 21]", results[0]);
+    try std.testing.expectEqualStrings("[1,3,6.7,0.89,-876,5.43,21]", results[0]);
 }
 
 test "jq:L2386 any(keys[]|tostring?;true)" {
@@ -286,7 +286,7 @@ test "jq:L2398 map(try implode catch .)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"implode input must be an array\",\"string (\\\"a\\\") can't be imploded, unicode codepoint needs to be numeric\",\"number (null) can't be imploded, unicode codepoint needs to be numeric\"]", results[0]);
+    try std.testing.expectEqualStrings("[\"implode input must be an array\",\"string (\\\"a\\\") can't be imploded,unicode codepoint needs to be numeric\",\"number (null) can't be imploded,unicode codepoint needs to be numeric\"]", results[0]);
 }
 
 test "jq:L2402 try 0[implode] catch ." {

@@ -67,6 +67,35 @@ const Ctx = struct {
     next_var_id: u32 = 0,
     next_func_id: u32 = 0,
 
+    // Active filter arg bindings for function body re-parsing
+    filter_arg_bindings: std.ArrayList(FilterArgBinding) = std.ArrayList(FilterArgBinding){},
+
+    // When true, function calls are parsed for syntax but not expanded.
+    // Used during the initial body parse in parseFunctionDef where we only
+    // need to advance the lexer and detect recursion patterns.
+    scanning_body: bool = false,
+
+    // Index into function_table of the recursive function currently being expanded.
+    // null means we're not inside a recursive expansion. When set, self-references
+    // emit call_function instead of trying to expand (which would infinite-loop).
+    expanding_recursive_func: ?usize = null,
+
+    // Lexical scoping: defines a "hidden range" in the function table.
+    // Functions with index in [func_hidden_start, func_hidden_end) are skipped
+    // during lookup. This implements jq's lexical scoping: when re-parsing a
+    // function body, definitions made AFTER the function was defined (but before
+    // the current re-parse started inner defs) are hidden.
+    func_hidden_start: ?usize = null,
+    func_hidden_end: ?usize = null,
+
+    // Temporary pattern allocations (freed after compilation)
+    pattern_allocs: std.ArrayList([]const Pattern) = std.ArrayList([]const Pattern){},
+    pattern_obj_allocs: std.ArrayList([]const ObjectPatternField) = std.ArrayList([]const ObjectPatternField){},
+    pattern_raw_allocs: std.ArrayList([]const RawInstr) = std.ArrayList([]const RawInstr){},
+
+    // Label variable IDs for compile-time break validation
+    label_var_ids: std.ArrayList(u32) = std.ArrayList(u32){},
+
     // Source offset tracking for error diagnostics
     last_tok_offset: u32 = 0,
     error_offset: u32 = 0,
@@ -94,6 +123,20 @@ const Ctx = struct {
         ctx.error_len = len;
         return error.QuerySyntaxError;
     }
+
+    /// Allocate and track a Pattern slice (freed after compilation).
+    fn dupePatterns(ctx: *Ctx, items: []const Pattern) error{OutOfMemory}![]const Pattern {
+        const owned = try ctx.alloc.dupe(Pattern, items);
+        try ctx.pattern_allocs.append(ctx.alloc, owned);
+        return owned;
+    }
+
+    /// Allocate and track an ObjectPatternField slice (freed after compilation).
+    fn dupeObjFields(ctx: *Ctx, items: []const ObjectPatternField) error{OutOfMemory}![]const ObjectPatternField {
+        const owned = try ctx.alloc.dupe(ObjectPatternField, items);
+        try ctx.pattern_obj_allocs.append(ctx.alloc, owned);
+        return owned;
+    }
 };
 
 const VariableEntry = struct {
@@ -106,17 +149,39 @@ const VariableScope = struct {
     parent: ?*VariableScope,
 };
 
+/// Describes one parameter of a user-defined function.
+const ParamInfo = struct {
+    name: StrRef,
+    is_filter: bool, // true = filter arg (code), false = value arg ($var)
+    var_id: u32, // Variable ID (only meaningful for value args)
+};
+
 const FunctionEntry = struct {
     name: StrRef,
-    param_count: u8,
-    param_ids: []u32, // Variable IDs for parameters
-    body_start_raw: u32, // Raw instruction index where function body starts
-    def_func_raw_ip: u32, // Raw instruction index where def_function will be emitted
-    body_end_raw: u32, // Raw instruction index where function body ends
-    id: u32,
+    params: []ParamInfo, // Parameter descriptors
+    body_raw: []const RawInstr, // Unused at runtime; kept for potential future use
+    is_recursive: bool, // true if body references the function itself
+    /// Source range of the function body (for re-parsing during expansion).
+    body_src_start: u32,
+    body_src_end: u32,
+    /// For recursive functions: offset within the main instruction stream
+    /// where the body was emitted (set during call-site expansion).
+    /// 0 means not yet emitted.
+    recursive_body_ip: u32,
+    /// For recursive functions: the end IP (past return_function).
+    recursive_body_end_ip: u32,
+    /// Lexical scope snapshot: the function table length at the time this function
+    /// was defined. During body re-parsing, only functions with index < this value
+    /// are visible, implementing jq's lexical scoping for function references.
+    func_table_snapshot: usize,
+
+    fn paramCount(self: *const FunctionEntry) u8 {
+        return @intCast(self.params.len);
+    }
 
     fn deinit(self: *const FunctionEntry, alloc: std.mem.Allocator) void {
-        alloc.free(self.param_ids);
+        alloc.free(self.params);
+        if (self.body_raw.len > 0) alloc.free(self.body_raw);
     }
 };
 
@@ -124,6 +189,60 @@ const PathStep = struct {
     kind: enum { key, index },
     key: StrRef = .{ .offset = 0, .len = 0 },
     index: i64 = 0,
+};
+
+/// Maps a function parameter index to its runtime variable ID at a call site.
+const ValueVarBinding = struct {
+    param_idx: usize,
+    var_id: u32,
+};
+
+/// Represents a function call argument at a call site.
+/// For filter args, stores the source text range to re-parse at each expansion.
+/// For value args, stores pre-compiled instructions.
+const CallArg = struct {
+    /// Source byte range for re-parsing (used for filter args).
+    src_start: u32,
+    src_end: u32,
+    /// Pre-compiled instructions (used for value args).
+    instructions: []const RawInstr,
+    is_filter: bool,
+};
+
+/// Active filter argument binding during function body re-parsing.
+/// When an identifier matches a filter arg name, the compiler re-parses
+/// the arg's source range instead of emitting a field access.
+const FilterArgBinding = struct {
+    name: StrRef,
+    src_start: u32,
+    src_end: u32,
+};
+
+// ── Destructuring pattern types ──────────────────────────────────────────
+
+/// Represents a destructuring pattern for `as` bindings.
+/// Used in `expr as PATTERN | body`, `reduce expr as PATTERN (...)`,
+/// and `foreach expr as PATTERN (...)`.
+const Pattern = union(enum) {
+    /// Simple variable binding: `$var`
+    simple: u32, // var_id
+    /// Array destructuring: `[$a, $b, ...]`
+    array: []const Pattern,
+    /// Object destructuring: `{key: $var, ...}`
+    object: []const ObjectPatternField,
+};
+
+const ObjectPatternField = struct {
+    key: PatternKey,
+    pattern: Pattern,
+};
+
+const PatternKey = union(enum) {
+    /// Static key from identifier or string literal
+    static: StrRef,
+    /// Computed key from expression (only in single-phase `as` path).
+    /// Stores the raw instructions that compute the key string.
+    computed: []const RawInstr,
 };
 
 // ── Scope management ─────────────────────────────────────────────────────
@@ -147,19 +266,23 @@ fn popScope(ctx: *Ctx, alloc: std.mem.Allocator) void {
     ctx.current_scope = old_scope.parent orelse unreachable;
 }
 
-/// Declare a variable in the current scope
+/// Declare a variable in the current scope.
+/// If a variable with the same name already exists in the current scope,
+/// it is shadowed with a new variable ID (matching jq's `as` semantics
+/// where rebinding is allowed).
 fn declareVariable(ctx: *Ctx, name_ref: StrRef, alloc: std.mem.Allocator) (ZqError || error{OutOfMemory})!u32 {
-    // Check for duplicate in current scope
-    for (ctx.current_scope.variables.items) |var_entry| {
+    const var_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    // Check for duplicate in current scope — shadow by updating the entry.
+    for (ctx.current_scope.variables.items) |*var_entry| {
         const existing_name = ctx.intern.items[var_entry.name.offset..][0..var_entry.name.len];
         const new_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
         if (std.mem.eql(u8, existing_name, new_name)) {
-            return ctx.syntaxErr(ctx.last_tok_offset, 0); // Variable already declared in this scope
+            var_entry.id = var_id;
+            return var_id;
         }
     }
-
-    const var_id = ctx.next_var_id;
-    ctx.next_var_id += 1;
 
     try ctx.current_scope.variables.append(alloc, VariableEntry{
         .name = name_ref,
@@ -167,6 +290,24 @@ fn declareVariable(ctx: *Ctx, name_ref: StrRef, alloc: std.mem.Allocator) (ZqErr
     });
 
     return var_id;
+}
+
+/// Declare or reuse a variable in the current scope.
+/// If a variable with the same name already exists in the current scope,
+/// returns its existing var_id without allocating a new one. This is used
+/// by `?//` (destructuring alternative) where the same variable name may
+/// appear in multiple alternative patterns and must share a single slot.
+fn reuseOrDeclareVariable(ctx: *Ctx, name_ref: StrRef, alloc: std.mem.Allocator) (ZqError || error{OutOfMemory})!u32 {
+    // Check if the variable already exists in the current scope — reuse it.
+    for (ctx.current_scope.variables.items) |var_entry| {
+        const existing_name = ctx.intern.items[var_entry.name.offset..][0..var_entry.name.len];
+        const new_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
+        if (std.mem.eql(u8, existing_name, new_name)) {
+            return var_entry.id;
+        }
+    }
+    // Not found — allocate a new variable.
+    return declareVariable(ctx, name_ref, alloc);
 }
 
 /// Lookup a variable in the scope chain
@@ -185,52 +326,874 @@ fn lookupVariable(ctx: *Ctx, name_ref: StrRef) ?u32 {
     return null;
 }
 
+// ── Destructuring pattern parsing and emission ──────────────────────────
+
+/// Scan a destructuring pattern from the token stream, declaring all variables.
+/// This is the "scan phase" used by reduce/foreach where variables must be
+/// declared before the body is parsed. Does NOT support computed keys.
+fn scanAndDeclarePattern(ctx: *Ctx) (ZqError || error{OutOfMemory})!Pattern {
+    const peek = try ctx.lex.peek();
+
+    switch (peek.tag) {
+        .dollar => {
+            _ = try ctx.nextToken(); // consume $
+            const ident = try ctx.nextToken();
+            if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+            const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+            const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+            return Pattern{ .simple = var_id };
+        },
+        .lbracket => {
+            _ = try ctx.nextToken(); // consume [
+            var elements = std.ArrayList(Pattern){};
+            defer elements.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbracket) break;
+                const elem = try scanAndDeclarePattern(ctx);
+                try elements.append(ctx.alloc, elem);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume ]
+
+            if (elements.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupePatterns(elements.items);
+            return Pattern{ .array = owned };
+        },
+        .lbrace => {
+            _ = try ctx.nextToken(); // consume {
+            var fields = std.ArrayList(ObjectPatternField){};
+            defer fields.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbrace) break;
+                const field = try scanObjectPatternField(ctx);
+                try fields.append(ctx.alloc, field);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume }
+
+            if (fields.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupeObjFields(fields.items);
+            return Pattern{ .object = owned };
+        },
+        else => {
+            return ctx.syntaxErr(peek.offset, peek.len);
+        },
+    }
+}
+
+/// Like scanAndDeclarePattern but reuses existing variables in the current scope
+/// instead of shadowing them. Used by `?//` (destructuring alternative) for the
+/// second and subsequent patterns, so that shared variable names map to the same
+/// var_id across all alternatives.
+fn scanAndDeclarePatternReuse(ctx: *Ctx) (ZqError || error{OutOfMemory})!Pattern {
+    const peek = try ctx.lex.peek();
+
+    switch (peek.tag) {
+        .dollar => {
+            _ = try ctx.nextToken(); // consume $
+            const ident = try ctx.nextToken();
+            if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+            const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+            const var_id = try reuseOrDeclareVariable(ctx, name_ref, ctx.alloc);
+            return Pattern{ .simple = var_id };
+        },
+        .lbracket => {
+            _ = try ctx.nextToken(); // consume [
+            var elements = std.ArrayList(Pattern){};
+            defer elements.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbracket) break;
+                const elem = try scanAndDeclarePatternReuse(ctx);
+                try elements.append(ctx.alloc, elem);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume ]
+
+            if (elements.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupePatterns(elements.items);
+            return Pattern{ .array = owned };
+        },
+        .lbrace => {
+            _ = try ctx.nextToken(); // consume {
+            var fields = std.ArrayList(ObjectPatternField){};
+            defer fields.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbrace) break;
+                const field = try scanObjectPatternFieldReuse(ctx);
+                try fields.append(ctx.alloc, field);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume }
+
+            if (fields.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupeObjFields(fields.items);
+            return Pattern{ .object = owned };
+        },
+        else => {
+            return ctx.syntaxErr(peek.offset, peek.len);
+        },
+    }
+}
+
+/// Like scanObjectPatternField but uses reuseOrDeclareVariable.
+fn scanObjectPatternFieldReuse(ctx: *Ctx) (ZqError || error{OutOfMemory})!ObjectPatternField {
+    const peek = try ctx.lex.peek();
+
+    if (peek.tag == .dollar) {
+        _ = try ctx.nextToken();
+        const ident = try ctx.nextToken();
+        if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+        const var_id = try reuseOrDeclareVariable(ctx, name_ref, ctx.alloc);
+        return ObjectPatternField{
+            .key = .{ .static = name_ref },
+            .pattern = Pattern{ .simple = var_id },
+        };
+    }
+
+    if (peek.tag == .lparen) {
+        return ctx.syntaxErr(peek.offset, peek.len);
+    }
+
+    const key_ref = try parseStaticPatternKey(ctx);
+    const colon = try ctx.nextToken();
+    if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+    const sub_pattern = try scanAndDeclarePatternReuse(ctx);
+
+    return ObjectPatternField{
+        .key = .{ .static = key_ref },
+        .pattern = sub_pattern,
+    };
+}
+
+/// Parse a single object pattern field (used by scanAndDeclarePattern).
+/// Handles: `key: PATTERN`, `"key": PATTERN`, `$var` (shorthand).
+/// Does NOT handle computed keys `(expr): PATTERN`.
+fn scanObjectPatternField(ctx: *Ctx) (ZqError || error{OutOfMemory})!ObjectPatternField {
+    const peek = try ctx.lex.peek();
+
+    if (peek.tag == .dollar) {
+        _ = try ctx.nextToken();
+        const ident = try ctx.nextToken();
+        if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+        const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+        return ObjectPatternField{
+            .key = .{ .static = name_ref },
+            .pattern = Pattern{ .simple = var_id },
+        };
+    }
+
+    if (peek.tag == .lparen) {
+        return ctx.syntaxErr(peek.offset, peek.len);
+    }
+
+    const key_ref = try parseStaticPatternKey(ctx);
+    const colon = try ctx.nextToken();
+    if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+    const sub_pattern = try scanAndDeclarePattern(ctx);
+
+    return ObjectPatternField{
+        .key = .{ .static = key_ref },
+        .pattern = sub_pattern,
+    };
+}
+
+/// Parse a static key name (identifier, keyword, or string literal) and return its interned ref.
+fn parseStaticPatternKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!StrRef {
+    const tok = try ctx.nextToken();
+    if (tok.tag == .string_lit) {
+        const raw = tok.slice(ctx.src);
+        const content = raw[1 .. raw.len - 1];
+        return internDecodedStr(&ctx.intern, ctx.alloc, content);
+    }
+    if (tok.tag == .ident or tok.tag == .and_kw or tok.tag == .or_kw or
+        tok.tag == .not_kw or tok.tag == .true_kw or tok.tag == .false_kw or
+        tok.tag == .def_kw or tok.tag == .as_kw or tok.tag == .reduce_kw or
+        tok.tag == .if_kw or tok.tag == .then_kw or tok.tag == .elif_kw or
+        tok.tag == .else_kw or tok.tag == .end_kw or
+        tok.tag == .try_kw or tok.tag == .catch_kw or
+        tok.tag == .label_kw or tok.tag == .break_kw)
+    {
+        return internStr(&ctx.intern, ctx.alloc, tok.slice(ctx.src));
+    }
+    return ctx.syntaxErr(tok.offset, tok.len);
+}
+
+/// Emit bytecode to destructure the current value into pattern variables.
+/// The value to destructure should be on the value_stack (just pushed by
+/// load_key/load_index/etc, or push_current for iterate elements).
+///
+/// For a simple pattern, emits capture_variable.
+/// For array/object patterns, emits save/restore_input pairs with indexed/keyed
+/// extraction wrapped in try/catch for null-on-missing semantics.
+fn emitPatternCapture(ctx: *Ctx, pattern: Pattern) (ZqError || error{OutOfMemory})!void {
+    switch (pattern) {
+        .simple => |var_id| {
+            try ctx.emit(.capture_variable, .{ .index = var_id });
+        },
+        .array => |elements| {
+            // The value to destructure is on value_stack. Pop it to current via pipe.
+            try ctx.emit(.pipe, .{ .none = {} });
+
+            for (elements, 0..) |elem, idx| {
+                try ctx.emit(.save_input, .{ .none = {} });
+
+                // Wrap extraction in try/catch for null-on-missing
+                const try_pos = ctx.raw.items.len;
+                try ctx.emit(.try_begin, .{ .index = 0 });
+
+                try ctx.emit(.load_index, .{ .index = @intCast(idx) });
+
+                const try_end_pos = ctx.raw.items.len;
+                try ctx.emit(.try_end, .{ .index = 0 });
+
+                // Catch handler: push null to value_stack
+                const catch_ip: u32 = @intCast(ctx.raw.items.len);
+                ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                try ctx.emit(.push_null, .{ .none = {} });
+
+                // Continue label
+                const continue_ip: u32 = @intCast(ctx.raw.items.len);
+                ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+
+                // Recursively capture sub-pattern
+                try emitPatternCapture(ctx, elem);
+
+                try ctx.emit(.restore_input, .{ .none = {} });
+            }
+        },
+        .object => |fields| {
+            // The value to destructure is on value_stack. Pop it to current via pipe.
+            try ctx.emit(.pipe, .{ .none = {} });
+
+            for (fields) |field| {
+                try ctx.emit(.save_input, .{ .none = {} });
+
+                switch (field.key) {
+                    .static => |key_ref| {
+                        const try_pos = ctx.raw.items.len;
+                        try ctx.emit(.try_begin, .{ .index = 0 });
+
+                        try ctx.emit(.load_key, .{ .str_ref = key_ref });
+
+                        const try_end_pos = ctx.raw.items.len;
+                        try ctx.emit(.try_end, .{ .index = 0 });
+
+                        const catch_ip: u32 = @intCast(ctx.raw.items.len);
+                        ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                        try ctx.emit(.push_null, .{ .none = {} });
+
+                        const continue_ip: u32 = @intCast(ctx.raw.items.len);
+                        ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+                    },
+                    .computed => |instrs| {
+                        const try_pos = ctx.raw.items.len;
+                        try ctx.emit(.try_begin, .{ .index = 0 });
+
+                        // save_input for load_computed (pops base from if_stack)
+                        try ctx.emit(.save_input, .{ .none = {} });
+
+                        // Copy the saved key expression instructions
+                        for (instrs) |instr| {
+                            try ctx.raw.append(ctx.alloc, instr);
+                        }
+
+                        try ctx.emit(.load_computed, .{ .none = {} });
+                        // load_computed sets current, push it to value_stack
+                        try ctx.emit(.push_current, .{ .none = {} });
+
+                        const try_end_pos = ctx.raw.items.len;
+                        try ctx.emit(.try_end, .{ .index = 0 });
+
+                        const catch_ip: u32 = @intCast(ctx.raw.items.len);
+                        ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                        try ctx.emit(.push_null, .{ .none = {} });
+
+                        const continue_ip: u32 = @intCast(ctx.raw.items.len);
+                        ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+                    },
+                }
+
+                try emitPatternCapture(ctx, field.pattern);
+
+                try ctx.emit(.restore_input, .{ .none = {} });
+            }
+        },
+    }
+}
+
+/// Emit bytecode to destructure the current value into pattern variables,
+/// WITHOUT wrapping index/key lookups in try/catch. If the value's type does
+/// not match the pattern structure (e.g., indexing an array on a string),
+/// the load_key/load_index will produce a TypeError that propagates to the
+/// caller's try_begin/try_end. Used by `?//` (destructuring alternative).
+fn emitPatternCaptureStrict(ctx: *Ctx, pattern: Pattern) (ZqError || error{OutOfMemory})!void {
+    switch (pattern) {
+        .simple => |var_id| {
+            try ctx.emit(.capture_variable, .{ .index = var_id });
+        },
+        .array => |elements| {
+            try ctx.emit(.pipe, .{ .none = {} });
+
+            for (elements, 0..) |elem, idx| {
+                try ctx.emit(.save_input, .{ .none = {} });
+
+                // No try/catch — let TypeError propagate to outer handler
+                try ctx.emit(.load_index, .{ .index = @intCast(idx) });
+
+                try emitPatternCaptureStrict(ctx, elem);
+
+                try ctx.emit(.restore_input, .{ .none = {} });
+            }
+        },
+        .object => |fields| {
+            try ctx.emit(.pipe, .{ .none = {} });
+
+            for (fields) |field| {
+                try ctx.emit(.save_input, .{ .none = {} });
+
+                switch (field.key) {
+                    .static => |key_ref| {
+                        // No try/catch — let TypeError propagate to outer handler
+                        try ctx.emit(.load_key, .{ .str_ref = key_ref });
+                    },
+                    .computed => |instrs| {
+                        // No try/catch — let TypeError propagate to outer handler
+                        try ctx.emit(.save_input, .{ .none = {} });
+                        for (instrs) |instr| {
+                            try ctx.raw.append(ctx.alloc, instr);
+                        }
+                        try ctx.emit(.load_computed, .{ .none = {} });
+                        try ctx.emit(.push_current, .{ .none = {} });
+                    },
+                }
+
+                try emitPatternCaptureStrict(ctx, field.pattern);
+
+                try ctx.emit(.restore_input, .{ .none = {} });
+            }
+        },
+    }
+}
+
+/// Parse a destructuring pattern AND emit the capture bytecode in one pass.
+/// Used by `parseLogical` for `expr as PATTERN | body` where body comes after
+/// the pattern. Supports computed keys `(expr): $var`.
+fn parseAndEmitPattern(ctx: *Ctx) (ZqError || error{OutOfMemory})!Pattern {
+    const peek = try ctx.lex.peek();
+
+    switch (peek.tag) {
+        .dollar => {
+            _ = try ctx.nextToken();
+            const ident = try ctx.nextToken();
+            if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+            const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+            const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+            try ctx.emit(.capture_variable, .{ .index = var_id });
+            return Pattern{ .simple = var_id };
+        },
+        .lbracket => {
+            _ = try ctx.nextToken(); // consume [
+            var elements = std.ArrayList(Pattern){};
+            defer elements.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbracket) break;
+                const elem = try scanAndDeclarePatternWithComputed(ctx);
+                try elements.append(ctx.alloc, elem);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume ]
+
+            if (elements.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupePatterns(elements.items);
+            const pattern = Pattern{ .array = owned };
+            try emitPatternCapture(ctx, pattern);
+            return pattern;
+        },
+        .lbrace => {
+            _ = try ctx.nextToken(); // consume {
+            var fields = std.ArrayList(ObjectPatternField){};
+            defer fields.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbrace) break;
+                const field = try scanObjectPatternFieldWithComputed(ctx);
+                try fields.append(ctx.alloc, field);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken(); // consume }
+
+            if (fields.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupeObjFields(fields.items);
+            const pattern = Pattern{ .object = owned };
+            try emitPatternCapture(ctx, pattern);
+            return pattern;
+        },
+        else => {
+            return ctx.syntaxErr(peek.offset, peek.len);
+        },
+    }
+}
+
+/// Like scanAndDeclarePattern but supports computed keys.
+fn scanAndDeclarePatternWithComputed(ctx: *Ctx) (ZqError || error{OutOfMemory})!Pattern {
+    const peek = try ctx.lex.peek();
+
+    switch (peek.tag) {
+        .dollar => {
+            _ = try ctx.nextToken();
+            const ident = try ctx.nextToken();
+            if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+            const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+            const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+            return Pattern{ .simple = var_id };
+        },
+        .lbracket => {
+            _ = try ctx.nextToken();
+            var elements = std.ArrayList(Pattern){};
+            defer elements.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbracket) break;
+                const elem = try scanAndDeclarePatternWithComputed(ctx);
+                try elements.append(ctx.alloc, elem);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken();
+
+            if (elements.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupePatterns(elements.items);
+            return Pattern{ .array = owned };
+        },
+        .lbrace => {
+            _ = try ctx.nextToken();
+            var fields = std.ArrayList(ObjectPatternField){};
+            defer fields.deinit(ctx.alloc);
+
+            while (true) {
+                const next = try ctx.lex.peek();
+                if (next.tag == .rbrace) break;
+                const field = try scanObjectPatternFieldWithComputed(ctx);
+                try fields.append(ctx.alloc, field);
+                const after = try ctx.lex.peek();
+                if (after.tag == .comma) {
+                    _ = try ctx.nextToken();
+                }
+            }
+            _ = try ctx.nextToken();
+
+            if (fields.items.len == 0) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+
+            const owned = try ctx.dupeObjFields(fields.items);
+            return Pattern{ .object = owned };
+        },
+        else => {
+            return ctx.syntaxErr(peek.offset, peek.len);
+        },
+    }
+}
+
+/// Parse an object pattern field, supporting computed keys `(expr): PATTERN`.
+fn scanObjectPatternFieldWithComputed(ctx: *Ctx) (ZqError || error{OutOfMemory})!ObjectPatternField {
+    const peek = try ctx.lex.peek();
+
+    if (peek.tag == .dollar) {
+        _ = try ctx.nextToken();
+        const ident = try ctx.nextToken();
+        if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+        const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+        return ObjectPatternField{
+            .key = .{ .static = name_ref },
+            .pattern = Pattern{ .simple = var_id },
+        };
+    }
+
+    if (peek.tag == .lparen) {
+        _ = try ctx.nextToken(); // consume (
+
+        // Compile the key expression into the raw buffer temporarily
+        const start: u32 = @intCast(ctx.raw.items.len);
+        try parsePipe(ctx);
+        const end: u32 = @intCast(ctx.raw.items.len);
+
+        // Validate: {(true):$foo} should fail at compile time because
+        // true is a boolean, not a valid key expression for destructuring.
+        if (end - start == 1) {
+            const only_instr = ctx.raw.items[start];
+            if (only_instr.op == .push_bool) {
+                return ctx.syntaxErr(peek.offset, peek.len);
+            }
+        }
+
+        // Save the instructions and truncate the raw buffer so the key expression
+        // doesn't appear in the normal instruction stream.
+        const saved_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[start..end]);
+        // Track for cleanup (use pattern_raw_allocs)
+        try ctx.pattern_raw_allocs.append(ctx.alloc, saved_instrs);
+        ctx.raw.items.len = start;
+
+        const rparen = try ctx.nextToken();
+        if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+        const colon = try ctx.nextToken();
+        if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+
+        const sub_pattern = try scanAndDeclarePatternWithComputed(ctx);
+
+        return ObjectPatternField{
+            .key = .{ .computed = saved_instrs },
+            .pattern = sub_pattern,
+        };
+    }
+
+    const key_ref = try parseStaticPatternKey(ctx);
+    const colon = try ctx.nextToken();
+    if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+    const sub_pattern = try scanAndDeclarePatternWithComputed(ctx);
+
+    return ObjectPatternField{
+        .key = .{ .static = key_ref },
+        .pattern = sub_pattern,
+    };
+}
+
+/// Collect all variable IDs from a pattern (for pop_variable cleanup).
+fn collectPatternVarIds(pattern: Pattern, list: *std.ArrayList(u32), alloc: std.mem.Allocator) error{OutOfMemory}!void {
+    switch (pattern) {
+        .simple => |var_id| {
+            try list.append(alloc, var_id);
+        },
+        .array => |elements| {
+            for (elements) |elem| {
+                try collectPatternVarIds(elem, list, alloc);
+            }
+        },
+        .object => |fields| {
+            for (fields) |field| {
+                try collectPatternVarIds(field.pattern, list, alloc);
+            }
+        },
+    }
+}
+
 // ── Function management ──────────────────────────────────────────────────
 
-/// Define a function in the function table
-fn defineFunctionWithBody(ctx: *Ctx, name_ref: StrRef, param_ids: []u32, body_start_raw: u32, body_end_raw: u32, def_func_raw_ip: u32, alloc: std.mem.Allocator) error{OutOfMemory}!u32 {
-    const func_id = ctx.next_func_id;
-    ctx.next_func_id += 1;
-
-    // Copy param_ids since they need to outlive the current parsing scope
-    const param_copy = try alloc.dupe(u32, param_ids);
+/// Register a user-defined function. `params` and `body_raw` are duped.
+fn registerFunction(
+    ctx: *Ctx,
+    name_ref: StrRef,
+    params: []const ParamInfo,
+    body_raw: []const RawInstr,
+    is_recursive: bool,
+    body_src_start: u32,
+    body_src_end: u32,
+    alloc: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const params_copy = try alloc.dupe(ParamInfo, params);
+    // Only store body_raw for recursive functions (needed for call_function target).
+    // Non-recursive functions re-parse from source during expansion.
+    const body_copy = if (is_recursive) try alloc.dupe(RawInstr, body_raw) else &[_]RawInstr{};
 
     try ctx.function_table.append(alloc, FunctionEntry{
         .name = name_ref,
-        .param_count = @intCast(param_ids.len),
-        .param_ids = param_copy,
-        .body_start_raw = body_start_raw,
-        .def_func_raw_ip = def_func_raw_ip,
-        .body_end_raw = body_end_raw,
-        .id = func_id,
+        .params = params_copy,
+        .body_raw = body_copy,
+        .is_recursive = is_recursive,
+        .body_src_start = body_src_start,
+        .body_src_end = body_src_end,
+        .recursive_body_ip = 0,
+        .recursive_body_end_ip = 0,
+        .func_table_snapshot = ctx.function_table.items.len,
     });
-
-    return func_id;
 }
 
-/// Lookup a function by name
-fn lookupFunction(ctx: *Ctx, name_ref: StrRef) ?u32 {
-    for (ctx.function_table.items) |func| {
+/// Lookup a function by name AND arity. Searches backward so the latest
+/// definition (shadowing) wins. Returns the index into function_table.
+/// Respects the hidden range [func_hidden_start, func_hidden_end) for
+/// lexical scoping during function body re-parsing.
+fn lookupFunction(ctx: *Ctx, name_ref: StrRef, arity: u8) ?usize {
+    const lookup_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
+    var i: usize = ctx.function_table.items.len;
+    while (i > 0) {
+        i -= 1;
+        // Lexical scoping: skip functions in the hidden range.
+        if (ctx.func_hidden_start) |start| {
+            if (ctx.func_hidden_end) |end| {
+                if (i >= start and i < end) continue;
+            }
+        }
+        const func = &ctx.function_table.items[i];
         const func_name = ctx.intern.items[func.name.offset..][0..func.name.len];
-        const lookup_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
-        if (std.mem.eql(u8, func_name, lookup_name)) {
-            return func.id;
+        if (std.mem.eql(u8, func_name, lookup_name) and func.paramCount() == arity) {
+            return i;
         }
     }
     return null;
+}
+
+/// Check if a function body contains a self-reference (recursive call).
+fn bodyIsSelfReferencing(ctx: *Ctx, name_ref: StrRef, arity: u8, body: []const RawInstr) bool {
+    const func_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
+    for (body) |instr| {
+        if (instr.op == .call_function) {
+            // The operand.index is used as a tag: -1 means "self-call" set during parsing
+            if (instr.operand.index == -1) return true;
+        } else if (instr.op == .call_filter_arg) {
+            // Filter arg references are not self-calls
+            continue;
+        } else if (instr.op == .load_key) {
+            // Check for bare ident that matches function name with arity 0
+            if (arity == 0) {
+                const key_name = ctx.intern.items[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                if (std.mem.eql(u8, key_name, func_name)) {
+                    // This could be a field access, not a function call.
+                    // We can't distinguish at this level, so we conservatively
+                    // don't flag load_key as self-reference.
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Inline-expand a function body into ctx.raw by re-parsing the body source
+/// with filter argument bindings active. This ensures that pipe-after-generator
+/// patterns are handled correctly by parsePipe's distribution logic.
+fn expandFunctionCall(ctx: *Ctx, func_idx: usize, call_args: []const CallArg) (ZqError || error{OutOfMemory})!void {
+    const func = &ctx.function_table.items[func_idx];
+
+    // For value args ($param), evaluate the arg expression and capture_variable.
+    var value_var_ids = std.ArrayList(ValueVarBinding){};
+    defer value_var_ids.deinit(ctx.alloc);
+
+    for (func.params, 0..) |param, pi| {
+        if (!param.is_filter) {
+            // Value arg: emit the argument expression, then capture_variable
+            if (pi < call_args.len) {
+                const ca = &call_args[pi];
+                for (ca.instructions) |instr| {
+                    try ctx.raw.append(ctx.alloc, instr);
+                }
+            }
+            const new_var_id = ctx.next_var_id;
+            ctx.next_var_id += 1;
+            try ctx.emit(.capture_variable, .{ .index = new_var_id });
+            try value_var_ids.append(ctx.alloc, .{ .param_idx = pi, .var_id = new_var_id });
+        }
+    }
+
+    if (func.is_recursive) {
+        // Recursive function: emit body once, use call_function for self-calls.
+        if (func.recursive_body_ip == 0) {
+            const jump_pos = ctx.raw.items.len;
+            try ctx.emit(.jump, .{ .index = 0 });
+
+            const body_start_ip: u32 = @intCast(ctx.raw.items.len);
+            func.recursive_body_ip = body_start_ip;
+
+            // Re-parse body from source with expanding_recursive_func set so that
+            // self-references emit call_function instead of trying to expand.
+            const saved_expanding = ctx.expanding_recursive_func;
+            ctx.expanding_recursive_func = func_idx;
+            try reParseBodyWithBindings(ctx, func, call_args, &value_var_ids);
+            ctx.expanding_recursive_func = saved_expanding;
+
+            try ctx.emit(.return_function, .{ .none = {} });
+            const body_end_ip: u32 = @intCast(ctx.raw.items.len);
+            func.recursive_body_end_ip = body_end_ip;
+
+            ctx.raw.items[jump_pos].operand = .{ .index = @intCast(body_end_ip) };
+            try ctx.emit(.call_function, .{ .index = @intCast(body_start_ip) });
+        } else {
+            try ctx.emit(.call_function, .{ .index = @intCast(func.recursive_body_ip) });
+        }
+    } else {
+        // Non-recursive: re-parse the body from source with filter arg bindings active.
+        try reParseBodyWithBindings(ctx, func, call_args, &value_var_ids);
+    }
+
+    // Pop value arg variables
+    for (value_var_ids.items) |vv| {
+        try ctx.emit(.pop_variable, .{ .index = vv.var_id });
+    }
+}
+
+/// Re-parse a function body from source with filter arg bindings active.
+/// This ensures that pipe-after-generator patterns are correctly handled.
+fn reParseBodyWithBindings(
+    ctx: *Ctx,
+    func: *const FunctionEntry,
+    call_args: []const CallArg,
+    value_var_ids: *const std.ArrayList(ValueVarBinding),
+) (ZqError || error{OutOfMemory})!void {
+    // Push filter arg bindings so parsePrimaryInner can resolve them.
+    const bindings_start = ctx.filter_arg_bindings.items.len;
+    for (func.params, 0..) |param, pi| {
+        if (param.is_filter and pi < call_args.len) {
+            try ctx.filter_arg_bindings.append(ctx.alloc, FilterArgBinding{
+                .name = param.name,
+                .src_start = call_args[pi].src_start,
+                .src_end = call_args[pi].src_end,
+            });
+        }
+    }
+
+    // Declare value arg variables in a new scope.
+    try pushScope(ctx, ctx.alloc);
+    for (value_var_ids.items) |vv| {
+        const param = func.params[vv.param_idx];
+        const var_id = try declareVariable(ctx, param.name, ctx.alloc);
+        // We already emitted capture_variable with vv.var_id, but need to
+        // ensure body references resolve to the same var_id.
+        // Update the scope entry to use the pre-allocated var_id.
+        for (ctx.current_scope.variables.items) |*ve| {
+            if (ve.id == var_id) {
+                ve.id = vv.var_id;
+                break;
+            }
+        }
+    }
+
+    // Save and redirect lexer to the body source range.
+    const saved_lex_pos = ctx.lex.pos;
+    ctx.lex.pos = func.body_src_start;
+
+    // Save function table length to scope inner defs.
+    const func_table_save = ctx.function_table.items.len;
+
+    // Set up lexical scoping: hide functions defined after this function but
+    // before the current re-parse. This ensures the body sees only functions
+    // that existed at definition time (jq's lexical scoping).
+    const saved_hidden_start = ctx.func_hidden_start;
+    const saved_hidden_end = ctx.func_hidden_end;
+    if (func.func_table_snapshot < func_table_save) {
+        ctx.func_hidden_start = func.func_table_snapshot;
+        ctx.func_hidden_end = func_table_save;
+    }
+
+    // Re-parse the body.
+    try parseFilter(ctx);
+
+    // Restore lexical scoping state.
+    ctx.func_hidden_start = saved_hidden_start;
+    ctx.func_hidden_end = saved_hidden_end;
+
+    // Restore lexer position.
+    ctx.lex.pos = saved_lex_pos;
+
+    // Remove inner defs from function table (they're scoped to this expansion).
+    while (ctx.function_table.items.len > func_table_save) {
+        const inner = ctx.function_table.pop().?;
+        inner.deinit(ctx.alloc);
+    }
+
+    // Pop the scope.
+    popScope(ctx, ctx.alloc);
+
+    // Pop filter arg bindings.
+    ctx.filter_arg_bindings.items.len = bindings_start;
 }
 
 // ── Token classification ──────────────────────────────────────────────────────
 
 /// Returns true if the token tag is valid as a variable name after `$`.
 /// Keywords are allowed as variable names in jq (e.g. `$if`, `$reduce`).
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+/// Check if a source range is a simple identifier that matches an active filter arg binding.
+/// If so, returns the binding's original source range (for pass-through propagation).
+fn resolveFilterArgPassthrough(ctx: *Ctx, src_start: u32, src_end: u32) ?*const FilterArgBinding {
+    if (src_start >= src_end) return null;
+    const arg_text = std.mem.trim(u8, ctx.src[src_start..src_end], " \t\r\n");
+    if (arg_text.len == 0) return null;
+    if (!isIdentStart(arg_text[0])) return null;
+    for (arg_text[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    // It's a simple identifier. Check against active filter arg bindings (innermost first).
+    var bk: usize = ctx.filter_arg_bindings.items.len;
+    while (bk > 0) {
+        bk -= 1;
+        const binding = &ctx.filter_arg_bindings.items[bk];
+        const bname = ctx.intern.items[binding.name.offset..][0..binding.name.len];
+        if (std.mem.eql(u8, bname, arg_text)) {
+            // Recursively resolve: the binding itself might point to another pass-through.
+            if (resolveFilterArgPassthrough(ctx, binding.src_start, binding.src_end)) |inner| {
+                return inner;
+            }
+            return binding;
+        }
+    }
+    return null;
+}
+
 fn isVarNameToken(tag: Token.Tag) bool {
     return tag == .ident or tag == .and_kw or tag == .or_kw or
         tag == .not_kw or tag == .true_kw or tag == .false_kw or
         tag == .def_kw or tag == .as_kw or tag == .reduce_kw or
         tag == .if_kw or tag == .then_kw or tag == .elif_kw or
         tag == .else_kw or tag == .end_kw or tag == .try_kw or
-        tag == .catch_kw;
+        tag == .catch_kw or tag == .label_kw or tag == .break_kw;
 }
 
 // ── Instruction insertion ─────────────────────────────────────────────────────
@@ -253,7 +1216,7 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .alt_check => {
+            .jump, .jump_if_false, .array_collect_start, .alt_check, .limit_start => {
                 if (r.operand.index >= p) r.operand.index += 1;
             },
             // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
@@ -264,11 +1227,10 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
             else => {},
         }
     }
-    // Fix up function-table body ranges.
+    // Fix up recursive function body IPs in the function table.
     for (ctx.function_table.items) |*func| {
-        if (func.body_start_raw >= p) func.body_start_raw += 1;
-        if (func.body_end_raw >= p) func.body_end_raw += 1;
-        if (func.def_func_raw_ip >= p) func.def_func_raw_ip += 1;
+        if (func.recursive_body_ip > 0 and func.recursive_body_ip >= p) func.recursive_body_ip += 1;
+        if (func.recursive_body_end_ip > 0 and func.recursive_body_end_ip >= p) func.recursive_body_end_ip += 1;
     }
 }
 
@@ -307,6 +1269,17 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         }
         ctx.function_table.deinit(alloc);
     }
+    defer ctx.label_var_ids.deinit(alloc);
+    defer ctx.filter_arg_bindings.deinit(alloc);
+    defer {
+        // Cleanup pattern allocations
+        for (ctx.pattern_allocs.items) |slice| alloc.free(slice);
+        ctx.pattern_allocs.deinit(alloc);
+        for (ctx.pattern_obj_allocs.items) |slice| alloc.free(slice);
+        ctx.pattern_obj_allocs.deinit(alloc);
+        for (ctx.pattern_raw_allocs.items) |slice| alloc.free(slice);
+        ctx.pattern_raw_allocs.deinit(alloc);
+    }
     // Freed unless fuse() consumes it (via toOwnedSlice). Covers both Zig
     // errors (OOM) and early `.err` CompileResult returns.
     var intern_consumed = false;
@@ -322,10 +1295,11 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         }
     }
 
-    // Pre-allocate: the intern buffer is bounded by 2× source length (keys + dot
-    // separators in fused paths). This prevents any reallocation during parsing,
-    // which would otherwise invalidate StrRef offsets that reference live slices.
-    try ctx.intern.ensureTotalCapacity(alloc, src.len * 2 + 16);
+    // Pre-allocate the intern buffer. With function body re-parsing, the same
+    // source identifiers may be interned multiple times (once per expansion),
+    // so we allocate generously to minimize reallocations. StrRef uses offsets
+    // (not pointers), so reallocation is safe for correctness.
+    try ctx.intern.ensureTotalCapacity(alloc, src.len * 8 + 256);
 
     // Pre-declare external variables in root scope
     var ext_var_ids = try alloc.alloc(u32, external_vars.len);
@@ -394,18 +1368,14 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    // Parse function definitions at the top level before the main expression
-    // Function definitions in jq are: def name(params): body;
-    // They can appear multiple times before the main query
-    while (true) {
-        const peek = try ctx.lex.peek();
-        if (peek.tag == .def_kw) {
-            // Parse function definition
-            try parseFunctionDef(ctx);
-        } else {
-            // Not a function definition, start parsing the main expression
-            break;
-        }
+    // Check for `def` keyword — function definitions can appear before any expression.
+    // In jq, `def f: body; expr` means: define f, then evaluate expr.
+    // `def` can also appear inline: `expr | def f: body; more_expr`.
+    const peek = try ctx.lex.peek();
+    if (peek.tag == .def_kw) {
+        _ = try ctx.nextToken(); // consume 'def'
+        try parseFunctionDef(ctx);
+        return;
     }
 
     try parsePipe(ctx);
@@ -431,18 +1401,25 @@ fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
             },
             .lbracket => {
                 _ = try ctx.nextToken();
-                const inner = try ctx.nextToken();
+                const inner = try ctx.lex.peek();
                 switch (inner.tag) {
                     .int_lit, .string_lit => {
+                        _ = try ctx.nextToken();
                         const close = try ctx.nextToken();
                         if (close.tag != .rbracket) return false;
+                        const sep = try ctx.lex.peek();
+                        if (sep.tag == .dot) _ = try ctx.nextToken();
+                    },
+                    .rbracket => {
+                        // .[] — iterate update
+                        _ = try ctx.nextToken();
                         const sep = try ctx.lex.peek();
                         if (sep.tag == .dot) _ = try ctx.nextToken();
                     },
                     else => return false,
                 }
             },
-            .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => return true,
+            .eq_assign, .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => return true,
             else => return false,
         }
     }
@@ -450,7 +1427,11 @@ fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
 
 /// Parse and emit an update-assignment expression.
 /// Called only when peekIsUpdateAssign() returned true.
-/// Handles: .path |= f, .path += rhs, .path -= rhs, etc.
+/// Handles: .path = rhs, .path |= f, .path += rhs, .path -= rhs, etc.
+///
+/// For `|=`: RHS is evaluated against the navigated value (current .path value).
+/// For `=`: RHS is evaluated against the original input (before navigation).
+/// For `+=`, `-=`, etc.: navigated_value OP rhs, where rhs is evaluated against original input.
 fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Consume the leading dot
     _ = try ctx.nextToken();
@@ -497,17 +1478,8 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     else => return ctx.syntaxErr(ctx.last_tok_offset, 0),
                 }
             },
-            .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => break,
+            .eq_assign, .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => break,
             else => break,
-        }
-    }
-
-    // Emit navigation: for each path step, save_input then navigate_key/index
-    for (path_steps.items) |step| {
-        try ctx.emit(.save_input, .{ .none = {} });
-        switch (step.kind) {
-            .key => try ctx.emit(.navigate_key, .{ .str_ref = step.key }),
-            .index => try ctx.emit(.navigate_index, .{ .index = step.index }),
         }
     }
 
@@ -515,47 +1487,102 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const assign_tok = try ctx.nextToken();
     ctx.last_tok_offset = assign_tok.offset;
 
-    // Parse RHS and emit arithmetic wrapper if needed
     switch (assign_tok.tag) {
-        .pipe_eq => try parseAlternative(ctx),
-        .plus_eq => {
+        .pipe_eq => {
+            // |= : navigate first, evaluate RHS against navigated value
+            try emitNavigation(ctx, path_steps.items);
             try parseAlternative(ctx);
-            try ctx.emit(.add, .{ .none = {} });
+            try emitUpdateChain(ctx, path_steps.items);
         },
-        .minus_eq => {
+        .eq_assign => {
+            // = : evaluate RHS against original input FIRST, then navigate
             try parseAlternative(ctx);
-            try ctx.emit(.sub, .{ .none = {} });
+            try emitNavigation(ctx, path_steps.items);
+            try emitUpdateChain(ctx, path_steps.items);
         },
-        .star_eq => {
+        .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq => {
+            // Compound assignment: navigated_value OP rhs(original_input)
+            // 1. Save original input in temp variable
+            const tmp_var_id = ctx.next_var_id;
+            ctx.next_var_id += 1;
+            try ctx.emit(.push_current, .{ .none = {} });
+            try ctx.emit(.capture_variable, .{ .index = tmp_var_id });
+
+            // 2. Navigate to target
+            try emitNavigation(ctx, path_steps.items);
+
+            // 3. Push navigated value (left operand for arithmetic)
+            try ctx.emit(.push_current, .{ .none = {} });
+
+            // 4. Restore original input as current for RHS evaluation
+            try ctx.emit(.load_variable, .{ .index = tmp_var_id });
+            try ctx.emit(.pipe, .{ .none = {} });
+
+            // 5. Evaluate RHS against original input
             try parseAlternative(ctx);
-            try ctx.emit(.mul, .{ .none = {} });
-        },
-        .slash_eq => {
-            try parseAlternative(ctx);
-            try ctx.emit(.div, .{ .none = {} });
-        },
-        .percent_eq => {
-            try parseAlternative(ctx);
-            try ctx.emit(.mod, .{ .none = {} });
+
+            // 6. Apply arithmetic: left=navigated, right=rhs_result
+            const arith_op: Instruction.Op = switch (assign_tok.tag) {
+                .plus_eq => .add,
+                .minus_eq => .sub,
+                .star_eq => .mul,
+                .slash_eq => .div,
+                .percent_eq => .mod,
+                else => unreachable,
+            };
+            try ctx.emit(arith_op, .{ .none = {} });
+
+            // 7. Update chain
+            try emitUpdateChain(ctx, path_steps.items);
         },
         .double_slash_eq => {
-            // .path //= rhs  →  .path |= (. // rhs)
+            // //= : .path //= rhs → if .path is truthy keep it, else set to rhs(original)
+            // Save original input in temp variable
+            const tmp_var_id = ctx.next_var_id;
+            ctx.next_var_id += 1;
+            try ctx.emit(.push_current, .{ .none = {} });
+            try ctx.emit(.capture_variable, .{ .index = tmp_var_id });
+
+            // Navigate
+            try emitNavigation(ctx, path_steps.items);
+
+            // Use alternative: . // rhs
             try ctx.emit(.alt_start, .{ .none = {} });
-            try ctx.emit(.identity, .{ .none = {} });
+            try ctx.emit(.push_current, .{ .none = {} });
             const check_pos = ctx.raw.items.len;
             try ctx.emit(.alt_check, .{ .index = 0 });
             try ctx.emit(.restore_input, .{ .none = {} });
+
+            // Restore original for RHS
+            try ctx.emit(.load_variable, .{ .index = tmp_var_id });
+            try ctx.emit(.pipe, .{ .none = {} });
             try parseAlternative(ctx);
             ctx.raw.items[check_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+            // Update chain
+            try emitUpdateChain(ctx, path_steps.items);
         },
         else => return ctx.syntaxErr(assign_tok.offset, assign_tok.len),
     }
+}
 
-    // Emit update instructions in REVERSE path order
-    var i = path_steps.items.len;
+/// Emit navigation instructions for a path: save_input + navigate_key/index for each step.
+fn emitNavigation(ctx: *Ctx, steps: []const PathStep) error{OutOfMemory}!void {
+    for (steps) |step| {
+        try ctx.emit(.save_input, .{ .none = {} });
+        switch (step.kind) {
+            .key => try ctx.emit(.navigate_key, .{ .str_ref = step.key }),
+            .index => try ctx.emit(.navigate_index, .{ .index = step.index }),
+        }
+    }
+}
+
+/// Emit update instructions in reverse path order.
+fn emitUpdateChain(ctx: *Ctx, steps: []const PathStep) error{OutOfMemory}!void {
+    var i = steps.len;
     while (i > 0) {
         i -= 1;
-        const step = path_steps.items[i];
+        const step = steps[i];
         switch (step.kind) {
             .key => try ctx.emit(.update_key, .{ .str_ref = step.key }),
             .index => try ctx.emit(.update_index, .{ .index = step.index }),
@@ -568,13 +1595,235 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try parseUpdateAssign(ctx);
         return;
     }
+    var left_start: usize = ctx.raw.items.len;
     try parseComma(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .pipe) break;
         _ = try ctx.nextToken();
-        try ctx.emit(.pipe, .{ .none = {} });
-        try parseComma(ctx);
+
+        // If the right side starts with `def`, delegate to parseFilter which
+        // handles function definitions. This supports `expr | def f: body; cont`.
+        const after_pipe = try ctx.lex.peek();
+        if (after_pipe.tag == .def_kw) {
+            try ctx.emit(.pipe, .{ .none = {} });
+            _ = try ctx.nextToken(); // consume 'def'
+            try parseFunctionDef(ctx);
+            break;
+        }
+
+        // Check if the left side contains generator outputs (comma expression).
+        // If so, we need to distribute the pipe over each generator branch.
+        // `(a, b) | c` becomes `(a | c), (b | c)` — each comma branch gets
+        // its own copy of the right side so that pipe semantics are correct.
+        if (leftSideHasOutput(ctx.raw.items[left_start..])) {
+            // Save the lexer position before parsing the right side.
+            // We'll re-parse the right side for each branch of the comma.
+            const right_src_start = ctx.lex.pos;
+
+            // Parse right side once to advance the lexer past it.
+            const right_raw_start: u32 = @intCast(ctx.raw.items.len);
+            try parseComma(ctx);
+            const right_src_end = ctx.lex.pos;
+
+            // Discard the right side instructions (we'll re-parse per branch).
+            ctx.raw.items.len = right_raw_start;
+
+            // Now restructure: extract the comma branches from the left side,
+            // and for each branch, emit: branch | right_side.
+            // The left side has the pattern:
+            //   save_input, <branch_0>, output, restore_input, <branch_1>
+            // For chained: save_input, save_input, <b0>, output, restore_input, <b1>, output, restore_input, <b2>
+
+            // Extract left side instructions.
+            const left_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[left_start..right_raw_start]);
+            defer ctx.alloc.free(left_instrs);
+            ctx.raw.items.len = left_start;
+
+            // Find the branches by splitting at top-level output instructions.
+            var branches = std.ArrayList([]const RawInstr){};
+            defer branches.deinit(ctx.alloc);
+
+            var branch_start: usize = 0;
+            var depth: u32 = 0;
+            var i: usize = 0;
+            while (i < left_instrs.len) : (i += 1) {
+                switch (left_instrs[i].op) {
+                    .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
+                    .array_collect_end, .try_end, .label_end, .limit_end => {
+                        if (depth > 0) depth -= 1;
+                    },
+                    .output => {
+                        if (depth == 0) {
+                            // Found a branch boundary.
+                            // Skip leading save_input instructions for this branch.
+                            var bs = branch_start;
+                            while (bs < i and left_instrs[bs].op == .save_input) bs += 1;
+                            try branches.append(ctx.alloc, left_instrs[bs..i]);
+                            // Skip past output and restore_input
+                            branch_start = i + 1;
+                            if (branch_start < left_instrs.len and left_instrs[branch_start].op == .restore_input)
+                                branch_start += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            // Last branch (no trailing output)
+            {
+                var bs = branch_start;
+                while (bs < left_instrs.len and left_instrs[bs].op == .save_input) bs += 1;
+                if (bs < left_instrs.len) {
+                    try branches.append(ctx.alloc, left_instrs[bs..left_instrs.len]);
+                }
+            }
+
+            // Emit: (branch_0 | right), (branch_1 | right), ...
+            for (branches.items, 0..) |branch, bi| {
+                if (bi > 0) {
+                    // Insert save_input before the previous branch at its start
+                    // and wrap with output/restore_input (comma semantics).
+                    try insertRawInstr(ctx, left_start, RawInstr{
+                        .op = .save_input,
+                        .operand = .{ .none = {} },
+                    });
+                    try ctx.emit(.output, .{ .none = {} });
+                    try ctx.emit(.restore_input, .{ .none = {} });
+                }
+
+                // Emit branch instructions
+                for (branch) |instr| {
+                    try ctx.raw.append(ctx.alloc, instr);
+                }
+
+                // Emit pipe
+                try ctx.emit(.pipe, .{ .none = {} });
+
+                // Re-parse the right side from source
+                const saved_lex_pos = ctx.lex.pos;
+                ctx.lex.pos = right_src_start;
+                try parseComma(ctx);
+                ctx.lex.pos = saved_lex_pos;
+            }
+
+            // Restore lexer position to after the right side
+            ctx.lex.pos = right_src_end;
+        } else {
+            try ctx.emit(.pipe, .{ .none = {} });
+            try parseComma(ctx);
+        }
+        left_start = ctx.raw.items.len;
+    }
+}
+
+/// Check if a raw instruction sequence contains `output` instructions at the
+/// top nesting level (not inside array_collect or try blocks). This indicates
+/// the expression is a generator (e.g., comma expression) whose outputs need
+/// special handling when used as the left side of a pipe.
+fn leftSideHasOutput(instrs: []const RawInstr) bool {
+    var depth: u32 = 0;
+    for (instrs) |instr| {
+        switch (instr.op) {
+            .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
+            .array_collect_end, .try_end, .label_end, .limit_end => {
+                if (depth > 0) depth -= 1;
+            },
+            .output => {
+                if (depth == 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Extract branches from a generator (comma expression) instruction sequence.
+/// If the sequence has no generators, returns a single branch (the whole slice).
+/// Each branch is a sub-slice of `instrs` between save_input/output boundaries.
+fn extractBranches(alloc: std.mem.Allocator, instrs: []const RawInstr) error{OutOfMemory}!std.ArrayList([]const RawInstr) {
+    var branches = std.ArrayList([]const RawInstr){};
+
+    if (!leftSideHasOutput(instrs)) {
+        try branches.append(alloc, instrs);
+        return branches;
+    }
+
+    var branch_start: usize = 0;
+    var depth: u32 = 0;
+    var i: usize = 0;
+    while (i < instrs.len) : (i += 1) {
+        switch (instrs[i].op) {
+            .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
+            .array_collect_end, .try_end, .label_end, .limit_end => {
+                if (depth > 0) depth -= 1;
+            },
+            .output => {
+                if (depth == 0) {
+                    var bs = branch_start;
+                    while (bs < i and instrs[bs].op == .save_input) bs += 1;
+                    try branches.append(alloc, instrs[bs..i]);
+                    branch_start = i + 1;
+                    if (branch_start < instrs.len and instrs[branch_start].op == .restore_input)
+                        branch_start += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    // Last branch (no trailing output)
+    {
+        var bs = branch_start;
+        while (bs < instrs.len and instrs[bs].op == .save_input) bs += 1;
+        if (bs < instrs.len) {
+            try branches.append(alloc, instrs[bs..]);
+        }
+    }
+
+    return branches;
+}
+
+/// Distribute a binary operation over generator branches (Cartesian product).
+/// `(a, b) OP (c, d)` becomes `(a OP c), (a OP d), (b OP c), (b OP d)`.
+/// Called when at least one operand contains generators (comma expressions).
+fn distributeBinaryOp(
+    ctx: *Ctx,
+    op: Instruction.Op,
+    emit_start: usize,
+    right_raw_start: usize,
+) (ZqError || error{OutOfMemory})!void {
+    // Copy left and right instructions before clearing
+    const left_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[emit_start..right_raw_start]);
+    defer ctx.alloc.free(left_instrs);
+    const right_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[right_raw_start..]);
+    defer ctx.alloc.free(right_instrs);
+
+    // Extract branches from each side
+    var left_branches = try extractBranches(ctx.alloc, left_instrs);
+    defer left_branches.deinit(ctx.alloc);
+    var right_branches = try extractBranches(ctx.alloc, right_instrs);
+    defer right_branches.deinit(ctx.alloc);
+
+    // Clear all instructions back to emit_start
+    ctx.raw.items.len = emit_start;
+
+    // Emit Cartesian product with comma semantics
+    var combo: usize = 0;
+    for (left_branches.items) |lbranch| {
+        for (right_branches.items) |rbranch| {
+            if (combo > 0) {
+                // Wrap previous combo: insert save_input at start, emit output + restore_input
+                try insertRawInstr(ctx, emit_start, .{ .op = .save_input, .operand = .{ .none = {} } });
+                try ctx.emit(.output, .{ .none = {} });
+                try ctx.emit(.restore_input, .{ .none = {} });
+            }
+
+            // Emit left branch, right branch, then the operation
+            for (lbranch) |instr| try ctx.raw.append(ctx.alloc, instr);
+            for (rbranch) |instr| try ctx.raw.append(ctx.alloc, instr);
+            try ctx.emit(op, .{ .none = {} });
+
+            combo += 1;
+        }
     }
 }
 
@@ -613,8 +1862,15 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try ctx.emit(.output, .{ .none = {} });
         try ctx.emit(.restore_input, .{ .none = {} });
 
-        // Parse the right expression
-        try parseAlternative(ctx);
+        // Parse the right expression. If it starts with `def`, use parseFilter
+        // to handle the definition (jq allows `a, def f: body; expr`).
+        const after_comma = try ctx.lex.peek();
+        if (after_comma.tag == .def_kw) {
+            _ = try ctx.nextToken(); // consume 'def'
+            try parseFunctionDef(ctx);
+        } else {
+            try parseAlternative(ctx);
+        }
     }
 }
 
@@ -660,51 +1916,212 @@ fn parseAlternative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// parseLogical: `or`, `and` (lowest precedence)
-/// Also handles `expr as $var` suffix
+/// Also handles `expr as PATTERN` suffix where PATTERN can be:
+///   $var           — simple variable binding
+///   [$a, $b, ...]  — array destructuring
+///   {key: $var}    — object destructuring (with static or computed keys)
 fn parseLogical(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseOr(ctx);
 
-    // Check for `as $var` suffix
+    // Check for `as PATTERN` suffix
     const t = try ctx.lex.peek();
     if (t.tag == .as_kw) {
-        _ = try ctx.nextToken();
-        const dollar = try ctx.nextToken();
-        if (dollar.tag != .dollar) return ctx.syntaxErr(dollar.offset, dollar.len);
-        const ident = try ctx.nextToken();
-        if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
+        _ = try ctx.nextToken(); // consume 'as'
 
-        const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
-        const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+        // Scan the first pattern (declare variables, no bytecode emission yet).
+        const first_pattern = try scanAndDeclarePattern(ctx);
 
-        // Emit capture instruction
+        // Check for `?//` (destructuring alternative operator).
+        if (try peekIsDestructAlt(ctx)) {
+            try parseDestructAlt(ctx, first_pattern);
+        } else {
+            // Normal `as PATTERN` — emit capture bytecode now.
+            try emitPatternCapture(ctx, first_pattern);
+        }
+    }
+}
+
+/// Returns true if the next two tokens are `?` followed by `//`,
+/// forming the `?//` destructuring alternative operator.
+/// Consumes both tokens if matched; otherwise restores the lexer position.
+fn peekIsDestructAlt(ctx: *Ctx) ZqError!bool {
+    const saved_pos = ctx.lex.pos;
+    const t1 = try ctx.lex.next();
+    if (t1.tag != .question) {
+        ctx.lex.pos = saved_pos;
+        return false;
+    }
+    const t2 = try ctx.lex.next();
+    if (t2.tag != .double_slash) {
+        ctx.lex.pos = saved_pos;
+        return false;
+    }
+    // Consumed `?//` — do NOT restore position.
+    return true;
+}
+
+/// Parse and compile a `?//` (destructuring alternative) chain.
+/// Called after the first pattern has been scanned and the first `?//` consumed.
+///
+/// Grammar: `expr as P1 ?// P2 ?// ... ?// Pn | body`
+///
+/// Semantics: evaluate `expr`, try to match against P1. If P1 fails (type
+/// error during destructuring), try P2, and so on. If all patterns fail,
+/// the expression produces empty (no output). Variables from ALL patterns
+/// are in scope in `body`; variables from non-matching patterns remain null.
+///
+/// Desugars to:
+///   push_null + capture_variable for each declared var (null-initialize)
+///   save_input                   (preserve expr result for each attempt)
+///   try_begin(catch_ip = P2)
+///     <strict capture P1>
+///   try_end(0)
+///   restore_input                (clean up saved input on success)
+///   jump(body)
+///   P2: restore_input
+///   try_begin(catch_ip = P3)
+///     <strict capture P2>
+///   try_end(0)
+///   restore_input
+///   jump(body)
+///   ...
+///   Pn: restore_input
+///   try_begin(catch_ip = empty)
+///     <strict capture Pn>
+///   try_end(0)
+///   restore_input
+///   jump(body)
+///   empty: restore_input
+///   call_builtin(empty)
+///   body: ...
+fn parseDestructAlt(ctx: *Ctx, first_pattern: Pattern) (ZqError || error{OutOfMemory})!void {
+    // Collect all patterns in the chain.
+    var patterns = std.ArrayList(Pattern){};
+    defer patterns.deinit(ctx.alloc);
+    try patterns.append(ctx.alloc, first_pattern);
+
+    // Scan remaining patterns, reusing variable names from the first.
+    while (true) {
+        const pat = try scanAndDeclarePatternReuse(ctx);
+        try patterns.append(ctx.alloc, pat);
+        // Check for another `?//`
+        if (!(try peekIsDestructAlt(ctx))) break;
+    }
+
+    // Collect all unique var_ids across all patterns.
+    var all_var_ids = std.ArrayList(u32){};
+    defer all_var_ids.deinit(ctx.alloc);
+    for (patterns.items) |pat| {
+        try collectPatternVarIds(pat, &all_var_ids, ctx.alloc);
+    }
+
+    // Null-initialize all variables so non-matching patterns produce null.
+    for (all_var_ids.items) |var_id| {
+        try ctx.emit(.push_null, .{ .none = {} });
         try ctx.emit(.capture_variable, .{ .index = var_id });
+    }
+
+    // The expr result is on the value stack. We need to save it for each attempt.
+    // Pipe it to current, then save_input for the first pattern attempt.
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    // Track jump positions that need backpatching to the body start.
+    var jump_to_body = std.ArrayList(usize){};
+    defer jump_to_body.deinit(ctx.alloc);
+
+    for (patterns.items, 0..) |pat, i| {
+        const is_last = (i == patterns.items.len - 1);
+
+        if (i > 0) {
+            // Catch target for the previous pattern's try_begin lands here.
+            // Restore input to get expr result back as current.
+            try ctx.emit(.restore_input, .{ .none = {} });
+            // Re-save for the next attempt (or for cleanup after last).
+            try ctx.emit(.save_input, .{ .none = {} });
+        }
+
+        // Wrap strict capture in try_begin/try_end.
+        const try_begin_pos = ctx.raw.items.len;
+        try ctx.emit(.try_begin, .{ .index = 0 });
+
+        // Push current to value_stack so emitPatternCaptureStrict can pipe it.
+        try ctx.emit(.push_current, .{ .none = {} });
+
+        // Emit strict pattern capture (errors propagate to try_begin's catch).
+        try emitPatternCaptureStrict(ctx, pat);
+
+        const try_end_pos = ctx.raw.items.len;
+        try ctx.emit(.try_end, .{ .index = 0 });
+
+        // Success path: restore saved input (clean up if_stack), jump to body.
+        try ctx.emit(.restore_input, .{ .none = {} });
+        const jmp_pos = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+        try jump_to_body.append(ctx.alloc, jmp_pos);
+
+        // Backpatch try_begin: catch_ip = next instruction (next pattern's restore or empty handler).
+        const catch_ip: u32 = @intCast(ctx.raw.items.len);
+        ctx.raw.items[try_begin_pos].operand = .{ .index = catch_ip };
+
+        // Backpatch try_end: after_ip = the restore_input after try_end (ip+1 is default for 0).
+        _ = try_end_pos; // try_end with operand 0 means ip+1, which is correct.
+
+        if (is_last) {
+            // All patterns failed — restore input and produce empty.
+            try ctx.emit(.restore_input, .{ .none = {} });
+            try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.empty) });
+        }
+    }
+
+    // Body starts here — backpatch all jump-to-body positions.
+    const body_ip: u32 = @intCast(ctx.raw.items.len);
+    for (jump_to_body.items) |jmp_pos| {
+        ctx.raw.items[jmp_pos].operand = .{ .index = body_ip };
     }
 }
 
 fn parseOr(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_raw_start: usize = ctx.raw.items.len;
     try parseAnd(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .or_kw) break;
         _ = try ctx.nextToken();
+        const right_raw_start: usize = ctx.raw.items.len;
         try parseAnd(ctx);
-        try ctx.emit(.or_op, .{ .none = {} });
+        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
+            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
+        {
+            try distributeBinaryOp(ctx, .or_op, left_raw_start, right_raw_start);
+        } else {
+            try ctx.emit(.or_op, .{ .none = {} });
+        }
     }
 }
 
 fn parseAnd(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_raw_start: usize = ctx.raw.items.len;
     try parseComparison(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .and_kw) break;
         _ = try ctx.nextToken();
+        const right_raw_start: usize = ctx.raw.items.len;
         try parseComparison(ctx);
-        try ctx.emit(.and_op, .{ .none = {} });
+        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
+            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
+        {
+            try distributeBinaryOp(ctx, .and_op, left_raw_start, right_raw_start);
+        } else {
+            try ctx.emit(.and_op, .{ .none = {} });
+        }
     }
 }
 
 /// parseComparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
 fn parseComparison(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_raw_start: usize = ctx.raw.items.len;
     try parseAdditive(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -718,13 +2135,21 @@ fn parseComparison(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
+        const right_raw_start: usize = ctx.raw.items.len;
         try parseAdditive(ctx);
-        try ctx.emit(op, .{ .none = {} });
+        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
+            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
+        {
+            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
+        } else {
+            try ctx.emit(op, .{ .none = {} });
+        }
     }
 }
 
 /// parseAdditive: `+`, `-`
 fn parseAdditive(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_raw_start: usize = ctx.raw.items.len;
     try parseMultiplicative(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -734,13 +2159,21 @@ fn parseAdditive(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
+        const right_raw_start: usize = ctx.raw.items.len;
         try parseMultiplicative(ctx);
-        try ctx.emit(op, .{ .none = {} });
+        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
+            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
+        {
+            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
+        } else {
+            try ctx.emit(op, .{ .none = {} });
+        }
     }
 }
 
 /// parseMultiplicative: `*`, `/`, `%`
 fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const left_raw_start: usize = ctx.raw.items.len;
     try parseUnary(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -751,8 +2184,15 @@ fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
+        const right_raw_start: usize = ctx.raw.items.len;
         try parseUnary(ctx);
-        try ctx.emit(op, .{ .none = {} });
+        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
+            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
+        {
+            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
+        } else {
+            try ctx.emit(op, .{ .none = {} });
+        }
     }
 }
 
@@ -796,6 +2236,80 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "any")) return .any;
     if (std.mem.eql(u8, name, "all")) return .all;
     if (std.mem.eql(u8, name, "unique")) return .unique;
+    if (std.mem.eql(u8, name, "paths")) return .paths;
+    if (std.mem.eql(u8, name, "leaf_paths")) return .leaf_paths;
+
+    // Math builtins (zero-arg)
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+    if (std.mem.eql(u8, name, "floor")) return .floor_;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil_;
+    if (std.mem.eql(u8, name, "round")) return .round_;
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt_;
+    if (std.mem.eql(u8, name, "fabs")) return .fabs_;
+    if (std.mem.eql(u8, name, "nan")) return .nan_;
+    if (std.mem.eql(u8, name, "infinite")) return .infinite_;
+    if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_;
+    if (std.mem.eql(u8, name, "isnan")) return .isnan_;
+    if (std.mem.eql(u8, name, "isnormal")) return .isnormal_;
+    if (std.mem.eql(u8, name, "exp")) return .exp_;
+    if (std.mem.eql(u8, name, "exp2")) return .exp2_;
+    if (std.mem.eql(u8, name, "exp10")) return .exp10_;
+    if (std.mem.eql(u8, name, "log")) return .log_;
+    if (std.mem.eql(u8, name, "log2")) return .log2_;
+    if (std.mem.eql(u8, name, "log10")) return .log10_;
+    if (std.mem.eql(u8, name, "cbrt")) return .cbrt_;
+    if (std.mem.eql(u8, name, "sin")) return .sin_;
+    if (std.mem.eql(u8, name, "cos")) return .cos_;
+    if (std.mem.eql(u8, name, "tan")) return .tan_;
+    if (std.mem.eql(u8, name, "asin")) return .asin_;
+    if (std.mem.eql(u8, name, "acos")) return .acos_;
+    if (std.mem.eql(u8, name, "atan")) return .atan_;
+    if (std.mem.eql(u8, name, "rint")) return .rint_;
+    if (std.mem.eql(u8, name, "nearbyint")) return .nearbyint_;
+    if (std.mem.eql(u8, name, "trunc")) return .trunc_;
+    if (std.mem.eql(u8, name, "significand")) return .significand_;
+    if (std.mem.eql(u8, name, "logb")) return .logb_;
+    if (std.mem.eql(u8, name, "j0")) return .j0_;
+    if (std.mem.eql(u8, name, "j1")) return .j1_;
+    if (std.mem.eql(u8, name, "lgamma")) return .lgamma_;
+    if (std.mem.eql(u8, name, "tgamma")) return .tgamma_;
+
+    // Type-check filter builtins (zero-arg)
+    if (std.mem.eql(u8, name, "arrays")) return .arrays_;
+    if (std.mem.eql(u8, name, "objects")) return .objects_;
+    if (std.mem.eql(u8, name, "strings")) return .strings_;
+    if (std.mem.eql(u8, name, "numbers")) return .numbers_;
+    if (std.mem.eql(u8, name, "booleans")) return .booleans_;
+    if (std.mem.eql(u8, name, "nulls")) return .nulls_;
+    if (std.mem.eql(u8, name, "scalars")) return .scalars_;
+    if (std.mem.eql(u8, name, "normals")) return .normals_;
+    if (std.mem.eql(u8, name, "iterables")) return .iterables_;
+
+    // String builtins
+    if (std.mem.eql(u8, name, "ascii_downcase")) return .ascii_downcase;
+    if (std.mem.eql(u8, name, "ascii_upcase")) return .ascii_upcase;
+    if (std.mem.eql(u8, name, "ascii")) return .ascii_;
+    if (std.mem.eql(u8, name, "explode")) return .explode_;
+    if (std.mem.eql(u8, name, "implode")) return .implode_;
+
+    // Array utility builtins (zero-arg)
+    if (std.mem.eql(u8, name, "transpose")) return .transpose_;
+
+    // JSON builtins
+    if (std.mem.eql(u8, name, "tojson")) return .tojson;
+    if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
+
+    // Misc builtins
+    // Note: `not` is handled as .not_kw in the lexer, emitting Op.not directly.
+    if (std.mem.eql(u8, name, "builtins")) return .builtins_;
+    if (std.mem.eql(u8, name, "debug")) return .debug_;
+    if (std.mem.eql(u8, name, "stderr")) return .stderr_;
+    if (std.mem.eql(u8, name, "input")) return .input_;
+    if (std.mem.eql(u8, name, "inputs")) return .inputs_;
+    if (std.mem.eql(u8, name, "env")) return .env_;
+    if (std.mem.eql(u8, name, "halt")) return .halt_;
+    if (std.mem.eql(u8, name, "halt_error")) return .halt_error_;
+
     return null;
 }
 
@@ -826,7 +2340,35 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "del") or
         std.mem.eql(u8, name, "while") or
         std.mem.eql(u8, name, "until") or
-        std.mem.eql(u8, name, "repeat");
+        std.mem.eql(u8, name, "repeat") or
+        std.mem.eql(u8, name, "getpath") or
+        std.mem.eql(u8, name, "setpath") or
+        std.mem.eql(u8, name, "delpaths") or
+        std.mem.eql(u8, name, "pow") or
+        std.mem.eql(u8, name, "atan2") or
+        std.mem.eql(u8, name, "remainder") or
+        std.mem.eql(u8, name, "hypot") or
+        std.mem.eql(u8, name, "scalb") or
+        std.mem.eql(u8, name, "scalbln") or
+        std.mem.eql(u8, name, "ldexp") or
+        std.mem.eql(u8, name, "fma") or
+        std.mem.eql(u8, name, "drem") or
+        std.mem.eql(u8, name, "map_values") or
+        std.mem.eql(u8, name, "isempty") or
+        std.mem.eql(u8, name, "debug") or
+        std.mem.eql(u8, name, "halt_error") or
+        std.mem.eql(u8, name, "split") or
+        std.mem.eql(u8, name, "join") or
+        std.mem.eql(u8, name, "startswith") or
+        std.mem.eql(u8, name, "endswith") or
+        std.mem.eql(u8, name, "ltrimstr") or
+        std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "test") or
+        std.mem.eql(u8, name, "match") or
+        std.mem.eql(u8, name, "sub") or
+        std.mem.eql(u8, name, "gsub") or
+        std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "error");
 }
 
 /// Compile a single-arg value builtin that must support generator expressions (commas)
@@ -1184,6 +2726,225 @@ fn compileRepeat(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 ///   pop_variable($var)
 ///   pop_variable($acc)
 ///   pop_variable($arr)
+/// Compile `label $name | BODY`.
+///
+/// Bytecode layout:
+///   label_begin(exit_ip)          — generates break token, pushes LabelFrame
+///   capture_variable($name)       — stores break token in $name
+///   pipe                          — begin body
+///   <BODY>
+///   exit_ip:                      — handleBreak jumps here on break
+///
+/// No label_end or pop_variable is emitted because iterate loops would
+/// re-execute them on every pass, prematurely clearing the label frame
+/// and break token variable.
+fn compileLabel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Consume `$name`
+    const dollar = try ctx.nextToken();
+    if (dollar.tag != .dollar) return ctx.syntaxErr(dollar.offset, dollar.len);
+    const name_tok = try ctx.nextToken();
+    if (!isVarNameToken(name_tok.tag)) return ctx.syntaxErr(name_tok.offset, name_tok.len);
+
+    // Declare the label variable in a new scope
+    try pushScope(ctx, ctx.alloc);
+    const name_ref = try internStr(&ctx.intern, ctx.alloc, name_tok.slice(ctx.src));
+    const var_id = try declareVariable(ctx, name_ref, ctx.alloc);
+
+    // Register as a label variable so `break` can verify at compile time
+    try ctx.label_var_ids.append(ctx.alloc, var_id);
+
+    // label_begin(exit_ip) — exit_ip backpatched below
+    const label_begin_ip = ctx.raw.items.len;
+    try ctx.emit(.label_begin, .{ .index = 0 });
+
+    // capture_variable($name) — store break token
+    try ctx.emit(.capture_variable, .{ .index = var_id });
+
+    // Consume `|`
+    const pipe_tok = try ctx.nextToken();
+    if (pipe_tok.tag != .pipe) return ctx.syntaxErr(pipe_tok.offset, pipe_tok.len);
+
+    // pipe
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // <BODY>
+    try parsePipe(ctx);
+
+    // Backpatch label_begin's exit_ip to the instruction after the body.
+    // We do NOT emit label_end or pop_variable here because when the body
+    // contains iterators (.[], range, etc.), the iterate loop re-executes
+    // all instructions from resume_ip through instructions.len. Emitting
+    // label_end/pop_variable would cause them to fire on every iteration,
+    // prematurely clearing the label frame and break token variable.
+    // The label frame is cleaned up by handleBreak (on break) or left on
+    // the stack (harmless — reset() clears everything between records).
+    ctx.raw.items[label_begin_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `setpath(PATH; VALUE)`.
+/// Emits: save_input, <PATH>, restore_input, save_input, <VALUE>, call_builtin(setpath)
+/// VM pops value, pops path from value_stack, uses current (restored original) as base.
+fn compileSetpath(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save original input, eval PATH
+    try ctx.emit(.save_input, .{ .none = {} });
+    try parsePipe(ctx);
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Restore original input for VALUE eval
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    // Eval VALUE
+    try parsePipe(ctx);
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // Restore original input as current for setpath
+    try ctx.emit(.restore_input, .{ .none = {} });
+
+    // call_builtin(setpath) — pops value and path from stack, uses current as base
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+}
+
+/// Compile a two-arg math builtin: `pow(a;b)`, `atan2(y;x)`, etc.
+/// Pattern: save_input, eval a, restore_input, save_input, eval b, restore_input, call_builtin
+fn compileTwoArgMath(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save original input, eval first arg
+    try ctx.emit(.save_input, .{ .none = {} });
+    try parsePipe(ctx);
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Restore original input for second arg eval
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    // Eval second arg
+    try parsePipe(ctx);
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // Restore original input as current
+    try ctx.emit(.restore_input, .{ .none = {} });
+
+    // call_builtin — pops two args from stack
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+}
+
+/// Compile a three-arg math builtin: `fma(x;y;z)`.
+fn compileThreeArgMath(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save original input, eval first arg
+    try ctx.emit(.save_input, .{ .none = {} });
+    try parsePipe(ctx);
+
+    // Consume ';'
+    var semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Restore original input for second arg
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try parsePipe(ctx);
+
+    // Consume ';'
+    semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Restore original input for third arg
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try parsePipe(ctx);
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+}
+
+/// Compile `map_values(f)`: for arrays [.[] | f], for objects {keys, mapped values}.
+/// Desugar to: [.[] | f] for arrays, or .keys as $k | .values | map(f) | ... for objects
+/// Actually simplest: same as map but uses map_values builtin to reconstruct with keys.
+/// For now: emit as a filter-arg builtin like sort_by.
+fn compileMapValues(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    try compileFilterArgBuiltin(ctx, .map_values_);
+}
+
+/// Compile `isempty(f)`: returns true if f produces no outputs.
+/// Desugar: `first(f | false, true) // true` — but simpler with a dedicated builtin.
+/// We'll use: save_input, array_collect_start, <f>, output, array_collect_end,
+/// call_builtin(isempty_) which checks if collected array is empty.
+fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Use limit(1;f) approach: collect into array, check if empty
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    const start_pos = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    try parsePipe(ctx);
+
+    try ctx.emit(.output, .{ .none = {} });
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.isempty_) });
+}
+
+/// Compile `debug(msg)` with an argument — just pass through current value (ignore arg).
+fn compileDebugArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+    try parsePipe(ctx);
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    // Just pass through current value — debug is a no-op for now
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.debug_) });
+}
+
+/// Compile `halt_error(code)` with an argument.
+fn compileHaltErrorArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+    try parsePipe(ctx);
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.halt_error_) });
+}
+
+/// error(msg) — compile as: msg | pipe | error
+/// Evaluates the message expression, makes it the current value, then errors.
+fn compileErrorArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+    try parsePipe(ctx);
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.error_) });
+}
+
 fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // Allocate hidden variable IDs for $arr and $acc
     const arr_id = ctx.next_var_id;
@@ -1215,18 +2976,13 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // restore_input — current = original input
     try ctx.emit(.restore_input, .{ .none = {} });
 
-    // Consume `as $var`
+    // Consume `as PATTERN`
     const as_tok = try ctx.nextToken();
     if (as_tok.tag != .as_kw) return ctx.syntaxErr(as_tok.offset, as_tok.len);
-    const dollar_tok = try ctx.nextToken();
-    if (dollar_tok.tag != .dollar) return ctx.syntaxErr(dollar_tok.offset, dollar_tok.len);
-    const var_tok = try ctx.nextToken();
-    if (!isVarNameToken(var_tok.tag)) return ctx.syntaxErr(var_tok.offset, var_tok.len);
 
-    // Declare the user-visible $var in a new scope
+    // Declare pattern variables in a new scope
     try pushScope(ctx, ctx.alloc);
-    const var_name_ref = try internStr(&ctx.intern, ctx.alloc, var_tok.slice(ctx.src));
-    const var_id = try declareVariable(ctx, var_name_ref, ctx.alloc);
+    const pattern = try scanAndDeclarePattern(ctx);
 
     // Consume `(`
     const lparen = try ctx.nextToken();
@@ -1255,8 +3011,9 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // iterate — IterFrame over collected array
     try ctx.emit(.iterate, .{ .none = {} });
 
-    // capture_variable($var) — bind current element
-    try ctx.emit(.capture_variable, .{ .index = var_id });
+    // Bind current element to pattern variables
+    try ctx.emit(.push_current, .{ .none = {} });
+    try emitPatternCapture(ctx, pattern);
 
     // load_variable($acc) — push accumulator
     try ctx.emit(.load_variable, .{ .index = acc_id });
@@ -1288,8 +3045,17 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // load_variable($acc) — push final accumulator
     try ctx.emit(.load_variable, .{ .index = acc_id });
 
-    // Cleanup: pop variables in reverse allocation order
-    try ctx.emit(.pop_variable, .{ .index = var_id });
+    // Cleanup: pop pattern variables in reverse order, then hidden vars
+    {
+        var pvar_ids = std.ArrayList(u32){};
+        defer pvar_ids.deinit(ctx.alloc);
+        try collectPatternVarIds(pattern, &pvar_ids, ctx.alloc);
+        var pi = pvar_ids.items.len;
+        while (pi > 0) {
+            pi -= 1;
+            try ctx.emit(.pop_variable, .{ .index = pvar_ids.items[pi] });
+        }
+    }
     try ctx.emit(.pop_variable, .{ .index = acc_id });
     try ctx.emit(.pop_variable, .{ .index = arr_id });
 
@@ -1376,18 +3142,13 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // restore_input
     try ctx.emit(.restore_input, .{ .none = {} });
 
-    // Consume `as $var`
+    // Consume `as PATTERN`
     const as_tok = try ctx.nextToken();
     if (as_tok.tag != .as_kw) return ctx.syntaxErr(as_tok.offset, as_tok.len);
-    const dollar_tok = try ctx.nextToken();
-    if (dollar_tok.tag != .dollar) return ctx.syntaxErr(dollar_tok.offset, dollar_tok.len);
-    const var_tok = try ctx.nextToken();
-    if (!isVarNameToken(var_tok.tag)) return ctx.syntaxErr(var_tok.offset, var_tok.len);
 
-    // Declare the user-visible $var in a new scope
+    // Declare pattern variables in a new scope
     try pushScope(ctx, ctx.alloc);
-    const var_name_ref = try internStr(&ctx.intern, ctx.alloc, var_tok.slice(ctx.src));
-    const var_id = try declareVariable(ctx, var_name_ref, ctx.alloc);
+    const pattern = try scanAndDeclarePattern(ctx);
 
     // Consume `(`
     const lparen = try ctx.nextToken();
@@ -1440,8 +3201,9 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // iterate — inner: over EXPR values
     try ctx.emit(.iterate, .{ .none = {} });
 
-    // capture_variable($var)
-    try ctx.emit(.capture_variable, .{ .index = var_id });
+    // Bind current element to pattern variables
+    try ctx.emit(.push_current, .{ .none = {} });
+    try emitPatternCapture(ctx, pattern);
 
     // load_variable($acc)
     try ctx.emit(.load_variable, .{ .index = acc_id });
@@ -1496,8 +3258,17 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // iterate — emit each individually (makes foreach a generator)
     try ctx.emit(.iterate, .{ .none = {} });
 
-    // Cleanup: pop variables in reverse allocation order
-    try ctx.emit(.pop_variable, .{ .index = var_id });
+    // Cleanup: pop pattern variables in reverse order, then hidden vars
+    {
+        var pvar_ids = std.ArrayList(u32){};
+        defer pvar_ids.deinit(ctx.alloc);
+        try collectPatternVarIds(pattern, &pvar_ids, ctx.alloc);
+        var pi = pvar_ids.items.len;
+        while (pi > 0) {
+            pi -= 1;
+            try ctx.emit(.pop_variable, .{ .index = pvar_ids.items[pi] });
+        }
+    }
     try ctx.emit(.pop_variable, .{ .index = acc_id });
     try ctx.emit(.pop_variable, .{ .index = init_arr_id });
     try ctx.emit(.pop_variable, .{ .index = arr_id });
@@ -1869,48 +3640,55 @@ fn compileLast(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.load_index, .{ .index = -1 });
 }
 
-/// Compile `limit(n;f)`: supports generator expressions (commas) in first arg.
+/// Compile `limit(n;f)`: streaming implementation using limit_start/limit_end opcodes.
 /// `limit(5,7; range(9))` → first 5 of range(9), then first 7 of range(9)
-/// Collects n's generator outputs into [n_values], collects f's outputs into [f_outputs],
-/// then calls limit_gen which produces first n_values[i] elements of f_outputs for each i.
+/// Each n value sets up a streaming limit scope that counts outputs and stops early.
 fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.nextToken(); // consume '('
 
-    // Collect n values into array (supports generators like 5,7)
+    // Save original input to a variable
+    const input_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    try pushScope(ctx, ctx.alloc);
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = input_var });
+
+    // Collect n values into array (handles generators like 5,7)
     try parseArgToArray(ctx);
     try ctx.emit(.pipe, .{ .none = {} });
 
-    // Save n-values array
-    try ctx.emit(.save_input, .{ .none = {} });
+    // Iterate over n values
+    try ctx.emit(.iterate, .{ .none = {} });
+
+    // Push current n to value_stack for limit_start
+    try ctx.emit(.push_current, .{ .none = {} });
+    // Set current to original input for body evaluation
+    try ctx.emit(.load_variable, .{ .index = input_var });
+    try ctx.emit(.pipe, .{ .none = {} });
 
     const semi = try ctx.nextToken();
     if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
 
-    // Collect [f] outputs into array
-    const start_pos = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    // limit_start: pops n from value_stack, sets up streaming counter
+    const limit_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.limit_start, .{ .index = 0 }); // backpatch exit_ip
 
+    // Parse body expression f
     try parsePipe(ctx);
-
-    try ctx.emit(.output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
-    const end_pos: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+    // Emit output inside the limit scope — the limit counter in the output handler
+    // will decrement for each value and stop evaluation when exhausted.
+    try ctx.emit(.output, .{ .none = {} });
 
-    try ctx.emit(.pipe, .{ .none = {} });
+    // exit_ip points past the inner output (end of the limit scope).
+    // Used by limit_start for n=0 (skip body) and by the output handler
+    // for scope membership checks.
+    ctx.raw.items[limit_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
 
-    // Call limit_gen: current is [f_outputs], [n_values] on if_stack
-    // Returns a flat array of results; iterate to produce individual values
-    try ctx.emit(
-        .call_builtin,
-        .{ .index = @intFromEnum(types.BuiltinId.limit_gen) },
-    );
-    try ctx.emit(.pipe, .{ .none = {} });
-    try ctx.emit(.iterate, .{ .none = {} });
+    popScope(ctx, ctx.alloc);
 }
 
 /// Compile `del(.key)` or `del(.[n])`: static single-level path deletion.
@@ -2071,6 +3849,19 @@ fn compileStringInterpolation(ctx: *Ctx, first_part_raw: []const u8, format_bid:
 
 /// parsePrimary: literals, identifiers (with .field, [index]), `(` expr `)`, `$var`, `def name:`, `func(...)`
 fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const start = ctx.raw.items.len;
+    try parsePrimaryInner(ctx);
+    // Postfix ? operator: wraps the preceding primary expression in try_begin/try_end
+    while (true) {
+        const peek = try ctx.lex.peek();
+        if (peek.tag != .question) break;
+        _ = try ctx.nextToken();
+        try insertRawInstr(ctx, start, .{ .op = .try_begin, .operand = .{ .index = 0 }, .src_offset = ctx.last_tok_offset });
+        try ctx.emit(.try_end, .{ .index = 0 });
+    }
+}
+
+fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.nextToken();
     switch (t.tag) {
         .true_kw => {
@@ -2117,8 +3908,43 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
             // Builtins that can be zero-arg OR one-arg: check for '(' first.
             // If followed by '(', fall through to arg-builtin dispatch.
+            // BUT: user-defined functions shadow builtins when called with matching arity.
             if (peek.tag == .lparen and isArgBuiltin(ident_name)) {
                 // Will be handled by the arg-builtin dispatch below
+            } else if (peek.tag == .lparen and zeroArgBuiltinId(ident_name) != null) {
+                // A zero-arg builtin followed by '(' — could be chaining (e.g., `add(...)`)
+                // OR a user-defined function call shadowing the builtin.
+                // Check for user-defined function first (jq allows shadowing builtins).
+                const maybe_name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+                // Quick arity scan
+                const sp = ctx.lex.pos;
+                _ = try ctx.lex.next(); // skip '('
+                var sc: u8 = 0;
+                var pd: u32 = 1;
+                var hc = false;
+                while (pd > 0) {
+                    const tok = try ctx.lex.next();
+                    switch (tok.tag) {
+                        .lparen => pd += 1,
+                        .rparen => pd -= 1,
+                        .semicolon => {
+                            if (pd == 1) sc += 1;
+                            hc = true;
+                        },
+                        .eof => break,
+                        else => hc = true,
+                    }
+                }
+                const ac: u8 = if (hc) sc + 1 else 0;
+                ctx.lex.pos = sp;
+                if (lookupFunction(ctx, maybe_name_ref, ac) != null) {
+                    // User function shadows the builtin — fall through to user function dispatch below.
+                } else {
+                    // No user function — treat as zero-arg builtin (the `(` is chaining).
+                    const bid = zeroArgBuiltinId(ident_name).?;
+                    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+                    return;
+                }
             } else if (zeroArgBuiltinId(ident_name)) |bid| {
                 // Zero-arg builtins: length, keys, values, type, empty, tostring, tonumber, error, add, keys_unsorted
                 // These do NOT consume parens even if followed by '(' (which would be chaining).
@@ -2183,6 +4009,62 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileUntil(ctx);
                 } else if (std.mem.eql(u8, ident_name, "repeat")) {
                     try compileRepeat(ctx);
+                } else if (std.mem.eql(u8, ident_name, "getpath")) {
+                    try compileValueArgBuiltin1(ctx, .getpath);
+                } else if (std.mem.eql(u8, ident_name, "setpath")) {
+                    try compileSetpath(ctx);
+                } else if (std.mem.eql(u8, ident_name, "delpaths")) {
+                    try compileValueArgBuiltin1(ctx, .delpaths);
+                } else if (std.mem.eql(u8, ident_name, "pow")) {
+                    try compileTwoArgMath(ctx, .pow_);
+                } else if (std.mem.eql(u8, ident_name, "atan2")) {
+                    try compileTwoArgMath(ctx, .atan2_);
+                } else if (std.mem.eql(u8, ident_name, "remainder")) {
+                    try compileTwoArgMath(ctx, .remainder_);
+                } else if (std.mem.eql(u8, ident_name, "hypot")) {
+                    try compileTwoArgMath(ctx, .hypot_);
+                } else if (std.mem.eql(u8, ident_name, "scalb")) {
+                    try compileTwoArgMath(ctx, .scalb_);
+                } else if (std.mem.eql(u8, ident_name, "scalbln")) {
+                    try compileTwoArgMath(ctx, .scalbln_);
+                } else if (std.mem.eql(u8, ident_name, "ldexp")) {
+                    try compileTwoArgMath(ctx, .ldexp_);
+                } else if (std.mem.eql(u8, ident_name, "fma")) {
+                    try compileThreeArgMath(ctx, .fma_);
+                } else if (std.mem.eql(u8, ident_name, "drem")) {
+                    try compileTwoArgMath(ctx, .drem_);
+                } else if (std.mem.eql(u8, ident_name, "map_values")) {
+                    try compileMapValues(ctx);
+                } else if (std.mem.eql(u8, ident_name, "isempty")) {
+                    try compileIsempty(ctx);
+                } else if (std.mem.eql(u8, ident_name, "debug")) {
+                    try compileDebugArg(ctx);
+                } else if (std.mem.eql(u8, ident_name, "halt_error")) {
+                    try compileHaltErrorArg(ctx);
+                } else if (std.mem.eql(u8, ident_name, "split")) {
+                    try compileValueArgBuiltin1(ctx, .split_);
+                } else if (std.mem.eql(u8, ident_name, "join")) {
+                    try compileValueArgBuiltin1(ctx, .join_);
+                } else if (std.mem.eql(u8, ident_name, "startswith")) {
+                    try compileValueArgBuiltin1(ctx, .startswith_);
+                } else if (std.mem.eql(u8, ident_name, "endswith")) {
+                    try compileValueArgBuiltin1(ctx, .endswith_);
+                } else if (std.mem.eql(u8, ident_name, "ltrimstr")) {
+                    try compileValueArgBuiltin1(ctx, .ltrimstr_);
+                } else if (std.mem.eql(u8, ident_name, "rtrimstr")) {
+                    try compileValueArgBuiltin1(ctx, .rtrimstr_);
+                } else if (std.mem.eql(u8, ident_name, "test")) {
+                    try compileValueArgBuiltin1(ctx, .test_);
+                } else if (std.mem.eql(u8, ident_name, "match")) {
+                    try compileValueArgBuiltin1(ctx, .match_);
+                } else if (std.mem.eql(u8, ident_name, "sub")) {
+                    try compileTwoArgMath(ctx, .sub_);
+                } else if (std.mem.eql(u8, ident_name, "gsub")) {
+                    try compileTwoArgMath(ctx, .gsub_);
+                } else if (std.mem.eql(u8, ident_name, "bsearch")) {
+                    try compileValueArgBuiltin1(ctx, .bsearch_);
+                } else if (std.mem.eql(u8, ident_name, "error")) {
+                    try compileErrorArg(ctx);
                 }
                 return;
             }
@@ -2197,29 +4079,192 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 return;
             }
 
-            // User-defined function call
+            // User-defined function call with arguments
             if (peek.tag == .lparen) {
                 const name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
-                const func_id = lookupFunction(ctx, name_ref) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                _ = try ctx.nextToken(); // consume '('
-                var arg_count: usize = 0;
-                while (true) {
-                    const next_tok = try ctx.lex.peek();
-                    if (next_tok.tag == .rparen) {
-                        _ = try ctx.nextToken();
-                        break;
-                    }
-                    try parseLogical(ctx);
-                    arg_count += 1;
-                    const sep_tok = try ctx.lex.peek();
-                    if (sep_tok.tag == .semicolon) {
-                        _ = try ctx.nextToken();
-                    } else if (sep_tok.tag != .rparen) {
-                        return ctx.syntaxErr(ctx.last_tok_offset, 0);
+
+                // Count arguments by scanning for `;` separators at paren depth 1.
+                // arity = number of `;` + 1 (if any content), or 0 for empty `()`.
+                const saved_pos = ctx.lex.pos;
+                _ = try ctx.lex.next(); // skip '('
+                var semicolons: u8 = 0;
+                var paren_depth: u32 = 1;
+                var has_content = false;
+                while (paren_depth > 0) {
+                    const scan = try ctx.lex.next();
+                    switch (scan.tag) {
+                        .lparen => paren_depth += 1,
+                        .rparen => paren_depth -= 1,
+                        .semicolon => {
+                            if (paren_depth == 1) semicolons += 1;
+                            has_content = true;
+                        },
+                        .eof => break,
+                        else => has_content = true,
                     }
                 }
-                try ctx.emit(.call_function, .{ .index = func_id });
-                return;
+                const arity_count: u8 = if (has_content) semicolons + 1 else 0;
+                ctx.lex.pos = saved_pos;
+
+                // When scanning a function body, don't expand calls — just parse
+                // the arguments syntactically and emit a placeholder load_key.
+                if (ctx.scanning_body) {
+                    if (lookupFunction(ctx, name_ref, arity_count) != null) {
+                        _ = try ctx.nextToken(); // consume '('
+                        if (arity_count > 0) {
+                            var ai: u8 = 0;
+                            while (ai < arity_count) : (ai += 1) {
+                                try parsePipe(ctx);
+                                if (ai + 1 < arity_count) {
+                                    const sep = try ctx.nextToken();
+                                    if (sep.tag != .semicolon) return ctx.syntaxErr(sep.offset, sep.len);
+                                }
+                            }
+                        }
+                        const rp = try ctx.nextToken();
+                        if (rp.tag != .rparen) return ctx.syntaxErr(rp.offset, rp.len);
+                        // Emit placeholder — the actual expansion happens during reParseBodyWithBindings.
+                        try ctx.emit(.load_key, .{ .str_ref = name_ref });
+                        return;
+                    }
+                    // Not a known function — fall through to field access.
+                    return ctx.syntaxErr(t.offset, t.len);
+                }
+
+                if (lookupFunction(ctx, name_ref, arity_count)) |func_idx| {
+                    _ = try ctx.nextToken(); // consume '('
+                    const func = &ctx.function_table.items[func_idx];
+
+                    // Parse each argument into a CallArg.
+                    // For filter args: save source position range for re-parsing.
+                    // For value args: save pre-compiled instructions.
+                    var call_args = std.ArrayList(CallArg){};
+                    defer {
+                        for (call_args.items) |ca| {
+                            if (ca.instructions.len > 0) ctx.alloc.free(ca.instructions);
+                        }
+                        call_args.deinit(ctx.alloc);
+                    }
+
+                    if (arity_count > 0) {
+                        var ai: u8 = 0;
+                        while (ai < arity_count) : (ai += 1) {
+                            const is_filter = if (ai < func.params.len) func.params[ai].is_filter else true;
+
+                            if (is_filter) {
+                                // Filter arg: record source positions, parse to validate
+                                // and advance the lexer, then discard the instructions.
+                                //
+                                // Special case: if the arg is a single identifier that matches
+                                // an active filter arg binding, propagate the original source
+                                // range to avoid infinite re-parse loops in nested calls.
+                                const src_start = ctx.lex.pos;
+                                const raw_start: u32 = @intCast(ctx.raw.items.len);
+                                try parsePipe(ctx);
+                                const src_end = ctx.lex.pos;
+                                ctx.raw.items.len = raw_start;
+
+                                // Check if this arg is a simple filter arg pass-through.
+                                var resolved_start = src_start;
+                                var resolved_end = src_end;
+                                if (resolveFilterArgPassthrough(ctx, src_start, src_end)) |binding| {
+                                    resolved_start = binding.src_start;
+                                    resolved_end = binding.src_end;
+                                }
+
+                                try call_args.append(ctx.alloc, CallArg{
+                                    .src_start = resolved_start,
+                                    .src_end = resolved_end,
+                                    .instructions = &.{},
+                                    .is_filter = true,
+                                });
+                            } else {
+                                // Value arg: compile and keep the instructions
+                                const raw_start: u32 = @intCast(ctx.raw.items.len);
+                                try parsePipe(ctx);
+                                const raw_end: u32 = @intCast(ctx.raw.items.len);
+
+                                const arg_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[raw_start..raw_end]);
+                                ctx.raw.items.len = raw_start;
+
+                                try call_args.append(ctx.alloc, CallArg{
+                                    .src_start = 0,
+                                    .src_end = 0,
+                                    .instructions = arg_instrs,
+                                    .is_filter = false,
+                                });
+                            }
+
+                            if (ai + 1 < arity_count) {
+                                const sep_tok = try ctx.nextToken();
+                                if (sep_tok.tag != .semicolon) return ctx.syntaxErr(sep_tok.offset, sep_tok.len);
+                            }
+                        }
+                    }
+
+                    const rparen = try ctx.nextToken();
+                    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+                    try expandFunctionCall(ctx, func_idx, call_args.items);
+                    return;
+                }
+                // Not a user function — fall through to field access.
+                // (The `(` will be consumed as part of a different construct,
+                // e.g. chaining. Actually, an unknown ident followed by ( is
+                // a syntax error in jq if it's not a builtin or def.)
+                return ctx.syntaxErr(t.offset, t.len);
+            }
+
+            // Check for active filter arg binding (used during function body re-parsing).
+            // If matched, re-parse the arg's source range instead of emitting load_key.
+            {
+                var matched_binding = false;
+                // Search bindings backward so innermost scope wins.
+                var bk: usize = ctx.filter_arg_bindings.items.len;
+                while (bk > 0) {
+                    bk -= 1;
+                    const binding = &ctx.filter_arg_bindings.items[bk];
+                    const bname = ctx.intern.items[binding.name.offset..][0..binding.name.len];
+                    if (std.mem.eql(u8, bname, ident_name)) {
+                        // Re-parse the filter arg source range. Temporarily hide
+                        // the matched binding and any bindings after it to prevent
+                        // infinite recursion when the arg source contains identifiers
+                        // that match these same bindings (e.g., id(x):x called with [x]).
+                        const saved_bindings_len = ctx.filter_arg_bindings.items.len;
+                        ctx.filter_arg_bindings.items.len = bk;
+                        const saved_lex_pos = ctx.lex.pos;
+                        ctx.lex.pos = binding.src_start;
+                        try parsePipe(ctx);
+                        ctx.lex.pos = saved_lex_pos;
+                        ctx.filter_arg_bindings.items.len = saved_bindings_len;
+                        matched_binding = true;
+                        break;
+                    }
+                }
+                if (matched_binding) return;
+            }
+
+            // Check for zero-arg user-defined function
+            if (!ctx.scanning_body) {
+                // First check: recursive self-call. The function being expanded may be
+                // in the hidden range (lexical scoping), so check by name directly
+                // before calling lookupFunction which respects the hidden range.
+                if (ctx.expanding_recursive_func) |expanding_idx| {
+                    const exp_func = &ctx.function_table.items[expanding_idx];
+                    const exp_name = ctx.intern.items[exp_func.name.offset..][0..exp_func.name.len];
+                    if (std.mem.eql(u8, exp_name, ident_name) and exp_func.paramCount() == 0) {
+                        try ctx.emit(.call_function, .{ .index = @intCast(exp_func.recursive_body_ip) });
+                        return;
+                    }
+                }
+
+                const name_ref = try internStr(&ctx.intern, ctx.alloc, ident_name);
+                if (lookupFunction(ctx, name_ref, 0)) |func_idx| {
+                    // Zero-arg user function call — inline expand
+                    const empty_args: []const CallArg = &.{};
+                    try expandFunctionCall(ctx, func_idx, empty_args);
+                    return;
+                }
             }
 
             // Plain identifier → field access
@@ -2244,6 +4289,15 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try parseBracket(ctx);
                     try parseSuffixes(ctx, start);
                 },
+                .string_lit => {
+                    // ."foo" — quoted field access
+                    _ = try ctx.nextToken();
+                    const str_content = extractStringContent(after.slice(ctx.src));
+                    const ref = try internStr(&ctx.intern, ctx.alloc, str_content);
+                    const start = ctx.raw.items.len;
+                    try ctx.emit(.load_key, .{ .str_ref = ref });
+                    try parseSuffixes(ctx, start);
+                },
                 else => {
                     // Bare dot — push the current value onto the stack.
                     // Using push_current ensures the value is available for binary operators
@@ -2252,10 +4306,16 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 },
             }
         },
+        .dot_dot => {
+            // Recursive descent operator: .. equivalent to def recurse: ., (.[]? | recurse);
+            try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.recurse) });
+        },
         .lparen => {
+            const paren_start = ctx.raw.items.len;
             try parsePipe(ctx);
             const close = try ctx.nextToken();
             if (close.tag != .rparen) return ctx.syntaxErr(close.offset, close.len);
+            try parseSuffixes(ctx, paren_start);
         },
         .dollar => {
             // Variable reference: $var, possibly followed by suffixes like [], .field, [0]
@@ -2265,11 +4325,15 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         },
         .lbrace => {
             // Object literal
+            const obj_start = ctx.raw.items.len;
             try parseObjectLiteral(ctx);
+            try parseSuffixes(ctx, obj_start);
         },
         .if_kw => {
             // Conditional: if COND then THEN [elif COND then THEN]* [else ELSE] end
+            const if_start = ctx.raw.items.len;
             try parseIfBody(ctx);
+            try parseSuffixes(ctx, if_start);
         },
         .try_kw => {
             // try EXPR [catch EXPR]
@@ -2277,7 +4341,9 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         },
         .lbracket => {
             // Array construction: [expr] — collect all outputs of expr into an array.
+            const arr_start = ctx.raw.items.len;
             try parseArrayConstruct(ctx);
+            try parseSuffixes(ctx, arr_start);
         },
         .at => {
             // Format string: @text, @json, @html "...\(...)...", etc.
@@ -2315,6 +4381,29 @@ fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         },
         .reduce_kw => {
             try compileReduce(ctx);
+        },
+        .label_kw => {
+            try compileLabel(ctx);
+        },
+        .break_kw => {
+            // `break $name` — load break token and trigger non-local exit
+            const dollar = try ctx.nextToken();
+            if (dollar.tag != .dollar) return ctx.syntaxErr(dollar.offset, dollar.len);
+            const name_tok = try ctx.nextToken();
+            if (!isVarNameToken(name_tok.tag)) return ctx.syntaxErr(name_tok.offset, name_tok.len);
+            const name_ref = try internStr(&ctx.intern, ctx.alloc, name_tok.slice(ctx.src));
+            const var_id = lookupVariable(ctx, name_ref) orelse return ctx.syntaxErr(name_tok.offset, name_tok.len);
+            // Verify this is a label variable, not a regular `as` binding
+            var is_label_var = false;
+            for (ctx.label_var_ids.items) |lid| {
+                if (lid == var_id) {
+                    is_label_var = true;
+                    break;
+                }
+            }
+            if (!is_label_var) return ctx.syntaxErr(name_tok.offset, name_tok.len);
+            try ctx.emit(.load_variable, .{ .index = var_id });
+            try ctx.emit(.break_op, .{ .none = {} });
         },
         .not_kw => {
             // `not` is a zero-arg builtin filter in jq (always postfix: `expr | not`)
@@ -2501,78 +4590,195 @@ fn parseVariableReference(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// Parse a function definition: def name(params): body
+/// Parse a `def name(params): body; continuation` expression.
+/// The `def` keyword has already been consumed by the caller.
+///
+/// Parses the function definition and registers it in the function table,
+/// then parses the continuation expression (the code that follows the `;`).
+/// The body is parsed into a separate instruction buffer, not the main stream.
 fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    // Function name
+    // Function name — accept identifiers AND keywords (jq allows `def if: ...`)
     const name_tok = try ctx.nextToken();
-    if (name_tok.tag != .ident) return ctx.syntaxErr(name_tok.offset, name_tok.len);
+    if (!isVarNameToken(name_tok.tag) and name_tok.tag != .ident)
+        return ctx.syntaxErr(name_tok.offset, name_tok.len);
     const name_ref = try internStr(&ctx.intern, ctx.alloc, name_tok.slice(ctx.src));
 
-    // Parameters: (param1; param2; ...)
-    const lparen = try ctx.nextToken();
-    if (lparen.tag != .lparen) return ctx.syntaxErr(lparen.offset, lparen.len);
+    // Parse optional parameters: (param1; param2; ...)
+    // No parens = zero-arg function
+    var params = std.ArrayList(ParamInfo){};
+    defer params.deinit(ctx.alloc);
 
-    // First pass: collect parameter names
-    var param_names = std.ArrayList(StrRef){};
-    defer param_names.deinit(ctx.alloc);
+    const peek = try ctx.lex.peek();
+    if (peek.tag == .lparen) {
+        _ = try ctx.nextToken(); // consume '('
+        while (true) {
+            const ptok = try ctx.lex.peek();
+            if (ptok.tag == .rparen) {
+                _ = try ctx.nextToken();
+                break;
+            }
 
-    while (true) {
-        const param_tok = try ctx.lex.peek();
-        if (param_tok.tag == .rparen) {
-            _ = try ctx.nextToken();
-            break;
-        }
+            if (ptok.tag == .dollar) {
+                // Value parameter: $name
+                _ = try ctx.nextToken(); // consume '$'
+                const pname = try ctx.nextToken();
+                if (!isVarNameToken(pname.tag)) return ctx.syntaxErr(pname.offset, pname.len);
+                const pname_ref = try internStr(&ctx.intern, ctx.alloc, pname.slice(ctx.src));
+                const var_id = ctx.next_var_id;
+                ctx.next_var_id += 1;
+                try params.append(ctx.alloc, ParamInfo{
+                    .name = pname_ref,
+                    .is_filter = false,
+                    .var_id = var_id,
+                });
+            } else if (isVarNameToken(ptok.tag)) {
+                // Filter parameter: name (no $)
+                const pname = try ctx.nextToken();
+                const pname_ref = try internStr(&ctx.intern, ctx.alloc, pname.slice(ctx.src));
+                try params.append(ctx.alloc, ParamInfo{
+                    .name = pname_ref,
+                    .is_filter = true,
+                    .var_id = 0, // unused for filter args
+                });
+            } else {
+                return ctx.syntaxErr(ptok.offset, ptok.len);
+            }
 
-        // Parse parameter name
-        const param_name = try ctx.nextToken();
-        if (param_name.tag != .ident) return ctx.syntaxErr(param_name.offset, param_name.len);
-
-        const param_ref = try internStr(&ctx.intern, ctx.alloc, param_name.slice(ctx.src));
-        try param_names.append(ctx.alloc, param_ref);
-
-        // Check for more parameters or end of list
-        const next_tok = try ctx.lex.peek();
-        if (next_tok.tag == .semicolon) {
-            _ = try ctx.nextToken();
-        } else if (next_tok.tag != .rparen) {
-            return ctx.syntaxErr(ctx.last_tok_offset, 0);
+            // Check for ';' separator or ')' end
+            const sep = try ctx.lex.peek();
+            if (sep.tag == .semicolon) {
+                _ = try ctx.nextToken();
+            } else if (sep.tag != .rparen) {
+                return ctx.syntaxErr(sep.offset, sep.len);
+            }
         }
     }
 
-    // Colon before function body
+    // Consume ':'
     const colon = try ctx.nextToken();
     if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
 
-    // Create a new scope for function body
+    // Record the body source start (lexer position after ':').
+    const body_src_start = ctx.lex.pos;
+
+    // Parse body into a SEPARATE raw instruction buffer to:
+    // 1. Advance the lexer past the body
+    // 2. Detect recursion (for zero-arg functions)
+    // 3. Store body_raw for recursive functions (needed for call_function)
+    const saved_raw = ctx.raw;
+    ctx.raw = std.ArrayList(RawInstr){};
+
+    // Enable scanning mode: function calls in the body are parsed for syntax
+    // but NOT expanded. This avoids infinite recursion when nested functions
+    // share filter param names. Actual expansion happens via reParseBodyWithBindings.
+    const saved_scanning_body = ctx.scanning_body;
+    ctx.scanning_body = true;
+
+    // Create a scope for the function body and declare parameters
     try pushScope(ctx, ctx.alloc);
 
-    // Declare all parameters in the new scope and collect their IDs
-    var param_ids = std.ArrayList(u32){};
-    defer param_ids.deinit(ctx.alloc);
-
-    for (param_names.items) |param_ref| {
-        const param_id = try declareVariable(ctx, param_ref, ctx.alloc);
-        try param_ids.append(ctx.alloc, param_id);
+    for (params.items) |*param| {
+        if (param.is_filter) {
+            const pvar_id = try declareVariable(ctx, param.name, ctx.alloc);
+            param.var_id = pvar_id;
+        } else {
+            _ = try declareVariable(ctx, param.name, ctx.alloc);
+        }
     }
 
-    // Track where function body starts
-    const body_start = @as(u32, @intCast(ctx.raw.items.len));
+    // Save function table length to detect inner defs that shadow this function.
+    const func_table_start = ctx.function_table.items.len;
 
-    // Parse function body
-    try parseLogical(ctx);
+    // Parse the function body (use parseFilter to support nested defs)
+    try parseFilter(ctx);
 
-    // Define the function with body_start (position of def_function, will be resolved later)
-    const def_func_pos = @as(u32, @intCast(ctx.raw.items.len));
-    const body_end = @as(u32, @intCast(ctx.raw.items.len + 1)); // Position after def_function
-    const func_id = try defineFunctionWithBody(ctx, name_ref, param_ids.items, body_start, body_end, def_func_pos, ctx.alloc);
+    // Record body source end position.
+    const body_src_end = ctx.lex.pos;
 
-    // Emit def_function instruction (will be resolved at compile time)
-    try ctx.emit(.def_function, .{ .index = func_id });
+    // Extract the body instructions
+    var body_raw = ctx.raw;
+    ctx.raw = saved_raw;
 
-    // Pop the parameter scope (will also emit pop_variable for each parameter)
-    for (param_ids.items) |param_id| {
-        try ctx.emit(.pop_variable, .{ .index = param_id });
-    }
+    // Restore scanning mode
+    ctx.scanning_body = saved_scanning_body;
+
+    // Pop the body scope
     popScope(ctx, ctx.alloc);
+
+    // Post-process: replace filter param references with call_filter_arg.
+    // This is only needed for recursive functions (which use body_raw directly).
+    var processed_body = std.ArrayList(RawInstr){};
+    defer processed_body.deinit(ctx.alloc);
+
+    for (body_raw.items) |instr| {
+        var replaced = false;
+        if (instr.op == .load_key) {
+            const key = ctx.intern.items[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+            for (params.items, 0..) |param, pi| {
+                if (param.is_filter) {
+                    const pname = ctx.intern.items[param.name.offset..][0..param.name.len];
+                    if (std.mem.eql(u8, key, pname)) {
+                        try processed_body.append(ctx.alloc, RawInstr{
+                            .op = .call_filter_arg,
+                            .operand = .{ .index = @intCast(pi) },
+                            .src_offset = instr.src_offset,
+                        });
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!replaced) {
+            try processed_body.append(ctx.alloc, instr);
+        }
+    }
+    body_raw.deinit(ctx.alloc);
+
+    // Check for self-reference (recursion) BEFORE removing inner defs.
+    const arity: u8 = @intCast(params.items.len);
+    var is_recursive = false;
+    const func_name = ctx.intern.items[name_ref.offset..][0..name_ref.len];
+    if (arity == 0) {
+        // Check if any inner def shadows this function name (same name, same arity).
+        // If so, load_key references in the body are NOT self-references.
+        var shadowed_by_inner = false;
+        for (ctx.function_table.items[func_table_start..]) |inner_func| {
+            const inner_name = ctx.intern.items[inner_func.name.offset..][0..inner_func.name.len];
+            if (std.mem.eql(u8, inner_name, func_name) and inner_func.paramCount() == arity) {
+                shadowed_by_inner = true;
+                break;
+            }
+        }
+        if (!shadowed_by_inner) {
+            for (processed_body.items) |instr| {
+                if (instr.op == .load_key) {
+                    const key = ctx.intern.items[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                    if (std.mem.eql(u8, key, func_name)) {
+                        is_recursive = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove inner defs registered during the body scan.
+    // These are scoped to the body and will be re-registered during actual expansion.
+    while (ctx.function_table.items.len > func_table_start) {
+        const inner = ctx.function_table.pop().?;
+        inner.deinit(ctx.alloc);
+    }
+
+    // Register the function with body source range.
+    try registerFunction(ctx, name_ref, params.items, processed_body.items, is_recursive, body_src_start, body_src_end, ctx.alloc);
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Parse the continuation expression (code after the def)
+    try parseFilter(ctx);
 }
 
 /// Parse an object literal: {key1: value1, key2: value2, ...}
@@ -2593,9 +4799,9 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const colon = try ctx.nextToken();
         if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
 
-        // Parse value expression
-        // The VM's object_key handler will get the value from stack or current
-        try parseLogical(ctx);
+        // Parse value expression — allow `//` (alternative) inside object values
+        // so that `{z: null // 3}` works.
+        try parseAlternative(ctx);
 
         try ctx.emit(.object_key, .{ .none = {} });
 
@@ -2632,7 +4838,8 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         peek.tag == .if_kw or peek.tag == .then_kw or peek.tag == .elif_kw or
         peek.tag == .else_kw or peek.tag == .end_kw or peek.tag == .and_kw or
         peek.tag == .or_kw or peek.tag == .not_kw or peek.tag == .def_kw or
-        peek.tag == .as_kw or peek.tag == .reduce_kw)
+        peek.tag == .as_kw or peek.tag == .reduce_kw or
+        peek.tag == .label_kw or peek.tag == .break_kw)
     {
         // Literal key - push as string value for object construction
         const key = try ctx.nextToken();
@@ -2693,6 +4900,18 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
                         }
                         had_suffix = true;
                         try parseBracket(ctx);
+                    },
+                    .string_lit => {
+                        // ."foo" — quoted field access in suffix position
+                        _ = try ctx.nextToken();
+                        if (had_suffix) {
+                            try ctx.emit(.pipe, .{ .none = {} });
+                            segment_start = ctx.raw.items.len;
+                        }
+                        had_suffix = true;
+                        const str_content = extractStringContent(nt.slice(ctx.src));
+                        const ref = try internStr(&ctx.intern, ctx.alloc, str_content);
+                        try ctx.emit(.load_key, .{ .str_ref = ref });
                     },
                     .dollar => {
                         // .$var - variable reference
@@ -2833,6 +5052,15 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
 // ── String interning ──────────────────────────────────────────────────────────
 
+/// Extract the content of a string literal token, stripping surrounding quotes.
+/// Input: `"foo"` → output: `foo`.
+fn extractStringContent(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
 fn internStr(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) error{OutOfMemory}!StrRef {
     const off: u32 = @intCast(buf.items.len);
     try buf.appendSlice(alloc, s);
@@ -2939,7 +5167,7 @@ fn internPath(
 
 fn fuse(
     raw: []const RawInstr,
-    function_table: *std.ArrayList(FunctionEntry),
+    _: *std.ArrayList(FunctionEntry),
     intern: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
 ) error{OutOfMemory}!Compiled {
@@ -3014,7 +5242,14 @@ fn fuse(
                     .offset = r.operand.str_ref.offset,
                     .len = r.operand.str_ref.len,
                 } },
-                .load_index, .capture_variable, .load_variable, .pop_variable, .def_function, .call_function => .{ .index = r.operand.index },
+                .load_index, .capture_variable, .load_variable, .pop_variable, .def_function, .call_filter_arg => .{ .index = r.operand.index },
+                // call_function operand is a jump target IP that needs remapping.
+                .call_function => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .return_function => .{ .none = {} },
                 .load_computed => .{ .none = {} },
                 .push_bool => .{ .bool = r.operand.bool },
                 .push_int => .{ .int = r.operand.int },
@@ -3081,23 +5316,28 @@ fn fuse(
                 .navigate_index, .update_index => .{ .index = r.operand.index },
                 // call_builtin: operand is BuiltinId encoded as index; pass through as-is.
                 .call_builtin => .{ .index = r.operand.index },
+                // Label/break: label_begin carries exit_ip that needs remapping.
+                .label_begin => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .label_end => .{ .none = {} },
+                .break_op => .{ .none = {} },
+                // Limit: limit_start carries exit_ip that needs remapping.
+                .limit_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .limit_end => .{ .none = {} },
             },
         };
     }
 
-    // Create function table for VM
-    const function_defs = try alloc.alloc(types.FunctionDef, function_table.items.len);
-    for (function_table.items, function_defs) |func, *def| {
-        // Map raw instruction indices to fused instruction indices
-        const fused_body_start = index_map.items[func.body_start_raw];
-        const fused_body_end = index_map.items[func.body_end_raw];
-
-        def.* = types.FunctionDef{
-            .body_ip = fused_body_start,
-            .body_end = fused_body_end,
-            .param_count = func.param_count,
-        };
-    }
+    // Function bodies are inline-expanded at compile time; the VM function table
+    // is empty (kept for interface compatibility).
+    const function_defs = try alloc.alloc(types.FunctionDef, 0);
 
     const source_map = try fused_src_offsets.toOwnedSlice(alloc);
     errdefer alloc.free(source_map);

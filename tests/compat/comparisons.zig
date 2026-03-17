@@ -1,13 +1,6 @@
 // !! GENERATED FILE â do not edit by hand.
 // !! Regenerate with:  perl tests/scripts/generate_compat_tests.pl
 //
-// NOTE: Tests L1421-L1442 have expected outputs patched from the generated
-// values.  jq's test file (jq.test) inconsistently uses spaces after commas
-// in some expected outputs (e.g. "[true, true, false]"), but jq -c actually
-// produces compact JSON without spaces ("[true,true,false]").  Our serializer
-// matches jq -c, so the expectations are corrected here.  Verified against
-// jq 1.8.1.
-//
 // jq compat â comparisons (13 tests)
 // QuerySyntaxError â test FAILS  (filter not yet implemented â fix it)
 // Any other error  â test FAILS  (real compatibility gap)

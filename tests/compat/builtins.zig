@@ -31,7 +31,7 @@ test "jq:L581 1+1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2", results[0]);
+    try std.testing.expectEqualStrings("2.0", results[0]);
 }
 
 test "jq:L585 2-1" {
@@ -70,7 +70,7 @@ test "jq:L593 1e+0+0.001e3" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2", results[0]);
+    try std.testing.expectEqualStrings("20e-1", results[0]);
 }
 
 test "jq:L597 .+4" {
@@ -83,7 +83,7 @@ test "jq:L597 .+4" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("19", results[0]);
+    try std.testing.expectEqualStrings("19.0", results[0]);
 }
 
 test "jq:L601 .+null" {
@@ -226,7 +226,7 @@ test "jq:L641 [10 * 20, 20 / .]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[200, 5]", results[0]);
+    try std.testing.expectEqualStrings("[200,5]", results[0]);
 }
 
 test "jq:L645 1 + 2 * 2 + 10 / 2" {
@@ -252,7 +252,7 @@ test "jq:L649 [16 / 4 / 2, 16 / 4 * 2, 16 - 4 - 2, 16 - 4 + 2]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[2, 8, 10, 14]", results[0]);
+    try std.testing.expectEqualStrings("[2,8,10,14]", results[0]);
 }
 
 test "jq:L653 1e-19 + 1e-20 - 5e-21" {
@@ -265,7 +265,7 @@ test "jq:L653 1e-19 + 1e-20 - 5e-21" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("0.000000000000000000105", results[0]);
+    try std.testing.expectEqualStrings("1.05e-19", results[0]);
 }
 
 test "jq:L657 1 / 1e-17" {
@@ -278,7 +278,7 @@ test "jq:L657 1 / 1e-17" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("100000000000000000", results[0]);
+    try std.testing.expectEqualStrings("1e+17", results[0]);
 }
 
 test "jq:L661 9E999999999, 9999999999E999999990, 1E-999999999, 0.000000..." {
@@ -462,15 +462,15 @@ test "jq:L725 [{_a_:42},.object,10,.num,false,true,null,_b_,[1,4]] | .[..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 9), results.len);
-    try std.testing.expectEqualStrings("[true,  true,  false, false, false, false, false, false, false]", results[0]);
-    try std.testing.expectEqualStrings("[true,  true,  false, false, false, false, false, false, false]", results[1]);
-    try std.testing.expectEqualStrings("[false, false, true,  true,  false, false, false, false, false]", results[2]);
-    try std.testing.expectEqualStrings("[false, false, true,  true,  false, false, false, false, false]", results[3]);
-    try std.testing.expectEqualStrings("[false, false, false, false, true,  false, false, false, false]", results[4]);
-    try std.testing.expectEqualStrings("[false, false, false, false, false, true,  false, false, false]", results[5]);
-    try std.testing.expectEqualStrings("[false, false, false, false, false, false, true,  false, false]", results[6]);
-    try std.testing.expectEqualStrings("[false, false, false, false, false, false, false, true,  false]", results[7]);
-    try std.testing.expectEqualStrings("[false, false, false, false, false, false, false, false, true ]", results[8]);
+    try std.testing.expectEqualStrings("[true,true,false,false,false,false,false,false,false]", results[0]);
+    try std.testing.expectEqualStrings("[true,true,false,false,false,false,false,false,false]", results[1]);
+    try std.testing.expectEqualStrings("[false,false,true,true,false,false,false,false,false]", results[2]);
+    try std.testing.expectEqualStrings("[false,false,true,true,false,false,false,false,false]", results[3]);
+    try std.testing.expectEqualStrings("[false,false,false,false,true,false,false,false,false]", results[4]);
+    try std.testing.expectEqualStrings("[false,false,false,false,false,true,false,false,false]", results[5]);
+    try std.testing.expectEqualStrings("[false,false,false,false,false,false,true,false,false]", results[6]);
+    try std.testing.expectEqualStrings("[false,false,false,false,false,false,false,true,false]", results[7]);
+    try std.testing.expectEqualStrings("[false,false,false,false,false,false,false,false,true ]", results[8]);
 }
 
 test "jq:L737 [.[] | length]" {

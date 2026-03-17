@@ -139,7 +139,7 @@ test "jq:L2258 map(abs)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1e-1, 1000000000000000002]", results[0]);
+    try std.testing.expectEqualStrings("[1e-1,1000000000000000002]", results[0]);
 }
 
 test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {

@@ -18,7 +18,7 @@ test "jq:L1742 {_k_: {_a_: 1, _b_: 2}} * ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}}", results[0]);
+    try std.testing.expectEqualStrings("{\"k\":{\"a\":0,\"b\":2,\"c\":3}}", results[0]);
 }
 
 test "jq:L1746 {_k_: {_a_: 1, _b_: 2}, _hello_: {_x_: 1}} * ." {
@@ -31,7 +31,7 @@ test "jq:L1746 {_k_: {_a_: 1, _b_: 2}, _hello_: {_x_: 1}} * ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}, \"hello\": 1}", results[0]);
+    try std.testing.expectEqualStrings("{\"k\":{\"a\":0,\"b\":2,\"c\":3},\"hello\":1}", results[0]);
 }
 
 test "jq:L1750 {_k_: {_a_: 1, _b_: 2}, _hello_: 1} * ." {
@@ -44,7 +44,7 @@ test "jq:L1750 {_k_: {_a_: 1, _b_: 2}, _hello_: 1} * ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"k\": {\"a\": 0, \"b\": 2, \"c\": 3}, \"hello\": {\"x\": 1}}", results[0]);
+    try std.testing.expectEqualStrings("{\"k\":{\"a\":0,\"b\":2,\"c\":3},\"hello\":{\"x\":1}}", results[0]);
 }
 
 test "jq:L1754 {_a_: {_b_: 1}, _c_: {_d_: 2}, _e_: 5} * ." {
@@ -57,7 +57,7 @@ test "jq:L1754 {_a_: {_b_: 1}, _c_: {_d_: 2}, _e_: 5} * ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\": {\"b\": 2}, \"c\": {\"d\": 3, \"f\": 9}, \"e\": 5}", results[0]);
+    try std.testing.expectEqualStrings("{\"a\":{\"b\":2},\"c\":{\"d\":3,\"f\":9},\"e\":5}", results[0]);
 }
 
 test "jq:L1758 [.[]|arrays]" {
@@ -161,7 +161,7 @@ test "jq:L1786 flatten" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, 1, 2, 3]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,3]", results[0]);
 }
 
 test "jq:L1790 flatten(0)" {
@@ -174,7 +174,7 @@ test "jq:L1790 flatten(0)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, [1], [[2]], [[[3]]]]", results[0]);
+    try std.testing.expectEqualStrings("[0,[1],[[2]],[[[3]]]]", results[0]);
 }
 
 test "jq:L1794 flatten(2)" {
@@ -187,7 +187,7 @@ test "jq:L1794 flatten(2)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, 1, 2, [3]]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,[3]]", results[0]);
 }
 
 test "jq:L1798 flatten(2)" {
@@ -200,7 +200,7 @@ test "jq:L1798 flatten(2)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, 1, 2, 1, [3], 2]", results[0]);
+    try std.testing.expectEqualStrings("[0,1,2,1,[3],2]", results[0]);
 }
 
 test "jq:L1802 try flatten(-1) catch ." {
@@ -321,7 +321,7 @@ test "jq:L1838 strftime(_%A, %B %d, %Y_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Tuesday, June 30, 2015\"", results[0]);
+    try std.testing.expectEqualStrings("\"Tuesday,June 30,2015\"", results[0]);
 }
 
 test "jq:L1842 strftime(_%Y-%m-%dT%H:%M:%SZ_)" {

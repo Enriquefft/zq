@@ -341,7 +341,7 @@ test "jq:L345 [foreach .[] as {a:$a} (0; . + $a; -.)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[-1, -1, -4]", results[0]);
+    try std.testing.expectEqualStrings("[-1,-1,-4]", results[0]);
 }
 
 test "jq:L349 [-foreach -.[] as $x (0; . + $x)]" {
@@ -669,7 +669,7 @@ test "jq:L466 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[], [2,3], [0,1,2,3,4], [5,6], [], []]", results[0]);
+    try std.testing.expectEqualStrings("[[],[2,3],[0,1,2,3,4],[5,6],[],[]]", results[0]);
 }
 
 test "jq:L470 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {

@@ -247,6 +247,167 @@ pub const BuiltinId = enum(u16) {
     range2_gen, // range([from1,from2,...];[to1,to2,...]) — Cartesian product
     range3_gen, // range([from1,...];[to1,...];[by1,...]) — Cartesian product
     limit_gen, // limit([n1,n2,...]; f_collected_array)
+
+    // Path algebra builtins
+    getpath, // getpath(PATH) — retrieve value at path
+    setpath, // setpath(PATH; VALUE) — set value at path
+    delpaths, // delpaths(PATHS) — delete multiple paths
+    paths, // paths — enumerate all paths (generator)
+    leaf_paths, // leaf_paths — enumerate leaf paths (generator)
+    recurse, // .. — recursive descent (generator)
+
+    // Math builtins (zero-arg, operate on current value)
+    abs, // absolute value: int→int, float→float
+    floor_, // floor: float→int, int→int
+    ceil_, // ceil: float→int, int→int
+    round_, // round: float→int (half away from zero), int→int
+    sqrt_, // square root: returns float
+    fabs_, // abs but always returns float
+    nan_, // returns NaN (ignores input)
+    infinite_, // returns positive infinity (ignores input)
+    isinfinite_, // true if input is infinite
+    isnan_, // true if input is NaN
+    isnormal_, // true if input is a normal number
+    exp_, // e^x
+    exp2_, // 2^x
+    exp10_, // 10^x
+    log_, // natural log
+    log2_, // log base 2
+    log10_, // log base 10
+    cbrt_, // cube root
+    sin_, // sine
+    cos_, // cosine
+    tan_, // tangent
+    asin_, // arc sine
+    acos_, // arc cosine
+    atan_, // arc tangent
+    rint_, // round to nearest int (return float)
+    nearbyint_, // round to nearest int (return float)
+    trunc_, // truncate toward zero (return float)
+    significand_, // floating point significand
+    logb_, // floating point exponent
+    j0_, // Bessel function of first kind, order 0
+    j1_, // Bessel function of first kind, order 1
+    lgamma_, // log-gamma function
+    tgamma_, // gamma function
+
+    // Two-arg math builtins
+    pow_, // pow(a;b) — a^b
+    atan2_, // atan2(y;x)
+    remainder_, // IEEE remainder
+    hypot_, // hypotenuse
+    scalb_, // x * 2^n
+    scalbln_, // same as scalb
+    ldexp_, // x * 2^n
+    fma_, // fused multiply-add (three args)
+    drem_, // same as remainder
+
+    // Type-check filter builtins (zero-arg)
+    arrays_, // select arrays only
+    objects_, // select objects only
+    strings_, // select strings only
+    numbers_, // select numbers only
+    booleans_, // select booleans only
+    nulls_, // select nulls only
+    values_, // select non-null values
+    scalars_, // select non-array, non-object values
+    normals_, // select normal values
+    iterables_, // select arrays and objects
+
+    // String builtins
+    ascii_downcase, // lowercase ASCII
+    ascii_upcase, // uppercase ASCII
+    ascii_, // ASCII value of char / char from int
+    explode_, // string to array of codepoints
+    implode_, // array of codepoints to string
+
+    // JSON builtins
+    tojson, // serialize to JSON string
+    fromjson, // parse JSON string to value
+
+    // String builtins (arg-taking)
+    split_, // split(sep) — split string by separator
+    join_, // join(sep) — join array with separator
+    startswith_, // startswith(str) — test prefix
+    endswith_, // endswith(str) — test suffix
+    ltrimstr_, // ltrimstr(str) — remove prefix
+    rtrimstr_, // rtrimstr(str) — remove suffix
+    test_, // test(regex) — simplified substring match
+    match_, // match(regex) — simplified match details
+    sub_, // sub(regex; replacement) — replace first
+    gsub_, // gsub(regex; replacement) — replace all
+
+    // Array utility builtins
+    transpose_, // transpose — transpose array of arrays (zero-arg)
+    bsearch_, // bsearch(x) — binary search in sorted array (one-arg)
+
+    // Misc builtins
+    not_, // logical negation
+    builtins_, // list all builtin names
+    debug_, // pass through (debug to stderr)
+    stderr_, // same as debug
+    input_, // read from stdin (produce empty)
+    inputs_, // read all from stdin (produce empty)
+    env_, // environment variables object
+    halt_, // exit
+    halt_error_, // exit with error
+    map_values_, // map_values(f)
+    isempty_, // isempty(f) — true if f produces no output
+    first_, // first(expr)
+    last_, // last(expr)
+
+    /// Derive the jq-visible name from the enum tag at comptime.
+    ///
+    /// Rules:
+    /// 1. Tags ending with `_gen` → null (internal generator variants)
+    /// 2. Arity-suffixed tags (e.g. `range2`, `range3`, `flatten_n`) → null (overloads)
+    /// 3. Tags starting with `format_` → replace prefix with `@` (e.g. `format_base64` → `@base64`)
+    /// 4. Tags ending with a single trailing `_` → strip it (Zig keyword avoidance)
+    /// 5. Everything else → @tagName as-is
+    pub fn jqName(comptime self: BuiltinId) ?[]const u8 {
+        @setEvalBranchQuota(10_000);
+        const tag = @tagName(self);
+
+        // Rule 1: internal generator variants
+        if (tag.len >= 4 and std.mem.eql(u8, tag[tag.len - 4 ..], "_gen")) return null;
+
+        // Rule 2: arity-suffixed overloads
+        if (isAritySuffix(tag)) return null;
+
+        // Rule 3: format_ prefix → @name
+        if (tag.len > 7 and std.mem.eql(u8, tag[0..7], "format_")) {
+            return "@" ++ tag[7..];
+        }
+
+        // Rule 4: trailing underscore (Zig keyword avoidance)
+        if (tag.len > 1 and tag[tag.len - 1] == '_') {
+            // Only strip if the char before '_' is NOT '_' (avoid stripping double underscores)
+            if (tag.len < 2 or tag[tag.len - 2] != '_') {
+                return tag[0 .. tag.len - 1];
+            }
+        }
+
+        // Rule 5: use tag name as-is
+        return tag;
+    }
+
+    fn isAritySuffix(tag: []const u8) bool {
+        // Explicit list of arity-suffixed overloads (base name already appears separately).
+        const arity_tags = [_][]const u8{ "range2", "range3", "flatten_n" };
+        for (arity_tags) |at| {
+            if (std.mem.eql(u8, tag, at)) return true;
+        }
+        return false;
+    }
+
+    /// Return the number of unique jq-visible builtin names.
+    pub fn jqBuiltinCount() comptime_int {
+        var count: comptime_int = 0;
+        for (std.enums.values(BuiltinId)) |id| {
+            if (comptime id.jqName() != null) count += 1;
+        }
+        return count;
+    }
 };
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────
@@ -344,6 +505,12 @@ pub const Instruction = struct {
         def_function,
         /// Call function by name. operand.index = function id.
         call_function,
+        /// Return from a function call. Pops the call stack and returns to caller.
+        return_function,
+        /// Placeholder for a filter argument reference inside a function body.
+        /// During inline expansion, replaced with the caller's argument instructions.
+        /// operand.index = parameter index within the function.
+        call_filter_arg,
 
         // Object construction operations
         /// Begin object construction frame.
@@ -422,6 +589,23 @@ pub const Instruction = struct {
         /// pops base array from if_stack, reconstructs array with element replaced.
         /// Pushes modified array to value_stack; sets current to it.
         update_index,
+
+        // Label/break (non-local exit)
+        /// Begin a label scope. Generates a unique break token, pushes it to value_stack
+        /// as an int, and pushes a LabelFrame onto the label_stack.
+        /// operand.index = variable id for the label token.
+        label_begin,
+        /// End of label scope. No-op; label frame cleanup is handled by handleBreak or reset.
+        label_end,
+        /// Trigger a non-local exit. Loads the break token from variable, sets pending_break_token.
+        break_op,
+
+        /// Begin a limit(n;f) scope. Pops n from value_stack.
+        /// If n <= 0: n==0 produces empty, n<0 raises error. Jumps to operand.index.
+        /// Otherwise pushes LimitFrame with counter.
+        limit_start,
+        /// End of limit scope. Pops LimitFrame.
+        limit_end,
     };
 
     pub const Operand = union {

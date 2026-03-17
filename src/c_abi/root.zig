@@ -15,9 +15,13 @@ const Value = types.Value;
 /// Parse error: malformed input JSON.
 const ERR_PARSE: c_int = -1;
 /// Query execution error: TypeError or IndexOutOfBounds.
-const ERR_EXECUTE: c_int = -2;
+const ERR_TYPE: c_int = -2;
 /// Out of memory during execute.
 const ERR_OOM: c_int = -3;
+/// Array index out of bounds.
+const ERR_INDEX: c_int = -4;
+/// User-raised error via the `error` builtin.
+const ERR_USER: c_int = -5;
 
 // ── QueryHandle ───────────────────────────────────────────────────────────────
 
@@ -31,10 +35,15 @@ pub const QueryHandle = struct {
     result_buf: []u8,
     /// Number of content bytes in result_buf (excludes the null terminator).
     result_len: usize,
+    /// Null-terminated buffer holding the last error as JSON.
+    error_buf: []u8,
+    /// Number of content bytes in error_buf (excludes the null terminator).
+    error_len: usize,
 
     /// Minimum initial capacity for the result buffer (avoids tiny reallocations
     /// for the common case of small query outputs).
     const INITIAL_RESULT_CAP: usize = 4096;
+    const INITIAL_ERROR_CAP: usize = 512;
 };
 
 // ── Compact JSON serialiser ───────────────────────────────────────────────────
@@ -180,6 +189,65 @@ fn handleAllocator() std.mem.Allocator {
     return std.heap.page_allocator;
 }
 
+// ── Error serialization ──────────────────────────────────────────────────────
+
+/// Write a JSON error object into the handle's error buffer.
+fn setError(handle: *QueryHandle, code: c_int, kind_str: []const u8, message: ?[]const u8) void {
+    const allocator = handle.allocator;
+    var tmp = std.ArrayList(u8){};
+    defer tmp.deinit(allocator);
+
+    tmp.appendSlice(allocator, "{\"error_code\":") catch return;
+    var code_buf: [12]u8 = undefined;
+    const code_str = std.fmt.bufPrint(&code_buf, "{d}", .{code}) catch return;
+    tmp.appendSlice(allocator, code_str) catch return;
+    tmp.appendSlice(allocator, ",\"error\":\"") catch return;
+    tmp.appendSlice(allocator, kind_str) catch return;
+    tmp.append(allocator, '"') catch return;
+
+    if (message) |msg| {
+        tmp.appendSlice(allocator, ",\"message\":\"") catch return;
+        writeEscaped(&tmp, allocator, msg) catch return;
+        tmp.append(allocator, '"') catch return;
+    }
+
+    tmp.append(allocator, '}') catch return;
+
+    // Ensure room for content + null terminator.
+    const needed = tmp.items.len + 1;
+    if (needed > handle.error_buf.len) {
+        const new_buf = allocator.realloc(handle.error_buf, needed) catch return;
+        handle.error_buf = new_buf;
+    }
+    @memcpy(handle.error_buf[0..tmp.items.len], tmp.items);
+    handle.error_buf[tmp.items.len] = 0;
+    handle.error_len = tmp.items.len;
+}
+
+/// Map a ZqError to a granular C ABI error code.
+fn errorToCode(e: ZqError) c_int {
+    return switch (e) {
+        error.TypeError => ERR_TYPE,
+        error.IndexOutOfBounds => ERR_INDEX,
+        error.UserError => ERR_USER,
+        error.OutOfMemory => ERR_OOM,
+        error.UnexpectedToken,
+        error.UnexpectedEof,
+        error.InvalidUtf8,
+        error.InvalidNumber,
+        error.UnterminatedString,
+        error.DepthLimitExceeded,
+        error.IoError,
+        error.QuerySyntaxError,
+        => ERR_PARSE,
+    };
+}
+
+/// Map a ZqError to its kind string for JSON output.
+fn errorToKindStr(e: ZqError) []const u8 {
+    return @tagName(err_mod.kindFromZqError(e));
+}
+
 // ── C ABI exports ─────────────────────────────────────────────────────────────
 
 /// Compile `query_str` into a reusable `QueryHandle`.
@@ -187,18 +255,44 @@ fn handleAllocator() std.mem.Allocator {
 /// Returns null on any error (syntax, OOM). On success the caller owns the
 /// handle and must release it with `zq_free` exactly once.
 pub export fn zq_compile(query_str: [*:0]const u8) ?*QueryHandle {
+    return zq_compile_ext(query_str, null);
+}
+
+/// Compile `query_str` into a reusable `QueryHandle`, with error reporting.
+///
+/// On failure, if `error_out` is non-null, it is set to a null-terminated
+/// JSON string describing the compile error. The string is statically
+/// allocated or from a thread-local buffer and valid until the next
+/// `zq_compile_ext` call from the same thread.
+///
+/// Returns null on any error (syntax, OOM). On success the caller owns the
+/// handle and must release it with `zq_free` exactly once.
+pub export fn zq_compile_ext(query_str: [*:0]const u8, error_out: ?*[*:0]const u8) ?*QueryHandle {
     const allocator = handleAllocator();
     const src = std.mem.sliceTo(query_str, 0);
 
     // Compile first; avoids allocating the handle on syntax errors.
-    const compile_result = CompiledQuery.compile(src, .{}, allocator) catch return null;
+    const compile_result = CompiledQuery.compile(src, .{}, allocator) catch {
+        if (error_out) |out| {
+            out.* = formatCompileErrorStatic("out_of_memory", null);
+        }
+        return null;
+    };
     var compiled_mut = switch (compile_result) {
         .ok => |cq| cq,
-        .err => return null,
+        .err => |ce| {
+            if (error_out) |out| {
+                out.* = formatCompileErrorStatic(@tagName(ce.kind), null);
+            }
+            return null;
+        },
     };
 
     const parser = Parser.init(allocator) catch {
         compiled_mut.deinit();
+        if (error_out) |out| {
+            out.* = formatCompileErrorStatic("out_of_memory", null);
+        }
         return null;
     };
     var parser_mut = parser;
@@ -208,10 +302,18 @@ pub export fn zq_compile(query_str: [*:0]const u8) ?*QueryHandle {
         compiled_mut.deinit();
         return null;
     };
-    // Null-terminate immediately so zq_get_result is always safe.
     result_buf[0] = 0;
 
+    const error_buf = allocator.alloc(u8, QueryHandle.INITIAL_ERROR_CAP) catch {
+        allocator.free(result_buf);
+        parser_mut.deinit();
+        compiled_mut.deinit();
+        return null;
+    };
+    error_buf[0] = 0;
+
     const handle = allocator.create(QueryHandle) catch {
+        allocator.free(error_buf);
         allocator.free(result_buf);
         parser_mut.deinit();
         compiled_mut.deinit();
@@ -224,9 +326,36 @@ pub export fn zq_compile(query_str: [*:0]const u8) ?*QueryHandle {
         .parser = parser_mut,
         .result_buf = result_buf,
         .result_len = 0,
+        .error_buf = error_buf,
+        .error_len = 0,
     };
 
     return handle;
+}
+
+/// Format a compile error as a static null-terminated string.
+/// Uses a thread-local buffer for the formatted JSON.
+fn formatCompileErrorStatic(kind: []const u8, message: ?[]const u8) [*:0]const u8 {
+    const S = struct {
+        threadlocal var buf: [1024]u8 = undefined;
+    };
+    var fbs = std.io.fixedBufferStream(&S.buf);
+    const writer = fbs.writer();
+    writer.print("{{\"error\":\"{s}\"", .{kind}) catch {
+        S.buf[0] = 0;
+        return @ptrCast(&S.buf);
+    };
+    if (message) |msg| {
+        writer.print(",\"message\":\"{s}\"", .{msg}) catch {};
+    }
+    writer.print("}}", .{}) catch {};
+    const pos = fbs.pos;
+    if (pos < S.buf.len) {
+        S.buf[pos] = 0;
+    } else {
+        S.buf[S.buf.len - 1] = 0;
+    }
+    return @ptrCast(S.buf[0..pos :0]);
 }
 
 /// Execute the compiled query against `input_ptr[0..input_len]`.
@@ -235,6 +364,9 @@ pub export fn zq_compile(query_str: [*:0]const u8) ?*QueryHandle {
 /// handle's result buffer in compact JSON format (one value per line for
 /// multiple results). Returns 0 on success or a negative error code on failure.
 ///
+/// Error codes: -1=parse, -2=type_error, -3=OOM, -4=index_out_of_bounds, -5=user_error
+///
+/// On failure, call `zq_get_error` to retrieve a JSON error object.
 /// The result buffer is updated only on success. On failure the buffer retains
 /// the output from the previous successful execute (or is empty if there was
 /// no prior successful execute).
@@ -246,26 +378,35 @@ pub export fn zq_execute(
     const allocator = handle.allocator;
     const input = input_ptr[0..input_len];
 
+    // Clear previous error.
+    handle.error_len = 0;
+    handle.error_buf[0] = 0;
+
     // Reset the parser state machine so it is ready for a fresh record.
     handle.parser.reset();
 
     // Feed the entire input in one call with is_eof = true.
     const feed_result = handle.parser.feed(input, true) catch |e| {
-        return switch (e) {
-            error.OutOfMemory => ERR_OOM,
-            else => ERR_PARSE,
-        };
+        const code = errorToCode(e);
+        setError(handle, code, errorToKindStr(e), null);
+        return code;
     };
 
     const tape = switch (feed_result) {
         .done => |d| d.tape,
         // is_eof = true means feed() must return .done or an error, never
         // .need_more.  Treat it as a parse error defensively.
-        .need_more => return ERR_PARSE,
+        .need_more => {
+            setError(handle, ERR_PARSE, "unexpected_eof", null);
+            return ERR_PARSE;
+        },
     };
 
     // Execute the compiled query against the tape.
-    var iterator = handle.query.execute(tape, &.{}, allocator) catch return ERR_OOM;
+    var iterator = handle.query.execute(tape, &.{}, allocator) catch {
+        setError(handle, ERR_OOM, "out_of_memory", null);
+        return ERR_OOM;
+    };
     defer iterator.deinit();
 
     // Accumulate all results into a temporary ArrayList, then move into the
@@ -279,24 +420,39 @@ pub export fn zq_execute(
 
     var value_count: usize = 0;
     while (iterator.next() catch |e| {
-        return switch (e) {
-            error.TypeError, error.IndexOutOfBounds => ERR_EXECUTE,
-            else => ERR_PARSE,
-        };
+        const code = errorToCode(e);
+        // Extract user error message if available.
+        var user_msg: ?[]const u8 = null;
+        if (iterator.user_error_msg) |msg| {
+            switch (msg) {
+                .string => |s| user_msg = s,
+                else => {},
+            }
+        }
+        setError(handle, code, errorToKindStr(e), user_msg);
+        return code;
     }) |val| {
         // Separate multiple values with a newline (JSONL style).
         if (value_count > 0) {
-            tmp.append(allocator, '\n') catch return ERR_OOM;
+            tmp.append(allocator, '\n') catch {
+                setError(handle, ERR_OOM, "out_of_memory", null);
+                return ERR_OOM;
+            };
         }
-        writeValueCompact(&tmp, allocator, val) catch return ERR_OOM;
+        writeValueCompact(&tmp, allocator, val) catch {
+            setError(handle, ERR_OOM, "out_of_memory", null);
+            return ERR_OOM;
+        };
         value_count += 1;
     }
 
     // Ensure there is room for the content plus a null terminator.
     const needed = tmp.items.len + 1;
     if (needed > handle.result_buf.len) {
-        const new_buf = allocator.realloc(handle.result_buf, needed) catch
+        const new_buf = allocator.realloc(handle.result_buf, needed) catch {
+            setError(handle, ERR_OOM, "out_of_memory", null);
             return ERR_OOM;
+        };
         handle.result_buf = new_buf;
     }
 
@@ -316,6 +472,13 @@ pub export fn zq_get_result(handle: *QueryHandle) [*:0]const u8 {
     return handle.result_buf[0..handle.result_len :0];
 }
 
+/// Return a pointer to the null-terminated JSON error string from the most
+/// recent failed `zq_execute` call. Returns an empty string if no error.
+/// Valid until the next `zq_execute` or `zq_free` call.
+pub export fn zq_get_error(handle: *QueryHandle) [*:0]const u8 {
+    return handle.error_buf[0..handle.error_len :0];
+}
+
 /// Release all resources owned by the handle and free the handle itself.
 /// The pointer must not be used after this call.
 pub export fn zq_free(handle: *QueryHandle) void {
@@ -323,5 +486,6 @@ pub export fn zq_free(handle: *QueryHandle) void {
     handle.query.deinit();
     handle.parser.deinit();
     allocator.free(handle.result_buf);
+    allocator.free(handle.error_buf);
     allocator.destroy(handle);
 }

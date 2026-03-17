@@ -18,8 +18,8 @@ test "jq:L1110 path(.foo[0,1])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("[\"foo\", 0]", results[0]);
-    try std.testing.expectEqualStrings("[\"foo\", 1]", results[1]);
+    try std.testing.expectEqualStrings("[\"foo\",0]", results[0]);
+    try std.testing.expectEqualStrings("[\"foo\",1]", results[1]);
 }
 
 test "jq:L1115 path(.[] | select(.>3))" {
@@ -137,8 +137,8 @@ test "jq:L1147 [_foo_,1] as $p | getpath($p), setpath($p; 20), delpaths(..." {
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqualStrings("\"b\"", results[0]);
-    try std.testing.expectEqualStrings("{\"bar\": 42, \"foo\": [\"a\", 20, \"c\", \"d\"]}", results[1]);
-    try std.testing.expectEqualStrings("{\"bar\": 42, \"foo\": [\"a\", \"c\", \"d\"]}", results[2]);
+    try std.testing.expectEqualStrings("{\"bar\":42,\"foo\":[\"a\",20,\"c\",\"d\"]}", results[1]);
+    try std.testing.expectEqualStrings("{\"bar\":42,\"foo\":[\"a\",\"c\",\"d\"]}", results[2]);
 }
 
 test "jq:L1153 map(getpath([2])), map(setpath([2]; 42)), map(delpaths([[..." {
@@ -151,9 +151,9 @@ test "jq:L1153 map(getpath([2])), map(setpath([2]; 42)), map(delpaths([[..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("[null, null, 2]", results[0]);
-    try std.testing.expectEqualStrings("[[0,null,42], [0,1,42], [0,1,42]]", results[1]);
-    try std.testing.expectEqualStrings("[[0], [0,1], [0,1]]", results[2]);
+    try std.testing.expectEqualStrings("[null,null,2]", results[0]);
+    try std.testing.expectEqualStrings("[[0,null,42],[0,1,42],[0,1,42]]", results[1]);
+    try std.testing.expectEqualStrings("[[0],[0,1],[0,1]]", results[2]);
 }
 
 test "jq:L1159 map(delpaths([[0,_foo_]]))" {
@@ -166,7 +166,7 @@ test "jq:L1159 map(delpaths([[0,_foo_]]))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[{\"x\":1}], [{\"bar\":2}]]", results[0]);
+    try std.testing.expectEqualStrings("[[{\"x\":1}],[{\"bar\":2}]]", results[0]);
 }
 
 test "jq:L1163 [_foo_,1] as $p | getpath($p), setpath($p; 20), delpaths(..." {
@@ -180,7 +180,7 @@ test "jq:L1163 [_foo_,1] as $p | getpath($p), setpath($p; 20), delpaths(..." {
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqualStrings("null", results[0]);
-    try std.testing.expectEqualStrings("{\"bar\":false, \"foo\": [null, 20]}", results[1]);
+    try std.testing.expectEqualStrings("{\"bar\":false,\"foo\":[null,20]}", results[1]);
     try std.testing.expectEqualStrings("{\"bar\":false}", results[2]);
 }
 
@@ -221,9 +221,9 @@ test "jq:L1177 del(.), del(empty), del((.foo,.bar,.baz) | .[2,3,0]), del..." {
     }
     try std.testing.expectEqual(@as(usize, 4), results.len);
     try std.testing.expectEqualStrings("null", results[0]);
-    try std.testing.expectEqualStrings("{\"foo\": [0,1,2,3,4], \"bar\": [0,1]}", results[1]);
-    try std.testing.expectEqualStrings("{\"foo\": [1,4], \"bar\": [1]}", results[2]);
-    try std.testing.expectEqualStrings("{\"bar\": [1]}", results[3]);
+    try std.testing.expectEqualStrings("{\"foo\":[0,1,2,3,4],\"bar\":[0,1]}", results[1]);
+    try std.testing.expectEqualStrings("{\"foo\":[1,4],\"bar\":[1]}", results[2]);
+    try std.testing.expectEqualStrings("{\"bar\":[1]}", results[3]);
 }
 
 test "jq:L1184 del(.[1], .[-6], .[2], .[-3:9])" {
@@ -236,7 +236,7 @@ test "jq:L1184 del(.[1], .[-6], .[2], .[-3:9])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0, 3, 5, 6, 9]", results[0]);
+    try std.testing.expectEqualStrings("[0,3,5,6,9]", results[0]);
 }
 
 test "jq:L1188 del(.[nan])" {

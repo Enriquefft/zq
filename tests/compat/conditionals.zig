@@ -200,7 +200,7 @@ test "jq:L1370 [.[] | [.foo[] // .bar]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[1,2], [1], [3], [42], [41]]", results[0]);
+    try std.testing.expectEqualStrings("[[1,2],[1],[3],[42],[41]]", results[0]);
 }
 
 test "jq:L1374 .[] //= .[0]" {

@@ -137,7 +137,7 @@ test "jq:L54 _Aa_r_n_t_b_f_u03bc_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Aa\\r\\n\\t\\b\\f\xce\xbc\"", results[0]);
+    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
 test "jq:L58 ." {
@@ -150,7 +150,7 @@ test "jq:L58 ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Aa\\r\\n\\t\\b\\f\xce\xbc\"", results[0]);
+    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
 test "jq:L62 _u_vw_" {
@@ -242,7 +242,7 @@ test "jq:L98 @urid" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"\xce\xbc\"", results[0]);
+    try std.testing.expectEqualStrings("\"\\u03bc\"", results[0]);
 }
 
 test "jq:L102 @html _<b>_(.)</b>_" {

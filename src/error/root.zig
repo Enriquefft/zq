@@ -148,6 +148,9 @@ fn extractLine(source: []const u8, offset: u32) []const u8 {
     return source[start..end];
 }
 
+/// Output format for diagnostic messages.
+pub const DiagnosticFormat = enum { text, json };
+
 /// Format a diagnostic message with source context and caret underline.
 /// Only called on the error path — allocates a LineTable then frees it.
 pub fn formatDiagnostic(
@@ -157,35 +160,98 @@ pub fn formatDiagnostic(
     offset: u32,
     len: u32,
     input_preview: ?[]const u8,
+    user_message: ?[]const u8,
     alloc: std.mem.Allocator,
+    format: DiagnosticFormat,
 ) void {
     const table = buildLineTable(filter_src, alloc) catch {
         // Fallback: bare error message if OOM
-        writer.print("zq: {s}\n", .{kindToString(kind)}) catch {};
+        switch (format) {
+            .text => writer.print("zq: {s}\n", .{kindToString(kind)}) catch {},
+            .json => writer.print("{{\"error\":\"{s}\"}}\n", .{@tagName(kind)}) catch {},
+        }
         return;
     };
     defer deinit(table, alloc);
     const loc = resolve(table, offset);
 
-    // Header: "zq: type error at line 1, col 8"
-    writer.print("zq: {s} at line {d}, col {d}\n", .{ kindToString(kind), loc.line, loc.col }) catch {};
+    switch (format) {
+        .text => {
+            // Header: "zq: type error at line 1, col 8"
+            writer.print("zq: {s} at line {d}, col {d}\n", .{ kindToString(kind), loc.line, loc.col }) catch {};
 
-    // Source line
-    const line_content = extractLine(filter_src, offset);
-    writer.print("  {s}\n", .{line_content}) catch {};
+            // Source line
+            const line_content = extractLine(filter_src, offset);
+            writer.print("  {s}\n", .{line_content}) catch {};
 
-    // Caret/tilde underline
-    const col_spaces = if (loc.col > 0) @as(usize, @intCast(loc.col - 1)) else 0;
-    writer.writeByteNTimes(' ', 2 + col_spaces) catch {};
-    writer.writeByte('^') catch {};
-    if (len > 1) writer.writeByteNTimes('~', len - 1) catch {};
-    writer.writeByte('\n') catch {};
+            // Caret/tilde underline
+            const col_spaces = if (loc.col > 0) @as(usize, @intCast(loc.col - 1)) else 0;
+            writer.writeByteNTimes(' ', 2 + col_spaces) catch {};
+            writer.writeByte('^') catch {};
+            if (len > 1) writer.writeByteNTimes('~', len - 1) catch {};
+            writer.writeByte('\n') catch {};
 
-    // Error kind description
-    writer.print("  {s}\n", .{kindToString(kind)}) catch {};
+            // Error kind description
+            writer.print("  {s}\n", .{kindToString(kind)}) catch {};
 
-    // Input context if available
-    if (input_preview) |preview| {
-        writer.print("  input was: {s}\n", .{preview}) catch {};
+            // User error message if available
+            if (user_message) |msg| {
+                writer.print("  message: {s}\n", .{msg}) catch {};
+            }
+
+            // Input context if available
+            if (input_preview) |preview| {
+                writer.print("  input was: {s}\n", .{preview}) catch {};
+            }
+        },
+        .json => {
+            // JSON error object
+            writer.print("{{\"error\":\"{s}\",\"line\":{d},\"col\":{d},\"offset\":{d},\"len\":{d}", .{
+                @tagName(kind), loc.line, loc.col, offset, len,
+            }) catch {};
+
+            // Filter source
+            writer.print(",\"filter\":\"", .{}) catch {};
+            writeJsonEscaped(writer, filter_src);
+            writer.print("\"", .{}) catch {};
+
+            // User message
+            if (user_message) |msg| {
+                writer.print(",\"message\":\"", .{}) catch {};
+                writeJsonEscaped(writer, msg);
+                writer.print("\"", .{}) catch {};
+            }
+
+            // Human-readable description
+            writer.print(",\"description\":\"{s}\"", .{kindToString(kind)}) catch {};
+
+            // Input preview
+            if (input_preview) |preview| {
+                writer.print(",\"input_preview\":\"", .{}) catch {};
+                writeJsonEscaped(writer, preview);
+                writer.print("\"", .{}) catch {};
+            }
+
+            writer.print("}}\n", .{}) catch {};
+        },
+    }
+}
+
+/// Write a string with JSON escaping to a writer.
+fn writeJsonEscaped(writer: anytype, s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => writer.print("\\\"", .{}) catch {},
+            '\\' => writer.print("\\\\", .{}) catch {},
+            '\n' => writer.print("\\n", .{}) catch {},
+            '\r' => writer.print("\\r", .{}) catch {},
+            '\t' => writer.print("\\t", .{}) catch {},
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                writer.print("\\u{x:0>4}", .{c}) catch {};
+            },
+            0x08 => writer.print("\\b", .{}) catch {},
+            0x0C => writer.print("\\f", .{}) catch {},
+            else => writer.writeByte(c) catch {},
+        }
     }
 }

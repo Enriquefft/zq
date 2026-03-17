@@ -31,7 +31,7 @@ test "jq:L118 {a,b,(.d):.a,e:.b}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"c\":1, \"e\":2}", results[0]);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":1,\"e\":2}", results[0]);
 }
 
 test "jq:L122 {_a_,b,_a$_(1+1)_}" {
@@ -44,7 +44,7 @@ test "jq:L122 {_a_,b,_a$_(1+1)_}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1, \"b\":2, \"a$2\":4}", results[0]);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2,\"a$2\":4}", results[0]);
 }
 
 test "jq:L126 {(0):1}" {

@@ -152,7 +152,7 @@ test "jq:L830 [.[]|floor]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[-2, 1, 1]", results[0]);
+    try std.testing.expectEqualStrings("[-2,1,1]", results[0]);
 }
 
 test "jq:L834 [.[]|sqrt]" {
@@ -285,7 +285,7 @@ test "jq:L884 [[20,10][1,0] as $x | def f: (100,200) as $y | def g: [$x..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[110.0, 130.0], [210.0, 130.0], [110.0, 230.0], [210.0, 230.0], [120.0, 160.0], [220.0, 160.0], [120.0, 260.0], [220.0, 260.0]]", results[0]);
+    try std.testing.expectEqualStrings("[[110.0,130.0],[210.0,130.0],[110.0,230.0],[210.0,230.0],[120.0,160.0],[220.0,160.0],[120.0,260.0],[220.0,260.0]]", results[0]);
 }
 
 test "jq:L889 def fac: if . == 1 then 1 else . * (. - 1 | fac) end; [.[..." {
@@ -428,9 +428,9 @@ test "jq:L938 .[] | . as {$a, b: [$c, {$d}]} ?// [$a, {$b}, $e] ?// $f ..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("[1, null, 2, 3, null, null]", results[0]);
-    try std.testing.expectEqualStrings("[4, 5, null, null, 7, null]", results[1]);
-    try std.testing.expectEqualStrings("[null, null, null, null, null, \"foo\"]", results[2]);
+    try std.testing.expectEqualStrings("[1,null,2,3,null,null]", results[0]);
+    try std.testing.expectEqualStrings("[4,5,null,null,7,null]", results[1]);
+    try std.testing.expectEqualStrings("[null,null,null,null,null,\"foo\"]", results[2]);
 }
 
 test "jq:L945 .[] | . as {a:$a} ?// {a:$a} ?// {a:$a} | $a" {

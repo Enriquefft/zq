@@ -113,7 +113,7 @@ test "jq:L530 . as {as: $kw, _str_: $str, (_e_+_x_+_p_): $exp} | [$kw, ..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1, 2, 3]", results[0]);
+    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
 }
 
 test "jq:L534 .[] as [$a, $b] | [$b, $a]" {
@@ -126,8 +126,8 @@ test "jq:L534 .[] as [$a, $b] | [$b, $a]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("[null, 1]", results[0]);
-    try std.testing.expectEqualStrings("[2, 1]", results[1]);
+    try std.testing.expectEqualStrings("[null,1]", results[0]);
+    try std.testing.expectEqualStrings("[2,1]", results[1]);
 }
 
 test "jq:L539 . as $i | . as [$i] | $i" {

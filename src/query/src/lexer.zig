@@ -10,6 +10,7 @@ pub const Token = struct {
 
     pub const Tag = enum {
         dot, // .
+        dot_dot, // ..
         pipe, // |
         lbracket, // [
         rbracket, // ]
@@ -77,10 +78,15 @@ pub const Token = struct {
         try_kw, // try
         catch_kw, // catch
 
+        // Label/break keywords
+        label_kw, // label
+        break_kw, // break
+
         // Optional operator
         question, // ?
 
-        // Update-assignment operators
+        // Assignment operators
+        eq_assign, // = (plain assignment)
         pipe_eq, // |=
         plus_eq, // +=
         minus_eq, // -=
@@ -121,6 +127,10 @@ pub const Lexer = struct {
         switch (l.src[l.pos]) {
             '.' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == '.') {
+                    l.pos += 1;
+                    return .{ .tag = .dot_dot, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .dot, .offset = start, .len = 1 };
             },
             '|' => {
@@ -225,7 +235,7 @@ pub const Lexer = struct {
                     l.pos += 1;
                     return .{ .tag = .eq, .offset = start, .len = 2 };
                 }
-                return error.QuerySyntaxError;
+                return .{ .tag = .eq_assign, .offset = start, .len = 1 };
             },
             '!' => {
                 l.pos += 1;
@@ -357,6 +367,10 @@ pub const Lexer = struct {
             .try_kw
         else if (std.mem.eql(u8, slice, "catch"))
             .catch_kw
+        else if (std.mem.eql(u8, slice, "label"))
+            .label_kw
+        else if (std.mem.eql(u8, slice, "break"))
+            .break_kw
         else
             .ident;
 

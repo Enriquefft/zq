@@ -50,17 +50,28 @@ zq fixes all of that. Same filter syntax. Just faster — and built for what dev
 
 ---
 
+## For AI Agents
+
+zq is designed for programmatic use. Key integration points:
+
+- **Capability discovery:** `zq -n 'builtins'` lists all built-in functions
+- **Structured errors:** `--json-errors` outputs diagnostics as JSON on stderr
+- **Granular exit codes:** 0=success, 1=false(-e), 2=usage, 3=compile error, 4=runtime error, 5=system error
+- **jq compatible:** same filter syntax — any jq knowledge transfers directly
+- **C ABI:** embed via `zq_compile`/`zq_execute`/`zq_get_error` for structured error details
+
+---
+
 ## Status
 
 Early development. Core query engine and parallel runtime are complete.
 
 | Metric | Value |
 |--------|-------|
-| jq compat tests | 111/539 (21%) — targeting 60% for v0.1 |
-| Module tests | 452/880 passing |
+| jq compat tests | 302/533 (57%) — targeting 60% for v0.1 |
 | Architecture | `error`, `types`, `io`, `parser`, `query`, `output`, `pool`, `c_abi` |
 
-The filter language already covers the most common real-world operators: field access, pipes, array/object construction, arithmetic, comparisons, conditionals, `try/catch`, `//`, `|=`, slicing, string interpolation, and recursive descent.
+The filter language covers: field access, pipes, array/object construction, arithmetic, comparisons, conditionals, `try/catch`, `//`, `|=`, slicing, string interpolation, recursive descent, `reduce`, `foreach`, and 130+ built-in functions.
 
 ---
 
@@ -108,8 +119,8 @@ Requires [Zig 0.15.2](https://ziglang.org/download/). Or with Nix: `direnv allow
 
 ## Roadmap
 
-**v0.1 — Useful:** 60%+ jq compat, all P0/P1 builtins, full CLI flags  
-**v0.5 — Fast:** 95% compat, WASM build, Python bindings  
+**v0.1 — Useful:** 60%+ jq compat, all P0/P1 builtins, full CLI flags, agent-ready diagnostics
+**v0.5 — Fast:** 95% compat, WASM build, Python bindings, auto-detect JSON error output
 **v1.0 — Complete:** 100% compat, LSP, plugin system, MCP server integration
 
 ---

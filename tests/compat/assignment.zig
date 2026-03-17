@@ -18,7 +18,7 @@ test "jq:L1221 .message = _goodbye_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"message\": \"goodbye\"}", results[0]);
+    try std.testing.expectEqualStrings("{\"message\":\"goodbye\"}", results[0]);
 }
 
 test "jq:L1225 .foo = .bar" {
@@ -31,7 +31,7 @@ test "jq:L1225 .foo = .bar" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"foo\":42, \"bar\":42}", results[0]);
+    try std.testing.expectEqualStrings("{\"foo\":42,\"bar\":42}", results[0]);
 }
 
 test "jq:L1229 .foo |= .+1" {
@@ -60,7 +60,7 @@ test "jq:L1233 .[] += 2, .[] *= 2, .[] -= 2, .[] /= 2, .[] %=2" {
     try std.testing.expectEqualStrings("[3,5,7]", results[0]);
     try std.testing.expectEqualStrings("[2,6,10]", results[1]);
     try std.testing.expectEqualStrings("[-1,1,3]", results[2]);
-    try std.testing.expectEqualStrings("[0.5, 1.5, 2.5]", results[3]);
+    try std.testing.expectEqualStrings("[0.5,1.5,2.5]", results[3]);
     try std.testing.expectEqualStrings("[1,1,1]", results[4]);
 }
 
@@ -100,7 +100,7 @@ test "jq:L1249 .[0].a |= {_old_:., _new_:(.+1)}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[{\"a\":{\"old\":1, \"new\":2},\"b\":2}]", results[0]);
+    try std.testing.expectEqualStrings("[{\"a\":{\"old\":1,\"new\":2},\"b\":2}]", results[0]);
 }
 
 test "jq:L1253 def inc(x): x |= .+1; inc(.[].a)" {
@@ -185,7 +185,7 @@ test "jq:L1282 .[2][3] = 1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[4, null, [null, null, null, 1]]", results[0]);
+    try std.testing.expectEqualStrings("[4,null,[null,null,null,1]]", results[0]);
 }
 
 test "jq:L1286 .foo[2].bar = 1" {
@@ -198,7 +198,7 @@ test "jq:L1286 .foo[2].bar = 1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"foo\":[11,null,{\"bar\":1}], \"bar\":42}", results[0]);
+    try std.testing.expectEqualStrings("{\"foo\":[11,null,{\"bar\":1}],\"bar\":42}", results[0]);
 }
 
 test "jq:L1290 try ((map(select(.a == 1))[].b) = 10) catch ." {

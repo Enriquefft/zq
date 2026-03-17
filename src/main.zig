@@ -11,7 +11,9 @@ const err_mod = @import("error");
 const EXIT_OK = 0;
 const EXIT_FALSE = 1; // -e: last output was false/null
 const EXIT_USAGE = 2;
-const EXIT_SYSTEM = 5;
+const EXIT_COMPILE = 3; // filter syntax/compilation error
+const EXIT_RUNTIME = 4; // TypeError, IndexOutOfBounds, UserError during query execution
+const EXIT_SYSTEM = 5; // OOM, I/O error, write failure
 
 const ExternalVar = struct {
     name: []const u8,
@@ -36,6 +38,7 @@ const Config = struct {
     external_vars: []const ExternalVar = &.{},
     positional_args: []const []const u8 = &.{},
     positional_is_json: bool = false,
+    json_errors: bool = false,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -63,6 +66,23 @@ const Config = struct {
         if (self._owned_positional_list) |l| alloc.free(l);
     }
 };
+
+/// Consolidated diagnostic context for query errors.
+/// Replaces scattered out-parameters (last_error_ip, etc.).
+const QueryDiag = struct {
+    last_ip: u32 = 0,
+    user_error_msg: ?[]const u8 = null,
+    error_kind: ?err_mod.ErrorKind = null,
+};
+
+/// Map an ErrorKind to the appropriate exit code.
+fn exitCodeForKind(kind: err_mod.ErrorKind) u8 {
+    return switch (kind) {
+        .query_syntax_error => EXIT_COMPILE,
+        .type_error, .index_out_of_bounds, .user_error => EXIT_RUNTIME,
+        .unexpected_token, .unexpected_eof, .invalid_utf8, .invalid_number, .unterminated_string, .depth_limit_exceeded, .io_error, .out_of_memory => EXIT_SYSTEM,
+    };
+}
 
 pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -128,8 +148,8 @@ pub fn main() !u8 {
     var cq = switch (compile_result) {
         .ok => |compiled| compiled,
         .err => |ce| {
-            err_mod.formatDiagnostic(stderr_writer, filter_src, ce.kind, ce.offset, ce.len, null, allocator);
-            return EXIT_USAGE;
+            err_mod.formatDiagnostic(stderr_writer, filter_src, ce.kind, ce.offset, ce.len, null, null, allocator, if (config.json_errors) .json else .text);
+            return EXIT_COMPILE;
         },
     };
     defer cq.deinit();
@@ -448,20 +468,25 @@ pub fn main() !u8 {
 
     var last_was_false_or_null = false;
     var had_parse_errors = false;
+    var pool_error_exit: ?u8 = null;
+
+    const diag_format: err_mod.DiagnosticFormat = if (config.json_errors) .json else .text;
 
     if (config.null_input) {
-        var last_error_ip: u32 = 0;
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &last_error_ip) catch |e| {
-            const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
-            err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
-            return EXIT_SYSTEM;
+        var diag = QueryDiag{};
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &diag) catch |e| {
+            const kind = err_mod.kindFromZqError(@errorCast(e));
+            const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
+            err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
+            return exitCodeForKind(kind);
         };
     } else if (config.slurp) {
-        var last_error_ip: u32 = 0;
-        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &last_error_ip) catch |e| {
-            const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
-            err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
-            return EXIT_SYSTEM;
+        var diag = QueryDiag{};
+        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &diag) catch |e| {
+            const kind = err_mod.kindFromZqError(@errorCast(e));
+            const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
+            err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
+            return exitCodeForKind(kind);
         };
     } else if (config.files.len == 0) {
         // Read from stdin using parallel pool.
@@ -485,9 +510,11 @@ pub fn main() !u8 {
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
+                const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (pool.last_error_ip < cq.source_map.len) cq.source_map[pool.last_error_ip] else 0;
-                err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
-                had_parse_errors = true;
+                err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, null, allocator, diag_format);
+                const code = exitCodeForKind(kind);
+                if (pool_error_exit == null or code > pool_error_exit.?) pool_error_exit = code;
                 continue;
             };
             const result = maybe orelse break;
@@ -507,11 +534,12 @@ pub fn main() !u8 {
             };
             defer file.close();
 
-            var last_error_ip: u32 = 0;
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &last_error_ip) catch |e| {
-                const src_offset = if (last_error_ip < cq.source_map.len) cq.source_map[last_error_ip] else 0;
-                err_mod.formatDiagnostic(stderr_writer, filter_src, err_mod.kindFromZqError(@errorCast(e)), src_offset, 0, null, allocator);
-                return EXIT_SYSTEM;
+            var diag = QueryDiag{};
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &diag) catch |e| {
+                const kind = err_mod.kindFromZqError(@errorCast(e));
+                const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
+                err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
+                return exitCodeForKind(kind);
             };
         }
     }
@@ -521,6 +549,7 @@ pub fn main() !u8 {
         return EXIT_SYSTEM;
     };
 
+    if (pool_error_exit) |code| return code;
     if (had_parse_errors) return EXIT_SYSTEM;
     if (config.exit_status and last_was_false_or_null) {
         return EXIT_FALSE;
@@ -540,13 +569,13 @@ fn processFile(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     raw_input: bool,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
     const budget = pool_mod.MemoryBudget.detect();
     var pool = try pool_mod.Pool.init(n_threads, budget, allocator);
     defer pool.deinit();
-    errdefer error_ip_out.* = pool.last_error_ip;
+    errdefer diag.last_ip = pool.last_error_ip;
 
     try pool.submit_file(file, cq, format, color, opts, raw_input, ext_bindings);
 
@@ -571,12 +600,12 @@ fn processSlurp(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     had_errors: *bool,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     if (config.raw_input) {
-        return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
+        return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator, diag);
     }
-    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors, error_ip_out);
+    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors, diag);
 }
 
 /// Collect all parsed JSON values into a single array, then run the query once.
@@ -590,7 +619,7 @@ fn processSlurpJson(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     had_errors: *bool,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     var rt = try types.RuntimeTape.init(allocator);
     defer rt.deinit(allocator);
@@ -631,7 +660,7 @@ fn processSlurpJson(
     const tape = rt.asTape();
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
 }
 
 /// Read all JSON values from a file/stdin using Source + Parser, copying each
@@ -718,7 +747,7 @@ fn processSlurpRaw(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     var text_buf = std.ArrayList(u8){};
     defer text_buf.deinit(allocator);
@@ -756,7 +785,7 @@ fn processSlurpRaw(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
 }
 
 fn readAllBytes(
@@ -791,7 +820,7 @@ fn processNullInput(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
     defer parser.deinit();
@@ -804,7 +833,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, error_ip_out);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
 }
 
 /// Execute the query against `tape` and write all output values.
@@ -821,7 +850,7 @@ fn writeRecord(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
-    error_ip_out: *u32,
+    diag: *QueryDiag,
 ) !bool {
     if (opt_it.*) |*it| {
         it.reset(tape, ext_bindings);
@@ -829,7 +858,16 @@ fn writeRecord(
         opt_it.* = try cq.execute(tape, ext_bindings, allocator);
     }
     const it = &opt_it.*.?;
-    errdefer error_ip_out.* = it.last_error_ip;
+    errdefer {
+        diag.last_ip = it.last_error_ip;
+        // Capture user error message from the iterator before it's cleaned up.
+        if (it.user_error_msg) |msg| {
+            switch (msg) {
+                .string => |s| diag.user_error_msg = s,
+                else => {},
+            }
+        }
+    }
 
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
@@ -1023,6 +1061,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 try positional_args.append(allocator, duped);
             }
             break;
+        } else if (std.mem.eql(u8, arg, "--json-errors")) {
+            config.json_errors = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             std.process.exit(EXIT_OK);
@@ -1160,7 +1200,7 @@ fn printUsage() void {
     printErr(
         \\Usage: zq [OPTIONS] <FILTER> [FILE...]
         \\
-        \\A high-performance JSON processor.
+        \\A high-performance JSON processor, compatible with jq filter syntax.
         \\
         \\Options:
         \\  -r, --raw-output      Output raw strings (no quotes)
@@ -1180,13 +1220,45 @@ fn printUsage() void {
         \\  --argjson NAME VALUE  Set $NAME to parsed JSON VALUE
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
+        \\  --json-errors         Output errors as JSON on stderr
         \\  -h, --help            Print this help
         \\  -V, --version         Print version
+        \\
+        \\Filter syntax:
+        \\  .               Identity
+        \\  .foo, .foo.bar  Field access
+        \\  .foo?           Optional field access (no error if missing)
+        \\  .[0], .[-1]     Array index
+        \\  .[2:5]          Array/string slice
+        \\  .[]             Iterate all elements
+        \\  |               Pipe (compose filters)
+        \\  ,               Output multiple values
+        \\  select(f)       Keep values where f is truthy
+        \\  if-then-else    Conditionals: if .x then .y else .z end
+        \\  try-catch       Error handling: try .x catch .y
+        \\  //              Alternative operator: .x // "default"
+        \\  |=, +=, -=      Update operators
+        \\  {a,b}, {x:.y}  Object construction
+        \\  [.[] | f]      Array construction
+        \\  \(.x)           String interpolation: "val=\(.x)"
+        \\  def f: body;   Function definition
+        \\  reduce          reduce .[] as $x (init; update)
+        \\  foreach         foreach .[] as $x (init; update; extract)
+        \\  ..              Recursive descent
+        \\
+        \\Format strings: @base64 @base64d @csv @tsv @html @uri @sh @json @text
         \\
         \\Examples:
         \\  echo '{"a":1}' | zq '.a'
         \\  zq '.[] | .name' data.json
         \\  zq -c '.' input.json
+        \\  zq 'select(.age > 30)' users.json
+        \\  zq '{name: .title, id: .num}' items.json
+        \\  zq '[.[] | .price] | add' orders.json
+        \\
+        \\Exit codes: 0=success, 1=false(-e), 2=usage, 3=compile, 4=runtime, 5=system
+        \\
+        \\Run 'zq -n builtins' for all built-in functions.
         \\
     );
 }

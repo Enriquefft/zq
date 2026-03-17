@@ -63,6 +63,11 @@ const RangeFrame = struct {
 const TryFrame = struct {
     /// IP of the catch handler. 0 = no catch (suppress error silently).
     catch_ip: u32,
+    /// IP to resume at when in suppress mode (catch_ip == 0) and the error
+    /// is caught inside an alternative (`//`) context.  Points to the
+    /// instruction right after the matching `try_end` so that `alt_check`
+    /// can evaluate the (falsy) result and fall through to the right side.
+    resume_ip: u32,
     /// Saved stack depths for unwinding on error.
     saved_iter_len: u32,
     saved_value_len: u32,
@@ -71,6 +76,63 @@ const TryFrame = struct {
     saved_range_len: u32,
     /// Saved alt_null_depth so the counter is restored correctly on error.
     saved_alt_null_depth: u32,
+    /// Saved label stack depth for unwinding on error.
+    saved_label_len: u32,
+    /// Saved limit stack depth for unwinding on error.
+    saved_limit_len: u32,
+    /// Saved call stack depth for unwinding on error.
+    saved_call_len: u32,
+};
+
+/// State for one active `limit(n;f)` scope.
+/// Pushed by limit_start, popped when counter reaches zero or scope exits naturally.
+const LimitFrame = struct {
+    remaining: u64,
+    /// IP of the limit_start instruction (start of the limit scope body).
+    body_start_ip: u32,
+    /// IP past the limit scope body (where to jump on exhaustion).
+    exit_ip: u32,
+    /// Saved stack depths for unwinding when limit is exhausted.
+    saved_iter_len: u32,
+    saved_range_len: u32,
+    /// Saved collect stack depth to distinguish body outputs from nested collections.
+    saved_collect_len: u32,
+};
+
+/// State for one active function call (used for recursive user-defined functions).
+/// Pushed by call_function, popped by return_function.
+const CallFrame = struct {
+    /// IP to resume at when the function body returns.
+    return_ip: u32,
+    /// Saved stack depths for correct unwinding.
+    saved_iter_len: u32,
+    saved_value_len: u32,
+    saved_if_len: u32,
+    saved_collect_len: u32,
+    saved_range_len: u32,
+    saved_try_len: u32,
+    saved_label_len: u32,
+    saved_limit_len: u32,
+    saved_alt_null_depth: u32,
+};
+
+/// State for one active `label $name` scope.
+/// Pushed by label_begin, popped by handleBreak or label_end.
+const LabelFrame = struct {
+    /// Unique break token associated with this label.
+    break_token: u32,
+    /// IP to jump to when `break $name` fires (the label_end instruction).
+    exit_ip: u32,
+    /// Saved stack depths for unwinding on break.
+    saved_iter_len: u32,
+    saved_value_len: u32,
+    saved_if_len: u32,
+    saved_collect_len: u32,
+    saved_range_len: u32,
+    saved_alt_null_depth: u32,
+    saved_try_len: u32,
+    saved_limit_len: u32,
+    saved_call_len: u32,
 };
 
 /// Resolve a slice bound (possibly negative) against collection length.
@@ -139,6 +201,8 @@ pub const ResultIterator = struct {
     runtime_tape_view: types.Tape,
     /// Object construction state.
     object_construct: std.ArrayList(ObjectField),
+    /// Stack of saved field counts for nested object construction.
+    object_construct_depth: std.ArrayList(u32),
     /// Stack of saved `current` values for if/elif branch restoration.
     /// save_input pushes; restore_input pops.
     if_stack: std.ArrayList(Value),
@@ -148,6 +212,16 @@ pub const ResultIterator = struct {
     try_stack: std.ArrayList(TryFrame),
     /// Active range generator frames. Pushed by range/range2/range3 builtins.
     range_stack: std.ArrayList(RangeFrame),
+    /// Active label frames for non-local exit (label/break).
+    label_stack: std.ArrayList(LabelFrame),
+    /// Active limit frames for streaming limit(n;f).
+    limit_stack: std.ArrayList(LimitFrame),
+    /// Active call frames for user-defined recursive function calls.
+    call_stack: std.ArrayList(CallFrame),
+    /// When set, the VM should execute handleBreak at the top of the step loop.
+    pending_break_token: ?u32,
+    /// Monotonically increasing counter for generating unique break tokens.
+    next_break_token: u32,
     /// Value stored by the `error` builtin so the catch handler can retrieve it.
     user_error_msg: ?Value,
     alloc: std.mem.Allocator,
@@ -200,6 +274,11 @@ pub const ResultIterator = struct {
         errdefer object_construct.deinit(allocator);
         try object_construct.ensureTotalCapacity(allocator, 128);
 
+        // Initialize object construction depth stack for nested objects
+        var object_construct_depth = std.ArrayList(u32){};
+        errdefer object_construct_depth.deinit(allocator);
+        try object_construct_depth.ensureTotalCapacity(allocator, 16);
+
         // Initialize if-branch input stack
         var if_stack = std.ArrayList(Value){};
         errdefer if_stack.deinit(allocator);
@@ -219,6 +298,21 @@ pub const ResultIterator = struct {
         var range_stack = std.ArrayList(RangeFrame){};
         errdefer range_stack.deinit(allocator);
         try range_stack.ensureTotalCapacity(allocator, max_stack_depth);
+
+        // Initialize label frame stack for non-local exit
+        var label_stack = std.ArrayList(LabelFrame){};
+        errdefer label_stack.deinit(allocator);
+        try label_stack.ensureTotalCapacity(allocator, 16);
+
+        // Initialize limit frame stack for streaming limit(n;f)
+        var limit_stack = std.ArrayList(LimitFrame){};
+        errdefer limit_stack.deinit(allocator);
+        try limit_stack.ensureTotalCapacity(allocator, 16);
+
+        // Initialize call frame stack for recursive user-defined functions
+        var call_stack = std.ArrayList(CallFrame){};
+        errdefer call_stack.deinit(allocator);
+        try call_stack.ensureTotalCapacity(allocator, 64);
 
         // Initialize runtime tape
         var runtime_tape = try types.RuntimeTape.init(allocator);
@@ -245,10 +339,16 @@ pub const ResultIterator = struct {
             .runtime_tape = runtime_tape,
             .runtime_tape_view = runtime_tape_view,
             .object_construct = object_construct,
+            .object_construct_depth = object_construct_depth,
             .if_stack = if_stack,
             .collect_stack = collect_stack,
             .try_stack = try_stack,
             .range_stack = range_stack,
+            .label_stack = label_stack,
+            .limit_stack = limit_stack,
+            .call_stack = call_stack,
+            .pending_break_token = null,
+            .next_break_token = 0,
             .user_error_msg = null,
             .alloc = allocator,
             .done = false,
@@ -265,11 +365,15 @@ pub const ResultIterator = struct {
         it.value_stack.deinit(it.alloc);
         it.variable_store.deinit(it.alloc);
         it.object_construct.deinit(it.alloc);
+        it.object_construct_depth.deinit(it.alloc);
         it.if_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
         it.try_stack.deinit(it.alloc);
         it.range_stack.deinit(it.alloc);
+        it.label_stack.deinit(it.alloc);
+        it.limit_stack.deinit(it.alloc);
+        it.call_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
     }
 
@@ -304,6 +408,11 @@ pub const ResultIterator = struct {
         it.collect_stack.clearRetainingCapacity();
         it.try_stack.clearRetainingCapacity();
         it.range_stack.clearRetainingCapacity();
+        it.label_stack.clearRetainingCapacity();
+        it.limit_stack.clearRetainingCapacity();
+        it.call_stack.clearRetainingCapacity();
+        it.pending_break_token = null;
+        it.next_break_token = 0;
         it.user_error_msg = null;
         it.runtime_tape.entries.clearRetainingCapacity();
         it.runtime_tape.string_buf.clearRetainingCapacity();
@@ -379,6 +488,16 @@ pub const ResultIterator = struct {
     /// to the active try frame (if any), propagating uncaught errors to the caller.
     fn step(it: *ResultIterator) ZqError!?Value {
         while (true) {
+            // Handle pending break (non-local exit from label/break).
+            if (it.pending_break_token) |token| {
+                if (!it.handleBreak(token)) {
+                    // No matching label found — treat as done.
+                    it.done = true;
+                    return null;
+                }
+                continue;
+            }
+
             if (it.ip >= it.instructions.len) {
                 if (it.stack.items.len == 0) {
                     // Check if there's an active inner range frame.
@@ -471,8 +590,17 @@ pub const ResultIterator = struct {
         // Unwind range frames.
         it.range_stack.items.len = frame.saved_range_len;
 
+        // Unwind label frames.
+        it.label_stack.items.len = frame.saved_label_len;
+
         // Restore null-propagation depth.
         it.alt_null_depth = frame.saved_alt_null_depth;
+
+        // Unwind limit frames.
+        it.limit_stack.items.len = frame.saved_limit_len;
+
+        // Unwind call frames.
+        it.call_stack.items.len = frame.saved_call_len;
 
         if (frame.catch_ip > 0) {
             // For UserError, the error message is the value stored by the `error` builtin.
@@ -484,6 +612,12 @@ pub const ResultIterator = struct {
                 it.current = Value{ .string = errorToString(err) };
             }
             it.ip = frame.catch_ip;
+        } else if (frame.saved_alt_null_depth > 0 and frame.resume_ip < it.instructions.len) {
+            // No catch but inside an alternative (`//`) context: push a false
+            // value so that `alt_check` sees a falsy result and falls through
+            // to evaluate the right side of `//`.
+            it.pushValue(.{ .bool_val = false });
+            it.ip = frame.resume_ip;
         } else {
             // No catch (try expr / expr?): suppress the error and signal that this
             // output path is exhausted by setting ip past the instruction sequence.
@@ -499,6 +633,65 @@ pub const ResultIterator = struct {
             }
             it.ip = @intCast(it.instructions.len);
         }
+    }
+
+    /// Handle a non-local exit triggered by `break $name`.
+    /// Searches the label_stack for a frame with a matching break token,
+    /// unwinds all stacks to the saved depths, and jumps to the label's exit_ip.
+    /// Returns true if a matching label was found, false otherwise.
+    fn handleBreak(it: *ResultIterator, token: u32) bool {
+        var idx: usize = it.label_stack.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const frame = it.label_stack.items[idx];
+            if (frame.break_token == token) {
+                // Unwind all stacks to saved depths.
+                it.stack.items.len = frame.saved_iter_len;
+                it.value_stack.items.len = frame.saved_value_len;
+                it.if_stack.items.len = frame.saved_if_len;
+
+                // Unwind collect frames, freeing their buffers and propagating to parent.
+                while (it.collect_stack.items.len > frame.saved_collect_len) {
+                    var cf = it.collect_stack.pop().?;
+                    defer cf.buffer.deinit(it.alloc);
+                    if (cf.buffer.items.len > 0 and it.collect_stack.items.len > 0) {
+                        const parent = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                        for (cf.buffer.items) |item| {
+                            parent.buffer.append(it.alloc, item) catch {};
+                        }
+                    }
+                }
+
+                it.range_stack.items.len = frame.saved_range_len;
+                it.alt_null_depth = frame.saved_alt_null_depth;
+                it.try_stack.items.len = frame.saved_try_len;
+                it.limit_stack.items.len = frame.saved_limit_len;
+                it.call_stack.items.len = frame.saved_call_len;
+                it.label_stack.items.len = idx;
+
+                // Resume execution after the label body. The label expression
+                // should produce no output on break (behave like `empty`).
+                // If exit_ip points to an `output` instruction (inserted by
+                // comma), skip it so no stale value leaks into output.
+                var ip = frame.exit_ip;
+                // Skip output and push_current+output sequences at exit_ip
+                // to prevent stale value leakage after break.
+                if (ip < it.instructions.len) {
+                    if (it.instructions[ip].op == .output) {
+                        ip += 1;
+                    } else if (ip + 1 < it.instructions.len and
+                        it.instructions[ip].op == .push_current and
+                        it.instructions[ip + 1].op == .output)
+                    {
+                        ip += 2; // skip push_current + output
+                    }
+                }
+                it.ip = ip;
+                it.pending_break_token = null;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Execute a single instruction. Returns:
@@ -530,6 +723,51 @@ pub const ResultIterator = struct {
                     try stackValueToValue(try it.popValue())
                 else
                     it.current;
+
+                // Check limit counter: find the innermost limit scope containing this output.
+                // Only count this output if it's the "real" output of the limit body,
+                // not an output inside a nested collect frame (e.g., parseArgToArray).
+                if (it.limit_stack.items.len > 0) {
+                    const output_ip = it.ip;
+                    var li: usize = it.limit_stack.items.len;
+                    while (li > 0) {
+                        li -= 1;
+                        var lf = &it.limit_stack.items[li];
+                        // Check if this output IP is within the limit scope
+                        if (output_ip > lf.body_start_ip and output_ip < lf.exit_ip) {
+                            // Skip if this output is inside a collect frame that was pushed
+                            // after the limit scope started (nested collection, not the limit's output).
+                            // Skip if this output is inside a collect frame that was pushed
+                            // after the limit scope started (nested collection, not the
+                            // limit's output — e.g., parseArgToArray inside the body).
+                            if (it.collect_stack.items.len > lf.saved_collect_len) {
+                                break;
+                            }
+                            lf.remaining -= 1;
+                            if (lf.remaining == 0) {
+                                const saved_iter = lf.saved_iter_len;
+                                const saved_range = lf.saved_range_len;
+                                // Pop this and any inner limit frames
+                                it.limit_stack.items.len = li;
+                                // Unwind iterate/range frames inside the limit scope
+                                it.stack.items.len = saved_iter;
+                                it.range_stack.items.len = saved_range;
+                                // Emit the final value, then signal exhaustion
+                                if (it.collect_stack.items.len > 0) {
+                                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                                    try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                                    it.value_stack.items.len = cf.outer_value_depth;
+                                    it.ip = @intCast(it.instructions.len);
+                                    return null;
+                                } else {
+                                    it.ip = @intCast(it.instructions.len);
+                                    return val;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
 
                 if (it.collect_stack.items.len > 0) {
                     // Collect mode: buffer value instead of yielding.
@@ -780,14 +1018,37 @@ pub const ResultIterator = struct {
 
             // Try-catch error handling
             .try_begin => {
+                const catch_ip: u32 = @intCast(instr.operand.index);
+                // For suppress mode (catch_ip == 0), find the matching try_end
+                // so we know where to resume if an error is caught inside an
+                // alternative (`//`) context.
+                const resume_ip: u32 = if (catch_ip == 0) blk: {
+                    var depth: u32 = 1;
+                    var scan: u32 = it.ip + 1;
+                    while (scan < it.instructions.len) : (scan += 1) {
+                        switch (it.instructions[scan].op) {
+                            .try_begin => depth += 1,
+                            .try_end => {
+                                depth -= 1;
+                                if (depth == 0) break :blk scan + 1;
+                            },
+                            else => {},
+                        }
+                    }
+                    break :blk @intCast(it.instructions.len);
+                } else 0;
                 it.try_stack.appendAssumeCapacity(TryFrame{
-                    .catch_ip = @intCast(instr.operand.index),
+                    .catch_ip = catch_ip,
+                    .resume_ip = resume_ip,
                     .saved_iter_len = @intCast(it.stack.items.len),
                     .saved_value_len = @intCast(it.value_stack.items.len),
                     .saved_if_len = @intCast(it.if_stack.items.len),
                     .saved_collect_len = @intCast(it.collect_stack.items.len),
                     .saved_range_len = @intCast(it.range_stack.items.len),
                     .saved_alt_null_depth = it.alt_null_depth,
+                    .saved_label_len = @intCast(it.label_stack.items.len),
+                    .saved_limit_len = @intCast(it.limit_stack.items.len),
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                 });
                 it.ip += 1;
                 return null;
@@ -821,7 +1082,9 @@ pub const ResultIterator = struct {
 
             // Object construction operations
             .object_construct_start => {
-                it.object_construct.clearRetainingCapacity();
+                // Save the current field count so nested object constructions
+                // don't clobber the outer object's fields.
+                it.object_construct_depth.appendAssumeCapacity(@intCast(it.object_construct.items.len));
                 // Snapshot input so each field's value expression starts from it.
                 it.current = it.input_value;
                 it.ip += 1;
@@ -859,7 +1122,14 @@ pub const ResultIterator = struct {
             },
 
             .object_construct_end => {
-                const obj = try it.constructObjectFromFields();
+                // Pop the depth marker to find where this level's fields start.
+                const saved_depth = if (it.object_construct_depth.items.len > 0)
+                    it.object_construct_depth.pop().?
+                else
+                    0;
+                const obj = try it.constructObjectFromFieldsRange(saved_depth);
+                // Truncate back to the saved depth, removing this level's fields.
+                it.object_construct.items.len = saved_depth;
                 it.pushValue(obj);
                 it.ip += 1;
                 return null;
@@ -1012,9 +1282,43 @@ pub const ResultIterator = struct {
             },
 
             .call_function => {
-                _ = @as(u32, @intCast(instr.operand.index));
-                it.ip += 1;
+                // Recursive function call: push a call frame and jump to the body.
+                const max_recursion_depth = 10000;
+                if (it.call_stack.items.len >= max_recursion_depth) {
+                    return error.TypeError;
+                }
+                const body_ip = @as(u32, @intCast(instr.operand.index));
+                try it.call_stack.append(it.alloc, CallFrame{
+                    .return_ip = it.ip + 1,
+                    .saved_iter_len = @intCast(it.stack.items.len),
+                    .saved_value_len = @intCast(it.value_stack.items.len),
+                    .saved_if_len = @intCast(it.if_stack.items.len),
+                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    .saved_range_len = @intCast(it.range_stack.items.len),
+                    .saved_try_len = @intCast(it.try_stack.items.len),
+                    .saved_label_len = @intCast(it.label_stack.items.len),
+                    .saved_limit_len = @intCast(it.limit_stack.items.len),
+                    .saved_alt_null_depth = it.alt_null_depth,
+                });
+                it.ip = body_ip;
                 return null;
+            },
+
+            .return_function => {
+                // Return from a recursive function call.
+                if (it.call_stack.items.len > 0) {
+                    const frame = it.call_stack.pop().?;
+                    it.ip = frame.return_ip;
+                } else {
+                    // Should not happen — return without matching call.
+                    it.ip += 1;
+                }
+                return null;
+            },
+
+            .call_filter_arg => {
+                // Should never appear at runtime — filter args are expanded at compile time.
+                return error.TypeError;
             },
 
             .call_builtin => {
@@ -1023,12 +1327,99 @@ pub const ResultIterator = struct {
                 if (result) |val| {
                     it.pushValue(val);
                 }
-                // doBuiltin advances ip when it sets up generators (range); otherwise advance here.
+                // doBuiltin advances ip when it sets up generators (range, paths, leaf_paths);
+                // otherwise advance here.
                 // For empty, ip is set past end of instructions — do not advance again.
                 // We only advance if doBuiltin didn't already change ip.
-                if (bid != .empty and bid != .range and bid != .range2 and bid != .range3) {
+                if (bid != .empty and bid != .range and bid != .range2 and bid != .range3 and
+                    bid != .paths and bid != .leaf_paths and bid != .recurse)
+                {
                     it.ip += 1;
                 }
+                return null;
+            },
+
+            .label_begin => {
+                // Save stack depths BEFORE pushing the token, so handleBreak
+                // restores to the state before label_begin's side effects.
+                const saved_value_len: u32 = @intCast(it.value_stack.items.len);
+
+                // Generate a unique break token and push it to the value stack as an int.
+                const token = it.next_break_token;
+                it.next_break_token += 1;
+                it.pushValue(.{ .int = @as(i64, @intCast(token)) });
+
+                // Push a LabelFrame for handleBreak to find.
+                try it.label_stack.append(it.alloc, LabelFrame{
+                    .break_token = token,
+                    .exit_ip = @intCast(instr.operand.index),
+                    .saved_iter_len = @intCast(it.stack.items.len),
+                    .saved_value_len = saved_value_len,
+                    .saved_if_len = @intCast(it.if_stack.items.len),
+                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    .saved_range_len = @intCast(it.range_stack.items.len),
+                    .saved_alt_null_depth = it.alt_null_depth,
+                    .saved_try_len = @intCast(it.try_stack.items.len),
+                    .saved_limit_len = @intCast(it.limit_stack.items.len),
+                    .saved_call_len = @intCast(it.call_stack.items.len),
+                });
+                it.ip += 1;
+                return null;
+            },
+
+            .label_end => {
+                // Pop the label frame if present (normal exit, no break fired).
+                if (it.label_stack.items.len > 0) {
+                    _ = it.label_stack.pop();
+                }
+                it.ip += 1;
+                return null;
+            },
+
+            .break_op => {
+                // Load break token from value stack (pushed by load_variable before this).
+                const token_sv = try it.popValue();
+                const token = switch (token_sv) {
+                    .int => |i| @as(u32, @intCast(i)),
+                    else => return error.TypeError,
+                };
+                it.pending_break_token = token;
+                return null;
+            },
+
+            .limit_start => {
+                const n_sv = try it.popValue();
+                const n_i: i64 = switch (n_sv) {
+                    .int => |i| i,
+                    .float => |f| @intFromFloat(@round(f)),
+                    else => return error.TypeError,
+                };
+                if (n_i < 0) {
+                    it.user_error_msg = .{ .string = "limit doesn't support negative count" };
+                    return error.UserError;
+                }
+                if (n_i == 0) {
+                    // Produce empty (no output) — trigger step loop to advance
+                    // the outer iterate or finalize collect frames.
+                    it.ip = @intCast(it.instructions.len);
+                    return null;
+                }
+                try it.limit_stack.append(it.alloc, .{
+                    .remaining = @intCast(n_i),
+                    .body_start_ip = it.ip,
+                    .exit_ip = @intCast(instr.operand.index),
+                    .saved_iter_len = @intCast(it.stack.items.len),
+                    .saved_range_len = @intCast(it.range_stack.items.len),
+                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                });
+                it.ip += 1;
+                return null;
+            },
+            .limit_end => {
+                if (it.limit_stack.items.len > 0) {
+                    _ = it.limit_stack.pop();
+                }
+                it.ip += 1;
                 return null;
             },
         }
@@ -1556,14 +1947,18 @@ pub const ResultIterator = struct {
     };
 
     fn constructObjectFromFields(it: *ResultIterator) ZqError!StackValue {
+        return it.constructObjectFromFieldsRange(0);
+    }
+
+    fn constructObjectFromFieldsRange(it: *ResultIterator, start_idx: u32) ZqError!StackValue {
         // Append object_start entry
         const obj_start_idx = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .object_start,
             .payload = .{ .skip = 0 }, // Will update after object_end
         });
 
-        // Append key-value pairs
-        for (it.object_construct.items) |field| {
+        // Append key-value pairs from start_idx to end
+        for (it.object_construct.items[start_idx..]) |field| {
             // Intern key string
             const key_ref = try it.runtime_tape.internString(it.alloc, field.key);
             // Append key entry
@@ -1746,15 +2141,159 @@ pub const ResultIterator = struct {
             .int => |li| switch (right) {
                 .int => |ri| .{ .int = li * ri },
                 .float => |rf| .{ .float = @as(f64, @floatFromInt(li)) * rf },
+                .null_val => .null_val,
+                .tape_value => |rtv| switch (rtv) {
+                    // int * string: repeat the string
+                    .string => |s| try it.doStringRepeat(s, li),
+                    else => error.TypeError,
+                },
                 else => error.TypeError,
             },
             .float => |lf| switch (right) {
                 .int => |ri| .{ .float = lf * @as(f64, @floatFromInt(ri)) },
                 .float => |rf| .{ .float = lf * rf },
+                .null_val => .null_val,
+                else => error.TypeError,
+            },
+            .null_val => .null_val,
+            .tape_value => |ltv| switch (ltv) {
+                .object => |lspan| switch (right) {
+                    .tape_value => |rtv| switch (rtv) {
+                        .object => |rspan| try it.doRecursiveMerge(lspan, rspan),
+                        .null_val => .null_val,
+                        else => error.TypeError,
+                    },
+                    .null_val => .null_val,
+                    else => error.TypeError,
+                },
+                // string * int/float: repeat the string
+                .string => |s| switch (right) {
+                    .int => |ri| try it.doStringRepeat(s, ri),
+                    .float => |rf| try it.doStringRepeat(s, @intFromFloat(@floor(rf))),
+                    .null_val => .null_val,
+                    else => error.TypeError,
+                },
                 else => error.TypeError,
             },
             else => error.TypeError,
         };
+    }
+
+    /// String repetition for `*` operator.
+    /// `"abc" * 3` produces `"abcabcabc"`. `"abc" * 0` produces `null`.
+    fn doStringRepeat(it: *ResultIterator, s: []const u8, n: i64) !StackValue {
+        if (n <= 0) return .null_val;
+        const count: usize = @intCast(n);
+        if (count == 1) return .{ .tape_value = .{ .string = s } };
+        // Guard against excessive allocations
+        const total_len = s.len * count;
+        if (total_len > 128 * 1024 * 1024) return error.OutOfMemory; // 128MB limit
+        const start_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
+        try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, total_len);
+        for (0..count) |_| {
+            it.runtime_tape.string_buf.appendSliceAssumeCapacity(s);
+        }
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[start_off..][0..total_len] } };
+    }
+
+    /// Recursive object merge for `*` operator.
+    /// For each key: if both values are objects, recurse; otherwise right wins.
+    fn doRecursiveMerge(it: *ResultIterator, lspan: types.Value.TapeSpan, rspan: types.Value.TapeSpan) ZqError!StackValue {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        // Write all left keys, recursively merging or overwriting with right's value when present.
+        var lpos = lspan.start + 1;
+        const lend = lspan.end - 1;
+        while (lpos < lend) {
+            const lkey = lspan.tape.getString(lspan.tape.entries[lpos].payload.string);
+            // Look for this key in right
+            var rpos2 = rspan.start + 1;
+            const rend2 = rspan.end - 1;
+            var right_val_pos: ?u32 = null;
+            while (rpos2 < rend2) {
+                const rkey = rspan.tape.getString(rspan.tape.entries[rpos2].payload.string);
+                if (std.mem.eql(u8, lkey, rkey)) {
+                    right_val_pos = rpos2 + 1;
+                    break;
+                }
+                rpos2 = skipEntry(rspan.tape.*, rpos2 + 1);
+            }
+            const new_key_ref = try it.runtime_tape.internString(it.alloc, lkey);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = new_key_ref } });
+            if (right_val_pos) |rvp| {
+                // Key exists in both: check if both values are objects for recursive merge
+                const lval = tapeEntryToValue(lspan.tape, lpos + 1);
+                const rval = tapeEntryToValue(rspan.tape, rvp);
+                switch (lval) {
+                    .object => |lobj_span| switch (rval) {
+                        .object => |robj_span| {
+                            // Both are objects: recursive merge.
+                            // The recursive call appends entries directly to runtime_tape,
+                            // so we just call it — no need to copy the result.
+                            _ = try it.doRecursiveMerge(lobj_span, robj_span);
+                        },
+                        else => {
+                            // Right is not an object: right wins
+                            const rval_sv = try valueToStackValue(rval);
+                            try it.stackValueToRuntimeTapeEntry(rval_sv);
+                        },
+                    },
+                    else => {
+                        // Left is not an object: right wins
+                        const rval_sv = try valueToStackValue(rval);
+                        try it.stackValueToRuntimeTapeEntry(rval_sv);
+                    },
+                }
+            } else {
+                // Key only in left: use left's value
+                const lval_sv = try valueToStackValue(tapeEntryToValue(lspan.tape, lpos + 1));
+                try it.stackValueToRuntimeTapeEntry(lval_sv);
+            }
+            lpos = skipEntry(lspan.tape.*, lpos + 1);
+        }
+
+        // Append right keys that are not in left
+        var rpos = rspan.start + 1;
+        const rend = rspan.end - 1;
+        while (rpos < rend) {
+            const rkey = rspan.tape.getString(rspan.tape.entries[rpos].payload.string);
+            // Check if left has this key
+            var lpos2 = lspan.start + 1;
+            var in_left = false;
+            while (lpos2 < lend) {
+                const lkey2 = lspan.tape.getString(lspan.tape.entries[lpos2].payload.string);
+                if (std.mem.eql(u8, rkey, lkey2)) {
+                    in_left = true;
+                    break;
+                }
+                lpos2 = skipEntry(lspan.tape.*, lpos2 + 1);
+            }
+            if (!in_left) {
+                const new_key_ref = try it.runtime_tape.internString(it.alloc, rkey);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = new_key_ref } });
+                const rval_sv = try valueToStackValue(tapeEntryToValue(rspan.tape, rpos + 1));
+                try it.stackValueToRuntimeTapeEntry(rval_sv);
+            }
+            rpos = skipEntry(rspan.tape.*, rpos + 1);
+        }
+
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape_view,
+            .start = obj_start,
+            .end = obj_end_idx + 1,
+        } } };
     }
 
     fn doDiv(it: *ResultIterator) ZqError!StackValue {
@@ -1799,6 +2338,28 @@ pub const ResultIterator = struct {
             try it.popValue()
         else
             try valueToStackValue(it.current);
+        // If either operand is a float (including inf/nan), use float modulo
+        const left_is_float = switch (left) {
+            .float => true,
+            else => false,
+        };
+        const right_is_float = switch (right) {
+            .float => true,
+            else => false,
+        };
+        if (left_is_float or right_is_float) {
+            const lf: f64 = switch (left) {
+                .int => |i| @as(f64, @floatFromInt(i)),
+                .float => |f| f,
+                else => return error.TypeError,
+            };
+            const rf: f64 = switch (right) {
+                .int => |i| @as(f64, @floatFromInt(i)),
+                .float => |f| f,
+                else => return error.TypeError,
+            };
+            return .{ .float = @rem(lf, rf) };
+        }
         const left_int = try toInt(left);
         const right_int = try toInt(right);
         if (right_int == 0) return error.TypeError; // modulo by zero
@@ -1869,6 +2430,122 @@ pub const ResultIterator = struct {
             .range2_gen => return try it.builtinRange2Gen(),
             .range3_gen => return try it.builtinRange3Gen(),
             .limit_gen => return try it.builtinLimitGen(),
+            .getpath => return try it.builtinGetpath(),
+            .setpath => return try it.builtinSetpath(),
+            .delpaths => return try it.builtinDelpaths(),
+            .paths => return try it.builtinPaths(),
+            .leaf_paths => return try it.builtinLeafPaths(),
+            .recurse => return try it.builtinRecurse(),
+
+            // Math builtins (zero-arg)
+            .abs => return try it.builtinAbs(),
+            .floor_ => return it.builtinFloor(),
+            .ceil_ => return it.builtinCeil(),
+            .round_ => return it.builtinRound(),
+            .sqrt_ => return it.builtinSqrt(),
+            .fabs_ => return it.builtinFabs(),
+            .nan_ => return .{ .float = std.math.nan(f64) },
+            .infinite_ => return .{ .float = std.math.inf(f64) },
+            .isinfinite_ => return it.builtinIsinfinite(),
+            .isnan_ => return it.builtinIsnan(),
+            .isnormal_ => return it.builtinIsnormal(),
+            .exp_ => return it.builtinExp(),
+            .exp2_ => return it.builtinExp2(),
+            .exp10_ => return it.builtinExp10(),
+            .log_ => return it.builtinLog(),
+            .log2_ => return it.builtinLog2(),
+            .log10_ => return it.builtinLog10(),
+            .cbrt_ => return it.builtinCbrt(),
+            .sin_ => return it.builtinSin(),
+            .cos_ => return it.builtinCos(),
+            .tan_ => return it.builtinTan(),
+            .asin_ => return it.builtinAsin(),
+            .acos_ => return it.builtinAcos(),
+            .atan_ => return it.builtinAtan(),
+            .rint_ => return it.builtinRint(),
+            .nearbyint_ => return it.builtinRint(),
+            .trunc_ => return it.builtinTrunc(),
+            .significand_ => return it.builtinSignificand(),
+            .logb_ => return it.builtinLogb(),
+            .j0_ => return .{ .float = 0.0 },
+            .j1_ => return .{ .float = 0.0 },
+            .lgamma_ => return it.builtinLgamma(),
+            .tgamma_ => return it.builtinTgamma(),
+
+            // Two-arg math builtins
+            .pow_ => return it.builtinPow(),
+            .atan2_ => return it.builtinAtan2(),
+            .remainder_ => return it.builtinRemainder(),
+            .hypot_ => return it.builtinHypot(),
+            .scalb_ => return it.builtinLdexp(),
+            .scalbln_ => return it.builtinLdexp(),
+            .ldexp_ => return it.builtinLdexp(),
+            .fma_ => return it.builtinFma(),
+            .drem_ => return it.builtinRemainder(),
+
+            // Type-check filter builtins
+            .arrays_ => return it.builtinTypeFilter(.array),
+            .objects_ => return it.builtinTypeFilter(.object),
+            .strings_ => return it.builtinTypeFilter(.string),
+            .numbers_ => return it.builtinTypeFilter(.number),
+            .booleans_ => return it.builtinTypeFilter(.boolean),
+            .nulls_ => return it.builtinTypeFilter(.null_type),
+            .values_ => return it.builtinTypeFilter(.values_type),
+            .scalars_ => return it.builtinTypeFilter(.scalar),
+            .normals_ => return it.builtinTypeFilter(.normal),
+            .iterables_ => return it.builtinTypeFilter(.iterable),
+
+            // String builtins
+            .ascii_downcase => return try it.builtinAsciiCase(false),
+            .ascii_upcase => return try it.builtinAsciiCase(true),
+            .ascii_ => return try it.builtinAscii(),
+            .explode_ => return try it.builtinExplode(),
+            .implode_ => return try it.builtinImplode(),
+
+            // String builtins (arg-taking)
+            .split_ => return try it.builtinSplit(),
+            .join_ => return try it.builtinJoin(),
+            .startswith_ => return try it.builtinStartswith(),
+            .endswith_ => return try it.builtinEndswith(),
+            .ltrimstr_ => return try it.builtinLtrimstr(),
+            .rtrimstr_ => return try it.builtinRtrimstr(),
+            .test_ => return try it.builtinTest(),
+            .match_ => return try it.builtinMatch(),
+            .sub_ => return try it.builtinSub(),
+            .gsub_ => return try it.builtinGsub(),
+
+            // Array utility builtins
+            .transpose_ => return try it.builtinTranspose(),
+            .bsearch_ => return try it.builtinBsearch(),
+
+            // JSON builtins
+            .tojson => return try it.builtinTojson(),
+            .fromjson => return try it.builtinFromjson(),
+
+            // Misc builtins
+            .not_ => return it.builtinNot(),
+            .builtins_ => return try it.builtinBuiltins(),
+            .debug_, .stderr_ => {
+                // Pass through current value (debug is a no-op for now)
+                return try valueToStackValue(it.current);
+            },
+            .input_, .inputs_ => {
+                // Produce empty — not applicable in query context
+                it.ip = @intCast(it.instructions.len);
+                return null;
+            },
+            .env_ => return try it.builtinEnv(),
+            .halt_ => {
+                it.ip = @intCast(it.instructions.len);
+                return null;
+            },
+            .halt_error_ => {
+                return error.UserError;
+            },
+            .map_values_ => return try it.builtinMapValues(),
+            .isempty_ => return try it.builtinIsempty(),
+            .first_ => return try it.builtinFirst(),
+            .last_ => return try it.builtinLast(),
         }
     }
 
@@ -1988,39 +2665,15 @@ pub const ResultIterator = struct {
     }
 
     fn builtinValues(it: *ResultIterator) ZqError!?StackValue {
-        switch (it.current) {
-            .object => |span| {
-                // Build array of values in insertion order
-                const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_start,
-                    .payload = .{ .skip = 0 },
-                });
-                var pos = span.start + 1;
-                const end = span.end - 1;
-                while (pos < end) {
-                    const val_sv = try valueToStackValue(tapeEntryToValue(span.tape, pos + 1));
-                    try it.stackValueToRuntimeTapeEntry(val_sv);
-                    pos = skipEntry(span.tape.*, pos + 1); // skip past value
-                }
-                const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_end,
-                    .payload = .{ .none = {} },
-                });
-                it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
-                    .start = arr_start,
-                    .end = arr_end_idx + 1,
-                } } };
+        // jq `values` is a type selector: select(. != null)
+        // Passes through all non-null values, produces empty for null.
+        return switch (it.current) {
+            .null_val => {
+                it.ip = @intCast(it.instructions.len);
+                return null;
             },
-            .array => {
-                // Array identity: values of an array is itself
-                return try valueToStackValue(it.current);
-            },
-            else => return error.TypeError,
-        }
+            else => try valueToStackValue(it.current),
+        };
     }
 
     fn builtinHas(it: *ResultIterator) ZqError!?StackValue {
@@ -3831,6 +4484,603 @@ pub const ResultIterator = struct {
         return try it.buildRuntimeArray(results.items);
     }
 
+    // ── Path algebra builtins ──────────────────────────────────────────────────
+
+    /// `getpath(PATH)`: walk the current value by path components, return result.
+    /// Path is an array of strings (object keys) and ints (array indices).
+    fn builtinGetpath(it: *ResultIterator) ZqError!?StackValue {
+        const path_sv = try it.popValue();
+        const path_val = try stackValueToValue(path_sv);
+
+        // Walk the path array directly from the tape without extracting elements.
+        // This avoids holding Value references that might become stale.
+        const span = switch (path_val) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+
+        var current = it.current;
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        while (pos < end) {
+            const entry = span.tape.entries[pos];
+            switch (entry.tag) {
+                .string => {
+                    const key = span.tape.getString(entry.payload.string);
+                    current = switch (current) {
+                        .object => |obj| lookupKey(obj.tape, obj, key) orelse .null_val,
+                        .null_val => .null_val,
+                        else => .null_val,
+                    };
+                },
+                .int => {
+                    const i = entry.payload.int;
+                    current = switch (current) {
+                        .array => |arr| blk: {
+                            if (i < 0) {
+                                const len = arrayLength(arr.tape, arr);
+                                const neg_idx = @as(i64, @intCast(len)) + i;
+                                if (neg_idx < 0) break :blk @as(Value, .null_val);
+                                break :blk lookupIndex(arr.tape, arr, @intCast(neg_idx)) orelse .null_val;
+                            } else {
+                                if (i > std.math.maxInt(u32)) break :blk @as(Value, .null_val);
+                                break :blk lookupIndex(arr.tape, arr, @intCast(i)) orelse .null_val;
+                            }
+                        },
+                        .null_val => .null_val,
+                        else => .null_val,
+                    };
+                },
+                else => {
+                    current = .null_val;
+                },
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+        return try valueToStackValue(current);
+    }
+
+    /// `setpath(PATH; VALUE)`: set a value at the given path in the current input.
+    /// Path and value are on the value stack; current is the base object.
+    fn builtinSetpath(it: *ResultIterator) ZqError!?StackValue {
+        const new_val_sv = try it.popValue();
+        const path_sv = try it.popValue();
+        const new_val = try stackValueToValue(new_val_sv);
+        const path_val = try stackValueToValue(path_sv);
+        const path_elems = try it.extractArrayElements(path_val);
+        defer it.alloc.free(path_elems);
+
+        const result = try it.setpathRecursive(it.current, path_elems, 0, new_val);
+        return try valueToStackValue(result);
+    }
+
+    /// Recursively rebuild the structure with the value at path[depth..] replaced.
+    fn setpathRecursive(it: *ResultIterator, base: Value, path: []const Value, depth: usize, new_val: Value) ZqError!Value {
+        if (depth >= path.len) return new_val;
+
+        const component = path[depth];
+        switch (component) {
+            .string => |key| {
+                // Build a new object with the key replaced/added.
+                var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                defer tmp_tape.deinit(it.alloc);
+
+                const obj_start = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                var found = false;
+                // Copy existing object fields, replacing the target key.
+                switch (base) {
+                    .object => |span| {
+                        var pos = span.start + 1;
+                        const end = span.end - 1;
+                        while (pos < end) {
+                            const k = span.tape.getString(span.tape.entries[pos].payload.string);
+                            const val_pos = pos + 1;
+                            const existing_val = tapeEntryToValue(span.tape, val_pos);
+                            if (std.mem.eql(u8, k, key)) {
+                                found = true;
+                                const replaced = try it.setpathRecursive(existing_val, path, depth + 1, new_val);
+                                const key_ref = try tmp_tape.internString(it.alloc, k);
+                                _ = try tmp_tape.appendEntry(it.alloc, .{
+                                    .tag = .key,
+                                    .payload = .{ .string = key_ref },
+                                });
+                                try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                            } else {
+                                const key_ref = try tmp_tape.internString(it.alloc, k);
+                                _ = try tmp_tape.appendEntry(it.alloc, .{
+                                    .tag = .key,
+                                    .payload = .{ .string = key_ref },
+                                });
+                                try writeValueToTape(&tmp_tape, it.alloc, existing_val);
+                            }
+                            pos = skipEntry(span.tape.*, val_pos);
+                        }
+                    },
+                    .null_val => {},
+                    else => {},
+                }
+
+                if (!found) {
+                    const replaced = try it.setpathRecursive(.null_val, path, depth + 1, new_val);
+                    const key_ref = try tmp_tape.internString(it.alloc, key);
+                    _ = try tmp_tape.appendEntry(it.alloc, .{
+                        .tag = .key,
+                        .payload = .{ .string = key_ref },
+                    });
+                    try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                }
+
+                const obj_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
+                });
+                tmp_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+
+                // Copy tmp_tape result to main runtime_tape.
+                const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                try it.runtime_tape.copySpan(tmp_tape.asTape(), obj_start, obj_end_idx + 1, it.alloc);
+                const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .object = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = result_start,
+                    .end = result_end,
+                } };
+            },
+            .int => |idx| {
+                // Build a new array with the element at idx replaced/added.
+                var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                defer tmp_tape.deinit(it.alloc);
+
+                const arr_start = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .array_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                const target_idx: usize = if (idx < 0) blk: {
+                    const len: i64 = switch (base) {
+                        .array => |span| @intCast(arrayLength(span.tape, span)),
+                        else => 0,
+                    };
+                    const resolved = len + idx;
+                    if (resolved < 0) break :blk 0;
+                    break :blk @intCast(resolved);
+                } else @intCast(idx);
+
+                switch (base) {
+                    .array => |span| {
+                        var pos = span.start + 1;
+                        const end = span.end - 1;
+                        var i: usize = 0;
+                        while (pos < end) : (i += 1) {
+                            const existing_val = tapeEntryToValue(span.tape, pos);
+                            if (i == target_idx) {
+                                const replaced = try it.setpathRecursive(existing_val, path, depth + 1, new_val);
+                                try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                            } else {
+                                try writeValueToTape(&tmp_tape, it.alloc, existing_val);
+                            }
+                            pos = skipEntry(span.tape.*, pos);
+                        }
+                        // If index is beyond array length, pad with nulls.
+                        while (i < target_idx) : (i += 1) {
+                            _ = try tmp_tape.appendEntry(it.alloc, .{
+                                .tag = .null_val,
+                                .payload = .{ .none = {} },
+                            });
+                        }
+                        if (i == target_idx) {
+                            const replaced = try it.setpathRecursive(.null_val, path, depth + 1, new_val);
+                            try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                        }
+                    },
+                    .null_val => {
+                        // null base: create array with nulls up to idx, then set.
+                        var i: usize = 0;
+                        while (i < target_idx) : (i += 1) {
+                            _ = try tmp_tape.appendEntry(it.alloc, .{
+                                .tag = .null_val,
+                                .payload = .{ .none = {} },
+                            });
+                        }
+                        const replaced = try it.setpathRecursive(.null_val, path, depth + 1, new_val);
+                        try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                    },
+                    else => return error.TypeError,
+                }
+
+                const arr_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .array_end,
+                    .payload = .{ .none = {} },
+                });
+                tmp_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+
+                // Copy to main runtime_tape.
+                const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                try it.runtime_tape.copySpan(tmp_tape.asTape(), arr_start, arr_end_idx + 1, it.alloc);
+                const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .array = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = result_start,
+                    .end = result_end,
+                } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    /// `delpaths(PATHS)`: delete multiple paths. Paths is an array of path arrays.
+    /// Sort paths in reverse order (deeper/higher-index first), apply each deletion.
+    fn builtinDelpaths(it: *ResultIterator) ZqError!?StackValue {
+        const paths_sv = try it.popValue();
+        const paths_val = try stackValueToValue(paths_sv);
+        const paths_elems = try it.extractArrayElements(paths_val);
+        defer it.alloc.free(paths_elems);
+
+        // Extract each path as an array of elements.
+        var path_list = std.ArrayList([]Value){};
+        defer {
+            for (path_list.items) |p| it.alloc.free(p);
+            path_list.deinit(it.alloc);
+        }
+        for (paths_elems) |p| {
+            const elems = try it.extractArrayElements(p);
+            try path_list.append(it.alloc, elems);
+        }
+
+        // Sort paths: longer paths first, then by last component descending.
+        // This ensures we delete deeper paths before shallower ones and
+        // higher indices before lower ones to avoid index shifting.
+        std.mem.sort([]Value, path_list.items, {}, struct {
+            fn lt(_: void, a: []Value, b: []Value) bool {
+                // Longer paths first.
+                if (a.len != b.len) return a.len > b.len;
+                // Same length: compare last component (higher index first).
+                if (a.len == 0) return false;
+                const a_last = a[a.len - 1];
+                const b_last = b[b.len - 1];
+                const a_int: i64 = switch (a_last) {
+                    .int => |i| i,
+                    else => 0,
+                };
+                const b_int: i64 = switch (b_last) {
+                    .int => |i| i,
+                    else => 0,
+                };
+                return a_int > b_int;
+            }
+        }.lt);
+
+        // Apply each deletion sequentially.
+        var current = it.current;
+        for (path_list.items) |path| {
+            current = try it.delpathSingle(current, path, 0);
+        }
+
+        return try valueToStackValue(current);
+    }
+
+    /// Delete a single path from a value.
+    fn delpathSingle(it: *ResultIterator, base: Value, path: []const Value, depth: usize) ZqError!Value {
+        if (depth >= path.len) return error.TypeError; // can't delete empty path
+
+        const component = path[depth];
+        const is_leaf = (depth + 1 == path.len);
+
+        switch (component) {
+            .string => |key| {
+                switch (base) {
+                    .object => |span| {
+                        var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                        defer tmp_tape.deinit(it.alloc);
+
+                        const obj_start = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .object_start,
+                            .payload = .{ .skip = 0 },
+                        });
+
+                        var pos = span.start + 1;
+                        const end = span.end - 1;
+                        while (pos < end) {
+                            const k = span.tape.getString(span.tape.entries[pos].payload.string);
+                            const val_pos = pos + 1;
+                            const existing_val = tapeEntryToValue(span.tape, val_pos);
+                            if (std.mem.eql(u8, k, key)) {
+                                if (!is_leaf) {
+                                    // Recurse deeper.
+                                    const replaced = try it.delpathSingle(existing_val, path, depth + 1);
+                                    const key_ref = try tmp_tape.internString(it.alloc, k);
+                                    _ = try tmp_tape.appendEntry(it.alloc, .{
+                                        .tag = .key,
+                                        .payload = .{ .string = key_ref },
+                                    });
+                                    try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                                }
+                                // else: skip this key-value pair (delete it).
+                            } else {
+                                const key_ref = try tmp_tape.internString(it.alloc, k);
+                                _ = try tmp_tape.appendEntry(it.alloc, .{
+                                    .tag = .key,
+                                    .payload = .{ .string = key_ref },
+                                });
+                                try writeValueToTape(&tmp_tape, it.alloc, existing_val);
+                            }
+                            pos = skipEntry(span.tape.*, val_pos);
+                        }
+
+                        const obj_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .object_end,
+                            .payload = .{ .none = {} },
+                        });
+                        tmp_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+
+                        const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        try it.runtime_tape.copySpan(tmp_tape.asTape(), obj_start, obj_end_idx + 1, it.alloc);
+                        const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                        return .{ .object = .{
+                            .tape = &it.runtime_tape_view,
+                            .start = result_start,
+                            .end = result_end,
+                        } };
+                    },
+                    else => return base,
+                }
+            },
+            .int => |idx| {
+                switch (base) {
+                    .array => |span| {
+                        var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                        defer tmp_tape.deinit(it.alloc);
+
+                        const arr_start = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .array_start,
+                            .payload = .{ .skip = 0 },
+                        });
+
+                        const arr_len = arrayLength(span.tape, span);
+                        const target_idx: usize = if (idx < 0) blk: {
+                            const resolved = @as(i64, @intCast(arr_len)) + idx;
+                            if (resolved < 0) break :blk std.math.maxInt(usize);
+                            break :blk @intCast(resolved);
+                        } else if (idx > std.math.maxInt(u32)) std.math.maxInt(usize) else @intCast(idx);
+
+                        var pos = span.start + 1;
+                        const end = span.end - 1;
+                        var i: usize = 0;
+                        while (pos < end) : (i += 1) {
+                            const existing_val = tapeEntryToValue(span.tape, pos);
+                            if (i == target_idx) {
+                                if (!is_leaf) {
+                                    const replaced = try it.delpathSingle(existing_val, path, depth + 1);
+                                    try writeValueToTape(&tmp_tape, it.alloc, replaced);
+                                }
+                                // else: skip this element (delete it).
+                            } else {
+                                try writeValueToTape(&tmp_tape, it.alloc, existing_val);
+                            }
+                            pos = skipEntry(span.tape.*, pos);
+                        }
+
+                        const arr_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .array_end,
+                            .payload = .{ .none = {} },
+                        });
+                        tmp_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+
+                        const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        try it.runtime_tape.copySpan(tmp_tape.asTape(), arr_start, arr_end_idx + 1, it.alloc);
+                        const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                        return .{ .array = .{
+                            .tape = &it.runtime_tape_view,
+                            .start = result_start,
+                            .end = result_end,
+                        } };
+                    },
+                    else => return base,
+                }
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    /// `paths`: enumerate all paths in the current value as a generator.
+    /// Each path is an array of strings and ints.
+    fn builtinPaths(it: *ResultIterator) ZqError!?StackValue {
+        return it.builtinPathsImpl(false);
+    }
+
+    /// `leaf_paths`: enumerate only leaf (scalar) paths.
+    fn builtinLeafPaths(it: *ResultIterator) ZqError!?StackValue {
+        return it.builtinPathsImpl(true);
+    }
+
+    /// Common implementation for paths and leaf_paths.
+    /// Collects all paths via DFS, builds them as an array of arrays on the
+    /// runtime tape, sets it as current, and calls doIterate to yield each path.
+    fn builtinPathsImpl(it: *ResultIterator, leaf_only: bool) ZqError!?StackValue {
+        var path_buf = std.ArrayList(Value){};
+        defer path_buf.deinit(it.alloc);
+        var all_paths = std.ArrayList(Value){};
+        defer all_paths.deinit(it.alloc);
+
+        try it.collectPaths(it.current, &path_buf, &all_paths, leaf_only);
+
+        if (all_paths.items.len == 0) {
+            it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+
+        // Build a container array of all path arrays on runtime tape.
+        const arr = try it.buildRuntimeArray(all_paths.items);
+        it.current = try stackValueToValue(arr);
+
+        // Set up iteration over the container. ip+1 is where execution resumes
+        // for each yielded element.
+        it.ip += 1;
+        try it.doIterate(it.ip);
+        return null;
+    }
+
+    /// Recursively collect all paths via DFS.
+    fn collectPaths(
+        it: *ResultIterator,
+        val: Value,
+        path_buf: *std.ArrayList(Value),
+        all_paths: *std.ArrayList(Value),
+        leaf_only: bool,
+    ) ZqError!void {
+        switch (val) {
+            .object => |span| {
+                if (!leaf_only and path_buf.items.len > 0) {
+                    // Emit the current path for intermediate nodes (skip root).
+                    const path_arr = try it.buildPathArray(path_buf.items);
+                    try all_paths.append(it.alloc, path_arr);
+                }
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    try path_buf.append(it.alloc, .{ .string = k });
+                    try it.collectPaths(child_val, path_buf, all_paths, leaf_only);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+            },
+            .array => |span| {
+                if (!leaf_only and path_buf.items.len > 0) {
+                    const path_arr = try it.buildPathArray(path_buf.items);
+                    try all_paths.append(it.alloc, path_arr);
+                }
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var i: i64 = 0;
+                while (pos < end) : (i += 1) {
+                    const child_val = tapeEntryToValue(span.tape, pos);
+                    try path_buf.append(it.alloc, .{ .int = i });
+                    try it.collectPaths(child_val, path_buf, all_paths, leaf_only);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos);
+                }
+            },
+            else => {
+                // Leaf node — emit only if not root (root scalars have no paths in jq).
+                if (path_buf.items.len > 0) {
+                    const path_arr = try it.buildPathArray(path_buf.items);
+                    try all_paths.append(it.alloc, path_arr);
+                }
+            },
+        }
+    }
+
+    /// `..` (recursive descent): output current value, then recursively descend
+    /// into all sub-values. Errors from non-iterable values are suppressed.
+    /// Equivalent to jq's `def recurse: ., (.[]? | recurse);`
+    fn builtinRecurse(it: *ResultIterator) ZqError!?StackValue {
+        var all_values = std.ArrayList(Value){};
+        defer all_values.deinit(it.alloc);
+
+        try it.collectRecurse(it.current, &all_values);
+
+        if (all_values.items.len == 0) {
+            it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+
+        // Build a container array of all collected values on runtime tape.
+        const arr = try it.buildRuntimeArray(all_values.items);
+        it.current = try stackValueToValue(arr);
+
+        // Set up iteration over the container.
+        it.ip += 1;
+        try it.doIterate(it.ip);
+        return null;
+    }
+
+    /// Recursively collect the value itself and all sub-values via DFS.
+    fn collectRecurse(
+        it: *ResultIterator,
+        val: Value,
+        all_values: *std.ArrayList(Value),
+    ) ZqError!void {
+        // Output the current value.
+        try all_values.append(it.alloc, val);
+
+        // Recurse into sub-values (array elements, object values).
+        switch (val) {
+            .array => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const child_val = tapeEntryToValue(span.tape, pos);
+                    try it.collectRecurse(child_val, all_values);
+                    pos = skipEntry(span.tape.*, pos);
+                }
+            },
+            .object => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    try it.collectRecurse(child_val, all_values);
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+            },
+            else => {
+                // Scalars: no sub-values to descend into (like .[]? suppressing errors).
+            },
+        }
+    }
+
+    /// Build a path array (e.g. ["a", 0, "b"]) on the runtime tape.
+    fn buildPathArray(it: *ResultIterator, components: []const Value) ZqError!Value {
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        for (components) |comp| {
+            switch (comp) {
+                .string => |s| {
+                    const str_ref = try it.runtime_tape.internString(it.alloc, s);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .string,
+                        .payload = .{ .string = str_ref },
+                    });
+                },
+                .int => |i| {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .int,
+                        .payload = .{ .int = i },
+                    });
+                },
+                else => return error.TypeError,
+            }
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } };
+    }
+
     fn toInt(val: StackValue) ZqError!i64 {
         return switch (val) {
             .int => |i| i,
@@ -3922,36 +5172,22 @@ pub const ResultIterator = struct {
 
     // ── Boolean operations ───────────────────────────────────────────────────────
 
-    /// Short-circuit AND: if left is falsy, push it and skip to after right expression.
+    /// Boolean AND: both operands evaluated, result is always a boolean.
+    /// Uses jq conditional semantics: only false and null are falsy.
     fn doAndOp(it: *ResultIterator) ZqError!void {
         const right = try it.popValue();
-        const left = try it.peekValue();
-
-        const left_truthy = try isTruthy(left);
-        if (!left_truthy) {
-            // Left is falsy: AND result is falsy, skip right
-            return;
-        }
-
-        // Left is truthy: AND result is right
-        _ = try it.popValue();
-        it.pushValue(right);
+        const left = try it.popValue();
+        const result = isCondTruthy(left) and isCondTruthy(right);
+        it.pushValue(.{ .bool_val = result });
     }
 
-    /// Short-circuit OR: if left is truthy, push it and skip to after right expression.
+    /// Boolean OR: both operands evaluated, result is always a boolean.
+    /// Uses jq conditional semantics: only false and null are falsy.
     fn doOrOp(it: *ResultIterator) ZqError!void {
         const right = try it.popValue();
-        const left = try it.peekValue();
-
-        const left_truthy = try isTruthy(left);
-        if (left_truthy) {
-            // Left is truthy: OR result is truthy, skip right
-            return;
-        }
-
-        // Left is falsy: OR result is right
-        _ = try it.popValue();
-        it.pushValue(right);
+        const left = try it.popValue();
+        const result = isCondTruthy(left) or isCondTruthy(right);
+        it.pushValue(.{ .bool_val = result });
     }
 
     /// jq conditional semantics: only `false` and `null` are falsy; everything
@@ -4075,6 +5311,1343 @@ pub const ResultIterator = struct {
         }
         it.ip = frame.resume_ip;
         return true;
+    }
+
+    // ── Math builtins ──────────────────────────────────────────────────────
+
+    fn getFloat(it: *ResultIterator) ZqError!f64 {
+        return switch (it.current) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => error.TypeError,
+        };
+    }
+
+    fn builtinAbs(it: *ResultIterator) ZqError!?StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .int = if (i < 0) -i else i },
+            .float => |f| .{ .float = @abs(f) },
+            .null_val => .{ .int = 0 },
+            else => try valueToStackValue(it.current),
+        };
+    }
+
+    fn builtinFloor(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .int = i },
+            .float => |f| .{ .int = @intFromFloat(@floor(f)) },
+            else => .{ .int = 0 },
+        };
+    }
+
+    fn builtinCeil(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .int = i },
+            .float => |f| .{ .int = @intFromFloat(@ceil(f)) },
+            else => .{ .int = 0 },
+        };
+    }
+
+    fn builtinRound(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .int = i },
+            .float => |f| .{ .int = @intFromFloat(@round(f)) },
+            else => .{ .int = 0 },
+        };
+    }
+
+    fn builtinSqrt(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .float = @sqrt(@as(f64, @floatFromInt(i))) },
+            .float => |f| .{ .float = @sqrt(f) },
+            else => .{ .float = std.math.nan(f64) },
+        };
+    }
+
+    fn builtinFabs(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .int => |i| .{ .float = @abs(@as(f64, @floatFromInt(i))) },
+            .float => |f| .{ .float = @abs(f) },
+            else => .{ .float = 0.0 },
+        };
+    }
+
+    fn builtinIsinfinite(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .float => |f| .{ .bool_val = std.math.isInf(f) },
+            .int => .{ .bool_val = false },
+            else => .{ .bool_val = false },
+        };
+    }
+
+    fn builtinIsnan(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .float => |f| .{ .bool_val = std.math.isNan(f) },
+            .int => .{ .bool_val = false },
+            else => .{ .bool_val = false },
+        };
+    }
+
+    fn builtinIsnormal(it: *ResultIterator) StackValue {
+        return switch (it.current) {
+            .float => |f| .{ .bool_val = std.math.isNormal(f) },
+            .int => .{ .bool_val = true },
+            else => .{ .bool_val = false },
+        };
+    }
+
+    fn builtinExp(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @exp(x) };
+    }
+
+    fn builtinExp2(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @exp2(x) };
+    }
+
+    fn builtinExp10(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @exp(x * @log(@as(f64, 10.0))) };
+    }
+
+    fn builtinLog(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @log(x) };
+    }
+
+    fn builtinLog2(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @log2(x) };
+    }
+
+    fn builtinLog10(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @log10(x) };
+    }
+
+    fn builtinCbrt(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = std.math.cbrt(x) };
+    }
+
+    fn builtinSin(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @sin(x) };
+    }
+
+    fn builtinCos(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @cos(x) };
+    }
+
+    fn builtinTan(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @tan(x) };
+    }
+
+    fn builtinAsin(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = std.math.asin(x) };
+    }
+
+    fn builtinAcos(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = std.math.acos(x) };
+    }
+
+    fn builtinAtan(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = std.math.atan(x) };
+    }
+
+    fn builtinRint(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @round(x) };
+    }
+
+    fn builtinTrunc(it: *ResultIterator) StackValue {
+        const x = it.getFloat() catch return .{ .float = std.math.nan(f64) };
+        return .{ .float = @trunc(x) };
+    }
+
+    fn builtinSignificand(it: *ResultIterator) StackValue {
+        const x = switch (it.current) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return .{ .float = std.math.nan(f64) },
+        };
+        const fr = std.math.frexp(x);
+        return .{ .float = fr.significand * 2.0 };
+    }
+
+    fn builtinLogb(it: *ResultIterator) StackValue {
+        const x = switch (it.current) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return .{ .float = std.math.nan(f64) },
+        };
+        const fr = std.math.frexp(x);
+        return .{ .float = @as(f64, @floatFromInt(fr.exponent - 1)) };
+    }
+
+    fn builtinLgamma(it: *ResultIterator) StackValue {
+        const x = switch (it.current) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return .{ .float = std.math.nan(f64) },
+        };
+        return .{ .float = std.math.lgamma(f64, x) };
+    }
+
+    fn builtinTgamma(it: *ResultIterator) StackValue {
+        const x = switch (it.current) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return .{ .float = std.math.nan(f64) },
+        };
+        // tgamma = exp(lgamma(x)) with sign correction
+        // For positive integers, it's (n-1)!
+        if (x > 0 and x <= 171) {
+            const lg = std.math.lgamma(f64, x);
+            return .{ .float = @exp(lg) };
+        }
+        return .{ .float = std.math.nan(f64) };
+    }
+
+    // ── Two-arg math builtins ──────────────────────────────────────────────
+
+    fn popFloat(it: *ResultIterator) ZqError!f64 {
+        const sv = try it.popValue();
+        return switch (sv) {
+            .int => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => error.TypeError,
+        };
+    }
+
+    fn builtinPow(it: *ResultIterator) ZqError!?StackValue {
+        const b = try it.popFloat();
+        const a = try it.popFloat();
+        return .{ .float = std.math.pow(f64, a, b) };
+    }
+
+    fn builtinAtan2(it: *ResultIterator) ZqError!?StackValue {
+        const x = try it.popFloat();
+        const y = try it.popFloat();
+        return .{ .float = std.math.atan2(y, x) };
+    }
+
+    fn builtinRemainder(it: *ResultIterator) ZqError!?StackValue {
+        const b = try it.popFloat();
+        const a = try it.popFloat();
+        return .{ .float = @rem(a, b) };
+    }
+
+    fn builtinHypot(it: *ResultIterator) ZqError!?StackValue {
+        const b = try it.popFloat();
+        const a = try it.popFloat();
+        return .{ .float = std.math.hypot(a, b) };
+    }
+
+    fn builtinLdexp(it: *ResultIterator) ZqError!?StackValue {
+        const n_f = try it.popFloat();
+        const x = try it.popFloat();
+        const n: i32 = @intFromFloat(n_f);
+        return .{ .float = std.math.ldexp(x, n) };
+    }
+
+    fn builtinFma(it: *ResultIterator) ZqError!?StackValue {
+        const z = try it.popFloat();
+        const y = try it.popFloat();
+        const x = try it.popFloat();
+        return .{ .float = @mulAdd(f64, x, y, z) };
+    }
+
+    // ── Type-check filter builtins ─────────────────────────────────────────
+
+    const TypeFilterKind = enum {
+        array,
+        object,
+        string,
+        number,
+        boolean,
+        null_type,
+        values_type,
+        scalar,
+        normal,
+        iterable,
+    };
+
+    fn builtinTypeFilter(it: *ResultIterator, comptime kind: TypeFilterKind) ?StackValue {
+        const matches = switch (kind) {
+            .array => switch (it.current) {
+                .array => true,
+                else => false,
+            },
+            .object => switch (it.current) {
+                .object => true,
+                else => false,
+            },
+            .string => switch (it.current) {
+                .string => true,
+                else => false,
+            },
+            .number => switch (it.current) {
+                .int, .float => true,
+                else => false,
+            },
+            .boolean => switch (it.current) {
+                .bool_val => true,
+                else => false,
+            },
+            .null_type => switch (it.current) {
+                .null_val => true,
+                else => false,
+            },
+            .values_type => switch (it.current) {
+                .null_val => false,
+                else => true,
+            },
+            .scalar => switch (it.current) {
+                .array, .object => false,
+                else => true,
+            },
+            .normal => switch (it.current) {
+                .null_val => false,
+                .bool_val => |b| b, // false is not normal
+                .float => |f| !std.math.isNan(f) and !std.math.isInf(f),
+                else => true,
+            },
+            .iterable => switch (it.current) {
+                .array, .object => true,
+                else => false,
+            },
+        };
+        if (matches) {
+            // Pass through current value
+            return valueToStackValue(it.current) catch null;
+        } else {
+            // Produce empty
+            it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+    }
+
+    // ── String builtins ────────────────────────────────────────────────────
+
+    fn builtinAsciiCase(it: *ResultIterator, comptime upper: bool) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        try buf.ensureTotalCapacity(it.alloc, s.len);
+        for (s) |c| {
+            if (upper) {
+                try buf.append(it.alloc, if (c >= 'a' and c <= 'z') c - 32 else c);
+            } else {
+                try buf.append(it.alloc, if (c >= 'A' and c <= 'Z') c + 32 else c);
+            }
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    fn builtinAscii(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| {
+                if (s.len == 0) return error.TypeError;
+                return .{ .int = @intCast(s[0]) };
+            },
+            .int => |i| {
+                if (i < 0 or i > 127) return error.TypeError;
+                var buf: [1]u8 = .{@intCast(@as(u8, @intCast(i)))};
+                const str_ref = try it.runtime_tape.internString(it.alloc, &buf);
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinExplode(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        var i: usize = 0;
+        while (i < s.len) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch {
+                // Invalid UTF-8 byte: emit as-is
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = @intCast(s[i]) },
+                });
+                i += 1;
+                continue;
+            };
+            if (i + seq_len > s.len) {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = @intCast(s[i]) },
+                });
+                i += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = @intCast(s[i]) },
+                });
+                i += 1;
+                continue;
+            };
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .int,
+                .payload = .{ .int = @intCast(cp) },
+            });
+            i += seq_len;
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
+    }
+
+    fn builtinImplode(it: *ResultIterator) ZqError!?StackValue {
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        while (pos < end) {
+            const val = tapeEntryToValue(span.tape, pos);
+            const cp_i: i64 = switch (val) {
+                .int => |i| i,
+                .float => |f| @intFromFloat(f),
+                else => return error.TypeError,
+            };
+            if (cp_i < 0 or cp_i > 0x10FFFF) return error.TypeError;
+            const cp: u21 = @intCast(@as(u32, @intCast(cp_i)));
+            var encode_buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(cp, &encode_buf) catch return error.TypeError;
+            try buf.appendSlice(it.alloc, encode_buf[0..len]);
+            pos = skipEntry(span.tape.*, pos);
+        }
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    // ── JSON builtins ──────────────────────────────────────────────────────
+
+    fn builtinTojson(it: *ResultIterator) ZqError!?StackValue {
+        return it.builtinFormatJson();
+    }
+
+    fn builtinFromjson(it: *ResultIterator) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |str| str,
+            else => return error.TypeError,
+        };
+        // Parse JSON string into a value using a simple recursive descent parser
+        return try parseJsonToStackValue(it, s);
+    }
+
+    // ── Misc builtins ──────────────────────────────────────────────────────
+
+    fn builtinNot(it: *ResultIterator) StackValue {
+        // jq truthiness: false and null are falsy, everything else is truthy
+        const truthy = switch (it.current) {
+            .null_val => false,
+            .bool_val => |b| b,
+            else => true,
+        };
+        return .{ .bool_val = !truthy };
+    }
+
+    fn builtinBuiltins(it: *ResultIterator) ZqError!?StackValue {
+        // Derive names from BuiltinId enum — single source of truth.
+        const names = comptime blk: {
+            const count = types.BuiltinId.jqBuiltinCount();
+            var result: [count][]const u8 = undefined;
+            var i: usize = 0;
+            for (std.enums.values(types.BuiltinId)) |id| {
+                if (id.jqName()) |name| {
+                    result[i] = name;
+                    i += 1;
+                }
+            }
+            break :blk result;
+        };
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        for (names) |name| {
+            const str_ref = try it.runtime_tape.internString(it.alloc, name);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .string,
+                .payload = .{ .string = str_ref },
+            });
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
+    }
+
+    fn builtinEnv(it: *ResultIterator) ZqError!?StackValue {
+        // Return empty object for now (environment not accessible in query context)
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape_view,
+            .start = obj_start,
+            .end = obj_end_idx + 1,
+        } } };
+    }
+
+    fn builtinMapValues(it: *ResultIterator) ZqError!?StackValue {
+        // map_values(f) is compiled like sort_by: the filter-arg builtin pattern
+        // collects [.[] | f] into an array on value_stack, original is on if_stack.
+        // We need to reconstruct the original structure with new values.
+        const mapped_sv = try it.popValue();
+        if (it.if_stack.items.len == 0) return error.TypeError;
+        const original = it.if_stack.pop().?;
+
+        switch (original) {
+            .array => {
+                // For arrays, the mapped values ARE the result
+                return mapped_sv;
+            },
+            .object => |span| {
+                // For objects, reconstruct with original keys and mapped values
+                const mapped_span = switch (mapped_sv) {
+                    .tape_value => |tv| switch (tv) {
+                        .array => |s| s,
+                        else => return error.TypeError,
+                    },
+                    else => return error.TypeError,
+                };
+
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                // Walk original keys and mapped values in parallel
+                var key_pos = span.start + 1;
+                const key_end = span.end - 1;
+                var val_pos = mapped_span.start + 1;
+                const val_end = mapped_span.end - 1;
+
+                while (key_pos < key_end and val_pos < val_end) {
+                    // Copy key from original
+                    const key_str = span.tape.getString(span.tape.entries[key_pos].payload.string);
+                    const key_ref = try it.runtime_tape.internString(it.alloc, key_str);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .key,
+                        .payload = .{ .string = key_ref },
+                    });
+
+                    // Copy mapped value
+                    const val = tapeEntryToValue(mapped_span.tape, val_pos);
+                    const val_sv = try valueToStackValue(val);
+                    try it.stackValueToRuntimeTapeEntry(val_sv);
+
+                    key_pos = skipEntry(span.tape.*, key_pos + 1); // skip original value
+                    val_pos = skipEntry(mapped_span.tape.*, val_pos);
+                }
+
+                const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+                return .{ .tape_value = .{ .object = .{
+                    .tape = &it.runtime_tape_view,
+                    .start = obj_start,
+                    .end = obj_end_idx + 1,
+                } } };
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn builtinIsempty(it: *ResultIterator) ZqError!?StackValue {
+        // isempty(f) compiled as: save_input, [f], call_builtin
+        // The collected array is on value_stack
+        const arr_sv = try it.popValue();
+        if (it.if_stack.items.len > 0) _ = it.if_stack.pop(); // pop saved input
+        const is_empty = switch (arr_sv) {
+            .tape_value => |tv| switch (tv) {
+                .array => |span| arrayLength(span.tape, span) == 0,
+                else => false,
+            },
+            else => false,
+        };
+        return .{ .bool_val = is_empty };
+    }
+
+    fn builtinFirst(it: *ResultIterator) ZqError!?StackValue {
+        // first as zero-arg: .[0]
+        return try valueToStackValue(try it.doLoadIndex(0));
+    }
+
+    fn builtinLast(it: *ResultIterator) ZqError!?StackValue {
+        // last as zero-arg: .[-1]
+        return try valueToStackValue(try it.doLoadIndex(-1));
+    }
+
+    // ── String builtins (arg-taking) ─────────────────────────────────────────
+
+    /// `split(sep)`: split string by separator.
+    fn builtinSplit(it: *ResultIterator) ZqError!?StackValue {
+        const sep_sv = try it.popValue();
+        const sep_val = try stackValueToValue(sep_sv);
+        const sep = switch (sep_val) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        var parts = std.ArrayList(Value){};
+        defer parts.deinit(it.alloc);
+
+        if (sep.len == 0) {
+            // Split into individual characters (Unicode codepoints)
+            var i: usize = 0;
+            while (i < input.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch 1;
+                const char_end = @min(i + seq_len, input.len);
+                try parts.append(it.alloc, .{ .string = input[i..char_end] });
+                i = char_end;
+            }
+        } else {
+            var start: usize = 0;
+            while (start <= input.len) {
+                if (start + sep.len <= input.len and std.mem.eql(u8, input[start..][0..sep.len], sep)) {
+                    try parts.append(it.alloc, .{ .string = input[start..start] });
+                    start += sep.len;
+                } else {
+                    // Find next occurrence of separator
+                    var end = start;
+                    var found = false;
+                    while (end < input.len) {
+                        if (end + sep.len <= input.len and std.mem.eql(u8, input[end..][0..sep.len], sep)) {
+                            try parts.append(it.alloc, .{ .string = input[start..end] });
+                            start = end + sep.len;
+                            found = true;
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if (!found) {
+                        try parts.append(it.alloc, .{ .string = input[start..input.len] });
+                        break;
+                    }
+                }
+            }
+        }
+
+        return try it.buildRuntimeArray(parts.items);
+    }
+
+    /// `join(sep)`: join array elements with separator.
+    /// In jq, join converts scalars to strings but raises an error for arrays/objects.
+    fn builtinJoin(it: *ResultIterator) ZqError!?StackValue {
+        const sep_sv = try it.popValue();
+        const sep_val = try stackValueToValue(sep_sv);
+        const sep = switch (sep_val) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var first = true;
+        while (pos < end) {
+            if (!first) {
+                try buf.appendSlice(it.alloc, sep);
+            }
+            first = false;
+
+            const elem = tapeEntryToValue(span.tape, pos);
+            switch (elem) {
+                .string => |s| try buf.appendSlice(it.alloc, s),
+                .null_val => {}, // null treated as empty string
+                .int => |n| {
+                    var tmp: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.TypeError;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .float => |f| {
+                    var tmp: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch return error.TypeError;
+                    try buf.appendSlice(it.alloc, s);
+                },
+                .bool_val => |b| try buf.appendSlice(it.alloc, if (b) "true" else "false"),
+                .array, .object => {
+                    // jq raises "string (...) and TYPE (...) cannot be added"
+                    var msg_buf = std.ArrayList(u8){};
+                    defer msg_buf.deinit(it.alloc);
+                    try msg_buf.appendSlice(it.alloc, "string (");
+                    try appendJsonString(&msg_buf, it.alloc, buf.items);
+                    try msg_buf.appendSlice(it.alloc, ") and ");
+                    switch (elem) {
+                        .array => try msg_buf.appendSlice(it.alloc, "array ("),
+                        .object => try msg_buf.appendSlice(it.alloc, "object ("),
+                        else => unreachable,
+                    }
+                    try serializeValueCompact(&msg_buf, it.alloc, elem);
+                    try msg_buf.appendSlice(it.alloc, ") cannot be added");
+                    return try it.raiseUserError(msg_buf.items);
+                },
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// Helper: raise a UserError with a message string.
+    fn raiseUserError(it: *ResultIterator, msg: []const u8) ZqError!?StackValue {
+        const str_ref = try it.runtime_tape.internString(it.alloc, msg);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.UserError;
+    }
+
+    /// `startswith(str)`: test if string starts with prefix.
+    fn builtinStartswith(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const prefix = switch (arg) {
+            .string => |s| s,
+            else => return try it.raiseUserError("startswith() requires string inputs"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("startswith() requires string inputs"),
+        };
+        return .{ .bool_val = std.mem.startsWith(u8, input, prefix) };
+    }
+
+    /// `endswith(str)`: test if string ends with suffix.
+    fn builtinEndswith(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const suffix = switch (arg) {
+            .string => |s| s,
+            else => return try it.raiseUserError("endswith() requires string inputs"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("endswith() requires string inputs"),
+        };
+        return .{ .bool_val = std.mem.endsWith(u8, input, suffix) };
+    }
+
+    /// `ltrimstr(str)`: remove prefix if present.
+    fn builtinLtrimstr(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const prefix = switch (arg) {
+            .string => |s| s,
+            else => return try it.raiseUserError("startswith() requires string inputs"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("startswith() requires string inputs"),
+        };
+        if (std.mem.startsWith(u8, input, prefix)) {
+            return .{ .tape_value = .{ .string = input[prefix.len..] } };
+        }
+        return .{ .tape_value = .{ .string = input } };
+    }
+
+    /// `rtrimstr(str)`: remove suffix if present.
+    fn builtinRtrimstr(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const suffix = switch (arg) {
+            .string => |s| s,
+            else => return try it.raiseUserError("endswith() requires string inputs"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("endswith() requires string inputs"),
+        };
+        if (suffix.len > 0 and std.mem.endsWith(u8, input, suffix)) {
+            return .{ .tape_value = .{ .string = input[0 .. input.len - suffix.len] } };
+        }
+        return .{ .tape_value = .{ .string = input } };
+    }
+
+    /// `test(regex)`: simplified — test if string contains substring.
+    fn builtinTest(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const pattern = switch (arg) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        return .{ .bool_val = std.mem.indexOf(u8, input, pattern) != null };
+    }
+
+    /// `match(regex)`: simplified — return match object for first substring occurrence.
+    fn builtinMatch(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const pattern = switch (arg) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        if (std.mem.indexOf(u8, input, pattern)) |pos| {
+            // Build match object: {"offset": N, "length": N, "string": "...", "captures": []}
+            const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .object_start,
+                .payload = .{ .skip = 0 },
+            });
+
+            // offset
+            const k_offset = try it.runtime_tape.internString(it.alloc, "offset");
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_offset } });
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .int, .payload = .{ .int = @intCast(pos) } });
+
+            // length
+            const k_length = try it.runtime_tape.internString(it.alloc, "length");
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_length } });
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .int, .payload = .{ .int = @intCast(pattern.len) } });
+
+            // string
+            const k_string = try it.runtime_tape.internString(it.alloc, "string");
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_string } });
+            const match_str = try it.runtime_tape.internString(it.alloc, pattern);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .string, .payload = .{ .string = match_str } });
+
+            // captures (empty array)
+            const k_captures = try it.runtime_tape.internString(it.alloc, "captures");
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_captures } });
+            const cap_start = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_start, .payload = .{ .skip = 0 } });
+            const cap_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_end, .payload = .{ .none = {} } });
+            it.runtime_tape.entries.items[cap_start].payload.skip = cap_end_idx + 1;
+
+            const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
+            it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+            return .{ .tape_value = .{ .object = .{
+                .tape = &it.runtime_tape_view,
+                .start = obj_start,
+                .end = obj_end_idx + 1,
+            } } };
+        }
+
+        // No match — raise error (jq behavior for test/match without match)
+        return error.TypeError;
+    }
+
+    /// `sub(pattern; replacement)`: replace first occurrence.
+    fn builtinSub(it: *ResultIterator) ZqError!?StackValue {
+        const replacement_sv = try it.popValue();
+        const pattern_sv = try it.popValue();
+        const replacement = switch (try stackValueToValue(replacement_sv)) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const pattern = switch (try stackValueToValue(pattern_sv)) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        if (std.mem.indexOf(u8, input, pattern)) |pos| {
+            var buf = std.ArrayList(u8){};
+            defer buf.deinit(it.alloc);
+            try buf.appendSlice(it.alloc, input[0..pos]);
+            try buf.appendSlice(it.alloc, replacement);
+            try buf.appendSlice(it.alloc, input[pos + pattern.len ..]);
+            const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+            return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        }
+        return .{ .tape_value = .{ .string = input } };
+    }
+
+    /// `gsub(pattern; replacement)`: replace all occurrences.
+    fn builtinGsub(it: *ResultIterator) ZqError!?StackValue {
+        const replacement_sv = try it.popValue();
+        const pattern_sv = try it.popValue();
+        const replacement = switch (try stackValueToValue(replacement_sv)) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const pattern = switch (try stackValueToValue(pattern_sv)) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        if (pattern.len == 0) {
+            // Empty pattern: return input unchanged (avoid infinite loop)
+            return .{ .tape_value = .{ .string = input } };
+        }
+
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        var i: usize = 0;
+        while (i < input.len) {
+            if (i + pattern.len <= input.len and std.mem.eql(u8, input[i..][0..pattern.len], pattern)) {
+                try buf.appendSlice(it.alloc, replacement);
+                i += pattern.len;
+            } else {
+                try buf.append(it.alloc, input[i]);
+                i += 1;
+            }
+        }
+
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    // ── Array utility builtins ───────────────────────────────────────────────
+
+    /// `transpose`: transpose array of arrays.
+    fn builtinTranspose(it: *ResultIterator) ZqError!?StackValue {
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return error.TypeError,
+        };
+
+        // Collect inner arrays and find max length
+        var inner_arrays = std.ArrayList(Value.TapeSpan){};
+        defer inner_arrays.deinit(it.alloc);
+        var max_len: u32 = 0;
+
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        while (pos < end) {
+            const elem = tapeEntryToValue(span.tape, pos);
+            switch (elem) {
+                .array => |inner| {
+                    const len = arrayLength(inner.tape, inner);
+                    if (len > max_len) max_len = len;
+                    try inner_arrays.append(it.alloc, inner);
+                },
+                else => return error.TypeError,
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+
+        // Build transposed array of arrays
+        const outer_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        var col: u32 = 0;
+        while (col < max_len) : (col += 1) {
+            const row_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .array_start,
+                .payload = .{ .skip = 0 },
+            });
+
+            for (inner_arrays.items) |inner| {
+                const elem = lookupIndex(inner.tape, inner, col);
+                if (elem) |v| {
+                    const sv = try valueToStackValue(v);
+                    try it.stackValueToRuntimeTapeEntry(sv);
+                } else {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .null_val,
+                        .payload = .{ .none = {} },
+                    });
+                }
+            }
+
+            const row_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .array_end,
+                .payload = .{ .none = {} },
+            });
+            it.runtime_tape.entries.items[row_start].payload.skip = row_end_idx + 1;
+        }
+
+        const outer_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[outer_start].payload.skip = outer_end_idx + 1;
+        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape_view,
+            .start = outer_start,
+            .end = outer_end_idx + 1,
+        } } };
+    }
+
+    /// `bsearch(x)`: binary search in sorted array.
+    /// Returns index if found, or (-1 - insertion_point) if not found.
+    fn builtinBsearch(it: *ResultIterator) ZqError!?StackValue {
+        const target_sv = try it.popValue();
+        const target = try stackValueToValue(target_sv);
+
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => {
+                // Build jq-compatible error: 'TYPE (VALUE) cannot be searched from'
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                switch (it.current) {
+                    .string => |s| {
+                        try msg_buf.appendSlice(it.alloc, "string (");
+                        try appendJsonString(&msg_buf, it.alloc, s);
+                        try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
+                    },
+                    .null_val => try msg_buf.appendSlice(it.alloc, "null cannot be searched from"),
+                    .bool_val => |b| {
+                        try msg_buf.appendSlice(it.alloc, if (b) "true cannot be searched from" else "false cannot be searched from");
+                    },
+                    .int => |n| {
+                        var tmp: [32]u8 = undefined;
+                        const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.TypeError;
+                        try msg_buf.appendSlice(it.alloc, "number (");
+                        try msg_buf.appendSlice(it.alloc, s);
+                        try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
+                    },
+                    .float => |f| {
+                        var tmp: [64]u8 = undefined;
+                        const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch return error.TypeError;
+                        try msg_buf.appendSlice(it.alloc, "number (");
+                        try msg_buf.appendSlice(it.alloc, s);
+                        try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
+                    },
+                    .object => try msg_buf.appendSlice(it.alloc, "object cannot be searched from"),
+                    .array => unreachable,
+                }
+                return try it.raiseUserError(msg_buf.items);
+            },
+        };
+
+        // Collect array elements for binary search
+        var elems = std.ArrayList(Value){};
+        defer elems.deinit(it.alloc);
+        var apos = span.start + 1;
+        const aend = span.end - 1;
+        while (apos < aend) {
+            try elems.append(it.alloc, tapeEntryToValue(span.tape, apos));
+            apos = skipEntry(span.tape.*, apos);
+        }
+
+        // Binary search
+        var lo: i64 = 0;
+        var hi: i64 = @intCast(elems.items.len);
+        while (lo < hi) {
+            const mid = @divTrunc(lo + hi, 2);
+            const cmp = jqCompareValues(elems.items[@intCast(mid)], target);
+            switch (cmp) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return .{ .int = mid },
+            }
+        }
+        // Not found: return -1 - lo (insertion point)
+        return .{ .int = -1 - lo };
+    }
+};
+
+/// Simple JSON parser for fromjson builtin.
+/// Parses a JSON string and builds entries in the ResultIterator's runtime tape.
+/// Uses a tape-first approach: all parsed values are written directly to the runtime
+/// tape. The top-level result is then read back as a StackValue.
+fn parseJsonToStackValue(it: *ResultIterator, json_str: []const u8) ZqError!StackValue {
+    var parser = JsonParser{ .src = json_str, .pos = 0, .it = it };
+    const start_idx: u32 = @intCast(it.runtime_tape.entries.items.len);
+    parser.writeValue() catch return error.TypeError;
+    it.runtime_tape_view.entries = it.runtime_tape.entries.items;
+    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+    return valueToStackValue(tapeEntryToValue(&it.runtime_tape_view, start_idx));
+}
+
+const JsonParser = struct {
+    src: []const u8,
+    pos: usize,
+    it: *ResultIterator,
+
+    fn skipWhitespace(self: *JsonParser) void {
+        while (self.pos < self.src.len and
+            (self.src[self.pos] == ' ' or self.src[self.pos] == '\t' or
+                self.src[self.pos] == '\n' or self.src[self.pos] == '\r'))
+        {
+            self.pos += 1;
+        }
+    }
+
+    /// Write a JSON value directly to the runtime tape.
+    fn writeValue(self: *JsonParser) ZqError!void {
+        self.skipWhitespace();
+        if (self.pos >= self.src.len) return error.TypeError;
+
+        switch (self.src[self.pos]) {
+            '"' => try self.writeString(),
+            '{' => try self.writeObject(),
+            '[' => try self.writeArray(),
+            't' => try self.writeLiteral("true", .true_val),
+            'f' => try self.writeLiteral("false", .false_val),
+            'n' => try self.writeLiteral("null", .null_val),
+            '-', '0'...'9' => try self.writeNumber(),
+            else => return error.TypeError,
+        }
+    }
+
+    fn writeLiteral(self: *JsonParser, expected: []const u8, tag: Tape.Tag) ZqError!void {
+        if (self.pos + expected.len > self.src.len) return error.TypeError;
+        if (!std.mem.eql(u8, self.src[self.pos..][0..expected.len], expected)) return error.TypeError;
+        self.pos += expected.len;
+        _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = tag,
+            .payload = .{ .none = {} },
+        });
+    }
+
+    fn writeNumber(self: *JsonParser) ZqError!void {
+        const start = self.pos;
+        if (self.pos < self.src.len and self.src[self.pos] == '-') self.pos += 1;
+        while (self.pos < self.src.len and self.src[self.pos] >= '0' and self.src[self.pos] <= '9') {
+            self.pos += 1;
+        }
+        var is_float = false;
+        if (self.pos < self.src.len and self.src[self.pos] == '.') {
+            is_float = true;
+            self.pos += 1;
+            while (self.pos < self.src.len and self.src[self.pos] >= '0' and self.src[self.pos] <= '9') {
+                self.pos += 1;
+            }
+        }
+        if (self.pos < self.src.len and (self.src[self.pos] == 'e' or self.src[self.pos] == 'E')) {
+            is_float = true;
+            self.pos += 1;
+            if (self.pos < self.src.len and (self.src[self.pos] == '+' or self.src[self.pos] == '-')) {
+                self.pos += 1;
+            }
+            while (self.pos < self.src.len and self.src[self.pos] >= '0' and self.src[self.pos] <= '9') {
+                self.pos += 1;
+            }
+        }
+        const num_str = self.src[start..self.pos];
+        if (!is_float) {
+            if (std.fmt.parseInt(i64, num_str, 10)) |n| {
+                _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = n },
+                });
+                return;
+            } else |_| {}
+        }
+        const f = std.fmt.parseFloat(f64, num_str) catch return error.TypeError;
+        _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .float,
+            .payload = .{ .float = f },
+        });
+    }
+
+    fn writeString(self: *JsonParser) ZqError!void {
+        const s = try self.parseStringBytes();
+        const str_ref = try self.it.runtime_tape.internString(self.it.alloc, s);
+        self.it.alloc.free(s);
+        _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .string,
+            .payload = .{ .string = str_ref },
+        });
+    }
+
+    /// Parse a JSON string and return the decoded bytes (caller must free).
+    fn parseStringBytes(self: *JsonParser) ZqError![]const u8 {
+        if (self.src[self.pos] != '"') return error.TypeError;
+        self.pos += 1;
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(self.it.alloc);
+        while (self.pos < self.src.len and self.src[self.pos] != '"') {
+            if (self.src[self.pos] == '\\') {
+                self.pos += 1;
+                if (self.pos >= self.src.len) return error.TypeError;
+                switch (self.src[self.pos]) {
+                    '"' => try buf.append(self.it.alloc, '"'),
+                    '\\' => try buf.append(self.it.alloc, '\\'),
+                    '/' => try buf.append(self.it.alloc, '/'),
+                    'b' => try buf.append(self.it.alloc, 0x08),
+                    'f' => try buf.append(self.it.alloc, 0x0C),
+                    'n' => try buf.append(self.it.alloc, '\n'),
+                    'r' => try buf.append(self.it.alloc, '\r'),
+                    't' => try buf.append(self.it.alloc, '\t'),
+                    'u' => {
+                        self.pos += 1;
+                        if (self.pos + 4 > self.src.len) return error.TypeError;
+                        const hex = std.fmt.parseInt(u16, self.src[self.pos..][0..4], 16) catch return error.TypeError;
+                        self.pos += 3; // will be incremented by 1 at end
+                        var encode_buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(@intCast(hex), &encode_buf) catch return error.TypeError;
+                        try buf.appendSlice(self.it.alloc, encode_buf[0..len]);
+                    },
+                    else => try buf.append(self.it.alloc, self.src[self.pos]),
+                }
+            } else {
+                try buf.append(self.it.alloc, self.src[self.pos]);
+            }
+            self.pos += 1;
+        }
+        if (self.pos >= self.src.len) return error.TypeError;
+        self.pos += 1; // skip closing quote
+        return try buf.toOwnedSlice(self.it.alloc);
+    }
+
+    fn writeArray(self: *JsonParser) ZqError!void {
+        self.pos += 1; // skip '['
+        self.skipWhitespace();
+
+        const arr_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        if (self.pos < self.src.len and self.src[self.pos] == ']') {
+            self.pos += 1;
+        } else {
+            while (true) {
+                try self.writeValue();
+                self.skipWhitespace();
+                if (self.pos >= self.src.len) return error.TypeError;
+                if (self.src[self.pos] == ']') {
+                    self.pos += 1;
+                    break;
+                }
+                if (self.src[self.pos] != ',') return error.TypeError;
+                self.pos += 1;
+            }
+        }
+
+        const arr_end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        self.it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+    }
+
+    fn writeObject(self: *JsonParser) ZqError!void {
+        self.pos += 1; // skip '{'
+        self.skipWhitespace();
+
+        const obj_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        if (self.pos < self.src.len and self.src[self.pos] == '}') {
+            self.pos += 1;
+        } else {
+            while (true) {
+                self.skipWhitespace();
+                // Parse key (must be a string)
+                if (self.pos >= self.src.len or self.src[self.pos] != '"') return error.TypeError;
+                const key_bytes = try self.parseStringBytes();
+                const key_ref = try self.it.runtime_tape.internString(self.it.alloc, key_bytes);
+                self.it.alloc.free(key_bytes);
+                _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                    .tag = .key,
+                    .payload = .{ .string = key_ref },
+                });
+
+                self.skipWhitespace();
+                if (self.pos >= self.src.len or self.src[self.pos] != ':') return error.TypeError;
+                self.pos += 1;
+
+                // Parse value directly into tape
+                try self.writeValue();
+
+                self.skipWhitespace();
+                if (self.pos >= self.src.len) return error.TypeError;
+                if (self.src[self.pos] == '}') {
+                    self.pos += 1;
+                    break;
+                }
+                if (self.src[self.pos] != ',') return error.TypeError;
+                self.pos += 1;
+            }
+        }
+
+        const obj_end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        self.it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
     }
 };
 
@@ -4595,4 +7168,48 @@ fn lookupIndex(tape: *const Tape, span: Value.TapeSpan, idx: u32) ?Value {
         i += 1;
     }
     return null;
+}
+
+/// Write a Value to a RuntimeTape. Used by setpath/delpaths to build results
+/// on a temporary tape without self-reference issues.
+fn writeValueToTape(tape: *types.RuntimeTape, alloc: std.mem.Allocator, val: Value) !void {
+    switch (val) {
+        .null_val => {
+            _ = try tape.appendEntry(alloc, .{
+                .tag = .null_val,
+                .payload = .{ .none = {} },
+            });
+        },
+        .bool_val => |b| {
+            _ = try tape.appendEntry(alloc, .{
+                .tag = if (b) .true_val else .false_val,
+                .payload = .{ .none = {} },
+            });
+        },
+        .int => |i| {
+            _ = try tape.appendEntry(alloc, .{
+                .tag = .int,
+                .payload = .{ .int = i },
+            });
+        },
+        .float => |f| {
+            _ = try tape.appendEntry(alloc, .{
+                .tag = .float,
+                .payload = .{ .float = f },
+            });
+        },
+        .string => |s| {
+            const str_ref = try tape.internString(alloc, s);
+            _ = try tape.appendEntry(alloc, .{
+                .tag = .string,
+                .payload = .{ .string = str_ref },
+            });
+        },
+        .object => |span| {
+            try tape.copySpan(span.tape.*, span.start, span.end, alloc);
+        },
+        .array => |span| {
+            try tape.copySpan(span.tape.*, span.start, span.end, alloc);
+        },
+    }
 }
