@@ -94,6 +94,16 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           bash npm/publish.sh "$VERSION" artifacts
 
+      - name: Publish to PyPI
+        if: "!contains(github.ref_name, '-')"
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          pip install twine
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash pypi/publish.sh "$VERSION" artifacts
+
       - name: Update Homebrew tap
         if: "!contains(github.ref_name, '-')"
         uses: peter-evans/repository-dispatch@v3
