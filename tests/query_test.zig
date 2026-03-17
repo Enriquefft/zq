@@ -1530,11 +1530,13 @@ test "try-catch: catch receives error name string" {
     var q = try compile("try .foo catch .");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    // Check values while iterator is alive to avoid dangling pointer from runtime tape.
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("TypeError", vals[0].string);
+    const val = (try it.next()) orelse return error.ExpectedValue;
+    try std.testing.expectEqualStrings("Cannot index number with string (\"foo\")", val.string);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
 
 test "try-catch: no error - yields try body, skips catch" {
