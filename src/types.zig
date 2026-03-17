@@ -356,55 +356,202 @@ pub const BuiltinId = enum(u16) {
     first_, // first(expr)
     last_, // last(expr)
 
-    /// Derive the jq-visible name from the enum tag at comptime.
-    ///
-    /// Rules:
-    /// 1. Tags ending with `_gen` → null (internal generator variants)
-    /// 2. Arity-suffixed tags (e.g. `range2`, `range3`, `flatten_n`) → null (overloads)
-    /// 3. Tags starting with `format_` → replace prefix with `@` (e.g. `format_base64` → `@base64`)
-    /// 4. Tags ending with a single trailing `_` → strip it (Zig keyword avoidance)
-    /// 5. Everything else → @tagName as-is
-    pub fn jqName(comptime self: BuiltinId) ?[]const u8 {
+    const JqEntry = struct { name: []const u8, arity: u8 };
+
+    /// Return the jq-visible "name/arity" entry for this builtin, or null for
+    /// internal variants that should not appear in `builtins` output.
+    pub fn jqEntry(comptime self: BuiltinId) ?JqEntry {
+        // Internal generator variants — not user-facing.
+        switch (self) {
+            .range1_gen, .range2_gen, .range3_gen, .limit_gen => return null,
+            else => {},
+        }
+        return .{ .name = self.jqBaseName(), .arity = self.jqArity() };
+    }
+
+    /// Derive the jq-visible base name from the enum tag at comptime.
+    fn jqBaseName(comptime self: BuiltinId) []const u8 {
         @setEvalBranchQuota(10_000);
         const tag = @tagName(self);
 
-        // Rule 1: internal generator variants
-        if (tag.len >= 4 and std.mem.eql(u8, tag[tag.len - 4 ..], "_gen")) return null;
+        // Arity-suffixed overloads → return base name
+        if (std.mem.eql(u8, tag, "range2") or std.mem.eql(u8, tag, "range3")) return "range";
+        if (std.mem.eql(u8, tag, "flatten_n")) return "flatten";
 
-        // Rule 2: arity-suffixed overloads
-        if (isAritySuffix(tag)) return null;
-
-        // Rule 3: format_ prefix → @name
+        // format_ prefix → @name
         if (tag.len > 7 and std.mem.eql(u8, tag[0..7], "format_")) {
             return "@" ++ tag[7..];
         }
 
-        // Rule 4: trailing underscore (Zig keyword avoidance)
-        if (tag.len > 1 and tag[tag.len - 1] == '_') {
-            // Only strip if the char before '_' is NOT '_' (avoid stripping double underscores)
-            if (tag.len < 2 or tag[tag.len - 2] != '_') {
-                return tag[0 .. tag.len - 1];
-            }
+        // Trailing underscore (Zig keyword avoidance) → strip it
+        if (tag.len > 1 and tag[tag.len - 1] == '_' and tag[tag.len - 2] != '_') {
+            return tag[0 .. tag.len - 1];
         }
 
-        // Rule 5: use tag name as-is
         return tag;
     }
 
-    fn isAritySuffix(tag: []const u8) bool {
-        // Explicit list of arity-suffixed overloads (base name already appears separately).
-        const arity_tags = [_][]const u8{ "range2", "range3", "flatten_n" };
-        for (arity_tags) |at| {
-            if (std.mem.eql(u8, tag, at)) return true;
-        }
-        return false;
+    /// Return the jq arity (number of explicit arguments, excluding input).
+    /// Exhaustive switch — the compiler enforces completeness when new variants are added.
+    fn jqArity(comptime self: BuiltinId) u8 {
+        return switch (self) {
+            // 0-arity: operate on input only
+            .length,
+            .keys,
+            .keys_unsorted,
+            .values,
+            .empty,
+            .type_,
+            .tostring,
+            .tonumber,
+            .add,
+            .sort,
+            .reverse,
+            .min,
+            .max,
+            .to_entries,
+            .from_entries,
+            .any,
+            .all,
+            .indices,
+            .unique,
+            .tojson,
+            .fromjson,
+            .not_,
+            .builtins_,
+            .debug_,
+            .stderr_,
+            .input_,
+            .inputs_,
+            .env_,
+            .halt_,
+            .paths,
+            .leaf_paths,
+            .recurse,
+            .abs,
+            .floor_,
+            .ceil_,
+            .round_,
+            .sqrt_,
+            .fabs_,
+            .nan_,
+            .infinite_,
+            .isinfinite_,
+            .isnan_,
+            .isnormal_,
+            .exp_,
+            .exp2_,
+            .exp10_,
+            .log_,
+            .log2_,
+            .log10_,
+            .cbrt_,
+            .sin_,
+            .cos_,
+            .tan_,
+            .asin_,
+            .acos_,
+            .atan_,
+            .rint_,
+            .nearbyint_,
+            .trunc_,
+            .significand_,
+            .logb_,
+            .j0_,
+            .j1_,
+            .lgamma_,
+            .tgamma_,
+            .arrays_,
+            .objects_,
+            .strings_,
+            .numbers_,
+            .booleans_,
+            .nulls_,
+            .values_,
+            .scalars_,
+            .normals_,
+            .iterables_,
+            .ascii_downcase,
+            .ascii_upcase,
+            .ascii_,
+            .explode_,
+            .implode_,
+            .transpose_,
+            .flatten,
+            .format_text,
+            .format_json,
+            .format_csv,
+            .format_tsv,
+            .format_html,
+            .format_uri,
+            .format_urid,
+            .format_sh,
+            .format_base64,
+            .format_base64d,
+            .error_,
+            => 0,
+
+            // 1-arity: one explicit argument
+            .has,
+            .in_,
+            .sort_by,
+            .group_by,
+            .min_by,
+            .max_by,
+            .unique_by,
+            .del,
+            .contains,
+            .inside,
+            .index_,
+            .rindex,
+            .getpath,
+            .delpaths,
+            .flatten_n,
+            .split_,
+            .join_,
+            .startswith_,
+            .endswith_,
+            .ltrimstr_,
+            .rtrimstr_,
+            .test_,
+            .match_,
+            .bsearch_,
+            .map_values_,
+            .isempty_,
+            .first_,
+            .last_,
+            .halt_error_,
+            .range,
+            => 1,
+
+            // 2-arity: two explicit arguments
+            .setpath,
+            .sub_,
+            .gsub_,
+            .pow_,
+            .atan2_,
+            .remainder_,
+            .hypot_,
+            .scalb_,
+            .scalbln_,
+            .ldexp_,
+            .drem_,
+            .range2,
+            => 2,
+
+            // 3-arity
+            .fma_, .range3 => 3,
+
+            // Internal generator variants — handled by jqEntry returning null
+            .range1_gen, .range2_gen, .range3_gen, .limit_gen => unreachable,
+        };
     }
 
-    /// Return the number of unique jq-visible builtin names.
+    /// Return the number of jq-visible builtin entries (including arity overloads).
     pub fn jqBuiltinCount() comptime_int {
         var count: comptime_int = 0;
         for (std.enums.values(BuiltinId)) |id| {
-            if (comptime id.jqName() != null) count += 1;
+            if (comptime id.jqEntry() != null) count += 1;
         }
         return count;
     }

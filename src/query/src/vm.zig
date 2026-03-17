@@ -5785,14 +5785,15 @@ pub const ResultIterator = struct {
     }
 
     fn builtinBuiltins(it: *ResultIterator) ZqError!?StackValue {
-        // Derive names from BuiltinId enum — single source of truth.
-        const names = comptime blk: {
+        // Derive "name/arity" entries from BuiltinId enum — single source of truth.
+        // Matches jq's format: ["length/0", "keys/0", "range/1", "range/2", ...]
+        const builtin_strs = comptime blk: {
             const count = types.BuiltinId.jqBuiltinCount();
             var result: [count][]const u8 = undefined;
             var i: usize = 0;
             for (std.enums.values(types.BuiltinId)) |id| {
-                if (id.jqName()) |name| {
-                    result[i] = name;
+                if (id.jqEntry()) |entry| {
+                    result[i] = entry.name ++ "/" ++ &[1]u8{'0' + entry.arity};
                     i += 1;
                 }
             }
@@ -5802,7 +5803,7 @@ pub const ResultIterator = struct {
             .tag = .array_start,
             .payload = .{ .skip = 0 },
         });
-        for (names) |name| {
+        for (builtin_strs) |name| {
             const str_ref = try it.runtime_tape.internString(it.alloc, name);
             _ = try it.runtime_tape.appendEntry(it.alloc, .{
                 .tag = .string,
