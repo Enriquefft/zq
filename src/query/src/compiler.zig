@@ -2,7 +2,7 @@ const std = @import("std");
 const ZqError = @import("error").ZqError;
 const types = @import("types");
 const Instruction = types.Instruction;
-const lx = @import("lexer.zig");
+const lx = @import("lexer");
 const Lexer = lx.Lexer;
 const Token = lx.Token;
 
@@ -5181,7 +5181,7 @@ fn fuse(
     // Track mapping from raw instruction index to fused instruction index
     var index_map = std.ArrayList(u32){};
     defer index_map.deinit(alloc);
-    try index_map.ensureTotalCapacity(alloc, raw.len);
+    try index_map.ensureTotalCapacity(alloc, raw.len + 1);
 
     var i: usize = 0;
     while (i < raw.len) {
@@ -5225,6 +5225,10 @@ fn fuse(
             i += 1;
         }
     }
+
+    // Sentinel: backpatched operands can point one past the last raw instruction
+    // (e.g. limit_start exit_ip, label_begin exit_ip). Map to one past fused end.
+    index_map.appendAssumeCapacity(@intCast(fused.items.len));
 
     // Intern buffer is now complete. Finalize and convert to []Instruction.
     const string_buf = try intern.toOwnedSlice(alloc);

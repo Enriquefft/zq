@@ -1,0 +1,338 @@
+const std = @import("std");
+
+/// Byte range in source for error reporting and LSP position mapping.
+pub const Span = struct {
+    start: u32,
+    end: u32,
+
+    pub fn empty() Span {
+        return .{ .start = 0, .end = 0 };
+    }
+
+    pub fn from(start: u32, end: u32) Span {
+        return .{ .start = start, .end = end };
+    }
+};
+
+/// Arena-allocated AST node. Every node carries a source Span.
+pub const Node = struct {
+    kind: Kind,
+    span: Span,
+
+    pub const Kind = union(enum) {
+        // ── Composition ──────────────────────────────────────────────
+        pipe: Pipe,
+        comma: Comma,
+        func_def: FuncDef,
+
+        // ── Operators ────────────────────────────────────────────────
+        alternative: Binary, // //
+        or_expr: Binary,
+        and_expr: Binary,
+        comparison: Comparison,
+        arithmetic: Arithmetic,
+        unary_neg: Unary, // -expr
+
+        // ── Binding ──────────────────────────────────────────────────
+        as_pattern: AsPattern,
+        destruct_alt: DestructAlt,
+
+        // ── Primary ──────────────────────────────────────────────────
+        identity, // .
+        recurse, // ..
+        field_access: FieldAccess,
+        index_access: IndexAccess,
+        iterate, // .[]
+        slice: Slice,
+        literal: Literal,
+        paren: Unary, // (expr)
+        variable_ref: VarRef,
+        optional: Unary, // expr?
+
+        // ── Constructors ─────────────────────────────────────────────
+        array_construct: ArrayConstruct,
+        object_construct: ObjectConstruct,
+        string_interp: StringInterp,
+        format_string: FormatString,
+
+        // ── Calls ────────────────────────────────────────────────────
+        builtin_call: BuiltinCall,
+        func_call: FuncCall,
+
+        // ── Control flow ─────────────────────────────────────────────
+        if_expr: IfExpr,
+        try_catch: TryCatch,
+        reduce: Reduce,
+        foreach: Foreach,
+        label_expr: LabelExpr,
+        break_expr: BreakExpr,
+
+        // ── Assignment ───────────────────────────────────────────────
+        update_assign: UpdateAssign,
+
+        // ── Suffix chain ─────────────────────────────────────────────
+        suffix: Suffix,
+
+        // ── Error recovery ───────────────────────────────────────────
+        error_node: ErrorNode,
+    };
+
+    // ── Node payload types ──────────────────────────────────────────
+
+    pub const Pipe = struct {
+        left: *Node,
+        right: *Node,
+    };
+
+    pub const Comma = struct {
+        left: *Node,
+        right: *Node,
+    };
+
+    pub const FuncDef = struct {
+        name: []const u8,
+        params: []const FuncParam,
+        body: *Node,
+        rest: *Node, // continuation after ;
+    };
+
+    pub const FuncParam = struct {
+        name: []const u8,
+        is_filter: bool,
+        span: Span,
+    };
+
+    pub const Binary = struct {
+        left: *Node,
+        right: *Node,
+    };
+
+    pub const Comparison = struct {
+        op: CmpOp,
+        left: *Node,
+        right: *Node,
+
+        pub const CmpOp = enum { eq, ne, lt, le, gt, ge };
+    };
+
+    pub const Arithmetic = struct {
+        op: ArithOp,
+        left: *Node,
+        right: *Node,
+
+        pub const ArithOp = enum { add, sub, mul, div, mod };
+    };
+
+    pub const Unary = struct {
+        operand: *Node,
+    };
+
+    pub const AsPattern = struct {
+        expr: *Node,
+        pattern: Pattern,
+        body: *Node,
+    };
+
+    pub const DestructAlt = struct {
+        expr: *Node,
+        patterns: []const Pattern,
+        body: *Node,
+    };
+
+    pub const FieldAccess = struct {
+        name: []const u8,
+    };
+
+    pub const IndexAccess = struct {
+        index: i64,
+    };
+
+    pub const Slice = struct {
+        has_from: bool,
+        from: i32,
+        has_to: bool,
+        to: i32,
+    };
+
+    pub const Literal = union(enum) {
+        int: i64,
+        float: f64,
+        string: []const u8,
+        bool_val: bool,
+        null_val,
+    };
+
+    pub const VarRef = struct {
+        name: []const u8,
+    };
+
+    pub const ArrayConstruct = struct {
+        /// null for empty array []
+        expr: ?*Node,
+    };
+
+    pub const ObjectConstruct = struct {
+        fields: []const ObjectField,
+    };
+
+    pub const ObjectField = struct {
+        key: ObjectKey,
+        value: *Node,
+        span: Span,
+    };
+
+    pub const ObjectKey = union(enum) {
+        ident: []const u8,
+        string: []const u8,
+        expr: *Node,
+    };
+
+    pub const StringInterp = struct {
+        parts: []const StringPart,
+    };
+
+    pub const FormatString = struct {
+        format: []const u8,
+        parts: []const StringPart,
+    };
+
+    pub const StringPart = union(enum) {
+        literal: []const u8,
+        expr: *Node,
+    };
+
+    pub const BuiltinCall = struct {
+        name: []const u8,
+        args: []const *Node,
+    };
+
+    pub const FuncCall = struct {
+        name: []const u8,
+        args: []const *Node,
+    };
+
+    pub const IfExpr = struct {
+        cond: *Node,
+        then_body: *Node,
+        elif_chains: []const ElifChain,
+        else_body: ?*Node,
+    };
+
+    pub const ElifChain = struct {
+        cond: *Node,
+        body: *Node,
+    };
+
+    pub const TryCatch = struct {
+        body: *Node,
+        catch_body: ?*Node,
+    };
+
+    pub const Reduce = struct {
+        expr: *Node,
+        pattern: Pattern,
+        init: *Node,
+        update: *Node,
+    };
+
+    pub const Foreach = struct {
+        expr: *Node,
+        pattern: Pattern,
+        init: *Node,
+        update: *Node,
+        extract: ?*Node,
+    };
+
+    pub const LabelExpr = struct {
+        name: []const u8,
+        body: *Node,
+    };
+
+    pub const BreakExpr = struct {
+        name: []const u8,
+    };
+
+    pub const UpdateAssign = struct {
+        path: []const PathStep,
+        op: AssignOp,
+        rhs: *Node,
+
+        pub const AssignOp = enum { pipe_eq, eq, plus_eq, minus_eq, star_eq, slash_eq, percent_eq, double_slash_eq };
+    };
+
+    pub const PathStep = union(enum) {
+        key: []const u8,
+        index: i64,
+        iterate,
+    };
+
+    pub const Suffix = struct {
+        base: *Node,
+        ops: []const SuffixOp,
+    };
+
+    pub const SuffixOp = union(enum) {
+        field: []const u8,
+        index: i64,
+        iterate,
+        slice: Slice,
+        optional,
+        bracket_expr: *Node, // .[expr]
+        bracket_str: []const u8,
+    };
+
+    pub const ErrorNode = struct {
+        message: []const u8,
+    };
+};
+
+/// Destructuring pattern for `as`, `reduce`, `foreach`.
+pub const Pattern = union(enum) {
+    simple: []const u8, // variable name
+    array: []const Pattern,
+    object: []const ObjectPatternField,
+};
+
+pub const ObjectPatternField = struct {
+    key: PatternKey,
+    pattern: Pattern,
+};
+
+pub const PatternKey = union(enum) {
+    static: []const u8,
+    computed: *Node,
+};
+
+/// Parse error collected during error-tolerant parsing.
+pub const ParseError = struct {
+    message: []const u8,
+    span: Span,
+    kind: Kind,
+
+    pub const Kind = enum {
+        unexpected_token,
+        missing_token,
+        unterminated,
+        invalid_literal,
+        unknown,
+    };
+};
+
+/// Result of parsing. Always contains an AST (possibly partial).
+pub const ParseResult = struct {
+    root: *Node,
+    errors: []const ParseError,
+    arena: std.heap.ArenaAllocator,
+    alloc: std.mem.Allocator,
+
+    pub fn deinit(self: *ParseResult) void {
+        if (self.errors.len > 0) {
+            self.alloc.free(self.errors);
+        }
+        self.arena.deinit();
+    }
+
+    pub fn hasErrors(self: *const ParseResult) bool {
+        return self.errors.len > 0;
+    }
+};

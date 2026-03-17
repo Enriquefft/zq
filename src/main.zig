@@ -43,6 +43,7 @@ const Config = struct {
     describe: bool = false,
     describe_depth: u32 = 12,
     validate: bool = false,
+    lsp_mode: bool = false,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -100,6 +101,12 @@ pub fn main() !u8 {
         }
     };
     defer config.deinit();
+
+    if (config.lsp_mode) {
+        const lsp_mod = @import("lsp");
+        lsp_mod.run(allocator) catch return EXIT_SYSTEM;
+        return EXIT_OK;
+    }
 
     if (config.validate) {
         return processValidate(&config, allocator);
@@ -1302,6 +1309,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             break;
         } else if (std.mem.eql(u8, arg, "--json-errors")) {
             config.json_errors = true;
+        } else if (std.mem.eql(u8, arg, "--lsp")) {
+            config.lsp_mode = true;
         } else if (std.mem.eql(u8, arg, "--validate")) {
             config.validate = true;
         } else if (std.mem.eql(u8, arg, "--describe")) {
@@ -1475,6 +1484,7 @@ fn printUsage() void {
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
+        \\  --lsp                 Start Language Server Protocol server on stdin/stdout
         \\  --validate            Check filter syntax without executing (exit 0=valid, 3=error)
         \\  --describe            Print input data shape (type, fields, count)
         \\  --depth N             Schema recursion depth (default: 12, 0=unlimited)

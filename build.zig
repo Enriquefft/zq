@@ -38,6 +38,22 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("error", error_module);
     parser_module.addImport("types", types_module);
 
+    const lexer_module = b.createModule(.{
+        .root_source_file = b.path("src/query/src/lexer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lexer_module.addImport("error", error_module);
+
+    const ast_module = b.createModule(.{
+        .root_source_file = b.path("src/ast/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_module.addImport("lexer", lexer_module);
+    ast_module.addImport("error", error_module);
+    ast_module.addImport("types", types_module);
+
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
         .target = target,
@@ -45,6 +61,7 @@ pub fn build(b: *std.Build) void {
     });
     query_module.addImport("error", error_module);
     query_module.addImport("types", types_module);
+    query_module.addImport("lexer", lexer_module);
 
     const output_module = b.createModule(.{
         .root_source_file = b.path("src/output/root.zig"),
@@ -83,6 +100,16 @@ pub fn build(b: *std.Build) void {
     c_abi_module.addImport("query", query_module);
     c_abi_module.addImport("parser", parser_module);
 
+    const lsp_module = b.createModule(.{
+        .root_source_file = b.path("src/lsp/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_module.addImport("ast", ast_module);
+    lsp_module.addImport("error", error_module);
+    lsp_module.addImport("types", types_module);
+    lsp_module.addImport("lexer", lexer_module);
+
     // ── Executable ─────────────────────────────────────────────────────────────
     const is_release = optimize != .Debug;
 
@@ -100,6 +127,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("output", output_module);
     exe_mod.addImport("pool", pool_module);
     exe_mod.addImport("describe", describe_module);
+    exe_mod.addImport("lsp", lsp_module);
     exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
@@ -207,6 +235,27 @@ pub fn build(b: *std.Build) void {
 
     const describe_tests = b.addTest(.{ .root_module = describe_test_mod });
     test_step.dependOn(&b.addRunArtifact(describe_tests).step);
+
+    const ast_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/ast_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_test_mod.addImport("ast", ast_module);
+
+    const ast_tests = b.addTest(.{ .root_module = ast_test_mod });
+    test_step.dependOn(&b.addRunArtifact(ast_tests).step);
+
+    const lsp_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/lsp_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_test_mod.addImport("lsp", lsp_module);
+    lsp_test_mod.addImport("ast", ast_module);
+
+    const lsp_tests = b.addTest(.{ .root_module = lsp_test_mod });
+    test_step.dependOn(&b.addRunArtifact(lsp_tests).step);
 
     // ── JSONTestSuite ──────────────────────────────────────────────────────
     const jts_options = b.addOptions();
