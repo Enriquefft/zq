@@ -781,3 +781,181 @@ pub const Format = enum {
     /// Raw output with no trailing newline (--join-output / -j).
     join,
 };
+
+// ─── Float Formatting ────────────────────────────────────────────────────────
+// Single source of truth for jq-compatible float formatting.
+// Implements jq's jvp_dtoa_fmt algorithm: uses Ryu shortest representation,
+// then selects between decimal and scientific notation based on jq's thresholds.
+
+/// Result of formatJqFloat — holds the formatted string and its backing buffer.
+pub const FormattedFloat = struct {
+    buf: [64]u8,
+    len: usize,
+
+    pub fn slice(self: *const FormattedFloat) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Format a f64 for JSON output using jq's non-decnum formatting rules.
+///
+/// Rules (matching jq's jvp_dtoa_fmt):
+///   1. NaN and Inf → "null"
+///   2. Integer-valued floats in i64 range → integer format (no decimal point)
+///   3. Otherwise: Ryu shortest representation, then:
+///      - If decpt <= -4 or decpt > ndigits + 15 → scientific notation (e.g. 1.05e-19)
+///      - If decpt <= 0 → decimal with leading zeros (e.g. 0.001)
+///      - Else → decimal with point inserted (e.g. 123.45)
+pub fn formatJqFloat(f: f64) FormattedFloat {
+    var result: FormattedFloat = .{ .buf = undefined, .len = 0 };
+
+    // NaN and Infinity → "null"
+    if (std.math.isNan(f) or std.math.isInf(f)) {
+        @memcpy(result.buf[0..4], "null");
+        result.len = 4;
+        return result;
+    }
+
+    // Integer-valued floats → format as integer (no decimal point)
+    if (f == @trunc(f)) {
+        // Check if it fits in i64 range
+        if (f >= @as(f64, @floatFromInt(@as(i64, std.math.minInt(i64)))) and
+            f <= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i64)))))
+        {
+            const i: i64 = @intFromFloat(f);
+            const s = std.fmt.bufPrint(&result.buf, "{d}", .{i}) catch unreachable;
+            result.len = s.len;
+            return result;
+        }
+        // Large integer-valued float outside i64 range — fall through to scientific
+    }
+
+    // Non-integer (or out-of-range integer-valued) float:
+    // Use Zig's Ryu-based {e} format to get the shortest representation
+    // in scientific notation: e.g. "1.05e-19", "5e-1", "1.23e5"
+    var ryu_buf: [64]u8 = undefined;
+    const ryu = std.fmt.bufPrint(&ryu_buf, "{e}", .{f}) catch unreachable;
+
+    // Parse the Ryu output to extract:
+    //   - sign (if negative)
+    //   - significant digits (without decimal point)
+    //   - exponent value
+    var pos: usize = 0;
+    const is_neg = ryu[0] == '-';
+    if (is_neg) pos = 1;
+
+    // Extract significant digits and locate 'e'
+    var digits: [20]u8 = undefined;
+    var ndigits: usize = 0;
+    while (pos < ryu.len and ryu[pos] != 'e') {
+        if (ryu[pos] != '.') {
+            digits[ndigits] = ryu[pos];
+            ndigits += 1;
+        }
+        pos += 1;
+    }
+
+    // Parse exponent (after 'e')
+    pos += 1; // skip 'e'
+    var exp_neg = false;
+    if (pos < ryu.len and ryu[pos] == '-') {
+        exp_neg = true;
+        pos += 1;
+    }
+    var exp_val: i32 = 0;
+    while (pos < ryu.len) {
+        exp_val = exp_val * 10 + @as(i32, ryu[pos] - '0');
+        pos += 1;
+    }
+    if (exp_neg) exp_val = -exp_val;
+
+    // decpt = exponent + 1 (jq's dtoa convention: digits[0].digits[1:] * 10^(decpt-1))
+    const decpt: i32 = exp_val + 1;
+    const nd: i32 = @intCast(ndigits);
+
+    // Now format according to jq's jvp_dtoa_fmt rules
+    var b: usize = 0;
+
+    if (is_neg) {
+        result.buf[b] = '-';
+        b += 1;
+    }
+
+    if (decpt <= -4 or decpt > nd + 15) {
+        // Scientific notation: d.dddde+XX or d.dddde-XX
+        result.buf[b] = digits[0];
+        b += 1;
+        if (ndigits > 1) {
+            result.buf[b] = '.';
+            b += 1;
+            @memcpy(result.buf[b .. b + ndigits - 1], digits[1..ndigits]);
+            b += ndigits - 1;
+        }
+        result.buf[b] = 'e';
+        b += 1;
+
+        var edecpt: i32 = decpt - 1;
+        if (edecpt < 0) {
+            result.buf[b] = '-';
+            b += 1;
+            edecpt = -edecpt;
+        } else {
+            result.buf[b] = '+';
+            b += 1;
+        }
+
+        // Format exponent with minimum 2 digits
+        var j: i32 = 2;
+        var k: i32 = 10;
+        while (10 * k <= edecpt) {
+            j += 1;
+            k *= 10;
+        }
+        while (true) {
+            const digit: u8 = @intCast(@divTrunc(edecpt, k));
+            result.buf[b] = digit + '0';
+            b += 1;
+            j -= 1;
+            if (j <= 0) break;
+            edecpt -= @as(i32, @intCast(digit)) * k;
+            edecpt *= 10;
+        }
+    } else if (decpt <= 0) {
+        // Decimal with leading zeros: 0.000...digits
+        result.buf[b] = '0';
+        b += 1;
+        result.buf[b] = '.';
+        b += 1;
+        var zeros: i32 = -decpt;
+        while (zeros > 0) : (zeros -= 1) {
+            result.buf[b] = '0';
+            b += 1;
+        }
+        @memcpy(result.buf[b .. b + ndigits], digits[0..ndigits]);
+        b += ndigits;
+    } else {
+        // Decimal: digits with point inserted at decpt position
+        const dp: usize = @intCast(decpt);
+        if (dp >= ndigits) {
+            // All digits before decimal point, possibly trailing zeros
+            @memcpy(result.buf[b .. b + ndigits], digits[0..ndigits]);
+            b += ndigits;
+            var trailing: usize = dp - ndigits;
+            while (trailing > 0) : (trailing -= 1) {
+                result.buf[b] = '0';
+                b += 1;
+            }
+        } else {
+            // Insert decimal point within digits
+            @memcpy(result.buf[b .. b + dp], digits[0..dp]);
+            b += dp;
+            result.buf[b] = '.';
+            b += 1;
+            @memcpy(result.buf[b .. b + ndigits - dp], digits[dp..ndigits]);
+            b += ndigits - dp;
+        }
+    }
+
+    result.len = b;
+    return result;
+}

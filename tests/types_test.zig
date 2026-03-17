@@ -5,6 +5,7 @@ const Tape = types.Tape;
 const Value = types.Value;
 const Instruction = types.Instruction;
 const RuntimeTape = types.RuntimeTape;
+const formatJqFloat = types.formatJqFloat;
 
 // ─── Tape ────────────────────────────────────────────────────────────────────
 
@@ -288,4 +289,42 @@ test "copySpan: strings are re-interned at new offsets" {
     try std.testing.expectEqual(@as(u32, 9), ref1.offset);
     try std.testing.expectEqualStrings("foo", rt_tape.getString(ref0));
     try std.testing.expectEqualStrings("bar", rt_tape.getString(ref1));
+}
+
+// ─── formatJqFloat ──────────────────────────────────────────────────────────
+
+test "formatJqFloat: integer-valued floats" {
+    const f = formatJqFloat;
+    try std.testing.expectEqualStrings("2", f(2.0).slice());
+    try std.testing.expectEqualStrings("100", f(100.0).slice());
+    try std.testing.expectEqualStrings("0", f(0.0).slice());
+    try std.testing.expectEqualStrings("0", f(-0.0).slice());
+    try std.testing.expectEqualStrings("-1", f(-1.0).slice());
+}
+
+test "formatJqFloat: simple decimals" {
+    const f = formatJqFloat;
+    try std.testing.expectEqualStrings("0.5", f(0.5).slice());
+    try std.testing.expectEqualStrings("1.5", f(1.5).slice());
+    try std.testing.expectEqualStrings("1.23", f(1.23).slice());
+    try std.testing.expectEqualStrings("-0.001", f(-0.001).slice());
+}
+
+test "formatJqFloat: scientific notation" {
+    const f = formatJqFloat;
+    // 1e17 fits in i64, so it's formatted as integer
+    try std.testing.expectEqualStrings("100000000000000000", f(1e17).slice());
+    // Non-integer floats use shortest representation with jq thresholds
+    try std.testing.expectEqualStrings("1.1e-19", f(1.1e-19).slice());
+    try std.testing.expectEqualStrings("1.05e-19", f(1.05e-19).slice());
+    try std.testing.expectEqualStrings("1.7976931348623157e+308", f(1.7976931348623157e+308).slice());
+    // Large integer-valued floats that overflow i64 use jvp_dtoa_fmt
+    try std.testing.expectEqualStrings("1e+20", f(1e20).slice());
+}
+
+test "formatJqFloat: NaN and Inf" {
+    const f = formatJqFloat;
+    try std.testing.expectEqualStrings("null", f(std.math.nan(f64)).slice());
+    try std.testing.expectEqualStrings("null", f(std.math.inf(f64)).slice());
+    try std.testing.expectEqualStrings("null", f(-std.math.inf(f64)).slice());
 }

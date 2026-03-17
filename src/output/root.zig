@@ -100,9 +100,8 @@ fn serializeValueCompact(ctx: anytype, val: Value, color: ?*const Color, opts: S
         },
         .float => |f| {
             if (color) |c| try ctx.writeSlice(c.number_color);
-            var tmp: [64]u8 = undefined;
-            const s = formatFloat(&tmp, f);
-            try ctx.writeSlice(s);
+            const formatted = types.formatJqFloat(f);
+            try ctx.writeSlice(formatted.slice());
             if (color) |c| try ctx.writeSlice(c.reset);
         },
         .string => |s| {
@@ -506,21 +505,4 @@ fn skipEntry(tape: *const types.Tape, idx: u32) u32 {
 }
 
 // ── Float formatting ──────────────────────────────────────────────────────────
-
-/// Format a float as JSON. Produces a decimal representation that round-trips
-/// through `parseFloat`. Special values (inf, nan) are rendered as `null` per
-/// the JSON specification (JSON has no representation for non-finite numbers).
-fn formatFloat(buf: *[64]u8, f: f64) []const u8 {
-    if (std.math.isNan(f) or std.math.isInf(f)) {
-        return "null";
-    }
-    // Check if the float is actually an integer
-    if (f == @trunc(f)) {
-        // Integer-valued float - format as integer (no decimal point)
-        const s = std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(f))}) catch unreachable;
-        return s;
-    }
-    // Non-integer float - format with decimal part
-    const s = std.fmt.bufPrint(buf, "{d}", .{f}) catch unreachable;
-    return s;
-}
+// Removed: formatFloat — use types.formatJqFloat() (single source of truth).

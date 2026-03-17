@@ -66,9 +66,8 @@ fn writeValueCompact(
             try buf.appendSlice(allocator, s);
         },
         .float => |f| {
-            var tmp: [64]u8 = undefined;
-            const s = formatFloat(&tmp, f);
-            try buf.appendSlice(allocator, s);
+            const formatted = types.formatJqFloat(f);
+            try buf.appendSlice(allocator, formatted.slice());
         },
         .string => |s| {
             try buf.append(allocator, '"');
@@ -147,11 +146,7 @@ fn skipEntry(tape: *const types.Tape, idx: u32) u32 {
 }
 
 // ── Float formatting ──────────────────────────────────────────────────────────
-
-fn formatFloat(buf: *[64]u8, f: f64) []const u8 {
-    if (std.math.isNan(f) or std.math.isInf(f)) return "null";
-    return std.fmt.bufPrint(buf, "{d}", .{f}) catch unreachable;
-}
+// Removed: formatFloat — use types.formatJqFloat() (single source of truth).
 
 // ── JSON string escaping ──────────────────────────────────────────────────────
 

@@ -53,13 +53,8 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
             try buf.appendSlice(alloc, s);
         },
         .float => |f| {
-            if (std.math.isNan(f) or std.math.isInf(f)) {
-                try buf.appendSlice(alloc, "null");
-            } else {
-                var tmp: [64]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-                try buf.appendSlice(alloc, s);
-            }
+            const formatted = types.formatJqFloat(f);
+            try buf.appendSlice(alloc, formatted.slice());
         },
         .string => |s| {
             try buf.append(alloc, '"');
