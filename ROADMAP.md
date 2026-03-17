@@ -30,7 +30,7 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-17)
 
-**Last updated:** `--validate` + `llms.txt` — filter syntax validation and machine-readable documentation for LLM/agent discovery
+**Last updated:** PyPI distribution (`pip install zq-json`) + LSP server (`zq --lsp`)
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
@@ -276,7 +276,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [ ] | Shell completions | bash, zsh, fish |
 | [ ] | CI benchmark regression | Fail CI if throughput drops > 10% vs previous release |
 | [ ] | Fuzz testing | AFL/libfuzzer on parser + query compiler |
-| [x] | Release automation | GitHub Actions: tag -> build 6 platforms -> create release |
+| [x] | Release automation | GitHub Actions: tag -> build 6 platforms -> create release -> publish npm + PyPI + Homebrew + AUR |
 
 ---
 
@@ -302,7 +302,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 |---|---------|-------------|---------------|
 | [ ] | **Agent framework integrations** | Pre-built tool definitions for LangChain, CrewAI, AutoGen, Claude Agent SDK. | Agents in any framework can use zq with zero configuration. |
 | [ ] | **`--schema FILE`** | Validate input against JSON Schema before processing. Exit with structured error on mismatch. | Agents can enforce data contracts in pipelines. |
-| [ ] | **LSP (Language Server)** | Language server for jq filter syntax. Autocomplete, hover docs, error diagnostics. | Coding agents (Cursor, Copilot, Claude Code) get IDE-level support when writing zq filters. |
+| [x] | **LSP (Language Server)** | Language server for jq filter syntax. Autocomplete, hover docs, error diagnostics, references, rename, semantic tokens, formatting. `zq --lsp` | Coding agents (Cursor, Copilot, Claude Code) get IDE-level support when writing zq filters. |
 | [ ] | **VS Code extension** | Syntax highlighting + LSP integration for `.jq` filter files. | Coding agents working in VS Code/Cursor get first-class zq support. |
 | [ ] | **Plugin system** | Custom builtins via shared library. Load with `--plugin path.so`. Uses the C ABI. | Agents can extend zq for domain-specific workflows without forking. |
 | [ ] | **`zq serve`** | Long-running HTTP/gRPC server mode. POST JSON + filter, get results. Connection pooling, compiled query caching. | Agents in networked environments (k8s, microservices) can call zq without process spawn overhead. |
@@ -329,8 +329,8 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [ ] | **Scoop** | Windows package manager |
 | [ ] | **Docker** | `docker run ghcr.io/Enriquefft/zq` |
 | [x] | **GitHub Releases** | Automated via CI on tag push |
-| [ ] | **npm** | `npx zq` — for Node/JS agent environments |
-| [ ] | **PyPI** | `pip install zq` — for Python agent environments |
+| [x] | **npm** | `npx @zqjson/zq` — for Node/JS agent environments |
+| [x] | **PyPI** | `pip install zq-json` — for Python agent environments |
 
 ### libzq (C ABI)
 
@@ -505,7 +505,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
 | Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | -- | -- | 10x |
 | Test count | **302 compat + module** | 400+ | 800+ | 1000+ |
-| Agent integration | **--json-errors, --describe, --validate, exit codes, C ABI errors, llms.txt, 134 builtins** | -- | Python bindings, WASM | Framework integrations, LSP, MCP |
+| Agent integration | **--json-errors, --describe, --validate, exit codes, C ABI errors, llms.txt, 134 builtins, LSP, npm, PyPI** | -- | Python bindings, WASM | Framework integrations, MCP |
 
 ---
 
