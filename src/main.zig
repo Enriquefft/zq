@@ -5,6 +5,7 @@ const parser_mod = @import("parser");
 const query_mod = @import("query");
 const output_mod = @import("output");
 const pool_mod = @import("pool");
+const describe_mod = @import("describe");
 const types = @import("types");
 const err_mod = @import("error");
 
@@ -39,6 +40,8 @@ const Config = struct {
     positional_args: []const []const u8 = &.{},
     positional_is_json: bool = false,
     json_errors: bool = false,
+    describe: bool = false,
+    describe_depth: u32 = 12,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -96,6 +99,10 @@ pub fn main() !u8 {
         }
     };
     defer config.deinit();
+
+    if (config.describe) {
+        return processDescribe(&config, allocator);
+    }
 
     // Determine filter source.
     const filter_src: []const u8 = blk: {
@@ -836,6 +843,158 @@ fn processNullInput(
     return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
 }
 
+/// Process --describe mode: infer schema from all inputs, write result to stdout.
+fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
+    // Validate incompatible options.
+    if (config.filter != null) {
+        printErr("zq: --describe does not accept a filter\n");
+        return EXIT_USAGE;
+    }
+    if (config.null_input) {
+        printErr("zq: --describe is incompatible with --null-input\n");
+        return EXIT_USAGE;
+    }
+    if (config.slurp) {
+        printErr("zq: --describe is incompatible with --slurp\n");
+        return EXIT_USAGE;
+    }
+    if (config.raw_input) {
+        printErr("zq: --describe is incompatible with --raw-input\n");
+        return EXIT_USAGE;
+    }
+
+    var inferrer = describe_mod.SchemaInferrer.init(allocator, config.describe_depth);
+    defer inferrer.deinit();
+
+    var parser = parser_mod.Parser.init(allocator) catch {
+        printErr("zq: out of memory\n");
+        return EXIT_SYSTEM;
+    };
+    defer parser.deinit();
+
+    if (config.files.len == 0) {
+        // Read from stdin.
+        describeStream(std.fs.File.stdin(), &inferrer, &parser, allocator) catch {
+            printErr("zq: I/O error reading stdin\n");
+            return EXIT_SYSTEM;
+        };
+    } else {
+        for (config.files) |path| {
+            const file = openFile(path) catch {
+                printErr("zq: could not open ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+            defer file.close();
+            describeStream(file, &inferrer, &parser, allocator) catch {
+                printErr("zq: I/O error reading ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+        }
+    }
+
+    // Determine output format.
+    const use_pretty = config.format == .pretty;
+
+    // Serialize into buffer then write to stdout.
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    const buf_writer = buf.writer(allocator);
+
+    if (use_pretty) {
+        const indent: describe_mod.Indent = if (config.tab_indent) .tab else .{ .spaces = config.indent_width };
+        inferrer.serializePretty(buf_writer, config.sort_keys, indent) catch {
+            printErr("zq: out of memory\n");
+            return EXIT_SYSTEM;
+        };
+    } else {
+        inferrer.serialize(buf_writer, config.sort_keys) catch {
+            printErr("zq: out of memory\n");
+            return EXIT_SYSTEM;
+        };
+    }
+    buf_writer.writeByte('\n') catch {
+        printErr("zq: out of memory\n");
+        return EXIT_SYSTEM;
+    };
+    std.fs.File.stdout().writeAll(buf.items) catch {
+        printErr("zq: write error\n");
+        return EXIT_SYSTEM;
+    };
+
+    return EXIT_OK;
+}
+
+/// Read all JSON values from a file/stdin using Source + Parser, feeding each to the SchemaInferrer.
+fn describeStream(
+    file: std.fs.File,
+    inferrer: *describe_mod.SchemaInferrer,
+    parser: *parser_mod.Parser,
+    allocator: std.mem.Allocator,
+) !void {
+    var src = try io_mod.Source.init(file, allocator);
+    defer src.deinit();
+
+    _ = try src.refill();
+
+    var fed_any = false;
+    while (true) {
+        const view = try src.peek();
+
+        if (view.bytes.len == 0 and view.is_eof) {
+            if (fed_any) {
+                const result = parser.feed("", true) catch {
+                    parser.reset();
+                    return;
+                };
+                switch (result) {
+                    .done => |d| {
+                        try inferrer.feedTape(d.tape);
+                        parser.reset();
+                    },
+                    .need_more => {
+                        parser.reset();
+                    },
+                }
+            }
+            break;
+        }
+
+        if (view.bytes.len == 0) {
+            _ = try src.refill();
+            continue;
+        }
+
+        fed_any = true;
+        const result = parser.feed(view.bytes, view.is_eof) catch {
+            const skip = std.mem.indexOfScalar(u8, view.bytes, '\n') orelse view.bytes.len - 1;
+            src.consume(skip + 1);
+            parser.reset();
+            fed_any = false;
+            if (view.is_eof and skip + 1 >= view.bytes.len) break;
+            continue;
+        };
+
+        switch (result) {
+            .done => |d| {
+                src.consume(d.consumed);
+                try inferrer.feedTape(d.tape);
+                parser.reset();
+                fed_any = false;
+            },
+            .need_more => {
+                src.consume(view.bytes.len);
+                if (view.is_eof) break;
+                _ = try src.refill();
+            },
+        }
+    }
+}
+
 /// Execute the query against `tape` and write all output values.
 /// On the first call, `opt_it.*` is null and the iterator is allocated.
 /// On subsequent calls, the existing iterator is reset() to the new tape —
@@ -1063,6 +1222,18 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             break;
         } else if (std.mem.eql(u8, arg, "--json-errors")) {
             config.json_errors = true;
+        } else if (std.mem.eql(u8, arg, "--describe")) {
+            config.describe = true;
+        } else if (std.mem.eql(u8, arg, "--depth")) {
+            i += 1;
+            if (i >= args.len) {
+                printErr("zq: --depth requires a number\n");
+                return error.UsageError;
+            }
+            config.describe_depth = std.fmt.parseInt(u32, args[i], 10) catch {
+                printErr("zq: --depth: invalid number\n");
+                return error.UsageError;
+            };
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             std.process.exit(EXIT_OK);
@@ -1092,17 +1263,18 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             printErr("\n");
             return error.UsageError;
         } else {
-            // Positional: first is filter, rest are files.
-            if (!filter_set) {
+            // Positional: in --describe mode all positionals are files;
+            // otherwise first is filter, rest are files.
+            if (config.describe or filter_set) {
+                const duped = try allocator.dupe(u8, arg);
+                try owned_files.append(allocator, duped);
+                try files.append(allocator, duped);
+            } else {
                 const duped = try allocator.dupe(u8, arg);
                 if (owned_filter) |old| allocator.free(old);
                 owned_filter = duped;
                 config.filter = duped;
                 filter_set = true;
-            } else {
-                const duped = try allocator.dupe(u8, arg);
-                try owned_files.append(allocator, duped);
-                try files.append(allocator, duped);
             }
         }
     }
@@ -1221,6 +1393,8 @@ fn printUsage() void {
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
+        \\  --describe            Print input data shape (type, fields, count)
+        \\  --depth N             Schema recursion depth (default: 12, 0=unlimited)
         \\  -h, --help            Print this help
         \\  -V, --version         Print version
         \\

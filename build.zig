@@ -66,6 +66,13 @@ pub fn build(b: *std.Build) void {
     pool_module.addImport("query", query_module);
     pool_module.addImport("output", output_module);
 
+    const describe_module = b.createModule(.{
+        .root_source_file = b.path("src/describe/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    describe_module.addImport("types", types_module);
+
     const c_abi_module = b.createModule(.{
         .root_source_file = b.path("src/c_abi/root.zig"),
         .target = target,
@@ -92,6 +99,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("query", query_module);
     exe_mod.addImport("output", output_module);
     exe_mod.addImport("pool", pool_module);
+    exe_mod.addImport("describe", describe_module);
     exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
@@ -188,6 +196,17 @@ pub fn build(b: *std.Build) void {
 
     const c_abi_tests = b.addTest(.{ .root_module = c_abi_test_mod });
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
+
+    const describe_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/describe_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    describe_test_mod.addImport("describe", describe_module);
+    describe_test_mod.addImport("parser", parser_module);
+
+    const describe_tests = b.addTest(.{ .root_module = describe_test_mod });
+    test_step.dependOn(&b.addRunArtifact(describe_tests).step);
 
     const compat_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/compat/root.zig"),

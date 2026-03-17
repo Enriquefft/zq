@@ -28,9 +28,9 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-16)
+## Quick Status (Updated 2026-03-17)
 
-**Last updated:** agent discovery optimizations — `--json-errors`, granular exit codes, builtins sync (134 builtins), expanded `--help`, C ABI error reporting, `QueryDiag` struct
+**Last updated:** `--describe` — input data shape inference with streaming merge, depth cap, optional field detection, pretty/compact output
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
@@ -54,7 +54,7 @@ Streaming (cat | zq .id):
   zq    1.4s   7 MB RSS     <- 16x faster than jq
 ```
 
-**Architecture:** error | types | io | parser | query | output | pool | c_abi | main.zig — all modules complete.
+**Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
 
 ---
 
@@ -74,7 +74,7 @@ Streaming (cat | zq .id):
 - [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 1.10x for `.id`)
 - [x] Startup time < 3ms (achieved: ~2ms)
 - [x] `--json-errors` produces structured error output
-- [ ] `--describe` shows input data shape
+- [x] `--describe` shows input data shape
 - [ ] `--validate` checks filter syntax without executing
 - [ ] MCP server with `query_json`, `describe_json`, `validate_filter` tools
 - [ ] `--tool-spec` outputs JSON tool definition for agent frameworks
@@ -88,7 +88,7 @@ failure mode agents hit with jq today.
 | | Feature | What it does | Why agents need it |
 |---|---------|-------------|-------------------|
 | [x] | **`--json-errors`** | Errors as JSON to stderr: `{"error": "type_error", "line": 1, "col": 5, "offset": 4, "len": 0, "filter": "...", "message": "...", "description": "..."}` | Agents can parse errors, understand what went wrong, and self-correct. jq's text errors cause retry loops. |
-| [ ] | **`--describe`** | Print input data shape to stdout: `{"type": "object", "fields": {"id": "number", "name": "string", "tags": "array"}, "count": 15000000}` | Agents can inspect data before writing a query. Eliminates blind guessing. |
+| [x] | **`--describe`** | Print input data shape to stdout: `{"type": "object", "fields": {"id": "number", "name": "string", "tags": "array"}, "count": 15000000}` | Agents can inspect data before writing a query. Eliminates blind guessing. |
 | [ ] | **`--validate FILTER`** | Check filter syntax, exit 0 if valid, exit 2 with JSON error if not. No input required. | Agents can verify a filter before running it on real data. Fail fast, no wasted work. |
 | [x] | **Documented exit codes** | 0=success, 1=false/null (-e), 2=usage, 3=compile error, 4=runtime error, 5=system error | Agents need unambiguous signal of what went wrong. Exit codes split by error category. |
 | [ ] | **`llms.txt`** | Machine-readable documentation file at repo root. Structured reference of all flags, builtins, and query syntax for LLM consumption. | How agents discover what zq can do. Optimized for context windows, not human scanning. |
@@ -502,7 +502,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
 | Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | -- | -- | 10x |
 | Test count | **302 compat + module** | 400+ | 800+ | 1000+ |
-| Agent integration | **--json-errors, exit codes, C ABI errors, 134 builtins** | --describe, --validate, MCP server | Python bindings, WASM, registry listings | Framework integrations, LSP |
+| Agent integration | **--json-errors, --describe, exit codes, C ABI errors, 134 builtins** | --validate, MCP server | Python bindings, WASM, registry listings | Framework integrations, LSP |
 
 ---
 
