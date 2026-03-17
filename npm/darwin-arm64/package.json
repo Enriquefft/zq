@@ -1,0 +1,14 @@
+{
+  "name": "@zqjson/darwin-arm64",
+  "version": "0.1.0",
+  "description": "zq binary for macOS arm64 (Apple Silicon)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Enriquefft/zq.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "preferUnplugged": true
+}

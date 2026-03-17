@@ -1,0 +1,14 @@
+{
+  "name": "@zqjson/freebsd-x64",
+  "version": "0.1.0",
+  "description": "zq binary for FreeBSD x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Enriquefft/zq.git"
+  },
+  "os": ["freebsd"],
+  "cpu": ["x64"],
+  "files": ["bin"],
+  "preferUnplugged": true
+}

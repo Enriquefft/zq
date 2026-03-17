@@ -1,0 +1,14 @@
+{
+  "name": "@zqjson/linux-arm64",
+  "version": "0.1.0",
+  "description": "zq binary for Linux arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Enriquefft/zq.git"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin"],
+  "preferUnplugged": true
+}

@@ -85,6 +85,15 @@ jobs:
             artifacts/zq-*.zip
             artifacts/checksums-sha256.txt
 
+      - name: Publish to npm
+        if: "!contains(github.ref_name, '-')"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash npm/publish.sh "$VERSION" artifacts
+
       - name: Update Homebrew tap
         if: "!contains(github.ref_name, '-')"
         uses: peter-evans/repository-dispatch@v3

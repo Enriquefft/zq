@@ -1,0 +1,27 @@
+{
+  "name": "@zqjson/zq",
+  "version": "0.1.0",
+  "description": "A drop-in replacement for jq, 25x faster — SIMD-accelerated JSON processor",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Enriquefft/zq.git"
+  },
+  "homepage": "https://github.com/Enriquefft/zq",
+  "keywords": ["json", "jq", "jsonl", "query", "filter", "cli", "simd", "zig", "streaming", "ndjson"],
+  "bin": {
+    "zq": "bin/zq"
+  },
+  "files": ["bin"],
+  "optionalDependencies": {
+    "@zqjson/linux-x64": "0.1.0",
+    "@zqjson/linux-arm64": "0.1.0",
+    "@zqjson/darwin-x64": "0.1.0",
+    "@zqjson/darwin-arm64": "0.1.0",
+    "@zqjson/win32-x64": "0.1.0",
+    "@zqjson/freebsd-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}
