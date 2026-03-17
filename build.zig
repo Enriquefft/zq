@@ -208,6 +208,47 @@ pub fn build(b: *std.Build) void {
     const describe_tests = b.addTest(.{ .root_module = describe_test_mod });
     test_step.dependOn(&b.addRunArtifact(describe_tests).step);
 
+    // ── JSONTestSuite ──────────────────────────────────────────────────────
+    const jts_options = b.addOptions();
+    jts_options.addOptionPath("test_suite_dir", b.path("tests/JSONTestSuite"));
+
+    const jts_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/json_test_suite_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    jts_test_mod.addImport("parser", parser_module);
+    jts_test_mod.addOptions("build_options", jts_options);
+
+    const jts_tests = b.addTest(.{ .root_module = jts_test_mod });
+    test_step.dependOn(&b.addRunArtifact(jts_tests).step);
+
+    // ── Fuzz steps (NOT in test_step) ────────────────────────────────────
+    const fuzz_parser_step = b.step("fuzz-parser", "Fuzz the JSON parser");
+
+    const fuzz_parser_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_parser_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_parser_mod.addImport("parser", parser_module);
+
+    const fuzz_parser_tests = b.addTest(.{ .root_module = fuzz_parser_mod });
+    fuzz_parser_step.dependOn(&b.addRunArtifact(fuzz_parser_tests).step);
+
+    const fuzz_query_step = b.step("fuzz-query", "Fuzz the query VM");
+
+    const fuzz_query_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_query_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_query_mod.addImport("parser", parser_module);
+    fuzz_query_mod.addImport("query", query_module);
+
+    const fuzz_query_tests = b.addTest(.{ .root_module = fuzz_query_mod });
+    fuzz_query_step.dependOn(&b.addRunArtifact(fuzz_query_tests).step);
+
     const compat_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/compat/root.zig"),
         .target = target,
