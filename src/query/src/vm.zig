@@ -9,31 +9,11 @@ const BuiltinId = types.BuiltinId;
 const max_stack_depth: u32 = 512;
 const max_value_stack: u32 = 256;
 
-const IterFrame = struct {
-    /// For arrays: position of the current value entry.
-    /// For objects: position of the current key entry (value is at pos + 1).
-    pos: u32,
-    /// Index of the *_end entry — iteration stops when next_pos >= end.
-    end: u32,
-    /// True when iterating an object (yields values, steps over keys).
-    is_object: bool,
-    /// Instruction pointer to restore when this frame produces the next element.
-    resume_ip: u32,
-    /// Pointer to the tape whose entries pos/end index into.
-    /// Points to either the input tape or the runtime_tape_view.
-    tape: *const Tape,
-};
-
 /// State for one active `[expr]` array collection.
 /// Pushed by array_collect_start, popped by array_collect_end or ip-exhaustion.
 const CollectFrame = struct {
     /// Accumulated outputs from the inner expression.
     buffer: std.ArrayList(StackValue),
-    /// IterFrame stack depth when collection started.
-    /// Used to distinguish inner vs outer iteration frames.
-    outer_stack_depth: u32,
-    /// RangeFrame stack depth when collection started.
-    outer_range_depth: u32,
     /// Value stack depth when collection started.
     /// Used to trim leftover operands after each output.
     outer_value_depth: u32,
@@ -41,13 +21,25 @@ const CollectFrame = struct {
     /// Used to clean up save_input entries when the iteration finalization
     /// shortcut bypasses restore_input instructions.
     outer_if_depth: u32,
+    /// Fork stack depth when collection started.
+    /// Used by yield_output to scope backtracking within the collect body.
+    outer_fork_depth: u32,
     /// IP of the matching array_collect_end instruction.
     end_ip: u32,
 };
 
-/// State for an active `range` generator.
-/// Pushed by range/range2/range3 call_builtin; advanced after each output.
-const RangeFrame = struct {
+// ── Fork stack types ─────────────────────────────────────────────────────────
+
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit };
+
+const EachState = struct {
+    pos: u32,
+    end: u32,
+    is_object: bool,
+    tape: *const Tape,
+};
+
+const RangeState = struct {
     current_int: i64,
     end_int: i64,
     step_int: i64,
@@ -55,48 +47,45 @@ const RangeFrame = struct {
     end_float: f64,
     step_float: f64,
     is_float: bool,
-    resume_ip: u32,
 };
 
-/// State for one active `try` block.
-/// Pushed by try_begin, popped by try_end (normal path) or handleCaughtError (error path).
-const TryFrame = struct {
-    /// IP of the catch handler. 0 = no catch (suppress error silently).
-    catch_ip: u32,
-    /// IP to resume at when in suppress mode (catch_ip == 0) and the error
-    /// is caught inside an alternative (`//`) context.  Points to the
-    /// instruction right after the matching `try_end` so that `alt_check`
-    /// can evaluate the (falsy) result and fall through to the right side.
-    resume_ip: u32,
-    /// Saved stack depths for unwinding on error.
-    saved_iter_len: u32,
-    saved_value_len: u32,
+const TryHandlerState = struct {
+    catch_ip: u32, // 0 = suppress mode (no catch handler)
     saved_if_len: u32,
     saved_collect_len: u32,
-    saved_range_len: u32,
-    /// Saved alt_null_depth so the counter is restored correctly on error.
-    saved_alt_null_depth: u32,
-    /// Saved label stack depth for unwinding on error.
-    saved_label_len: u32,
-    /// Saved limit stack depth for unwinding on error.
-    saved_limit_len: u32,
-    /// Saved call stack depth for unwinding on error.
     saved_call_len: u32,
 };
 
-/// State for one active `limit(n;f)` scope.
-/// Pushed by limit_start, popped when counter reaches zero or scope exits naturally.
-const LimitFrame = struct {
-    remaining: u64,
-    /// IP of the limit_start instruction (start of the limit scope body).
-    body_start_ip: u32,
-    /// IP past the limit scope body (where to jump on exhaustion).
+const LabelState = struct {
+    break_token: u32,
     exit_ip: u32,
-    /// Saved stack depths for unwinding when limit is exhausted.
-    saved_iter_len: u32,
-    saved_range_len: u32,
-    /// Saved collect stack depth to distinguish body outputs from nested collections.
+    saved_if_len: u32,
     saved_collect_len: u32,
+    saved_call_len: u32,
+};
+
+const LimitState = struct {
+    remaining: u64,
+    body_start_ip: u32,
+    exit_ip: u32,
+    saved_collect_len: u32,
+};
+
+const ForkAux = union {
+    none: void,
+    each_state: EachState,
+    range_state: RangeState,
+    try_handler_state: TryHandlerState,
+    label_state: LabelState,
+    limit_state: LimitState,
+};
+
+const Forkpoint = struct {
+    saved_value_stack_len: u32,
+    saved_current: Value,
+    backtrack_ip: u32,
+    fork_type: ForkType,
+    aux: ForkAux,
 };
 
 /// State for one active function call (used for recursive user-defined functions).
@@ -105,34 +94,11 @@ const CallFrame = struct {
     /// IP to resume at when the function body returns.
     return_ip: u32,
     /// Saved stack depths for correct unwinding.
-    saved_iter_len: u32,
     saved_value_len: u32,
     saved_if_len: u32,
     saved_collect_len: u32,
-    saved_range_len: u32,
-    saved_try_len: u32,
-    saved_label_len: u32,
-    saved_limit_len: u32,
-    saved_alt_null_depth: u32,
-};
-
-/// State for one active `label $name` scope.
-/// Pushed by label_begin, popped by handleBreak or label_end.
-const LabelFrame = struct {
-    /// Unique break token associated with this label.
-    break_token: u32,
-    /// IP to jump to when `break $name` fires (the label_end instruction).
-    exit_ip: u32,
-    /// Saved stack depths for unwinding on break.
-    saved_iter_len: u32,
-    saved_value_len: u32,
-    saved_if_len: u32,
-    saved_collect_len: u32,
-    saved_range_len: u32,
-    saved_alt_null_depth: u32,
-    saved_try_len: u32,
-    saved_limit_len: u32,
-    saved_call_len: u32,
+    /// Saved fork stack depth for unwinding on return.
+    saved_fork_len: u32,
 };
 
 /// Resolve a slice bound (possibly negative) against collection length.
@@ -189,8 +155,6 @@ pub const ResultIterator = struct {
     opts_allow_null: bool,
     ip: u32,
     current: Value,
-    /// Frame stack for iteration (.iterate opcode).
-    stack: std.ArrayList(IterFrame),
     /// Value stack for expression evaluation.
     value_stack: std.ArrayList(StackValue),
     /// Variable storage for variable capture and reference.
@@ -208,18 +172,10 @@ pub const ResultIterator = struct {
     if_stack: std.ArrayList(Value),
     /// Active array collection frames. Pushed by array_collect_start.
     collect_stack: std.ArrayList(CollectFrame),
-    /// Active try frames. Pushed by try_begin, popped by try_end or handleCaughtError.
-    try_stack: std.ArrayList(TryFrame),
-    /// Active range generator frames. Pushed by range/range2/range3 builtins.
-    range_stack: std.ArrayList(RangeFrame),
-    /// Active label frames for non-local exit (label/break).
-    label_stack: std.ArrayList(LabelFrame),
-    /// Active limit frames for streaming limit(n;f).
-    limit_stack: std.ArrayList(LimitFrame),
     /// Active call frames for user-defined recursive function calls.
     call_stack: std.ArrayList(CallFrame),
-    /// When set, the VM should execute handleBreak at the top of the step loop.
-    pending_break_token: ?u32,
+    /// Fork stack for unified backtracking (comma, iteration, range, try, alt, label, limit).
+    fork_stack: std.ArrayList(Forkpoint),
     /// Monotonically increasing counter for generating unique break tokens.
     next_break_token: u32,
     /// Value stored by the `error` builtin so the catch handler can retrieve it.
@@ -231,18 +187,8 @@ pub const ResultIterator = struct {
     done: bool,
     /// Defers initial tapeEntryToValue(&self.tape, 0) until after any struct move.
     initialized: bool,
-    /// Depth counter for alternative-operator null propagation (incremented by alt_start,
-    /// decremented by alt_check). When > 0, missing key lookups return null instead of TypeError,
-    /// matching jq's left-side semantics for the // operator.
-    alt_null_depth: u32,
     source_map: []const u32,
     last_error_ip: u32,
-    /// When true, the next `output` instruction is silently skipped (no value
-    /// yielded) and the flag is cleared.  Set by `handleCaughtError` in
-    /// suppress mode (try without catch) and by the `empty` builtin so that
-    /// execution continues past the current comma branch instead of
-    /// terminating the entire instruction sequence.
-    skip_output: bool = false,
 
     pub fn init(
         instructions: []const Instruction,
@@ -254,12 +200,6 @@ pub const ResultIterator = struct {
         source_map: []const u32,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
-        var stack = std.ArrayList(IterFrame){};
-        errdefer stack.deinit(allocator);
-        // Pre-allocate the full depth budget so doIterate can use
-        // appendAssumeCapacity — keeping next()'s error set free of OutOfMemory.
-        try stack.ensureTotalCapacity(allocator, max_stack_depth);
-
         var value_stack = std.ArrayList(StackValue){};
         errdefer value_stack.deinit(allocator);
         try value_stack.ensureTotalCapacity(allocator, max_value_stack);
@@ -298,30 +238,15 @@ pub const ResultIterator = struct {
         errdefer collect_stack.deinit(allocator);
         try collect_stack.ensureTotalCapacity(allocator, 16);
 
-        // Initialize try frame stack (nesting depth rarely exceeds 8)
-        var try_stack = std.ArrayList(TryFrame){};
-        errdefer try_stack.deinit(allocator);
-        try try_stack.ensureTotalCapacity(allocator, 16);
-
-        // Initialize range frame stack (supports up to max_stack_depth nesting)
-        var range_stack = std.ArrayList(RangeFrame){};
-        errdefer range_stack.deinit(allocator);
-        try range_stack.ensureTotalCapacity(allocator, max_stack_depth);
-
-        // Initialize label frame stack for non-local exit
-        var label_stack = std.ArrayList(LabelFrame){};
-        errdefer label_stack.deinit(allocator);
-        try label_stack.ensureTotalCapacity(allocator, 16);
-
-        // Initialize limit frame stack for streaming limit(n;f)
-        var limit_stack = std.ArrayList(LimitFrame){};
-        errdefer limit_stack.deinit(allocator);
-        try limit_stack.ensureTotalCapacity(allocator, 16);
-
         // Initialize call frame stack for recursive user-defined functions
         var call_stack = std.ArrayList(CallFrame){};
         errdefer call_stack.deinit(allocator);
         try call_stack.ensureTotalCapacity(allocator, 64);
+
+        // Initialize fork stack for unified backtracking
+        var fork_stack = std.ArrayList(Forkpoint){};
+        errdefer fork_stack.deinit(allocator);
+        try fork_stack.ensureTotalCapacity(allocator, max_stack_depth);
 
         // Initialize runtime tape
         var runtime_tape = try types.RuntimeTape.init(allocator);
@@ -342,7 +267,6 @@ pub const ResultIterator = struct {
             .opts_allow_null = opts_allow_null,
             .ip = 0,
             .current = undefined,
-            .stack = stack,
             .value_stack = value_stack,
             .variable_store = variable_store,
             .runtime_tape = runtime_tape,
@@ -351,19 +275,14 @@ pub const ResultIterator = struct {
             .object_construct_depth = object_construct_depth,
             .if_stack = if_stack,
             .collect_stack = collect_stack,
-            .try_stack = try_stack,
-            .range_stack = range_stack,
-            .label_stack = label_stack,
-            .limit_stack = limit_stack,
             .call_stack = call_stack,
-            .pending_break_token = null,
+            .fork_stack = fork_stack,
             .next_break_token = 0,
             .user_error_msg = null,
             .type_error_detail = null,
             .alloc = allocator,
             .done = false,
             .initialized = false,
-            .alt_null_depth = 0,
             .source_map = source_map,
             .last_error_ip = 0,
         };
@@ -371,7 +290,6 @@ pub const ResultIterator = struct {
 
     /// Free the internal eval stack. Idempotent.
     pub fn deinit(it: *ResultIterator) void {
-        it.stack.deinit(it.alloc);
         it.value_stack.deinit(it.alloc);
         it.variable_store.deinit(it.alloc);
         it.object_construct.deinit(it.alloc);
@@ -379,11 +297,8 @@ pub const ResultIterator = struct {
         it.if_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
-        it.try_stack.deinit(it.alloc);
-        it.range_stack.deinit(it.alloc);
-        it.label_stack.deinit(it.alloc);
-        it.limit_stack.deinit(it.alloc);
         it.call_stack.deinit(it.alloc);
+        it.fork_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
     }
 
@@ -399,7 +314,6 @@ pub const ResultIterator = struct {
         it.ip = 0;
         it.done = false;
         it.initialized = false;
-        it.stack.clearRetainingCapacity();
         it.value_stack.clearRetainingCapacity();
         // Restore variable slots to their initial null state without reallocating.
         // capacity >= max_value_stack is guaranteed by init()'s ensureTotalCapacity.
@@ -413,15 +327,10 @@ pub const ResultIterator = struct {
         }
         it.object_construct.clearRetainingCapacity();
         it.if_stack.clearRetainingCapacity();
-        it.alt_null_depth = 0;
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
-        it.try_stack.clearRetainingCapacity();
-        it.range_stack.clearRetainingCapacity();
-        it.label_stack.clearRetainingCapacity();
-        it.limit_stack.clearRetainingCapacity();
         it.call_stack.clearRetainingCapacity();
-        it.pending_break_token = null;
+        it.fork_stack.clearRetainingCapacity();
         it.next_break_token = 0;
         it.user_error_msg = null;
         it.type_error_detail = null;
@@ -433,10 +342,9 @@ pub const ResultIterator = struct {
         };
     }
 
-    /// True when null propagation is active: either globally via Opts, or locally
-    /// because we are evaluating the left side of a `//` alternative operator.
+    /// True when null propagation is active (globally via Opts).
     inline fn nullAllowed(it: *const ResultIterator) bool {
-        return it.opts_allow_null or it.alt_null_depth > 0;
+        return it.opts_allow_null;
     }
 
     // ── Value stack operations ──────────────────────────────────────────────────
@@ -499,65 +407,23 @@ pub const ResultIterator = struct {
     /// to the active try frame (if any), propagating uncaught errors to the caller.
     fn step(it: *ResultIterator) ZqError!?Value {
         while (true) {
-            // Handle pending break (non-local exit from label/break).
-            if (it.pending_break_token) |token| {
-                if (!it.handleBreak(token)) {
-                    // No matching label found — treat as done.
-                    it.done = true;
-                    return null;
-                }
-                continue;
-            }
-
             if (it.ip >= it.instructions.len) {
-                if (it.stack.items.len == 0) {
-                    // Check if there's an active inner range frame.
-                    if (it.collect_stack.items.len > 0) {
-                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                        if (it.range_stack.items.len > cf.outer_range_depth) {
-                            // Range frame belonging to this collect scope: advance it.
-                            if (it.advanceRangeFrame()) continue;
-                            // Range exhausted; check for more or finalize.
-                        }
-                    } else if (it.range_stack.items.len > 0) {
-                        // Top-level range (no collect scope).
-                        if (it.advanceRangeFrame()) continue;
-                        // Range exhausted.
-                    }
-                    // If an array collect frame is waiting to finalize, do it now.
-                    // This path is taken when all inner iteration frames are exhausted
-                    // after the last collect_output fired.
-                    if (it.collect_stack.items.len > 0) {
-                        const top_cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                        if (it.stack.items.len <= top_cf.outer_stack_depth and
-                            it.range_stack.items.len <= top_cf.outer_range_depth)
-                        {
-                            var completed = it.collect_stack.pop().?;
-                            defer completed.buffer.deinit(it.alloc);
-                            const arr_val = try it.buildCollectedArray(&completed);
-                            it.pushValue(arr_val);
-                            // Clean up any save_input entries that were bypassed
-                            // when the iteration finalization shortcut skipped
-                            // restore_input instructions.
-                            it.if_stack.items.len = completed.outer_if_depth;
-                            it.ip = completed.end_ip + 1; // skip past array_collect_end
-                            continue;
-                        }
-                    }
-                    if (it.collect_stack.items.len == 0 and it.range_stack.items.len == 0) {
-                        it.done = true;
-                        return null;
-                    }
-                    // Nothing advanced, we're in a stuck state — mark done.
-                    it.done = true;
-                    return null;
+                // Try fork-stack backtracking (handles comma, each, range, try, alt, label, limit).
+                if (it.doBacktrack()) continue;
+
+                // No forkpoints — check for collect frame finalization.
+                if (it.collect_stack.items.len > 0) {
+                    var completed = it.collect_stack.pop().?;
+                    defer completed.buffer.deinit(it.alloc);
+                    const arr_val = try it.buildCollectedArray(&completed);
+                    it.pushValue(arr_val);
+                    it.if_stack.items.len = completed.outer_if_depth;
+                    it.ip = completed.end_ip + 1;
+                    continue;
                 }
-                // Current instruction sequence is exhausted; advance the topmost
-                // iterate frame to its next element. If the frame is also exhausted,
-                // loop again — the outer frame (if any) will be handled on the next
-                // iteration without recursion.
-                if (!it.advanceFrame()) continue;
-                continue;
+
+                it.done = true;
+                return null;
             }
 
             const saved_ip = it.ip;
@@ -566,8 +432,7 @@ pub const ResultIterator = struct {
                 if (maybe_val) |v| return v;
                 // null → no output produced; continue main loop
             } else |err| {
-                if (it.try_stack.items.len > 0) {
-                    it.handleCaughtError(err);
+                if (it.handleError(err)) {
                     if (it.done) return null;
                     // Continue executing at catch handler (or done path handled above).
                 } else {
@@ -578,144 +443,55 @@ pub const ResultIterator = struct {
         }
     }
 
-    /// Unwind VM state to the saved depths in the active TryFrame and redirect
-    /// execution to the catch handler (or terminate if no handler).
-    fn handleCaughtError(it: *ResultIterator, err: ZqError) void {
-        const frame = it.try_stack.pop().?;
-
-        // Unwind iteration frames to the depth at try_begin.
-        it.stack.items.len = frame.saved_iter_len;
-
-        // Unwind value stack.
-        it.value_stack.items.len = frame.saved_value_len;
-
-        // Unwind if/input stack.
-        it.if_stack.items.len = frame.saved_if_len;
-
-        // Unwind collect frames, freeing their buffers.
-        while (it.collect_stack.items.len > frame.saved_collect_len) {
-            var cf = it.collect_stack.pop().?;
-            cf.buffer.deinit(it.alloc);
-        }
-
-        // Unwind range frames.
-        it.range_stack.items.len = frame.saved_range_len;
-
-        // Unwind label frames.
-        it.label_stack.items.len = frame.saved_label_len;
-
-        // Restore null-propagation depth.
-        it.alt_null_depth = frame.saved_alt_null_depth;
-
-        // Unwind limit frames.
-        it.limit_stack.items.len = frame.saved_limit_len;
-
-        // Unwind call frames.
-        it.call_stack.items.len = frame.saved_call_len;
-
-        if (frame.catch_ip > 0) {
-            // For UserError, the error message is the value stored by the `error` builtin.
-            // For TypeError with a detail message, use the descriptive message.
-            // For other errors, it's the error type name string.
-            if (err == error.UserError) {
-                it.current = it.user_error_msg orelse Value{ .string = "null" };
-                it.user_error_msg = null;
-            } else if (err == error.TypeError and it.type_error_detail != null) {
-                it.current = it.type_error_detail.?;
-                it.type_error_detail = null;
-            } else {
-                it.current = Value{ .string = errorToString(err) };
-            }
-            it.ip = frame.catch_ip;
-        } else if (frame.saved_alt_null_depth > 0 and frame.resume_ip < it.instructions.len) {
-            // No catch but inside an alternative (`//`) context: push a false
-            // value so that `alt_check` sees a falsy result and falls through
-            // to evaluate the right side of `//`.
-            it.pushValue(.{ .bool_val = false });
-            it.ip = frame.resume_ip;
-        } else {
-            // No catch (try expr / expr?): suppress the error.
-            // Trim the value_stack to the active collect frame's outer depth so
-            // that leftover operands don't corrupt the next iteration's pipeline input.
-            if (it.collect_stack.items.len > 0) {
-                const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                it.value_stack.items.len = cf.outer_value_depth;
-            } else {
-                it.value_stack.items.len = 0;
-            }
-
-            // If the instruction right after the try block is `output` (comma
-            // branch boundary), skip that output and continue execution so
-            // that subsequent comma branches can still produce values.  The
-            // skip_output handler in the output instruction is collect-mode
-            // aware: it still triggers iterate/range frame advancement when
-            // needed.  When the next instruction is NOT `output`, fall back
-            // to ip-past-end so the step() loop can advance any remaining
-            // iterate frame (e.g. `.[] | .foo?` continues to the next element).
-            if (frame.resume_ip < it.instructions.len and
-                it.instructions[frame.resume_ip].op == .output)
-            {
-                it.skip_output = true;
-                it.ip = frame.resume_ip;
-            } else {
-                it.ip = @intCast(it.instructions.len);
-            }
-        }
-    }
-
-    /// Handle a non-local exit triggered by `break $name`.
-    /// Searches the label_stack for a frame with a matching break token,
-    /// unwinds all stacks to the saved depths, and jumps to the label's exit_ip.
-    /// Returns true if a matching label was found, false otherwise.
-    fn handleBreak(it: *ResultIterator, token: u32) bool {
-        var idx: usize = it.label_stack.items.len;
+    /// Scan fork_stack for the nearest try_handler or alt_handler, unwind to it,
+    /// and route execution to the catch handler (or suppress).
+    /// Returns true if an error handler was found, false if error should propagate.
+    fn handleError(it: *ResultIterator, err: ZqError) bool {
+        var idx = it.fork_stack.items.len;
         while (idx > 0) {
             idx -= 1;
-            const frame = it.label_stack.items[idx];
-            if (frame.break_token == token) {
-                // Unwind all stacks to saved depths.
-                it.stack.items.len = frame.saved_iter_len;
-                it.value_stack.items.len = frame.saved_value_len;
-                it.if_stack.items.len = frame.saved_if_len;
+            const ft = it.fork_stack.items[idx].fork_type;
+            if (ft == .try_handler or ft == .alt_handler) {
+                const fp = it.fork_stack.items[idx];
+                const state = fp.aux.try_handler_state;
 
-                // Unwind collect frames, freeing their buffers and propagating to parent.
-                while (it.collect_stack.items.len > frame.saved_collect_len) {
+                // Unwind fork stack (pops generators between error and handler).
+                it.fork_stack.items.len = idx;
+                // Unwind other stacks.
+                it.value_stack.items.len = fp.saved_value_stack_len;
+                it.if_stack.items.len = state.saved_if_len;
+                // Unwind collect frames (free buffers).
+                while (it.collect_stack.items.len > state.saved_collect_len) {
                     var cf = it.collect_stack.pop().?;
-                    defer cf.buffer.deinit(it.alloc);
-                    if (cf.buffer.items.len > 0 and it.collect_stack.items.len > 0) {
-                        const parent = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                        for (cf.buffer.items) |item| {
-                            parent.buffer.append(it.alloc, item) catch {};
-                        }
+                    cf.buffer.deinit(it.alloc);
+                }
+                it.call_stack.items.len = state.saved_call_len;
+
+                if (state.catch_ip > 0) {
+                    // Route to catch handler with error as current.
+                    if (err == error.UserError) {
+                        it.current = it.user_error_msg orelse Value{ .string = "null" };
+                        it.user_error_msg = null;
+                    } else if (err == error.TypeError and it.type_error_detail != null) {
+                        it.current = it.type_error_detail.?;
+                        it.type_error_detail = null;
+                    } else {
+                        it.current = Value{ .string = errorToString(err) };
+                    }
+                    it.ip = state.catch_ip;
+                } else {
+                    // Suppress: backtrack to next generator path.
+                    if (it.collect_stack.items.len > 0) {
+                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                        it.value_stack.items.len = cf.outer_value_depth;
+                    } else {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                    }
+
+                    if (!it.doBacktrack()) {
+                        it.ip = @intCast(it.instructions.len);
                     }
                 }
-
-                it.range_stack.items.len = frame.saved_range_len;
-                it.alt_null_depth = frame.saved_alt_null_depth;
-                it.try_stack.items.len = frame.saved_try_len;
-                it.limit_stack.items.len = frame.saved_limit_len;
-                it.call_stack.items.len = frame.saved_call_len;
-                it.label_stack.items.len = idx;
-
-                // Resume execution after the label body. The label expression
-                // should produce no output on break (behave like `empty`).
-                // If exit_ip points to an `output` instruction (inserted by
-                // comma), skip it so no stale value leaks into output.
-                var ip = frame.exit_ip;
-                // Skip output and push_current+output sequences at exit_ip
-                // to prevent stale value leakage after break.
-                if (ip < it.instructions.len) {
-                    if (it.instructions[ip].op == .output) {
-                        ip += 1;
-                    } else if (ip + 1 < it.instructions.len and
-                        it.instructions[ip].op == .push_current and
-                        it.instructions[ip + 1].op == .output)
-                    {
-                        ip += 2; // skip push_current + output
-                    }
-                }
-                it.ip = ip;
-                it.pending_break_token = null;
                 return true;
             }
         }
@@ -746,105 +522,7 @@ pub const ResultIterator = struct {
                 return null;
             },
 
-            .output => {
-                // A suppressed try (no catch) or `empty` sets skip_output so
-                // that the current comma branch produces nothing while letting
-                // subsequent branches continue.
-                if (it.skip_output) {
-                    it.skip_output = false;
-                    if (it.collect_stack.items.len > 0) {
-                        // Collect mode: don't buffer a value, but still
-                        // handle iterate/range frame advancement so that
-                        // the next element is processed.
-                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                        it.value_stack.items.len = cf.outer_value_depth;
-                        if (it.stack.items.len > cf.outer_stack_depth or
-                            it.range_stack.items.len > cf.outer_range_depth)
-                        {
-                            it.ip = @intCast(it.instructions.len);
-                        } else {
-                            it.ip += 1;
-                        }
-                    } else {
-                        it.ip += 1;
-                    }
-                    return null;
-                }
-
-                const val = if (it.value_stack.items.len > 0)
-                    try stackValueToValue(try it.popValue())
-                else
-                    it.current;
-
-                // Check limit counter: find the innermost limit scope containing this output.
-                // Only count this output if it's the "real" output of the limit body,
-                // not an output inside a nested collect frame (e.g., parseArgToArray).
-                if (it.limit_stack.items.len > 0) {
-                    const output_ip = it.ip;
-                    var li: usize = it.limit_stack.items.len;
-                    while (li > 0) {
-                        li -= 1;
-                        var lf = &it.limit_stack.items[li];
-                        // Check if this output IP is within the limit scope
-                        if (output_ip > lf.body_start_ip and output_ip < lf.exit_ip) {
-                            // Skip if this output is inside a collect frame that was pushed
-                            // after the limit scope started (nested collection, not the limit's output).
-                            // Skip if this output is inside a collect frame that was pushed
-                            // after the limit scope started (nested collection, not the
-                            // limit's output — e.g., parseArgToArray inside the body).
-                            if (it.collect_stack.items.len > lf.saved_collect_len) {
-                                break;
-                            }
-                            lf.remaining -= 1;
-                            if (lf.remaining == 0) {
-                                const saved_iter = lf.saved_iter_len;
-                                const saved_range = lf.saved_range_len;
-                                // Pop this and any inner limit frames
-                                it.limit_stack.items.len = li;
-                                // Unwind iterate/range frames inside the limit scope
-                                it.stack.items.len = saved_iter;
-                                it.range_stack.items.len = saved_range;
-                                // Emit the final value, then signal exhaustion
-                                if (it.collect_stack.items.len > 0) {
-                                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                                    try cf.buffer.append(it.alloc, try valueToStackValue(val));
-                                    it.value_stack.items.len = cf.outer_value_depth;
-                                    it.ip = @intCast(it.instructions.len);
-                                    return null;
-                                } else {
-                                    it.ip = @intCast(it.instructions.len);
-                                    return val;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (it.collect_stack.items.len > 0) {
-                    // Collect mode: buffer value instead of yielding.
-                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                    try cf.buffer.append(it.alloc, try valueToStackValue(val));
-                    // Trim value_stack back to the depth at collect_start.
-                    // This prevents operand leftovers from one iteration contaminating
-                    // the next iteration's pipeline input via the pipe opcode.
-                    it.value_stack.items.len = cf.outer_value_depth;
-                    if (it.stack.items.len > cf.outer_stack_depth or
-                        it.range_stack.items.len > cf.outer_range_depth)
-                    {
-                        // More inner iterations pending (iter frame or range frame): trigger advance.
-                        it.ip = @intCast(it.instructions.len);
-                    } else {
-                        // No more inner iterations: continue to next instruction
-                        // (handles sequential comma-separated expressions).
-                        it.ip += 1;
-                    }
-                    return null;
-                } else {
-                    it.ip += 1;
-                    return val;
-                }
-            },
+            .output, .iterate => unreachable,
 
             .load_key => {
                 const result = lookupKeyInValue(
@@ -983,11 +661,6 @@ pub const ResultIterator = struct {
                 return null;
             },
 
-            .iterate => {
-                try it.doIterate(it.ip + 1);
-                return null;
-            },
-
             .push_bool => {
                 it.pushValue(.{ .bool_val = instr.operand.bool });
                 it.ip += 1;
@@ -1047,10 +720,9 @@ pub const ResultIterator = struct {
                 try buf.ensureTotalCapacity(it.alloc, 32);
                 try it.collect_stack.append(it.alloc, CollectFrame{
                     .buffer = buf,
-                    .outer_stack_depth = @intCast(it.stack.items.len),
-                    .outer_range_depth = @intCast(it.range_stack.items.len),
                     .outer_value_depth = @intCast(it.value_stack.items.len),
                     .outer_if_depth = @intCast(it.if_stack.items.len),
+                    .outer_fork_depth = @intCast(it.fork_stack.items.len),
                     .end_ip = @intCast(instr.operand.index),
                 });
                 it.ip += 1;
@@ -1068,80 +740,39 @@ pub const ResultIterator = struct {
                 return null;
             },
 
-            // Alternative operator (//)
-            .alt_start => {
-                it.if_stack.appendAssumeCapacity(it.current);
-                it.alt_null_depth += 1;
-                it.ip += 1;
-                return null;
-            },
+            // Deprecated opcodes — kept in enum for ABI stability.
+            .alt_start, .alt_check, .try_begin, .try_end => unreachable,
 
-            .alt_check => {
-                // Saturating decrement: guards against re-entry when a generator
-                // on the left side drives the VM back to this instruction on
-                // subsequent iterations (depth is already 0 after the first pass).
-                if (it.alt_null_depth > 0) it.alt_null_depth -= 1;
-                const val = if (it.value_stack.items.len > 0)
-                    try it.popValue()
-                else
-                    try valueToStackValue(it.current);
-                if (isCondTruthy(val)) {
-                    // Left side produced a usable value: clean up the saved input
-                    // and jump past the right expression.
-                    if (it.if_stack.items.len > 0) _ = it.if_stack.pop();
-                    it.pushValue(val);
-                    it.ip = @intCast(instr.operand.index);
-                } else {
-                    // Left side was false/null: fall through to restore_input which
-                    // will pop if_stack and reset current for the right expression.
-                    it.ip += 1;
-                }
-                return null;
-            },
-
-            // Try-catch error handling
-            .try_begin => {
-                const catch_ip: u32 = @intCast(instr.operand.index);
-                // For suppress mode (catch_ip == 0), find the matching try_end
-                // so we know where to resume if an error is caught inside an
-                // alternative (`//`) context.
-                const resume_ip: u32 = if (catch_ip == 0) blk: {
-                    var depth: u32 = 1;
-                    var scan: u32 = it.ip + 1;
-                    while (scan < it.instructions.len) : (scan += 1) {
-                        switch (it.instructions[scan].op) {
-                            .try_begin => depth += 1,
-                            .try_end => {
-                                depth -= 1;
-                                if (depth == 0) break :blk scan + 1;
-                            },
-                            else => {},
-                        }
-                    }
-                    break :blk @intCast(it.instructions.len);
-                } else 0;
-                it.try_stack.appendAssumeCapacity(TryFrame{
-                    .catch_ip = catch_ip,
-                    .resume_ip = resume_ip,
-                    .saved_iter_len = @intCast(it.stack.items.len),
-                    .saved_value_len = @intCast(it.value_stack.items.len),
-                    .saved_if_len = @intCast(it.if_stack.items.len),
-                    .saved_collect_len = @intCast(it.collect_stack.items.len),
-                    .saved_range_len = @intCast(it.range_stack.items.len),
-                    .saved_alt_null_depth = it.alt_null_depth,
-                    .saved_label_len = @intCast(it.label_stack.items.len),
-                    .saved_limit_len = @intCast(it.limit_stack.items.len),
-                    .saved_call_len = @intCast(it.call_stack.items.len),
+            // ── Fork-based try/alt/pop_try ────────────────────────────────
+            .fork_try, .fork_alt => {
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index),
+                    .fork_type = if (instr.op == .fork_try) .try_handler else .alt_handler,
+                    .aux = .{ .try_handler_state = .{
+                        .catch_ip = @intCast(instr.operand.index),
+                        .saved_if_len = @intCast(it.if_stack.items.len),
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                        .saved_call_len = @intCast(it.call_stack.items.len),
+                    } },
                 });
                 it.ip += 1;
                 return null;
             },
 
-            .try_end => {
-                // Normal (non-error) path: pop the try frame and skip the catch handler.
-                _ = it.try_stack.pop();
-                const after_ip = instr.operand.index;
-                it.ip = if (after_ip > 0) @intCast(after_ip) else it.ip + 1;
+            .pop_try => {
+                // Scan fork_stack backwards for nearest try_handler or alt_handler and remove it.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    const ft = it.fork_stack.items[idx].fork_type;
+                    if (ft == .try_handler or ft == .alt_handler) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
+                }
+                it.ip += 1;
                 return null;
             },
 
@@ -1373,15 +1004,10 @@ pub const ResultIterator = struct {
                 const body_ip = @as(u32, @intCast(instr.operand.index));
                 try it.call_stack.append(it.alloc, CallFrame{
                     .return_ip = it.ip + 1,
-                    .saved_iter_len = @intCast(it.stack.items.len),
                     .saved_value_len = @intCast(it.value_stack.items.len),
                     .saved_if_len = @intCast(it.if_stack.items.len),
                     .saved_collect_len = @intCast(it.collect_stack.items.len),
-                    .saved_range_len = @intCast(it.range_stack.items.len),
-                    .saved_try_len = @intCast(it.try_stack.items.len),
-                    .saved_label_len = @intCast(it.label_stack.items.len),
-                    .saved_limit_len = @intCast(it.limit_stack.items.len),
-                    .saved_alt_null_depth = it.alt_null_depth,
+                    .saved_fork_len = @intCast(it.fork_stack.items.len),
                 });
                 it.ip = body_ip;
                 return null;
@@ -1423,8 +1049,7 @@ pub const ResultIterator = struct {
             },
 
             .label_begin => {
-                // Save stack depths BEFORE pushing the token, so handleBreak
-                // restores to the state before label_begin's side effects.
+                // Save stack depths BEFORE pushing the token.
                 const saved_value_len: u32 = @intCast(it.value_stack.items.len);
 
                 // Generate a unique break token and push it to the value stack as an int.
@@ -1432,28 +1057,33 @@ pub const ResultIterator = struct {
                 it.next_break_token += 1;
                 it.pushValue(.{ .int = @as(i64, @intCast(token)) });
 
-                // Push a LabelFrame for handleBreak to find.
-                try it.label_stack.append(it.alloc, LabelFrame{
-                    .break_token = token,
-                    .exit_ip = @intCast(instr.operand.index),
-                    .saved_iter_len = @intCast(it.stack.items.len),
-                    .saved_value_len = saved_value_len,
-                    .saved_if_len = @intCast(it.if_stack.items.len),
-                    .saved_collect_len = @intCast(it.collect_stack.items.len),
-                    .saved_range_len = @intCast(it.range_stack.items.len),
-                    .saved_alt_null_depth = it.alt_null_depth,
-                    .saved_try_len = @intCast(it.try_stack.items.len),
-                    .saved_limit_len = @intCast(it.limit_stack.items.len),
-                    .saved_call_len = @intCast(it.call_stack.items.len),
+                // Push a label forkpoint.
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = saved_value_len,
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index), // exit_ip
+                    .fork_type = .label,
+                    .aux = .{ .label_state = .{
+                        .break_token = token,
+                        .exit_ip = @intCast(instr.operand.index),
+                        .saved_if_len = @intCast(it.if_stack.items.len),
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                        .saved_call_len = @intCast(it.call_stack.items.len),
+                    } },
                 });
                 it.ip += 1;
                 return null;
             },
 
             .label_end => {
-                // Pop the label frame if present (normal exit, no break fired).
-                if (it.label_stack.items.len > 0) {
-                    _ = it.label_stack.pop();
+                // Pop the label forkpoint if present (normal exit, no break fired).
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].fork_type == .label) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
                 }
                 it.ip += 1;
                 return null;
@@ -1466,7 +1096,39 @@ pub const ResultIterator = struct {
                     .int => |i| @as(u32, @intCast(i)),
                     else => return error.TypeError,
                 };
-                it.pending_break_token = token;
+                // Scan fork_stack backwards for matching label, unwind and jump.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].fork_type == .label) {
+                        const state = it.fork_stack.items[idx].aux.label_state;
+                        if (state.break_token == token) {
+                            const fp = it.fork_stack.items[idx];
+                            // Unwind fork stack.
+                            it.fork_stack.items.len = idx;
+                            // Unwind other stacks.
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                            it.if_stack.items.len = state.saved_if_len;
+                            // Unwind collect frames, freeing buffers and propagating to parent.
+                            while (it.collect_stack.items.len > state.saved_collect_len) {
+                                var cf = it.collect_stack.pop().?;
+                                defer cf.buffer.deinit(it.alloc);
+                                if (cf.buffer.items.len > 0 and it.collect_stack.items.len > 0) {
+                                    const parent = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                                    for (cf.buffer.items) |item| {
+                                        parent.buffer.append(it.alloc, item) catch {};
+                                    }
+                                }
+                            }
+                            it.call_stack.items.len = state.saved_call_len;
+                            // Break produces empty — set ip past end for backtracking.
+                            it.ip = @intCast(it.instructions.len);
+                            return null;
+                        }
+                    }
+                }
+                // No matching label found — treat as done.
+                it.done = true;
                 return null;
             },
 
@@ -1482,28 +1144,182 @@ pub const ResultIterator = struct {
                     return error.UserError;
                 }
                 if (n_i == 0) {
-                    // Produce empty (no output) — trigger step loop to advance
-                    // the outer iterate or finalize collect frames.
+                    // Produce empty (no output) — trigger step loop to advance.
                     it.ip = @intCast(it.instructions.len);
                     return null;
                 }
-                try it.limit_stack.append(it.alloc, .{
-                    .remaining = @intCast(n_i),
-                    .body_start_ip = it.ip,
-                    .exit_ip = @intCast(instr.operand.index),
-                    .saved_iter_len = @intCast(it.stack.items.len),
-                    .saved_range_len = @intCast(it.range_stack.items.len),
-                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index), // exit_ip
+                    .fork_type = .limit,
+                    .aux = .{ .limit_state = .{
+                        .remaining = @intCast(n_i),
+                        .body_start_ip = it.ip,
+                        .exit_ip = @intCast(instr.operand.index),
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    } },
                 });
                 it.ip += 1;
                 return null;
             },
             .limit_end => {
-                if (it.limit_stack.items.len > 0) {
-                    _ = it.limit_stack.pop();
+                // Pop the limit forkpoint if present.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].fork_type == .limit) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
                 }
                 it.ip += 1;
                 return null;
+            },
+
+            // ── Fork stack opcodes ──────────────────────────────────────────
+
+            .fork => {
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index),
+                    .fork_type = .normal,
+                    .aux = .{ .none = {} },
+                });
+                it.ip += 1;
+                return null;
+            },
+
+            .backtrack => {
+                if (!it.doBacktrack()) {
+                    // No forkpoints — let step() handle collect finalization or done.
+                    it.ip = @intCast(it.instructions.len);
+                }
+                return null;
+            },
+
+            .each => {
+                switch (it.current) {
+                    .array => |span| {
+                        const first = span.start + 1;
+                        const end = span.end - 1;
+                        if (first >= end) {
+                            // Empty array — backtrack to next generator.
+                            if (!it.doBacktrack()) {
+                                it.ip = @intCast(it.instructions.len);
+                            }
+                            return null;
+                        }
+                        it.fork_stack.appendAssumeCapacity(.{
+                            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                            .saved_current = it.current,
+                            .backtrack_ip = it.ip,
+                            .fork_type = .each,
+                            .aux = .{ .each_state = .{
+                                .pos = first,
+                                .end = end,
+                                .is_object = false,
+                                .tape = span.tape,
+                            } },
+                        });
+                        it.current = tapeEntryToValue(span.tape, first);
+                        it.ip += 1;
+                    },
+                    .object => |span| {
+                        const first_key = span.start + 1;
+                        const end = span.end - 1;
+                        if (first_key >= end) {
+                            if (!it.doBacktrack()) {
+                                it.ip = @intCast(it.instructions.len);
+                            }
+                            return null;
+                        }
+                        it.fork_stack.appendAssumeCapacity(.{
+                            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                            .saved_current = it.current,
+                            .backtrack_ip = it.ip,
+                            .fork_type = .each,
+                            .aux = .{ .each_state = .{
+                                .pos = first_key,
+                                .end = end,
+                                .is_object = true,
+                                .tape = span.tape,
+                            } },
+                        });
+                        it.current = tapeEntryToValue(span.tape, first_key + 1);
+                        it.ip += 1;
+                    },
+                    .null_val => {
+                        // null | .[] produces nothing.
+                        if (!it.doBacktrack()) {
+                            it.ip = @intCast(it.instructions.len);
+                        }
+                        return null;
+                    },
+                    else => return error.TypeError,
+                }
+                return null;
+            },
+
+            .yield_output => {
+                const val = if (it.value_stack.items.len > 0)
+                    try stackValueToValue(try it.popValue())
+                else
+                    it.current;
+
+                // Check limit counter via fork_stack.
+                {
+                    const output_ip = it.ip;
+                    var li: usize = it.fork_stack.items.len;
+                    while (li > 0) {
+                        li -= 1;
+                        if (it.fork_stack.items[li].fork_type == .limit) {
+                            var lstate = &it.fork_stack.items[li].aux.limit_state;
+                            if (output_ip > lstate.body_start_ip and output_ip < lstate.exit_ip) {
+                                if (it.collect_stack.items.len > lstate.saved_collect_len) {
+                                    break;
+                                }
+                                lstate.remaining -= 1;
+                                if (lstate.remaining == 0) {
+                                    // Exhausted: unwind fork stack to this limit.
+                                    it.fork_stack.items.len = li;
+                                    if (it.collect_stack.items.len > 0) {
+                                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                                        try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                                        it.value_stack.items.len = cf.outer_value_depth;
+                                        it.ip = @intCast(it.instructions.len);
+                                        return null;
+                                    } else {
+                                        it.ip = @intCast(it.instructions.len);
+                                        return val;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (it.collect_stack.items.len > 0) {
+                    // Collect mode: buffer value, then trigger backtracking via step() loop.
+                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                    try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                    it.value_stack.items.len = cf.outer_value_depth;
+                    if (it.fork_stack.items.len > cf.outer_fork_depth) {
+                        // Active generators within collect scope — set ip past end
+                        // so step() loop handles backtracking/advancement.
+                        it.ip = @intCast(it.instructions.len);
+                    } else {
+                        // No generators — continue sequentially (imperative loops).
+                        it.ip += 1;
+                    }
+                    return null;
+                } else {
+                    // Normal mode: yield value to caller.
+                    it.ip += 1;
+                    return val;
+                }
             },
         }
     }
@@ -2531,21 +2347,8 @@ pub const ResultIterator = struct {
             .in_ => return try it.builtinIn(),
             .type_ => return try it.builtinType(),
             .empty => {
-                // `empty` produces no output for the current branch.
-                // If the next instruction is `output` (comma branch boundary),
-                // skip that output and let subsequent comma branches continue.
-                // The skip_output handler is collect-mode aware and will still
-                // trigger iterate/range frame advancement when needed.
-                // Otherwise fall back to ip-past-end which terminates this
-                // output path and lets the step() loop advance any active
-                // iterate/range frame.
-                const next_ip = it.ip + 1;
-                if (next_ip < it.instructions.len and
-                    it.instructions[next_ip].op == .output)
-                {
-                    it.skip_output = true;
-                    it.ip = next_ip;
-                } else {
+                // `empty` produces no output — backtrack to next generator path.
+                if (!it.doBacktrack()) {
                     it.ip = @intCast(it.instructions.len);
                 }
                 return null;
@@ -4247,7 +4050,7 @@ pub const ResultIterator = struct {
         } } };
     }
 
-    /// `range(n)`: generate 0..n-1
+    /// `range(n)`: generate 0..n-1 via fork stack
     fn builtinRange1(it: *ResultIterator) ZqError!?StackValue {
         const end_sv = try it.popValue();
         const resume_ip = it.ip + 1;
@@ -4255,36 +4058,46 @@ pub const ResultIterator = struct {
         switch (end_sv) {
             .int => |end_n| {
                 if (end_n <= 0) {
-                    it.ip = @intCast(it.instructions.len);
+                    if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                     return null;
                 }
-                it.range_stack.appendAssumeCapacity(RangeFrame{
-                    .current_int = 0,
-                    .end_int = end_n,
-                    .step_int = 1,
-                    .current_float = 0,
-                    .end_float = 0,
-                    .step_float = 0,
-                    .is_float = false,
-                    .resume_ip = resume_ip,
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = resume_ip,
+                    .fork_type = .range,
+                    .aux = .{ .range_state = .{
+                        .current_int = 0,
+                        .end_int = end_n,
+                        .step_int = 1,
+                        .current_float = 0,
+                        .end_float = 0,
+                        .step_float = 0,
+                        .is_float = false,
+                    } },
                 });
                 it.current = .{ .int = 0 };
                 it.ip = resume_ip;
             },
             .float => |end_f| {
                 if (end_f <= 0) {
-                    it.ip = @intCast(it.instructions.len);
+                    if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                     return null;
                 }
-                it.range_stack.appendAssumeCapacity(RangeFrame{
-                    .current_int = 0,
-                    .end_int = 0,
-                    .step_int = 0,
-                    .current_float = 0,
-                    .end_float = end_f,
-                    .step_float = 1,
-                    .is_float = true,
-                    .resume_ip = resume_ip,
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = resume_ip,
+                    .fork_type = .range,
+                    .aux = .{ .range_state = .{
+                        .current_int = 0,
+                        .end_int = 0,
+                        .step_int = 0,
+                        .current_float = 0,
+                        .end_float = end_f,
+                        .step_float = 1,
+                        .is_float = true,
+                    } },
                 });
                 it.current = .{ .float = 0 };
                 it.ip = resume_ip;
@@ -4294,7 +4107,7 @@ pub const ResultIterator = struct {
         return null;
     }
 
-    /// `range(from;to)`: generate from..to-1
+    /// `range(from;to)`: generate from..to-1 via fork stack
     fn builtinRange2(it: *ResultIterator) ZqError!?StackValue {
         const to_sv = try it.popValue();
         const from_sv = try it.popValue();
@@ -4313,18 +4126,23 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (from_f >= to_f) {
-                it.ip = @intCast(it.instructions.len);
+                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                 return null;
             }
-            it.range_stack.appendAssumeCapacity(RangeFrame{
-                .current_int = 0,
-                .end_int = 0,
-                .step_int = 0,
-                .current_float = from_f,
-                .end_float = to_f,
-                .step_float = 1,
-                .is_float = true,
-                .resume_ip = resume_ip,
+            it.fork_stack.appendAssumeCapacity(.{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                .backtrack_ip = resume_ip,
+                .fork_type = .range,
+                .aux = .{ .range_state = .{
+                    .current_int = 0,
+                    .end_int = 0,
+                    .step_int = 0,
+                    .current_float = from_f,
+                    .end_float = to_f,
+                    .step_float = 1,
+                    .is_float = true,
+                } },
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4337,18 +4155,23 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (from_i >= to_i) {
-                it.ip = @intCast(it.instructions.len);
+                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                 return null;
             }
-            it.range_stack.appendAssumeCapacity(RangeFrame{
-                .current_int = from_i,
-                .end_int = to_i,
-                .step_int = 1,
-                .current_float = 0,
-                .end_float = 0,
-                .step_float = 0,
-                .is_float = false,
-                .resume_ip = resume_ip,
+            it.fork_stack.appendAssumeCapacity(.{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                .backtrack_ip = resume_ip,
+                .fork_type = .range,
+                .aux = .{ .range_state = .{
+                    .current_int = from_i,
+                    .end_int = to_i,
+                    .step_int = 1,
+                    .current_float = 0,
+                    .end_float = 0,
+                    .step_float = 0,
+                    .is_float = false,
+                } },
             });
             it.current = .{ .int = from_i };
         }
@@ -4356,7 +4179,7 @@ pub const ResultIterator = struct {
         return null;
     }
 
-    /// `range(from;to;by)`: generate from..to-1 stepping by `by`
+    /// `range(from;to;by)`: generate from..to-1 stepping by `by` via fork stack
     fn builtinRange3(it: *ResultIterator) ZqError!?StackValue {
         const by_sv = try it.popValue();
         const to_sv = try it.popValue();
@@ -4381,18 +4204,23 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (by_f == 0 or (by_f > 0 and from_f >= to_f) or (by_f < 0 and from_f <= to_f)) {
-                it.ip = @intCast(it.instructions.len);
+                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                 return null;
             }
-            it.range_stack.appendAssumeCapacity(RangeFrame{
-                .current_int = 0,
-                .end_int = 0,
-                .step_int = 0,
-                .current_float = from_f,
-                .end_float = to_f,
-                .step_float = by_f,
-                .is_float = true,
-                .resume_ip = resume_ip,
+            it.fork_stack.appendAssumeCapacity(.{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                .backtrack_ip = resume_ip,
+                .fork_type = .range,
+                .aux = .{ .range_state = .{
+                    .current_int = 0,
+                    .end_int = 0,
+                    .step_int = 0,
+                    .current_float = from_f,
+                    .end_float = to_f,
+                    .step_float = by_f,
+                    .is_float = true,
+                } },
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4409,18 +4237,23 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (by_i == 0 or (by_i > 0 and from_i >= to_i) or (by_i < 0 and from_i <= to_i)) {
-                it.ip = @intCast(it.instructions.len);
+                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
                 return null;
             }
-            it.range_stack.appendAssumeCapacity(RangeFrame{
-                .current_int = from_i,
-                .end_int = to_i,
-                .step_int = by_i,
-                .current_float = 0,
-                .end_float = 0,
-                .step_float = 0,
-                .is_float = false,
-                .resume_ip = resume_ip,
+            it.fork_stack.appendAssumeCapacity(.{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                .backtrack_ip = resume_ip,
+                .fork_type = .range,
+                .aux = .{ .range_state = .{
+                    .current_int = from_i,
+                    .end_int = to_i,
+                    .step_int = by_i,
+                    .current_float = 0,
+                    .end_float = 0,
+                    .step_float = 0,
+                    .is_float = false,
+                } },
             });
             it.current = .{ .int = from_i };
         }
@@ -5083,7 +4916,9 @@ pub const ResultIterator = struct {
         try it.collectPaths(it.current, &path_buf, &all_paths, leaf_only);
 
         if (all_paths.items.len == 0) {
-            it.ip = @intCast(it.instructions.len);
+            if (!it.doBacktrack()) {
+                it.ip = @intCast(it.instructions.len);
+            }
             return null;
         }
 
@@ -5091,10 +4926,12 @@ pub const ResultIterator = struct {
         const arr = try it.buildRuntimeArray(all_paths.items);
         it.current = try stackValueToValue(arr);
 
-        // Set up iteration over the container. ip+1 is where execution resumes
-        // for each yielded element.
-        it.ip += 1;
-        try it.doIterate(it.ip);
+        // Set up fork-based iteration over the container.
+        if (!it.setupEachFromCurrent()) {
+            if (!it.doBacktrack()) {
+                it.ip = @intCast(it.instructions.len);
+            }
+        }
         return null;
     }
 
@@ -5160,7 +4997,9 @@ pub const ResultIterator = struct {
         try it.collectRecurse(it.current, &all_values);
 
         if (all_values.items.len == 0) {
-            it.ip = @intCast(it.instructions.len);
+            if (!it.doBacktrack()) {
+                it.ip = @intCast(it.instructions.len);
+            }
             return null;
         }
 
@@ -5168,9 +5007,12 @@ pub const ResultIterator = struct {
         const arr = try it.buildRuntimeArray(all_values.items);
         it.current = try stackValueToValue(arr);
 
-        // Set up iteration over the container.
-        it.ip += 1;
-        try it.doIterate(it.ip);
+        // Set up fork-based iteration over the container.
+        if (!it.setupEachFromCurrent()) {
+            if (!it.doBacktrack()) {
+                it.ip = @intCast(it.instructions.len);
+            }
+        }
         return null;
     }
 
@@ -5382,106 +5224,177 @@ pub const ResultIterator = struct {
         };
     }
 
-    fn doIterate(it: *ResultIterator, resume_ip: u32) ZqError!void {
-        if (it.stack.items.len >= max_stack_depth) return error.DepthLimitExceeded;
+    // ── Fork stack backtracking ─────────────────────────────────────────────
 
+    /// Set up fork-based iteration over it.current (must be array/object).
+    /// Used by builtins (paths, recurse) that build a container and iterate.
+    /// Returns false if container is empty (caller should backtrack or set ip past end).
+    fn setupEachFromCurrent(it: *ResultIterator) bool {
         switch (it.current) {
             .array => |span| {
                 const first = span.start + 1;
-                const end = span.end - 1; // position of array_end
-                if (first >= end) {
-                    // Empty array — skip past all instructions; produce no output.
-                    it.ip = @intCast(it.instructions.len);
-                    return;
-                }
-                it.stack.appendAssumeCapacity(IterFrame{
-                    .pos = first,
-                    .end = end,
-                    .is_object = false,
-                    .resume_ip = resume_ip,
-                    .tape = span.tape,
+                const end = span.end - 1;
+                if (first >= end) return false;
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = it.ip,
+                    .fork_type = .each,
+                    .aux = .{ .each_state = .{
+                        .pos = first,
+                        .end = end,
+                        .is_object = false,
+                        .tape = span.tape,
+                    } },
                 });
                 it.current = tapeEntryToValue(span.tape, first);
-                it.ip = resume_ip;
+                it.ip += 1;
+                return true;
             },
             .object => |span| {
                 const first_key = span.start + 1;
-                const end = span.end - 1; // position of object_end
-                if (first_key >= end) {
-                    it.ip = @intCast(it.instructions.len);
-                    return;
-                }
-                it.stack.appendAssumeCapacity(IterFrame{
-                    .pos = first_key,
-                    .end = end,
-                    .is_object = true,
-                    .resume_ip = resume_ip,
-                    .tape = span.tape,
+                const end = span.end - 1;
+                if (first_key >= end) return false;
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = it.ip,
+                    .fork_type = .each,
+                    .aux = .{ .each_state = .{
+                        .pos = first_key,
+                        .end = end,
+                        .is_object = true,
+                        .tape = span.tape,
+                    } },
                 });
                 it.current = tapeEntryToValue(span.tape, first_key + 1);
-                it.ip = resume_ip;
+                it.ip += 1;
+                return true;
             },
-            // jq: `null | .[]` produces nothing (empty output), same as empty array.
-            .null_val => {
-                it.ip = @intCast(it.instructions.len);
-                return;
-            },
-            else => return error.TypeError,
+            else => return false,
         }
     }
 
-    /// Advance the topmost IterFrame to its next element.
-    /// Returns true and updates ip+current on success.
-    /// Returns false and pops the exhausted frame on failure.
-    fn advanceFrame(it: *ResultIterator) bool {
-        const frame = &it.stack.items[it.stack.items.len - 1];
-
-        const next_pos: u32 = if (frame.is_object)
-            skipEntry(frame.tape.*, frame.pos + 1) // step past value → next key
+    /// Advance an each-type forkpoint to the next element.
+    /// Returns true if advanced (sets it.current), false if exhausted.
+    fn advanceEachForkpoint(it: *ResultIterator, fp: *Forkpoint) bool {
+        var st = &fp.aux.each_state;
+        const next_pos: u32 = if (st.is_object)
+            skipEntry(st.tape.*, st.pos + 1) // step past value → next key
         else
-            skipEntry(frame.tape.*, frame.pos); // step past current value
+            skipEntry(st.tape.*, st.pos); // step past current value
 
-        if (next_pos >= frame.end) {
-            _ = it.stack.pop();
-            return false;
-        }
+        if (next_pos >= st.end) return false;
 
-        frame.pos = next_pos;
-        it.current = if (frame.is_object)
-            tapeEntryToValue(frame.tape, next_pos + 1) // value after key
+        st.pos = next_pos;
+        it.current = if (st.is_object)
+            tapeEntryToValue(st.tape, next_pos + 1) // value after key
         else
-            tapeEntryToValue(frame.tape, next_pos);
-        it.ip = frame.resume_ip;
+            tapeEntryToValue(st.tape, next_pos);
         return true;
     }
 
-    /// Advance the topmost RangeFrame to its next value.
-    /// Returns true if it produced a value; false if exhausted.
-    fn advanceRangeFrame(it: *ResultIterator) bool {
-        const frame = &it.range_stack.items[it.range_stack.items.len - 1];
-        if (frame.is_float) {
-            frame.current_float += frame.step_float;
-            if ((frame.step_float > 0 and frame.current_float >= frame.end_float) or
-                (frame.step_float < 0 and frame.current_float <= frame.end_float) or
-                frame.step_float == 0)
+    /// Advance a range-type forkpoint to the next value.
+    /// Returns true if advanced (sets it.current), false if exhausted.
+    fn advanceRangeForkpoint(it: *ResultIterator, fp: *Forkpoint) bool {
+        var st = &fp.aux.range_state;
+        if (st.is_float) {
+            st.current_float += st.step_float;
+            if ((st.step_float > 0 and st.current_float >= st.end_float) or
+                (st.step_float < 0 and st.current_float <= st.end_float) or
+                st.step_float == 0)
             {
-                _ = it.range_stack.pop();
                 return false;
             }
-            it.current = .{ .float = frame.current_float };
+            it.current = .{ .float = st.current_float };
         } else {
-            frame.current_int += frame.step_int;
-            if ((frame.step_int > 0 and frame.current_int >= frame.end_int) or
-                (frame.step_int < 0 and frame.current_int <= frame.end_int) or
-                frame.step_int == 0)
+            st.current_int += st.step_int;
+            if ((st.step_int > 0 and st.current_int >= st.end_int) or
+                (st.step_int < 0 and st.current_int <= st.end_int) or
+                st.step_int == 0)
             {
-                _ = it.range_stack.pop();
                 return false;
             }
-            it.current = .{ .int = frame.current_int };
+            it.current = .{ .int = st.current_int };
         }
-        it.ip = frame.resume_ip;
         return true;
+    }
+
+    /// Walk the fork stack from the top, trying to advance each forkpoint.
+    /// Normal forkpoints restore saved state and jump to backtrack_ip.
+    /// Each/range forkpoints try to advance; if exhausted, pop and continue.
+    /// Stops when it finds a forkpoint that can produce the next path.
+    /// Returns true if a path was found, false if all forkpoints exhausted.
+    fn backtrackToDepth(it: *ResultIterator, min_depth: u32) bool {
+        while (it.fork_stack.items.len > min_depth) {
+            const fp = &it.fork_stack.items[it.fork_stack.items.len - 1];
+            switch (fp.fork_type) {
+                .normal => {
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    it.ip = fp.backtrack_ip;
+                    _ = it.fork_stack.pop();
+                    return true;
+                },
+                .each => {
+                    if (it.advanceEachForkpoint(fp)) {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        it.ip = fp.backtrack_ip + 1; // resume AFTER the each instruction
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    _ = it.fork_stack.pop();
+                },
+                .range => {
+                    if (it.advanceRangeForkpoint(fp)) {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        it.ip = fp.backtrack_ip;
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    _ = it.fork_stack.pop();
+                },
+                .try_handler => {
+                    // Normal exhaustion — just pop, continue backtracking.
+                    _ = it.fork_stack.pop();
+                },
+                .alt_handler => {
+                    // Left side exhausted (all falsy or no outputs) — fire right side.
+                    const state = fp.aux.try_handler_state;
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    it.if_stack.items.len = state.saved_if_len;
+                    while (it.collect_stack.items.len > state.saved_collect_len) {
+                        var cf = it.collect_stack.pop().?;
+                        cf.buffer.deinit(it.alloc);
+                    }
+                    it.call_stack.items.len = state.saved_call_len;
+                    it.ip = fp.backtrack_ip; // right side IP
+                    _ = it.fork_stack.pop();
+                    return true;
+                },
+                .label => {
+                    // Label scope completed without break — just pop.
+                    _ = it.fork_stack.pop();
+                },
+                .limit => {
+                    // Limit scope completed — just pop.
+                    _ = it.fork_stack.pop();
+                },
+            }
+        }
+        return false;
+    }
+
+    /// Backtrack within the innermost scope (collect frame boundary or depth 0).
+    fn doBacktrack(it: *ResultIterator) bool {
+        const min_depth: u32 = if (it.collect_stack.items.len > 0)
+            it.collect_stack.items[it.collect_stack.items.len - 1].outer_fork_depth
+        else
+            0;
+        return it.backtrackToDepth(min_depth);
     }
 
     // ── Math builtins ──────────────────────────────────────────────────────

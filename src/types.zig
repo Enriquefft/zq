@@ -753,6 +753,23 @@ pub const Instruction = struct {
         limit_start,
         /// End of limit scope. Pops LimitFrame.
         limit_end,
+
+        // Fork stack opcodes (unified backtracking)
+        /// Push a forkpoint for backtracking. operand.index = backtrack target IP.
+        fork,
+        /// Backtrack: pop the most recent forkpoint and resume its alternative.
+        backtrack,
+        /// Iterate: push each element of array/object via fork stack.
+        each,
+        /// Yield a value to the caller (or buffer in collect mode).
+        yield_output,
+        /// Push a try-handler forkpoint. operand.index = catch handler IP (0 = suppress).
+        fork_try,
+        /// Push an alternative-handler forkpoint. operand.index = right-side IP.
+        /// Like fork_try but also fires on exhaustion (all outputs falsy).
+        fork_alt,
+        /// Remove the nearest try_handler or alt_handler from the fork stack.
+        pop_try,
     };
 
     pub const Operand = union {

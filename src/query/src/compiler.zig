@@ -571,23 +571,26 @@ fn emitPatternCapture(ctx: *Ctx, pattern: Pattern) (ZqError || error{OutOfMemory
             for (elements, 0..) |elem, idx| {
                 try ctx.emit(.save_input, .{ .none = {} });
 
-                // Wrap extraction in try/catch for null-on-missing
-                const try_pos = ctx.raw.items.len;
-                try ctx.emit(.try_begin, .{ .index = 0 });
+                // Wrap extraction in fork_try/pop_try for null-on-missing
+                const fork_pos = ctx.raw.items.len;
+                try ctx.emit(.fork_try, .{ .index = 0 });
 
                 try ctx.emit(.load_index, .{ .index = @intCast(idx) });
 
-                const try_end_pos = ctx.raw.items.len;
-                try ctx.emit(.try_end, .{ .index = 0 });
+                try ctx.emit(.pop_try, .{ .none = {} });
+
+                // Jump past catch handler
+                const jump_pos = ctx.raw.items.len;
+                try ctx.emit(.jump, .{ .index = 0 });
 
                 // Catch handler: push null to value_stack
                 const catch_ip: u32 = @intCast(ctx.raw.items.len);
-                ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                ctx.raw.items[fork_pos].operand = .{ .index = catch_ip };
                 try ctx.emit(.push_null, .{ .none = {} });
 
                 // Continue label
                 const continue_ip: u32 = @intCast(ctx.raw.items.len);
-                ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+                ctx.raw.items[jump_pos].operand = .{ .index = continue_ip };
 
                 // Recursively capture sub-pattern
                 try emitPatternCapture(ctx, elem);
@@ -604,46 +607,50 @@ fn emitPatternCapture(ctx: *Ctx, pattern: Pattern) (ZqError || error{OutOfMemory
 
                 switch (field.key) {
                     .static => |key_ref| {
-                        const try_pos = ctx.raw.items.len;
-                        try ctx.emit(.try_begin, .{ .index = 0 });
+                        const fork_pos = ctx.raw.items.len;
+                        try ctx.emit(.fork_try, .{ .index = 0 });
 
                         try ctx.emit(.load_key, .{ .str_ref = key_ref });
 
-                        const try_end_pos = ctx.raw.items.len;
-                        try ctx.emit(.try_end, .{ .index = 0 });
+                        try ctx.emit(.pop_try, .{ .none = {} });
+
+                        const jump_pos = ctx.raw.items.len;
+                        try ctx.emit(.jump, .{ .index = 0 });
 
                         const catch_ip: u32 = @intCast(ctx.raw.items.len);
-                        ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                        ctx.raw.items[fork_pos].operand = .{ .index = catch_ip };
                         try ctx.emit(.push_null, .{ .none = {} });
 
                         const continue_ip: u32 = @intCast(ctx.raw.items.len);
-                        ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+                        ctx.raw.items[jump_pos].operand = .{ .index = continue_ip };
                     },
                     .computed => |instrs| {
-                        const try_pos = ctx.raw.items.len;
-                        try ctx.emit(.try_begin, .{ .index = 0 });
+                        const fork_pos = ctx.raw.items.len;
+                        try ctx.emit(.fork_try, .{ .index = 0 });
 
                         // save_input for load_computed (pops base from if_stack)
                         try ctx.emit(.save_input, .{ .none = {} });
 
                         // Copy the saved key expression instructions
-                        for (instrs) |instr| {
-                            try ctx.raw.append(ctx.alloc, instr);
+                        for (instrs) |instr_item| {
+                            try ctx.raw.append(ctx.alloc, instr_item);
                         }
 
                         try ctx.emit(.load_computed, .{ .none = {} });
                         // load_computed sets current, push it to value_stack
                         try ctx.emit(.push_current, .{ .none = {} });
 
-                        const try_end_pos = ctx.raw.items.len;
-                        try ctx.emit(.try_end, .{ .index = 0 });
+                        try ctx.emit(.pop_try, .{ .none = {} });
+
+                        const jump_pos = ctx.raw.items.len;
+                        try ctx.emit(.jump, .{ .index = 0 });
 
                         const catch_ip: u32 = @intCast(ctx.raw.items.len);
-                        ctx.raw.items[try_pos].operand = .{ .index = catch_ip };
+                        ctx.raw.items[fork_pos].operand = .{ .index = catch_ip };
                         try ctx.emit(.push_null, .{ .none = {} });
 
                         const continue_ip: u32 = @intCast(ctx.raw.items.len);
-                        ctx.raw.items[try_end_pos].operand = .{ .index = continue_ip };
+                        ctx.raw.items[jump_pos].operand = .{ .index = continue_ip };
                     },
                 }
 
@@ -1216,12 +1223,12 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .alt_check, .limit_start => {
+            .jump, .jump_if_false, .array_collect_start, .limit_start, .fork => {
                 if (r.operand.index >= p) r.operand.index += 1;
             },
-            // try_begin/try_end use 0 as a sentinel (no handler / no jump), so only
-            // fix up non-zero indices.
-            .try_begin, .try_end => {
+            // fork_try/fork_alt/label_begin use 0 as a sentinel (no handler / unpatched),
+            // so only fix up non-zero indices.
+            .fork_try, .fork_alt, .label_begin => {
                 if (r.operand.index > 0 and r.operand.index >= p) r.operand.index += 1;
             },
             else => {},
@@ -1351,11 +1358,11 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         .len = tail.len,
     } };
 
-    // Append implicit OP_OUTPUT if not already present.
+    // Append implicit yield_output if not already present.
     const needs_output = ctx.raw.items.len == 0 or
-        ctx.raw.items[ctx.raw.items.len - 1].op != .output;
+        ctx.raw.items[ctx.raw.items.len - 1].op != .yield_output;
     if (needs_output) {
-        try ctx.emit(.output, .{ .none = {} });
+        try ctx.emit(.yield_output, .{ .none = {} });
     }
 
     var compiled = try fuse(ctx.raw.items, &ctx.function_table, &ctx.intern, alloc);
@@ -1546,18 +1553,29 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             // Navigate
             try emitNavigation(ctx, path_steps.items);
 
-            // Use alternative: . // rhs
-            try ctx.emit(.alt_start, .{ .none = {} });
+            // Use alternative: . // rhs via fork_alt
+            const fork_alt_pos = ctx.raw.items.len;
+            try ctx.emit(.fork_alt, .{ .index = 0 }); // backpatch to right side
+            // The current value from navigation is in `current`. Check truthiness.
             try ctx.emit(.push_current, .{ .none = {} });
-            const check_pos = ctx.raw.items.len;
-            try ctx.emit(.alt_check, .{ .index = 0 });
-            try ctx.emit(.restore_input, .{ .none = {} });
-
+            const jif_pos = ctx.raw.items.len;
+            try ctx.emit(.jump_if_false, .{ .index = 0 }); // backpatch to falsy
+            // Truthy: pop_try and re-push value for downstream.
+            try ctx.emit(.pop_try, .{ .none = {} });
+            try ctx.emit(.push_current, .{ .none = {} });
+            const jump_end_pos = ctx.raw.items.len;
+            try ctx.emit(.jump, .{ .index = 0 }); // backpatch to end
+            // Falsy: backtrack to try next output from left side
+            ctx.raw.items[jif_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+            try ctx.emit(.backtrack, .{ .none = {} });
+            // Right side
+            const right_ip: u32 = @intCast(ctx.raw.items.len);
+            ctx.raw.items[fork_alt_pos].operand = .{ .index = right_ip };
             // Restore original for RHS
             try ctx.emit(.load_variable, .{ .index = tmp_var_id });
             try ctx.emit(.pipe, .{ .none = {} });
             try parseAlternative(ctx);
-            ctx.raw.items[check_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+            ctx.raw.items[jump_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
 
             // Update chain
             try emitUpdateChain(ctx, path_steps.items);
@@ -1595,7 +1613,6 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try parseUpdateAssign(ctx);
         return;
     }
-    var left_start: usize = ctx.raw.items.len;
     try parseComma(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -1612,218 +1629,10 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             break;
         }
 
-        // Check if the left side contains generator outputs (comma expression).
-        // If so, we need to distribute the pipe over each generator branch.
-        // `(a, b) | c` becomes `(a | c), (b | c)` — each comma branch gets
-        // its own copy of the right side so that pipe semantics are correct.
-        if (leftSideHasOutput(ctx.raw.items[left_start..])) {
-            // Save the lexer position before parsing the right side.
-            // We'll re-parse the right side for each branch of the comma.
-            const right_src_start = ctx.lex.pos;
-
-            // Parse right side once to advance the lexer past it.
-            const right_raw_start: u32 = @intCast(ctx.raw.items.len);
-            try parseComma(ctx);
-            const right_src_end = ctx.lex.pos;
-
-            // Discard the right side instructions (we'll re-parse per branch).
-            ctx.raw.items.len = right_raw_start;
-
-            // Now restructure: extract the comma branches from the left side,
-            // and for each branch, emit: branch | right_side.
-            // The left side has the pattern:
-            //   save_input, <branch_0>, output, restore_input, <branch_1>
-            // For chained: save_input, save_input, <b0>, output, restore_input, <b1>, output, restore_input, <b2>
-
-            // Extract left side instructions.
-            const left_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[left_start..right_raw_start]);
-            defer ctx.alloc.free(left_instrs);
-            ctx.raw.items.len = left_start;
-
-            // Find the branches by splitting at top-level output instructions.
-            var branches = std.ArrayList([]const RawInstr){};
-            defer branches.deinit(ctx.alloc);
-
-            var branch_start: usize = 0;
-            var depth: u32 = 0;
-            var i: usize = 0;
-            while (i < left_instrs.len) : (i += 1) {
-                switch (left_instrs[i].op) {
-                    .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
-                    .array_collect_end, .try_end, .label_end, .limit_end => {
-                        if (depth > 0) depth -= 1;
-                    },
-                    .output => {
-                        if (depth == 0) {
-                            // Found a branch boundary.
-                            // Skip leading save_input instructions for this branch.
-                            var bs = branch_start;
-                            while (bs < i and left_instrs[bs].op == .save_input) bs += 1;
-                            try branches.append(ctx.alloc, left_instrs[bs..i]);
-                            // Skip past output and restore_input
-                            branch_start = i + 1;
-                            if (branch_start < left_instrs.len and left_instrs[branch_start].op == .restore_input)
-                                branch_start += 1;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            // Last branch (no trailing output)
-            {
-                var bs = branch_start;
-                while (bs < left_instrs.len and left_instrs[bs].op == .save_input) bs += 1;
-                if (bs < left_instrs.len) {
-                    try branches.append(ctx.alloc, left_instrs[bs..left_instrs.len]);
-                }
-            }
-
-            // Emit: (branch_0 | right), (branch_1 | right), ...
-            for (branches.items, 0..) |branch, bi| {
-                if (bi > 0) {
-                    // Insert save_input before the previous branch at its start
-                    // and wrap with output/restore_input (comma semantics).
-                    try insertRawInstr(ctx, left_start, RawInstr{
-                        .op = .save_input,
-                        .operand = .{ .none = {} },
-                    });
-                    try ctx.emit(.output, .{ .none = {} });
-                    try ctx.emit(.restore_input, .{ .none = {} });
-                }
-
-                // Emit branch instructions
-                for (branch) |instr| {
-                    try ctx.raw.append(ctx.alloc, instr);
-                }
-
-                // Emit pipe
-                try ctx.emit(.pipe, .{ .none = {} });
-
-                // Re-parse the right side from source
-                const saved_lex_pos = ctx.lex.pos;
-                ctx.lex.pos = right_src_start;
-                try parseComma(ctx);
-                ctx.lex.pos = saved_lex_pos;
-            }
-
-            // Restore lexer position to after the right side
-            ctx.lex.pos = right_src_end;
-        } else {
-            try ctx.emit(.pipe, .{ .none = {} });
-            try parseComma(ctx);
-        }
-        left_start = ctx.raw.items.len;
-    }
-}
-
-/// Check if a raw instruction sequence contains `output` instructions at the
-/// top nesting level (not inside array_collect or try blocks). This indicates
-/// the expression is a generator (e.g., comma expression) whose outputs need
-/// special handling when used as the left side of a pipe.
-fn leftSideHasOutput(instrs: []const RawInstr) bool {
-    var depth: u32 = 0;
-    for (instrs) |instr| {
-        switch (instr.op) {
-            .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
-            .array_collect_end, .try_end, .label_end, .limit_end => {
-                if (depth > 0) depth -= 1;
-            },
-            .output => {
-                if (depth == 0) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-/// Extract branches from a generator (comma expression) instruction sequence.
-/// If the sequence has no generators, returns a single branch (the whole slice).
-/// Each branch is a sub-slice of `instrs` between save_input/output boundaries.
-fn extractBranches(alloc: std.mem.Allocator, instrs: []const RawInstr) error{OutOfMemory}!std.ArrayList([]const RawInstr) {
-    var branches = std.ArrayList([]const RawInstr){};
-
-    if (!leftSideHasOutput(instrs)) {
-        try branches.append(alloc, instrs);
-        return branches;
-    }
-
-    var branch_start: usize = 0;
-    var depth: u32 = 0;
-    var i: usize = 0;
-    while (i < instrs.len) : (i += 1) {
-        switch (instrs[i].op) {
-            .array_collect_start, .try_begin, .label_begin, .limit_start => depth += 1,
-            .array_collect_end, .try_end, .label_end, .limit_end => {
-                if (depth > 0) depth -= 1;
-            },
-            .output => {
-                if (depth == 0) {
-                    var bs = branch_start;
-                    while (bs < i and instrs[bs].op == .save_input) bs += 1;
-                    try branches.append(alloc, instrs[bs..i]);
-                    branch_start = i + 1;
-                    if (branch_start < instrs.len and instrs[branch_start].op == .restore_input)
-                        branch_start += 1;
-                }
-            },
-            else => {},
-        }
-    }
-    // Last branch (no trailing output)
-    {
-        var bs = branch_start;
-        while (bs < instrs.len and instrs[bs].op == .save_input) bs += 1;
-        if (bs < instrs.len) {
-            try branches.append(alloc, instrs[bs..]);
-        }
-    }
-
-    return branches;
-}
-
-/// Distribute a binary operation over generator branches (Cartesian product).
-/// `(a, b) OP (c, d)` becomes `(a OP c), (a OP d), (b OP c), (b OP d)`.
-/// Called when at least one operand contains generators (comma expressions).
-fn distributeBinaryOp(
-    ctx: *Ctx,
-    op: Instruction.Op,
-    emit_start: usize,
-    right_raw_start: usize,
-) (ZqError || error{OutOfMemory})!void {
-    // Copy left and right instructions before clearing
-    const left_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[emit_start..right_raw_start]);
-    defer ctx.alloc.free(left_instrs);
-    const right_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[right_raw_start..]);
-    defer ctx.alloc.free(right_instrs);
-
-    // Extract branches from each side
-    var left_branches = try extractBranches(ctx.alloc, left_instrs);
-    defer left_branches.deinit(ctx.alloc);
-    var right_branches = try extractBranches(ctx.alloc, right_instrs);
-    defer right_branches.deinit(ctx.alloc);
-
-    // Clear all instructions back to emit_start
-    ctx.raw.items.len = emit_start;
-
-    // Emit Cartesian product with comma semantics
-    var combo: usize = 0;
-    for (left_branches.items) |lbranch| {
-        for (right_branches.items) |rbranch| {
-            if (combo > 0) {
-                // Wrap previous combo: insert save_input at start, emit output + restore_input
-                try insertRawInstr(ctx, emit_start, .{ .op = .save_input, .operand = .{ .none = {} } });
-                try ctx.emit(.output, .{ .none = {} });
-                try ctx.emit(.restore_input, .{ .none = {} });
-            }
-
-            // Emit left branch, right branch, then the operation
-            for (lbranch) |instr| try ctx.raw.append(ctx.alloc, instr);
-            for (rbranch) |instr| try ctx.raw.append(ctx.alloc, instr);
-            try ctx.emit(op, .{ .none = {} });
-
-            combo += 1;
-        }
+        // With fork/backtrack, pipe simply passes the value through.
+        // No distribution needed — generators naturally backtrack.
+        try ctx.emit(.pipe, .{ .none = {} });
+        try parseComma(ctx);
     }
 }
 
@@ -1844,26 +1653,47 @@ fn distributeBinaryOp(
 /// The final restore_input ensures the original input is available for
 /// any downstream pipe. The outputs are consumed by the output instruction.
 ///
-/// For chained `a, b, c` a save_input is inserted at chain_start on the
-/// second iteration, wrapping the entire left subtree.
+/// On execution, the fork pushes a backtrack point. When the first path
+/// completes and backtracks, execution resumes at L_b for the second path.
 fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const chain_start: usize = ctx.raw.items.len;
+    var jump_fixups = std.ArrayList(usize){};
+    defer jump_fixups.deinit(ctx.alloc);
+
+    var left_start: usize = ctx.raw.items.len;
     try parseAlternative(ctx);
+
+    // Track the position of the previous FORK so we can fix its target after
+    // the next insertRawInstr (which auto-adjusts it one past the new FORK,
+    // but we want it to point AT the new FORK for correct chaining).
+    var prev_fork_pos: ?usize = null;
+
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .comma) break;
         _ = try ctx.nextToken();
 
-        // Insert save_input before the entire left subtree.
-        // insertRawInstr fixes all existing jump targets >= chain_start.
-        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+        // Insert FORK before the left subtree — target placeholder.
+        try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
 
-        // Emit output for the left side, then restore_input
-        try ctx.emit(.output, .{ .none = {} });
-        try ctx.emit(.restore_input, .{ .none = {} });
+        // Fix previous FORK: insertRawInstr auto-adjusted its target from
+        // left_start to left_start+1 (because the old branch start shifted),
+        // but we want it to point AT left_start (this new FORK) for correct
+        // chaining: backtracking to the previous FORK should land on this FORK
+        // which sets up the next branch's forkpoint.
+        if (prev_fork_pos) |pfp| {
+            ctx.raw.items[pfp].operand.index = @intCast(left_start);
+        }
 
-        // Parse the right expression. If it starts with `def`, use parseFilter
-        // to handle the definition (jq allows `a, def f: body; expr`).
+        // Emit JUMP to end (placeholder, will be backpatched).
+        const jump_pos = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+        try jump_fixups.append(ctx.alloc, jump_pos);
+
+        // Save this FORK position for backpatching AFTER parsing the right side.
+        const current_fork_pos = left_start;
+
+        // Parse the right expression.
+        left_start = ctx.raw.items.len;
         const after_comma = try ctx.lex.peek();
         if (after_comma.tag == .def_kw) {
             _ = try ctx.nextToken(); // consume 'def'
@@ -1871,6 +1701,17 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         } else {
             try parseAlternative(ctx);
         }
+
+        // Backpatch FORK target to the start of the right side.
+        // Done AFTER parsing so inner insertRawInstr calls don't shift it.
+        ctx.raw.items[current_fork_pos].operand.index = @intCast(left_start);
+        prev_fork_pos = current_fork_pos;
+    }
+
+    // Backpatch all JUMP targets to point past the end.
+    const end_pos: i64 = @intCast(ctx.raw.items.len);
+    for (jump_fixups.items) |fixup| {
+        ctx.raw.items[fixup].operand.index = end_pos;
     }
 }
 
@@ -1878,16 +1719,19 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Precedence: lower than `or`/`and`, higher than `|`.
 ///
 /// For `a // b` emits:
-///   alt_start             ← push current to if_stack; enable implicit null propagation
+///   fork_alt L_right       ← error/exhaustion → try right side
 ///   <a>
-///   alt_check → after_b   ← decrement null-prop depth; if truthy keep value and jump;
-///                           if falsy discard and fall through to restore_input
-///   restore_input         ← restore original input for right-side evaluation
+///   pipe                   ← move result to current
+///   push_current           ← dup for truthiness check
+///   jump_if_false L_falsy
+///   pop_try                ← committed: left produced truthy value
+///   push_current           ← re-push value for downstream
+///   jump L_end
+///   L_falsy:
+///   backtrack              ← falsy output: try next <a> output
+///   L_right:
 ///   <b>
-///   after_b:
-///
-/// For chained `a // b // c` a second alt_start is inserted at chain_start on the
-/// second iteration, wrapping the entire left subtree.
+///   L_end:
 fn parseAlternative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const chain_start: usize = ctx.raw.items.len;
     try parseLogical(ctx);
@@ -1896,22 +1740,36 @@ fn parseAlternative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         if (t.tag != .double_slash) break;
         _ = try ctx.nextToken();
 
-        // Insert alt_start before the entire left subtree.
-        // insertRawInstr fixes all existing jump targets ≥ chain_start.
-        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .alt_start, .operand = .{ .none = {} } });
+        // Insert fork_alt before the entire left subtree.
+        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .fork_alt, .operand = .{ .index = 0 } });
 
-        // Emit alt_check with a placeholder target (backpatched after parsing right).
-        const check_pos = ctx.raw.items.len;
-        try ctx.emit(.alt_check, .{ .index = 0 });
+        // Move left result to current (handles both value_stack and current cases).
+        try ctx.emit(.pipe, .{ .none = {} });
 
-        // restore_input fires only on the falsy path so the right expr sees the saved input.
-        try ctx.emit(.restore_input, .{ .none = {} });
+        // Truthiness check: dup current and check.
+        try ctx.emit(.push_current, .{ .none = {} });
+        const jif_pos = ctx.raw.items.len;
+        try ctx.emit(.jump_if_false, .{ .index = 0 });
+
+        // Truthy: pop_try and re-push value for downstream.
+        try ctx.emit(.pop_try, .{ .none = {} });
+        try ctx.emit(.push_current, .{ .none = {} });
+        const jump_end_pos = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+
+        // Falsy: backtrack to try next left-side output.
+        ctx.raw.items[jif_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+        try ctx.emit(.backtrack, .{ .none = {} });
+
+        // Right side: fork_alt points here.
+        const right_ip: u32 = @intCast(ctx.raw.items.len);
+        ctx.raw.items[chain_start].operand = .{ .index = right_ip };
 
         // Parse the right expression.
         try parseLogical(ctx);
 
-        // Backpatch alt_check to jump here (one past the right expr).
-        ctx.raw.items[check_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+        // Backpatch jump to end.
+        ctx.raw.items[jump_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
     }
 }
 
@@ -2041,18 +1899,17 @@ fn parseDestructAlt(ctx: *Ctx, first_pattern: Pattern) (ZqError || error{OutOfMe
             try ctx.emit(.save_input, .{ .none = {} });
         }
 
-        // Wrap strict capture in try_begin/try_end.
-        const try_begin_pos = ctx.raw.items.len;
-        try ctx.emit(.try_begin, .{ .index = 0 });
+        // Wrap strict capture in fork_try/pop_try.
+        const fork_try_pos = ctx.raw.items.len;
+        try ctx.emit(.fork_try, .{ .index = 0 });
 
         // Push current to value_stack so emitPatternCaptureStrict can pipe it.
         try ctx.emit(.push_current, .{ .none = {} });
 
-        // Emit strict pattern capture (errors propagate to try_begin's catch).
+        // Emit strict pattern capture (errors propagate to fork_try's catch).
         try emitPatternCaptureStrict(ctx, pat);
 
-        const try_end_pos = ctx.raw.items.len;
-        try ctx.emit(.try_end, .{ .index = 0 });
+        try ctx.emit(.pop_try, .{ .none = {} });
 
         // Success path: restore saved input (clean up if_stack), jump to body.
         try ctx.emit(.restore_input, .{ .none = {} });
@@ -2060,17 +1917,14 @@ fn parseDestructAlt(ctx: *Ctx, first_pattern: Pattern) (ZqError || error{OutOfMe
         try ctx.emit(.jump, .{ .index = 0 });
         try jump_to_body.append(ctx.alloc, jmp_pos);
 
-        // Backpatch try_begin: catch_ip = next instruction (next pattern's restore or empty handler).
+        // Backpatch fork_try: catch_ip = next instruction (next pattern's restore or empty handler).
         const catch_ip: u32 = @intCast(ctx.raw.items.len);
-        ctx.raw.items[try_begin_pos].operand = .{ .index = catch_ip };
-
-        // Backpatch try_end: after_ip = the restore_input after try_end (ip+1 is default for 0).
-        _ = try_end_pos; // try_end with operand 0 means ip+1, which is correct.
+        ctx.raw.items[fork_try_pos].operand = .{ .index = catch_ip };
 
         if (is_last) {
             // All patterns failed — restore input and produce empty.
             try ctx.emit(.restore_input, .{ .none = {} });
-            try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.empty) });
+            try ctx.emit(.backtrack, .{ .none = {} });
         }
     }
 
@@ -2082,46 +1936,29 @@ fn parseDestructAlt(ctx: *Ctx, first_pattern: Pattern) (ZqError || error{OutOfMe
 }
 
 fn parseOr(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const left_raw_start: usize = ctx.raw.items.len;
     try parseAnd(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .or_kw) break;
         _ = try ctx.nextToken();
-        const right_raw_start: usize = ctx.raw.items.len;
         try parseAnd(ctx);
-        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
-            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
-        {
-            try distributeBinaryOp(ctx, .or_op, left_raw_start, right_raw_start);
-        } else {
-            try ctx.emit(.or_op, .{ .none = {} });
-        }
+        try ctx.emit(.or_op, .{ .none = {} });
     }
 }
 
 fn parseAnd(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const left_raw_start: usize = ctx.raw.items.len;
     try parseComparison(ctx);
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .and_kw) break;
         _ = try ctx.nextToken();
-        const right_raw_start: usize = ctx.raw.items.len;
         try parseComparison(ctx);
-        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
-            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
-        {
-            try distributeBinaryOp(ctx, .and_op, left_raw_start, right_raw_start);
-        } else {
-            try ctx.emit(.and_op, .{ .none = {} });
-        }
+        try ctx.emit(.and_op, .{ .none = {} });
     }
 }
 
 /// parseComparison: `==`, `!=`, `<`, `<=`, `>`, `>=`
 fn parseComparison(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const left_raw_start: usize = ctx.raw.items.len;
     try parseAdditive(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -2135,21 +1972,13 @@ fn parseComparison(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
-        const right_raw_start: usize = ctx.raw.items.len;
         try parseAdditive(ctx);
-        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
-            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
-        {
-            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
-        } else {
-            try ctx.emit(op, .{ .none = {} });
-        }
+        try ctx.emit(op, .{ .none = {} });
     }
 }
 
 /// parseAdditive: `+`, `-`
 fn parseAdditive(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const left_raw_start: usize = ctx.raw.items.len;
     try parseMultiplicative(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -2159,21 +1988,13 @@ fn parseAdditive(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
-        const right_raw_start: usize = ctx.raw.items.len;
         try parseMultiplicative(ctx);
-        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
-            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
-        {
-            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
-        } else {
-            try ctx.emit(op, .{ .none = {} });
-        }
+        try ctx.emit(op, .{ .none = {} });
     }
 }
 
 /// parseMultiplicative: `*`, `/`, `%`
 fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    const left_raw_start: usize = ctx.raw.items.len;
     try parseUnary(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -2184,15 +2005,8 @@ fn parseMultiplicative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             else => break,
         };
         _ = try ctx.nextToken();
-        const right_raw_start: usize = ctx.raw.items.len;
         try parseUnary(ctx);
-        if (leftSideHasOutput(ctx.raw.items[left_raw_start..right_raw_start]) or
-            leftSideHasOutput(ctx.raw.items[right_raw_start..]))
-        {
-            try distributeBinaryOp(ctx, op, left_raw_start, right_raw_start);
-        } else {
-            try ctx.emit(op, .{ .none = {} });
-        }
+        try ctx.emit(op, .{ .none = {} });
     }
 }
 
@@ -2385,39 +2199,56 @@ fn isArgBuiltin(name: []const u8) bool {
 fn compileValueArgBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.nextToken(); // consume '('
 
-    // Parse first alternative
-    const chain_start: usize = ctx.raw.items.len;
+    // Use fork/backtrack model for generator args: each comma alternative
+    // becomes a fork branch that evaluates the arg and calls the builtin.
+    // Structure: FORK L2, <arg1>, call_builtin, JUMP end, L2: <arg2>, call_builtin, end:
+    var jump_fixups = std.ArrayList(usize){};
+    defer jump_fixups.deinit(ctx.alloc);
+    var left_start: usize = ctx.raw.items.len;
     try parseAlternative(ctx);
+    var prev_fork_pos: ?usize = null;
 
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .comma) break;
         _ = try ctx.nextToken(); // consume ','
 
-        // Insert save_input before the entire left subtree
-        try insertRawInstr(ctx, chain_start, RawInstr{ .op = .save_input, .operand = .{ .none = {} } });
+        // Emit call_builtin for the left side before inserting FORK
+        try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
 
-        // Emit call_builtin for the left side
-        try ctx.emit(
-            .call_builtin,
-            .{ .index = @intFromEnum(bid) },
-        );
-        // Emit output for the left side, then restore_input
-        try ctx.emit(.output, .{ .none = {} });
-        try ctx.emit(.restore_input, .{ .none = {} });
+        // Insert FORK before the left branch
+        try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
+        if (prev_fork_pos) |pfp| {
+            ctx.raw.items[pfp].operand.index = @intCast(left_start);
+        }
+
+        // Emit JUMP past remaining alternatives
+        const jump_pos = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+        try jump_fixups.append(ctx.alloc, jump_pos);
+
+        const current_fork_pos = left_start;
+        left_start = ctx.raw.items.len;
 
         // Parse next alternative
         try parseAlternative(ctx);
+
+        // Backpatch FORK target to where the next alternative starts
+        ctx.raw.items[current_fork_pos].operand.index = @intCast(left_start);
+        prev_fork_pos = current_fork_pos;
     }
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
     // Emit call_builtin for the last (or only) alternative
-    try ctx.emit(
-        .call_builtin,
-        .{ .index = @intFromEnum(bid) },
-    );
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+
+    // Backpatch all JUMPs to end
+    const end_pos: i64 = @intCast(ctx.raw.items.len);
+    for (jump_fixups.items) |fixup| {
+        ctx.raw.items[fixup].operand.index = end_pos;
+    }
 }
 
 /// Parse a single semicolon-delimited argument that may contain commas (generators).
@@ -2432,7 +2263,7 @@ fn parseArgToArray(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parsePipe(ctx);
 
     // Each generated value needs to be collected
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // End collection
     const end_pos: u32 = @intCast(ctx.raw.items.len);
@@ -2451,13 +2282,13 @@ fn compileMap(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.array_collect_start, .{ .index = 0 });
 
     // Emit iterate: iterates over current value
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Parse the mapping expression (use parsePipe to support commas/pipes in filter args)
     try parsePipe(ctx);
 
     // Emit output to collect each element
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // Consume closing paren
     const rparen = try ctx.nextToken();
@@ -2509,10 +2340,7 @@ fn compileSelect(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const skip_ip: u32 = @intCast(ctx.raw.items.len);
     ctx.raw.items[jif_pos].operand = .{ .index = skip_ip };
     try ctx.emit(.restore_input, .{ .none = {} });
-    try ctx.emit(
-        .call_builtin,
-        .{ .index = @intFromEnum(types.BuiltinId.empty) },
-    );
+    try ctx.emit(.backtrack, .{ .none = {} });
 
     // done:
     const done_ip: u32 = @intCast(ctx.raw.items.len);
@@ -2559,7 +2387,7 @@ fn compileWhile(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.restore_input, .{ .none = {} });
 
     // output — emit current value
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // <update>
     try parsePipe(ctx);
@@ -2581,11 +2409,8 @@ fn compileWhile(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // restore_input (false path — balance the save_input)
     try ctx.emit(.restore_input, .{ .none = {} });
 
-    // call_builtin(empty) — produce no output on exit
-    try ctx.emit(
-        .call_builtin,
-        .{ .index = @intFromEnum(types.BuiltinId.empty) },
-    );
+    // backtrack — produce no output on exit
+    try ctx.emit(.backtrack, .{ .none = {} });
 }
 
 /// Compile `until(cond; update)` — apply update until cond is true, output
@@ -2676,7 +2501,7 @@ fn compileRepeat(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const loop_top: u32 = @intCast(ctx.raw.items.len);
 
     // output — emit current value
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // <f>
     try parsePipe(ctx);
@@ -2903,7 +2728,7 @@ fn compileIsempty(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
     try parsePipe(ctx);
 
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
@@ -2963,7 +2788,7 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseOr(ctx);
 
     // output
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // ACE1: array_collect_end
     const ace1_end: u32 = @intCast(ctx.raw.items.len);
@@ -3009,7 +2834,7 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.array_collect_start, .{ .index = 0 });
 
     // iterate — IterFrame over collected array
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Bind current element to pattern variables
     try ctx.emit(.push_current, .{ .none = {} });
@@ -3028,7 +2853,7 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.capture_variable, .{ .index = acc_id });
 
     // output — triggers IterFrame advance
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // Consume `)`
     const rparen = try ctx.nextToken();
@@ -3129,7 +2954,7 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseOr(ctx);
 
     // output
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // ACE1: array_collect_end
     const ace1_end: u32 = @intCast(ctx.raw.items.len);
@@ -3162,7 +2987,7 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parsePipe(ctx);
 
     // output
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // ACE2: array_collect_end
     const ace2_end: u32 = @intCast(ctx.raw.items.len);
@@ -3187,7 +3012,7 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.pipe, .{ .none = {} });
 
     // iterate — outer: over INIT values
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // capture_variable($acc)
     try ctx.emit(.capture_variable, .{ .index = acc_id });
@@ -3199,7 +3024,7 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.pipe, .{ .none = {} });
 
     // iterate — inner: over EXPR values
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Bind current element to pattern variables
     try ctx.emit(.push_current, .{ .none = {} });
@@ -3233,14 +3058,14 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try parsePipe(ctx);
 
         // output -> ACE3 buffer
-        try ctx.emit(.output, .{ .none = {} });
+        try ctx.emit(.yield_output, .{ .none = {} });
     } else {
         // 2-arg form: output accumulator directly
         // load_variable($acc)
         try ctx.emit(.load_variable, .{ .index = acc_id });
 
         // output -> ACE3 buffer
-        try ctx.emit(.output, .{ .none = {} });
+        try ctx.emit(.yield_output, .{ .none = {} });
     }
 
     // Consume `)`
@@ -3256,7 +3081,7 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.pipe, .{ .none = {} });
 
     // iterate — emit each individually (makes foreach a generator)
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Cleanup: pop pattern variables in reverse order, then hidden vars
     {
@@ -3303,7 +3128,7 @@ fn compileIn(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             .call_builtin,
             .{ .index = @intFromEnum(types.BuiltinId.in_) },
         );
-        try ctx.emit(.output, .{ .none = {} });
+        try ctx.emit(.yield_output, .{ .none = {} });
         try ctx.emit(.restore_input, .{ .none = {} });
 
         // For next alternative, save_input again
@@ -3387,7 +3212,7 @@ fn compileRange(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             .{ .index = @intFromEnum(types.BuiltinId.range1_gen) },
         );
         try ctx.emit(.pipe, .{ .none = {} });
-        try ctx.emit(.iterate, .{ .none = {} });
+        try ctx.emit(.each, .{ .none = {} });
         return;
     }
 
@@ -3417,7 +3242,7 @@ fn compileRange(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             .{ .index = @intFromEnum(types.BuiltinId.range2_gen) },
         );
         try ctx.emit(.pipe, .{ .none = {} });
-        try ctx.emit(.iterate, .{ .none = {} });
+        try ctx.emit(.each, .{ .none = {} });
         return;
     }
     if (t2.tag != .semicolon) return ctx.syntaxErr(t2.offset, t2.len);
@@ -3440,7 +3265,7 @@ fn compileRange(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         .{ .index = @intFromEnum(types.BuiltinId.range3_gen) },
     );
     try ctx.emit(.pipe, .{ .none = {} });
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 }
 
 // ── Tier 2 arg-taking builtins ──────────────────────────────────────────────
@@ -3487,12 +3312,12 @@ fn compileFilterArgBuiltin(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{Ou
     // Collect keys: [.[] | f]
     const start_pos = ctx.raw.items.len;
     try ctx.emit(.array_collect_start, .{ .index = 0 });
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Parse the filter expression (use parsePipe to support commas/pipes in filter args)
     try parsePipe(ctx);
 
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
@@ -3523,12 +3348,12 @@ fn compileWithEntries(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // map(f): array_collect_start, iterate, <f>, output, array_collect_end
     const start_pos = ctx.raw.items.len;
     try ctx.emit(.array_collect_start, .{ .index = 0 });
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Parse the filter expression (use parsePipe to support commas/pipes in filter args)
     try parsePipe(ctx);
 
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
@@ -3570,10 +3395,10 @@ fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory}
         // We need to insert iterate before the filter. Use insertRawInstr.
         // Actually, we need: iterate, <f>. The filter is already emitted.
         // Insert iterate before the filter.
-        try insertRawInstr(ctx, start_pos + 1, RawInstr{ .op = .iterate, .operand = .{ .none = {} } });
+        try insertRawInstr(ctx, start_pos + 1, RawInstr{ .op = .each, .operand = .{ .none = {} } });
     }
 
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
@@ -3594,26 +3419,27 @@ fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory}
 /// Compile `first(f)`: desugar to `[f] | .[0]`.
 /// Actually, more efficient: just collect first output. For now, use `[f] | .[0]`.
 fn compileFirst(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Desugar first(f) to limit(1; f) — stops after first output, doesn't evaluate rest.
     _ = try ctx.nextToken(); // consume '('
 
-    // Collect [f]
-    const start_pos = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    // Push n=1 for limit_start.
+    try ctx.emit(.push_int, .{ .int = 1 });
 
+    // limit_start: pops n from value_stack, sets up streaming counter.
+    const limit_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.limit_start, .{ .index = 0 }); // backpatch exit_ip
+
+    // Parse body expression f.
     try parsePipe(ctx);
-
-    try ctx.emit(.output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
-    const end_pos: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+    // Emit output inside the limit scope.
+    try ctx.emit(.yield_output, .{ .none = {} });
 
-    // .[0]
-    try ctx.emit(.pipe, .{ .none = {} });
-    try ctx.emit(.load_index, .{ .index = 0 });
+    // exit_ip points past the inner output (end of the limit scope).
+    ctx.raw.items[limit_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
 }
 
 /// Compile `last(f)`: desugar to `[f] | .[-1]`.
@@ -3626,7 +3452,7 @@ fn compileLast(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
     try parsePipe(ctx);
 
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
@@ -3658,7 +3484,7 @@ fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.pipe, .{ .none = {} });
 
     // Iterate over n values
-    try ctx.emit(.iterate, .{ .none = {} });
+    try ctx.emit(.each, .{ .none = {} });
 
     // Push current n to value_stack for limit_start
     try ctx.emit(.push_current, .{ .none = {} });
@@ -3681,7 +3507,7 @@ fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
     // Emit output inside the limit scope — the limit counter in the output handler
     // will decrement for each value and stop evaluation when exhausted.
-    try ctx.emit(.output, .{ .none = {} });
+    try ctx.emit(.yield_output, .{ .none = {} });
 
     // exit_ip points past the inner output (end of the limit scope).
     // Used by limit_start for n=0 (skip body) and by the output handler
@@ -3851,13 +3677,13 @@ fn compileStringInterpolation(ctx: *Ctx, first_part_raw: []const u8, format_bid:
 fn parsePrimary(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const start = ctx.raw.items.len;
     try parsePrimaryInner(ctx);
-    // Postfix ? operator: wraps the preceding primary expression in try_begin/try_end
+    // Postfix ? operator: wraps the preceding primary expression in fork_try/pop_try
     while (true) {
         const peek = try ctx.lex.peek();
         if (peek.tag != .question) break;
         _ = try ctx.nextToken();
-        try insertRawInstr(ctx, start, .{ .op = .try_begin, .operand = .{ .index = 0 }, .src_offset = ctx.last_tok_offset });
-        try ctx.emit(.try_end, .{ .index = 0 });
+        try insertRawInstr(ctx, start, .{ .op = .fork_try, .operand = .{ .index = 0 }, .src_offset = ctx.last_tok_offset });
+        try ctx.emit(.pop_try, .{ .none = {} });
     }
 }
 
@@ -3942,16 +3768,20 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 } else {
                     // No user function — treat as zero-arg builtin (the `(` is chaining).
                     const bid = zeroArgBuiltinId(ident_name).?;
+                    const start = ctx.raw.items.len;
                     try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+                    try parseSuffixes(ctx, start);
                     return;
                 }
             } else if (zeroArgBuiltinId(ident_name)) |bid| {
                 // Zero-arg builtins: length, keys, values, type, empty, tostring, tonumber, error, add, keys_unsorted
                 // These do NOT consume parens even if followed by '(' (which would be chaining).
+                const start = ctx.raw.items.len;
                 try ctx.emit(
                     .call_builtin,
                     .{ .index = @intFromEnum(bid) },
                 );
+                try parseSuffixes(ctx, start);
                 return;
             }
 
@@ -4426,20 +4256,21 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// correctly parses as `(try .foo) | .bar`, matching jq's term-level precedence.
 ///
 /// Emits for `try EXPR` (no catch):
-///   try_begin(catch_ip=0)    ← 0 = suppress on error
+///   fork_try(0)              ← 0 = suppress on error
 ///   <EXPR>
-///   try_end(after_ip=0)      ← 0 = no handler to skip; ip+1
+///   pop_try
 ///
 /// Emits for `try EXPR catch HDLR`:
-///   try_begin(catch_ip=N)    ← N = first instruction of HDLR
+///   fork_try(catch_ip)       ← push try_handler forkpoint
 ///   <EXPR>
-///   try_end(after_ip=M)      ← M = first instruction past HDLR
-///   N: <HDLR>                ← handler receives error string as `current`
-///   M: (next instruction)
+///   pop_try                  ← remove try_handler from fork stack
+///   jump L_past              ← skip handler
+///   L_handler: <HDLR>        ← handler receives error string as `current`
+///   L_past: (next instruction)
 fn parseTryCatch(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    // Emit try_begin with placeholder catch_ip (backpatched if catch is present).
-    const try_begin_pos = ctx.raw.items.len;
-    try ctx.emit(.try_begin, .{ .index = 0 });
+    // Emit fork_try with placeholder catch_ip (backpatched if catch is present).
+    const fork_try_pos = ctx.raw.items.len;
+    try ctx.emit(.fork_try, .{ .index = 0 });
 
     // Parse the try body at primary level so that `|` is left to the outer pipe.
     try parsePrimary(ctx);
@@ -4448,22 +4279,24 @@ fn parseTryCatch(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     if (t.tag == .catch_kw) {
         _ = try ctx.nextToken(); // consume 'catch'
 
-        // Emit try_end with placeholder after_ip (backpatched after parsing handler).
-        const try_end_pos = ctx.raw.items.len;
-        try ctx.emit(.try_end, .{ .index = 0 });
+        try ctx.emit(.pop_try, .{ .none = {} });
 
-        // Backpatch try_begin to point at the first instruction of the handler.
+        // Emit jump with placeholder (backpatched after parsing handler).
+        const jump_pos = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+
+        // Backpatch fork_try to point at the first instruction of the handler.
         const catch_ip: u32 = @intCast(ctx.raw.items.len);
-        ctx.raw.items[try_begin_pos].operand = .{ .index = catch_ip };
+        ctx.raw.items[fork_try_pos].operand = .{ .index = catch_ip };
 
         // Parse the catch handler at primary level.
         try parsePrimary(ctx);
 
-        // Backpatch try_end to jump past the handler.
-        ctx.raw.items[try_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+        // Backpatch jump to past the handler.
+        ctx.raw.items[jump_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
     } else {
-        // No catch: try_end with sentinel 0 means "no jump, ip+1".
-        try ctx.emit(.try_end, .{ .index = 0 });
+        // No catch: suppress mode.
+        try ctx.emit(.pop_try, .{ .none = {} });
     }
 }
 
@@ -4557,13 +4390,13 @@ fn parseArrayConstruct(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         // Save input so each comma-separated expression sees the original value.
         try ctx.emit(.save_input, .{ .none = {} });
         try parsePipe(ctx);
-        try ctx.emit(.output, .{ .none = {} });
+        try ctx.emit(.yield_output, .{ .none = {} });
         while ((try ctx.lex.peek()).tag == .comma) {
             _ = try ctx.nextToken(); // consume comma
             try ctx.emit(.restore_input, .{ .none = {} });
             try ctx.emit(.save_input, .{ .none = {} });
             try parsePipe(ctx);
-            try ctx.emit(.output, .{ .none = {} });
+            try ctx.emit(.yield_output, .{ .none = {} });
         }
         try ctx.emit(.restore_input, .{ .none = {} });
     }
@@ -4937,11 +4770,11 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
             },
             .question => {
                 _ = try ctx.nextToken();
-                // Retroactively wrap the preceding segment in try_begin / try_end
+                // Retroactively wrap the preceding segment in fork_try / pop_try
                 // (no catch handler — errors are suppressed silently).
                 // insertRawInstr shifts all existing jump targets past segment_start.
-                try insertRawInstr(ctx, segment_start, RawInstr{ .op = .try_begin, .operand = .{ .index = 0 } });
-                try ctx.emit(.try_end, .{ .index = 0 });
+                try insertRawInstr(ctx, segment_start, RawInstr{ .op = .fork_try, .operand = .{ .index = 0 } });
+                try ctx.emit(.pop_try, .{ .none = {} });
                 // The next `?` (if any) only wraps what comes after this try_end.
                 segment_start = ctx.raw.items.len;
                 // After a ?, the next suffix element starts a new segment but still
@@ -5002,7 +4835,7 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     switch (t.tag) {
         .rbracket => {
             _ = try ctx.nextToken();
-            try ctx.emit(.iterate, .{ .none = {} });
+            try ctx.emit(.each, .{ .none = {} });
         },
         .colon => {
             // .[:n] or .[:] — slice with no left bound
@@ -5261,9 +5094,7 @@ fn fuse(
                 .push_null => .{ .none = {} },
                 .push_current => .{ .none = {} },
                 .identity => .{ .none = {} },
-                .iterate => .{ .none = {} },
                 .pipe => .{ .none = {} },
-                .output => .{ .none = {} },
                 .add => .{ .none = {} },
                 .sub => .{ .none = {} },
                 .mul => .{ .none = {} },
@@ -5297,24 +5128,15 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .array_collect_end => .{ .none = {} },
-                // Alternative operator: remap jump target raw → fused index.
-                .alt_start => .{ .none = {} },
-                .alt_check => blk: {
-                    const idx_usize: usize = @intCast(r.operand.index);
-                    const fused_idx = index_map.items[idx_usize];
-                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
-                },
-                // Try-catch: remap non-zero index operands (0 = sentinel, no jump).
-                .try_begin => blk: {
+                // Deprecated opcodes — no longer emitted.
+                .alt_start, .alt_check, .try_begin, .try_end => unreachable,
+                // Fork-based try/alt: remap non-zero index operands (0 = sentinel).
+                .fork_try, .fork_alt => blk: {
                     const idx_usize: usize = @intCast(r.operand.index);
                     const fused_idx = if (r.operand.index > 0) index_map.items[idx_usize] else 0;
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
-                .try_end => blk: {
-                    const idx_usize: usize = @intCast(r.operand.index);
-                    const fused_idx = if (r.operand.index > 0) index_map.items[idx_usize] else 0;
-                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
-                },
+                .pop_try => .{ .none = {} },
                 .slice => .{ .slice_args = r.operand.slice_args },
                 .navigate_key, .update_key => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
                 .navigate_index, .update_index => .{ .index = r.operand.index },
@@ -5335,6 +5157,17 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .limit_end => .{ .none = {} },
+                // Fork stack opcodes: fork carries backtrack IP that needs remapping.
+                .fork => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .backtrack => .{ .none = {} },
+                .each => .{ .none = {} },
+                .yield_output => .{ .none = {} },
+                // Deprecated opcodes — no longer emitted by compiler.
+                .output, .iterate => unreachable,
             },
         };
     }

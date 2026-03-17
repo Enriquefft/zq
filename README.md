@@ -1,18 +1,14 @@
-# zq
+# zq — 25x faster jq
 
-> A drop-in replacement for jq — rewritten in Zig to be **25x faster**, with zero dependencies and native support for the streaming, high-throughput workloads that define modern AI pipelines.
+<!-- badges -->
+[![CI](https://github.com/Enriquefft/zq/actions/workflows/ci.yml/badge.svg)](https://github.com/Enriquefft/zq/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Drop-in replacement for jq. Same filter syntax, 25x faster on large files, with native JSONL streaming and LLM-safe truncated JSON recovery.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
 ```
-
----
-
-## What is it?
-
-[jq](https://jqlang.github.io/jq/) is the standard Unix tool for querying and transforming JSON. In the AI era, where every API response, model output, and data pipeline speaks JSON, it has become infrastructure. The problem: jq was built for a different era. It buckles under multi-gigabyte JSONL files, crashes on truncated JSON, and corrupts large integers above 2^53.
-
-zq fixes all of that. Same filter syntax. Just faster — and built for what developers actually need in 2026.
 
 ---
 
@@ -26,7 +22,7 @@ zq fixes all of that. Same filter syntax. Just faster — and built for what dev
 | jaq | 15.3s | 27.7s | 666 MB |
 | **zq** | **0.87s** | **2.9s** | **715 MB** |
 
-**Streaming mode — `cat file \| zq .id`**
+**Streaming mode — `cat file | zq .id`**
 
 | Tool | Time | RSS |
 |------|------|-----|
@@ -35,6 +31,22 @@ zq fixes all of that. Same filter syntax. Just faster — and built for what dev
 
 **Startup time:** ~2ms (2x faster than jq)
 **Binary size:** 2.7 MB static, stripped, zero dependencies
+
+---
+
+## Quick Demo
+
+```sh
+# Field access
+echo '{"name":"zq","fast":true}' | zq '.name'
+# "zq"
+
+# Filter + transform
+cat api_response.json | zq '[.results[] | select(.score > 0.9) | {id, label: .name}]'
+
+# Parallel JSONL — processes 15M records in under a second
+zq '.id' massive_dataset.jsonl > ids.txt
+```
 
 ---
 
@@ -59,19 +71,6 @@ zq is designed for programmatic use. Key integration points:
 - **Granular exit codes:** 0=success, 1=false(-e), 2=usage, 3=compile error, 4=runtime error, 5=system error
 - **jq compatible:** same filter syntax — any jq knowledge transfers directly
 - **C ABI:** embed via `zq_compile`/`zq_execute`/`zq_get_error` for structured error details
-
----
-
-## Status
-
-Early development. Core query engine and parallel runtime are complete.
-
-| Metric | Value |
-|--------|-------|
-| jq compat tests | 302/533 (57%) — targeting 60% for v0.1 |
-| Architecture | `error`, `types`, `io`, `parser`, `query`, `output`, `pool`, `c_abi` |
-
-The filter language covers: field access, pipes, array/object construction, arithmetic, comparisons, conditionals, `try/catch`, `//`, `|=`, slicing, string interpolation, recursive descent, `reduce`, `foreach`, and 130+ built-in functions.
 
 ---
 
@@ -120,9 +119,10 @@ Requires [Zig 0.15.2](https://ziglang.org/download/). Or with Nix: `direnv allow
 
 ## Roadmap
 
-**v0.1 — Useful:** 60%+ jq compat, all P0/P1 builtins, full CLI flags, agent-ready diagnostics
-**v0.5 — Fast:** 95% compat, WASM build, Python bindings, auto-detect JSON error output
-**v1.0 — Complete:** 100% compat, LSP, plugin system, MCP server integration
+**v0.1** ✅ — Core query engine, parallel runtime, agent-ready diagnostics, CLI parity
+**v0.2** ✅ — Unified fork/backtrack VM (61% jq compat — try-catch, alternative, label/break, limit)
+**v0.5** — WASM build, Python bindings, auto-detect JSON error output
+**v1.0** — Full jq compatibility, plugin system, MCP server integration
 
 ---
 
