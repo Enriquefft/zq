@@ -1,11 +1,14 @@
 #!/bin/bash
 # Scenario 3: Startup Latency
 # Time overhead of process initialization and single-record processing
+# Uses --warmup 0 and --shell=none to measure actual startup cost
 
 set -e
+set -o pipefail
 
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULT_FILE="$BENCHMARK_DIR/results/03_cold_start.md"
+RESULT_FILE="$BENCHMARK_DIR/results/03_startup_latency.md"
+JSON_FILE="$BENCHMARK_DIR/results/03_startup_latency.json"
 ZQ_BIN="$BENCHMARK_DIR/../zig-out/bin/zq"
 
 # Source progress utilities
@@ -15,9 +18,9 @@ mkdir -p "$BENCHMARK_DIR/results"
 
 # Quick mode reduces statistical rigor for faster iteration
 if [ "${ZQ_QUICK:-0}" = "1" ]; then
-    BM_WARMUP=1; BM_RUNS=10
+    BM_RUNS=10
 else
-    BM_WARMUP=5; BM_RUNS=100
+    BM_RUNS=100
 fi
 
 # Check prerequisites
@@ -28,6 +31,12 @@ fi
 if ! command -v "$ZQ_BIN" &> /dev/null; then
     echo "Error: zq not found. Build with: zig build" >&2
     exit 1
+fi
+
+# Create a tiny input file to avoid pipe overhead
+TINY_FILE="$BENCHMARK_DIR/data/tiny.json"
+if [ ! -f "$TINY_FILE" ]; then
+    echo '{"a":1}' > "$TINY_FILE"
 fi
 
 command -v jq  &> /dev/null || { echo "Warning: jq not found, skipping." >&2;  SKIP_JQ=true;  }
@@ -43,26 +52,28 @@ echo "" >> "$RESULT_FILE"
 
 echo "## Test Details" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
-echo "- **Input:** Single JSON object \`{\"a\":1}\`" >> "$RESULT_FILE"
+echo "- **Input:** \`tiny.json\` containing \`{\"a\":1}\`" >> "$RESULT_FILE"
 echo "- **Query:** \`.a\` (simple field extraction)" >> "$RESULT_FILE"
-echo "- **Warmup runs:** $BM_WARMUP" >> "$RESULT_FILE"
+echo "- **Warmup runs:** 0 (measures actual startup, not cached)" >> "$RESULT_FILE"
 echo "- **Benchmark runs:** $BM_RUNS" >> "$RESULT_FILE"
+echo "- **Shell:** none (--shell=none eliminates ~2-3ms shell overhead)" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
-# Build hyperfine command as an array to avoid quoting issues with eval
-HYPERFINE_ARGS=(hyperfine --warmup "$BM_WARMUP" --runs "$BM_RUNS"
-    --export-markdown "$BENCHMARK_DIR/results/03_cold_start_raw.md"
+# Build hyperfine command — --warmup 0 and --shell=none
+HYPERFINE_ARGS=(hyperfine --warmup 0 --runs "$BM_RUNS"
+    --shell=none
+    --export-markdown "$BENCHMARK_DIR/results/03_startup_latency_raw.md"
+    --export-json "$JSON_FILE"
     --ignore-failure)
 
-[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=("echo '{\"a\":1}' | jq .a")
-[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=("echo '{\"a\":1}' | jaq .a")
-[ "$SKIP_YQ"  != true ] && HYPERFINE_ARGS+=("echo '{\"a\":1}' | yq .a")
-HYPERFINE_ARGS+=("echo '{\"a\":1}' | \"$ZQ_BIN\" .a")
+[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=(--command-name jq "jq" ".a" "$TINY_FILE")
+[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=(--command-name jaq "jaq" ".a" "$TINY_FILE")
+[ "$SKIP_YQ"  != true ] && HYPERFINE_ARGS+=(--command-name yq "yq" ".a" "$TINY_FILE")
+HYPERFINE_ARGS+=(--command-name zq "$ZQ_BIN" ".a" "$TINY_FILE")
 
 echo "" >&2
-start_phase_timer "Hyperfine benchmark (cold start comparison)"
+start_phase_timer "Hyperfine benchmark (startup latency comparison)"
 "${HYPERFINE_ARGS[@]}" | tee -a "$RESULT_FILE"
 end_phase_timer "Hyperfine benchmark"
-
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2

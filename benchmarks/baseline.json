@@ -1,0 +1,5 @@
+{
+  "version": "1.0",
+  "note": "Baseline not yet established. Run benchmarks on CI to populate. This file will be updated on the first passing release tag.",
+  "scenarios": {}
+}

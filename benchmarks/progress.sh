@@ -12,7 +12,7 @@ ERASE_LINE='\033[K'
 
 # Global progress state
 MAIN_PROGRESS=0
-MAIN_TOTAL=4
+MAIN_TOTAL=5
 PHASE_START_TIME=0
 
 # Initialize main progress bar

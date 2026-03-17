@@ -1,0 +1,69 @@
+name: Benchmark Regression
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6 AM UTC
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq bc
+
+          # Install hyperfine (pinned version for --shell=none support)
+          HYPERFINE_VERSION="1.18.0"
+          curl -sSL "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+          mv "hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl/hyperfine" /usr/local/bin/hyperfine
+          chmod +x /usr/local/bin/hyperfine
+
+          # Install jaq (pinned version for reproducibility)
+          JAQ_VERSION="2.1.0"
+          curl -sSL "https://github.com/01mf02/jaq/releases/download/v${JAQ_VERSION}/jaq-v${JAQ_VERSION}-x86_64-unknown-linux-musl" -o /usr/local/bin/jaq
+          chmod +x /usr/local/bin/jaq
+
+          # Install gojq (pinned version for reproducibility)
+          GOJQ_VERSION="0.12.17"
+          curl -sSL "https://github.com/itchyny/gojq/releases/download/v${GOJQ_VERSION}/gojq_v${GOJQ_VERSION}_linux_amd64.tar.gz" | tar xz
+          mv "gojq_v${GOJQ_VERSION}_linux_amd64/gojq" /usr/local/bin/gojq
+          chmod +x /usr/local/bin/gojq
+
+      - name: Build zq
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Generate test data
+        run: |
+          cd benchmarks/data
+          bash huge.generator.sh
+          ls -lh huge.jsonl
+
+      - name: Run benchmarks (quick mode)
+        run: |
+          cd benchmarks
+          ZQ_QUICK=1 ./run_all.sh
+        env:
+          ZQ_QUICK: "1"
+
+      - name: Validate summary JSON
+        run: jq . benchmarks/results/summary.json
+
+      - name: Check regression
+        run: |
+          cd benchmarks
+          bash check_regression.sh results/summary.json baseline.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmarks/results/

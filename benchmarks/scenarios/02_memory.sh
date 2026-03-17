@@ -3,14 +3,15 @@
 # Memory footprint stability when processing large datasets in streaming mode
 
 set -e
+set -o pipefail
 
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_FILE="$BENCHMARK_DIR/data/huge.jsonl"
 RESULT_FILE="$BENCHMARK_DIR/results/02_memory.md"
 ZQ_BIN="$BENCHMARK_DIR/../zig-out/bin/zq"
 
-# Source progress utilities
-source "$BENCHMARK_DIR/progress.sh"
+# Source shared configuration (also sources progress.sh)
+source "$BENCHMARK_DIR/common.sh"
 
 mkdir -p "$BENCHMARK_DIR/results"
 
@@ -43,7 +44,7 @@ echo "" >> "$RESULT_FILE"
 echo "## Test Details" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 echo "- **File:** \`$DATA_FILE\`" >> "$RESULT_FILE"
-echo "- **Size:** $(du -h "$DATA_FILE" | cut -f1)" >> "$RESULT_FILE"
+echo "- **Size:** $(file_size_display "$DATA_FILE")" >> "$RESULT_FILE"
 echo "- **Lines:** $(wc -l < "$DATA_FILE")" >> "$RESULT_FILE"
 echo "- **Query:** \`select(.id > 500000)\` (streaming filter)" >> "$RESULT_FILE"
 echo "- **Note:** yq excluded — does not support JSONL multi-record files." >> "$RESULT_FILE"

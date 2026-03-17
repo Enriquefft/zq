@@ -2,6 +2,7 @@
 # Orchestrate all benchmark scenarios and generate summary report
 
 set -e
+set -o pipefail
 
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUMMARY_FILE="$BENCHMARK_DIR/results/SUMMARY.md"
@@ -18,6 +19,8 @@ export ZQ_QUICK
 
 # Source progress utilities
 source "$BENCHMARK_DIR/progress.sh"
+
+TOTAL_SCENARIOS=5
 
 # Initialize main progress bar
 init_main_progress
@@ -41,10 +44,6 @@ fi
 
 if ! command -v jaq &> /dev/null; then
     MISSING_TOOLS+=("jaq (install: package manager)")
-fi
-
-if ! command -v yq &> /dev/null; then
-    MISSING_TOOLS+=("yq (install: package manager)")
 fi
 
 if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
@@ -82,7 +81,7 @@ cat > "$SUMMARY_FILE" << EOF
 
 **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
-This report summarizes benchmark results comparing zq against jq across 4 key scenarios.
+This report summarizes benchmark results comparing zq against jq across 5 key scenarios.
 
 ---
 
@@ -111,7 +110,7 @@ echo "" >> "$SUMMARY_FILE"
 start_phase_timer "Multi-core Scalability"
 bash "$BENCHMARK_DIR/scenarios/01_parallelism.sh"
 end_phase_timer "Multi-core Scalability"
-update_main_progress 1 4 "Multi-core Scalability"
+update_main_progress 1 $TOTAL_SCENARIOS "Multi-core Scalability"
 echo "" >> "$SUMMARY_FILE"
 echo "## Scenario 1: Multi-core Scalability" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
@@ -122,7 +121,7 @@ echo "" >> "$SUMMARY_FILE"
 start_phase_timer "Memory Efficiency"
 bash "$BENCHMARK_DIR/scenarios/02_memory.sh"
 end_phase_timer "Memory Efficiency"
-update_main_progress 2 4 "Memory Efficiency"
+update_main_progress 2 $TOTAL_SCENARIOS "Memory Efficiency"
 echo "" >> "$SUMMARY_FILE"
 echo "## Scenario 2: Memory Efficiency" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
@@ -131,24 +130,35 @@ echo "" >> "$SUMMARY_FILE"
 
 # Scenario 3
 start_phase_timer "Startup Latency"
-bash "$BENCHMARK_DIR/scenarios/03_cold_start.sh"
+bash "$BENCHMARK_DIR/scenarios/03_startup_latency.sh"
 end_phase_timer "Startup Latency"
-update_main_progress 3 4 "Startup Latency"
+update_main_progress 3 $TOTAL_SCENARIOS "Startup Latency"
 echo "" >> "$SUMMARY_FILE"
 echo "## Scenario 3: Startup Latency" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
-echo "Full results: [03_cold_start.md](03_cold_start.md)" >> "$SUMMARY_FILE"
+echo "Full results: [03_startup_latency.md](03_startup_latency.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 
 # Scenario 4
-start_phase_timer "Malformed Data Resilience"
-bash "$BENCHMARK_DIR/scenarios/04_fault_tolerance.sh"
-end_phase_timer "Malformed Data Resilience"
-update_main_progress 4 4 "Malformed Data Resilience"
+start_phase_timer "Streaming Throughput"
+bash "$BENCHMARK_DIR/scenarios/04_streaming.sh"
+end_phase_timer "Streaming Throughput"
+update_main_progress 4 $TOTAL_SCENARIOS "Streaming Throughput"
 echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 4: Malformed Data Resilience" >> "$SUMMARY_FILE"
+echo "## Scenario 4: Streaming/Pipe Throughput" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
-echo "Full results: [04_fault_tolerance.md](04_fault_tolerance.md)" >> "$SUMMARY_FILE"
+echo "Full results: [04_streaming.md](04_streaming.md)" >> "$SUMMARY_FILE"
+echo "" >> "$SUMMARY_FILE"
+
+# Scenario 5
+start_phase_timer "Complex Query"
+bash "$BENCHMARK_DIR/scenarios/05_complex_query.sh"
+end_phase_timer "Complex Query"
+update_main_progress 5 $TOTAL_SCENARIOS "Complex Query"
+echo "" >> "$SUMMARY_FILE"
+echo "## Scenario 5: Complex Query" >> "$SUMMARY_FILE"
+echo "" >> "$SUMMARY_FILE"
+echo "Full results: [05_complex_query.md](05_complex_query.md)" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 
 echo "" >&2
@@ -160,12 +170,13 @@ cat >> "$SUMMARY_FILE" << EOF
 
 ## Test Scenarios
 
-This benchmark suite includes four test scenarios:
+This benchmark suite includes five test scenarios:
 
 1. **Multi-core Scalability**: Throughput on large-scale batch processing
 2. **Memory Efficiency**: Resource footprint during streaming operations
 3. **Startup Latency**: Process initialization overhead
-4. **Malformed Data Resilience**: Recovery rates when handling invalid JSON records
+4. **Streaming Throughput**: Pipe-based stdin processing performance
+5. **Complex Query**: Real-world transformation with multiple operators
 
 ---
 
@@ -179,10 +190,11 @@ echo "" >&2
 echo "  Finished: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >&2
 echo "" >&2
 echo "  Results:" >&2
-echo "    01_parallelism.md     — Multi-core Scalability" >&2
-echo "    02_memory.md          — Memory Efficiency" >&2
-echo "    03_cold_start.md      — Startup Latency" >&2
-echo "    04_fault_tolerance.md — Malformed Data Resilience" >&2
+echo "    01_parallelism.md      — Multi-core Scalability" >&2
+echo "    02_memory.md           — Memory Efficiency" >&2
+echo "    03_startup_latency.md  — Startup Latency" >&2
+echo "    04_streaming.md        — Streaming Throughput" >&2
+echo "    05_complex_query.md    — Complex Query" >&2
 echo "" >&2
 echo "  Full Summary: $SUMMARY_FILE" >&2
 echo "" >&2
