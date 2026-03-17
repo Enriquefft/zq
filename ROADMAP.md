@@ -30,12 +30,12 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-17)
 
-**Last updated:** `--describe` — input data shape inference with streaming merge, depth cap, optional field detection, pretty/compact output
+**Last updated:** `--validate` + `llms.txt` — filter syntax validation and machine-readable documentation for LLM/agent discovery
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       302/533 passing (56.7%)
-  +-- 228 skipped/failing
+Compat tests:       310/533 passing (58.2%)
+  +-- 220 skipped/failing
 Startup:            ~2 ms (2x faster than jq)
 Cold start:         sub-3ms
 
@@ -55,6 +55,7 @@ Streaming (cat | zq .id):
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
+**Agent interface:** `--json-errors`, `--describe`, `--validate`, exit codes, C ABI errors, `llms.txt`, 134 builtins.
 
 ---
 
@@ -75,9 +76,7 @@ Streaming (cat | zq .id):
 - [x] Startup time < 3ms (achieved: ~2ms)
 - [x] `--json-errors` produces structured error output
 - [x] `--describe` shows input data shape
-- [ ] `--validate` checks filter syntax without executing
-- [ ] MCP server with `query_json`, `describe_json`, `validate_filter` tools
-- [ ] `--tool-spec` outputs JSON tool definition for agent frameworks
+- [x] `--validate` checks filter syntax without executing
 
 ### Agent interface — P0
 
@@ -89,11 +88,9 @@ failure mode agents hit with jq today.
 |---|---------|-------------|-------------------|
 | [x] | **`--json-errors`** | Errors as JSON to stderr: `{"error": "type_error", "line": 1, "col": 5, "offset": 4, "len": 0, "filter": "...", "message": "...", "description": "..."}` | Agents can parse errors, understand what went wrong, and self-correct. jq's text errors cause retry loops. |
 | [x] | **`--describe`** | Print input data shape to stdout: `{"type": "object", "fields": {"id": "number", "name": "string", "tags": "array"}, "count": 15000000}` | Agents can inspect data before writing a query. Eliminates blind guessing. |
-| [ ] | **`--validate FILTER`** | Check filter syntax, exit 0 if valid, exit 2 with JSON error if not. No input required. | Agents can verify a filter before running it on real data. Fail fast, no wasted work. |
+| [x] | **`--validate FILTER`** | Check filter syntax, exit 0 if valid, exit 3 with JSON error if not. No input required. | Agents can verify a filter before running it on real data. Fail fast, no wasted work. |
 | [x] | **Documented exit codes** | 0=success, 1=false/null (-e), 2=usage, 3=compile error, 4=runtime error, 5=system error | Agents need unambiguous signal of what went wrong. Exit codes split by error category. |
-| [ ] | **`llms.txt`** | Machine-readable documentation file at repo root. Structured reference of all flags, builtins, and query syntax for LLM consumption. | How agents discover what zq can do. Optimized for context windows, not human scanning. |
-| [ ] | **MCP server** | zq as a Model Context Protocol tool. Agents call `query_json`, `describe_json`, `validate_filter` as structured tool calls — no CLI syntax needed. | The primary discovery and integration path. Agents using Claude, Cursor, Copilot, etc. can find and call zq natively. No shell escaping, no syntax guessing. |
-| [ ] | **`--tool-spec`** | Output a JSON tool definition (OpenAPI-compatible) describing zq's capabilities, flags, and builtins. | Any agent framework can auto-generate a tool binding from this. Universal discovery beyond MCP. |
+| [x] | **`llms.txt`** | Machine-readable documentation file at repo root. Structured reference of all flags, builtins, and query syntax for LLM consumption. | How agents discover what zq can do. Optimized for context windows, not human scanning. |
 
 ### Query language — P0
 
@@ -195,7 +192,6 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
 - [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 25x on 15M-record JSONL `.id`, 15x on `select()`)
-- [ ] MCP server listed in major registries (ships in v0.1, registry listing in v0.5)
 - [ ] `--strict` + `--suggest` + `--explain` all working
 - [ ] WASM build for sandboxed agent environments
 - [ ] Python bindings for programmatic agent use
@@ -208,7 +204,6 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [ ] | **`--suggest`** | On field-not-found errors, include available fields: `"available": ["foos", "foo_count"]`. On function errors, suggest closest builtin. | Agents can self-correct in a single retry instead of blind guessing. Closes the feedback loop. |
 | [ ] | **`--explain FILTER`** | Output a plain-english description of what a filter does: `"Select all elements from the .results array, extract the .name field from each"` | Agents can verify their own query intent before executing. Self-documentation. |
 | [ ] | **Structured `--help`** | `--help --json` outputs help as structured JSON: flags, builtins, examples, all machine-parseable. | Agents can programmatically understand zq's full capabilities without parsing human-readable text. |
-| [ ] | **MCP registry listing** | zq listed in Anthropic's MCP registry and other agent tool directories. | Passive discovery — agents find zq without being told about it. Ships after MCP server stabilizes in v0.1. |
 
 ### Agent interface — integration
 
@@ -459,6 +454,14 @@ capability and extends it for the LLM streaming workflow.
 | [x] | **mmap for large files** | io module (zero-copy reads) + pool submit_file (mmap -> byte-range chunks -> workers). |
 | [ ] | **Prefetch** | Issue `madvise(MADV_SEQUENTIAL)` for large file scans. |
 
+### Agent integration (deferred from v0.1)
+
+| | Item | Detail |
+|---|------|--------|
+| [ ] | **MCP server** | zq as a Model Context Protocol tool. Agents call `query_json`, `describe_json`, `validate_filter` as structured tool calls. Nice-to-have — agents already use zq effectively via CLI with `--json-errors` and `--describe`. |
+| [ ] | **`--tool-spec`** | Output a JSON tool definition (OpenAPI-compatible) describing zq's capabilities, flags, and builtins. Universal discovery beyond MCP. |
+| [ ] | **MCP registry listing** | List zq in Anthropic's MCP registry and other agent tool directories after MCP server stabilizes. |
+
 ### Developer experience
 
 | | Item | Detail |
@@ -493,7 +496,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **56.7%** (302/533) | 60% | 95% | 100% |
+| jq compat test pass rate | **58.2%** (310/533) | 60% | 95% | 100% |
 | Throughput vs jq (parallel, `.id`) | **25x** (0.87s vs 21.4s) | > 1x | 5x | 10x |
 | Throughput vs jq (parallel, `select()`) | **15x** (2.9s vs 41.6s) | -- | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
@@ -502,7 +505,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
 | Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | -- | -- | 10x |
 | Test count | **302 compat + module** | 400+ | 800+ | 1000+ |
-| Agent integration | **--json-errors, --describe, exit codes, C ABI errors, 134 builtins** | --validate, MCP server | Python bindings, WASM, registry listings | Framework integrations, LSP |
+| Agent integration | **--json-errors, --describe, --validate, exit codes, C ABI errors, llms.txt, 134 builtins** | -- | Python bindings, WASM | Framework integrations, LSP, MCP |
 
 ---
 

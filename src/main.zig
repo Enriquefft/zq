@@ -42,6 +42,7 @@ const Config = struct {
     json_errors: bool = false,
     describe: bool = false,
     describe_depth: u32 = 12,
+    validate: bool = false,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -99,6 +100,10 @@ pub fn main() !u8 {
         }
     };
     defer config.deinit();
+
+    if (config.validate) {
+        return processValidate(&config, allocator);
+    }
 
     if (config.describe) {
         return processDescribe(&config, allocator);
@@ -843,6 +848,81 @@ fn processNullInput(
     return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
 }
 
+/// Process --validate mode: compile filter only, report success or error.
+fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
+    if (config.files.len > 0) {
+        printErr("zq: --validate does not accept input files\n");
+        return EXIT_USAGE;
+    }
+    if (config.describe) {
+        printErr("zq: --validate is incompatible with --describe\n");
+        return EXIT_USAGE;
+    }
+
+    // Determine filter source.
+    const filter_src: []const u8 = blk: {
+        if (config.filter_file) |path| {
+            const file = std.fs.cwd().openFile(path, .{}) catch {
+                printErr("zq: could not open filter file: ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+            defer file.close();
+
+            const contents = file.readToEndAlloc(allocator, 1 * 1024 * 1024) catch {
+                printErr("zq: could not read filter file: ");
+                printErr(path);
+                printErr("\n");
+                return EXIT_SYSTEM;
+            };
+            // Note: leaks on this path, but process exits immediately after.
+            break :blk std.mem.trimRight(u8, contents, "\r\n");
+        }
+        break :blk config.filter orelse {
+            printErr("zq: --validate requires a filter\n");
+            return EXIT_USAGE;
+        };
+    };
+
+    // Build external variable declarations for compile.
+    var ext_decls_buf = allocator.alloc(query_mod.ExternalVarDecl, config.external_vars.len + 1) catch {
+        printErr("zq: out of memory\n");
+        return EXIT_SYSTEM;
+    };
+    defer allocator.free(ext_decls_buf);
+    for (config.external_vars, 0..) |ev, i| {
+        ext_decls_buf[i] = .{ .name = ev.name };
+    }
+    ext_decls_buf[config.external_vars.len] = .{ .name = "ARGS" };
+
+    const compile_result = query_mod.CompiledQuery.compile(filter_src, .{
+        .external_vars = ext_decls_buf,
+    }, allocator) catch {
+        printErr("zq: out of memory\n");
+        return EXIT_SYSTEM;
+    };
+
+    switch (compile_result) {
+        .ok => |compiled| {
+            var cq = compiled;
+            cq.deinit();
+            if (config.json_errors) {
+                std.fs.File.stdout().writeAll("{\"valid\":true}\n") catch {
+                    printErr("zq: write error\n");
+                    return EXIT_SYSTEM;
+                };
+            }
+            return EXIT_OK;
+        },
+        .err => |ce| {
+            const stderr_writer = StderrWriter{};
+            err_mod.formatDiagnostic(stderr_writer, filter_src, ce.kind, ce.offset, ce.len, null, null, allocator, if (config.json_errors) .json else .text);
+            return EXIT_COMPILE;
+        },
+    }
+}
+
 /// Process --describe mode: infer schema from all inputs, write result to stdout.
 fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
     // Validate incompatible options.
@@ -1222,6 +1302,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             break;
         } else if (std.mem.eql(u8, arg, "--json-errors")) {
             config.json_errors = true;
+        } else if (std.mem.eql(u8, arg, "--validate")) {
+            config.validate = true;
         } else if (std.mem.eql(u8, arg, "--describe")) {
             config.describe = true;
         } else if (std.mem.eql(u8, arg, "--depth")) {
@@ -1393,6 +1475,7 @@ fn printUsage() void {
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
+        \\  --validate            Check filter syntax without executing (exit 0=valid, 3=error)
         \\  --describe            Print input data shape (type, fields, count)
         \\  --depth N             Schema recursion depth (default: 12, 0=unlimited)
         \\  -h, --help            Print this help

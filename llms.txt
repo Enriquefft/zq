@@ -1,0 +1,229 @@
+# zq
+
+> zq is a high-performance JSON processor compatible with jq filter syntax. It is a drop-in jq replacement that runs 25x faster on large files via automatic parallelization. It produces structured JSON errors, machine-readable data shape descriptions, and uses documented exit codes — designed for reliable use by AI agents and automated workflows.
+
+## Installation
+
+- Static binaries (Linux, macOS, x86_64, aarch64): https://github.com/Enriquefft/zq/releases
+- Homebrew: `brew install Enriquefft/zq/zq`
+- AUR: `yay -S zq-bin`
+- Nix: `nix run github:Enriquefft/zq`
+
+## Quick start
+
+zq uses jq filter syntax. If you know jq, you know zq.
+
+```
+echo '{"name":"alice","age":30}' | zq '.name'
+zq '.[] | select(.age > 25)' users.json
+zq -c '{name: .title, id: .num}' items.json
+```
+
+## CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `FILTER` | jq filter expression (first positional argument) |
+| `FILE...` | Input files (remaining positional arguments; stdin if omitted) |
+| `-r`, `--raw-output` | Output raw strings without quotes |
+| `-R`, `--raw-input` | Read each input line as a raw string |
+| `-c`, `--compact-output` | Compact single-line JSON output |
+| `-e`, `--exit-status` | Exit 1 if last output is false or null |
+| `-n`, `--null-input` | Use `null` as input instead of reading stdin |
+| `-s`, `--slurp` | Read all inputs into a single array |
+| `-S`, `--sort-keys` | Sort object keys alphabetically |
+| `-j`, `--join-output` | No newline after each output value |
+| `-C`, `--color-output` | Force ANSI color output |
+| `-M`, `--monochrome-output` | Disable ANSI color output |
+| `-f FILE`, `--from-file FILE` | Read filter from file instead of argument |
+| `--tab` | Indent with tabs |
+| `--indent N` | Indent with N spaces (0-8, default 2) |
+| `--arg NAME VALUE` | Set `$NAME` to string `VALUE` |
+| `--argjson NAME VALUE` | Set `$NAME` to parsed JSON `VALUE` |
+| `--args` | Remaining arguments are string positional args (`$ARGS.positional`) |
+| `--jsonargs` | Remaining arguments are JSON positional args (`$ARGS.positional`) |
+| `--json-errors` | Emit errors as JSON to stderr |
+| `--validate` | Check filter syntax without executing (exit 0 if valid, 3 if error) |
+| `--describe` | Print input data shape (type, fields, count) to stdout |
+| `--depth N` | Schema inference depth for `--describe` (default 12, 0 = unlimited) |
+| `-h`, `--help` | Print help |
+| `-V`, `--version` | Print version |
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | False/null output (with `-e`) |
+| 2 | Usage error (bad arguments) |
+| 3 | Compile error (invalid filter syntax) |
+| 4 | Runtime error (type error, index out of bounds, user error) |
+| 5 | System error (I/O, out of memory) |
+
+## Filter syntax
+
+### Basics
+- `.` — identity (pass input through)
+- `.foo` — object field access
+- `.foo.bar` — nested field access
+- `.foo?` — optional field access (suppresses errors)
+- `.[0]` — array index
+- `.[-1]` — last element
+- `.[2:5]` — array/string slice
+- `.[]` — iterate all elements
+- `.[]?` — iterate (suppress errors on non-iterable)
+
+### Operators
+- `|` — pipe (compose filters)
+- `,` — output multiple values
+- `+`, `-`, `*`, `/`, `%` — arithmetic (also: object merge, string/array concat)
+- `==`, `!=`, `<`, `>`, `<=`, `>=` — comparison
+- `and`, `or`, `not` — boolean logic
+- `//` — alternative (null coalescing): `.foo // "default"`
+- `|=` — update: `.foo |= . + 1`
+- `+=`, `-=`, `*=`, `/=`, `%=`, `//=` — update shorthands
+
+### Construction
+- `{name: .foo, id: .bar}` — object construction
+- `{name}` — shorthand for `{name: .name}`
+- `{(.key): .value}` — computed key
+- `[.[] | .name]` — array construction
+- `"hello \(.name)"` — string interpolation
+
+### Control flow
+- `if .x then .y elif .z then .w else .v end` — conditional
+- `try .x catch .y` — error handling
+- `select(expr)` — keep value if expr is truthy
+- `empty` — produce no output
+
+### Iteration and reduction
+- `reduce .[] as $x (init; update)` — fold
+- `foreach .[] as $x (init; update; extract)` — stateful iteration
+- `while(cond; update)` — loop
+- `until(cond; update)` — loop until condition
+- `repeat(expr)` — infinite loop (use with `limit` or break condition)
+- `..` — recursive descent
+
+### Variables and functions
+- `expr as $x | ...` — bind variable
+- `def fname(args): body;` — define function (supports recursion)
+
+### Format strings
+- `@base64` / `@base64d` — Base64 encode/decode
+- `@uri` / `@urid` — URI encode/decode
+- `@html` — HTML escape
+- `@csv` / `@tsv` — CSV/TSV output
+- `@json` — JSON encode
+- `@sh` — shell-safe quoting
+- `@text` — identity format
+
+## Builtin functions
+
+### Data access
+`length`, `keys`, `keys_unsorted`, `values`, `has(key)`, `in(obj)`, `type`, `getpath(path)`, `setpath(path; val)`, `delpaths(paths)`, `paths`, `leaf_paths`
+
+### Selection and filtering
+`select(expr)`, `empty`, `map(expr)`, `map_values(expr)`, `del(path)`, `arrays`, `objects`, `strings`, `numbers`, `booleans`, `nulls`, `values`, `scalars`, `normals`, `iterables`
+
+### Aggregation
+`add`, `any`, `all`, `min`, `max`, `min_by(expr)`, `max_by(expr)`, `sort`, `sort_by(expr)`, `group_by(expr)`, `unique`, `unique_by(expr)`, `reverse`, `flatten`, `flatten(depth)`, `reduce`, `foreach`, `isempty(expr)`, `first(expr)`, `last(expr)`, `limit(n; expr)`
+
+### Object operations
+`to_entries`, `from_entries`, `with_entries(expr)`, `contains(val)`, `inside(val)`, `transpose`, `bsearch(val)`, `recurse`
+
+### String operations
+`ascii_downcase`, `ascii_upcase`, `ascii`, `explode`, `implode`, `split(sep)`, `join(sep)`, `startswith(str)`, `endswith(str)`, `ltrimstr(str)`, `rtrimstr(str)`, `test(regex)`, `match(regex)`, `sub(regex; repl)`, `gsub(regex; repl)`, `tostring`, `tojson`, `fromjson`
+
+### Math
+`floor`, `ceil`, `round`, `sqrt`, `pow(x; y)`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `abs`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(x; y)`, `cbrt`, `significand`, `logb`, `remainder(x; y)`, `hypot(x; y)`, `trunc`, `rint`, `nearbyint`, `j0`, `j1`, `lgamma`, `tgamma`, `scalb(x; y)`, `scalbln(x; y)`, `ldexp(x; y)`, `fma(x; y; z)`, `drem(x; y)`
+
+### Type conversion
+`tonumber`, `tostring`, `tojson`, `fromjson`, `type`, `not`
+
+### I/O and control
+`input`, `inputs`, `debug`, `stderr`, `error`, `error(msg)`, `halt`, `halt_error(code)`, `env`, `builtins`
+
+### Indexing
+`indices(val)`, `index(val)`, `rindex(val)`, `range(n)`, `range(from; to)`, `range(from; to; step)`
+
+## Agent features
+
+### Structured errors (--json-errors)
+
+When `--json-errors` is passed, errors are written to stderr as JSON:
+
+```json
+{"error":"query_syntax_error","line":1,"col":6,"offset":5,"len":3,"filter":".foo bar","description":"query syntax error"}
+```
+
+Fields: `error` (error type), `line`, `col`, `offset`, `len` (position in filter), `filter` (the filter string), `description` (human-readable message).
+
+Error types: `query_syntax_error`, `type_error`, `index_out_of_bounds`, `user_error`, `unexpected_token`, `unexpected_eof`, `invalid_utf8`, `invalid_number`, `unterminated_string`, `depth_limit_exceeded`, `io_error`, `out_of_memory`.
+
+### Filter validation (--validate)
+
+Check filter syntax without any input data:
+
+```
+zq --validate 'select(.x > 1) | .name'     # exits 0 if valid
+zq --validate --json-errors '.foo |'        # exits 3, JSON error to stderr
+zq --validate --json-errors '.foo | .bar'   # exits 0, prints {"valid":true} to stdout
+```
+
+### Data shape inference (--describe)
+
+Inspect input structure before writing a filter:
+
+```
+cat data.json | zq --describe -c
+```
+
+Output:
+```json
+{"type":"object","fields":{"id":"number","name":"string","tags":{"type":"array","elements":"string"}},"count":2}
+```
+
+Fields: `type` (value type or `"mixed"`), `fields` (object field schemas, each with optional `"optional":true`), `elements` (array element schema), `count` (number of records seen).
+
+### Parallel processing
+
+zq automatically parallelizes when given file arguments:
+
+```
+zq '.id' large.jsonl          # parallel (mmap, all cores)
+cat large.jsonl | zq '.id'    # streaming (batched, all cores)
+```
+
+No flags needed. File arguments trigger parallel mode automatically.
+
+## Common patterns
+
+```bash
+# Extract a field from each object in a JSONL file
+zq '.name' users.jsonl
+
+# Filter and reshape
+zq 'select(.status == "active") | {id, name: .display_name}' data.json
+
+# Count elements
+zq '[.[] | select(.type == "error")] | length' events.json
+
+# Aggregate
+zq '[.[] | .price] | add' orders.json
+
+# Group and count
+zq 'group_by(.category) | map({key: .[0].category, count: length})' items.json
+
+# Null-safe access with defaults
+zq '.config.timeout // 30' settings.json
+
+# Transform keys
+zq 'to_entries | map({(.key | ascii_downcase): .value}) | add' obj.json
+
+# Validate and inspect before querying
+zq --validate 'select(.x > 1)'
+zq --describe -c data.json
+
+# Machine-readable errors for automated pipelines
+zq --json-errors '.results[] | .id' api_response.json
+```
