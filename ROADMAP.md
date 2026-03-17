@@ -327,7 +327,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [x] | **AUR** | `yay -S zq-bin` |
 | [x] | **Nix** | `nix run github:Enriquefft/zq` |
 | [ ] | **Scoop** | Windows package manager |
-| [ ] | **Docker** | `docker run ghcr.io/Enriquefft/zq` |
+| [x] | **Docker** | `docker run ghcr.io/enriquefft/zq` |
 | [x] | **GitHub Releases** | Automated via CI on tag push |
 | [x] | **npm** | `npx @zqjson/zq` — for Node/JS agent environments |
 | [x] | **PyPI** | `pip install zq-json` — for Python agent environments |

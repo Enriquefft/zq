@@ -104,6 +104,7 @@ irm https://raw.githubusercontent.com/Enriquefft/zq/main/install.ps1 | iex
 brew install Enriquefft/zq/zq        # Homebrew (macOS + Linux)
 yay -S zq-bin                         # AUR (Arch Linux)
 nix run github:Enriquefft/zq          # Nix
+docker run -i ghcr.io/enriquefft/zq '.'   # Docker
 ```
 
 ### From source
