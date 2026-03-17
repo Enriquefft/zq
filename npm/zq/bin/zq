@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 "use strict";
 
+// Fallback shim — only used if postinstall failed to write a direct shell wrapper.
+// In the normal case, postinstall.js replaces this file with a POSIX shell script
+// that execs the native binary directly, avoiding Node.js startup overhead.
+
 const { execFileSync } = require("child_process");
+const path = require("path");
 
 const PLATFORMS = {
   "linux-x64": "@zqjson/linux-x64",
@@ -36,9 +41,7 @@ try {
   process.exit(1);
 }
 
-const args = process.argv.slice(2);
-try {
-  execFileSync(binPath, args, { stdio: "inherit" });
-} catch (e) {
-  process.exit(e.status ?? 1);
-}
+const result = require("child_process").spawnSync(binPath, process.argv.slice(2), {
+  stdio: "inherit",
+});
+process.exit(result.status ?? 1);

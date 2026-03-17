@@ -12,7 +12,10 @@
   "bin": {
     "zq": "bin/zq"
   },
-  "files": ["bin"],
+  "scripts": {
+    "postinstall": "node postinstall.js || exit 0"
+  },
+  "files": ["bin", "postinstall.js"],
   "optionalDependencies": {
     "@zqjson/linux-x64": "0.1.0",
     "@zqjson/linux-arm64": "0.1.0",
