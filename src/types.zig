@@ -16,7 +16,7 @@ pub const Tape = struct {
     /// Interned string/key bytes backing all `string_offset` references.
     string_buf: []const u8,
 
-    pub const Entry = struct {
+    pub const Entry = extern struct {
         tag: Tag,
         payload: Payload,
     };
@@ -580,7 +580,7 @@ pub const FunctionDef = struct {
 // ─── Instruction ─────────────────────────────────────────────────────────────
 // Bytecode emitted by Query.compile(), executed against a Tape.
 
-pub const Instruction = struct {
+pub const Instruction = extern struct {
     op: Op,
     operand: Operand,
 
@@ -772,8 +772,7 @@ pub const Instruction = struct {
         pop_try,
     };
 
-    pub const Operand = union {
-        string: []const u8,
+    pub const Operand = extern union {
         str_ref: Tape.StringRef,
         index: i64,
         bool: bool,

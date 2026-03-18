@@ -63,13 +63,14 @@ test "Value: string holds slice" {
 
 // ─── Instruction ─────────────────────────────────────────────────────────────
 
-test "Instruction: load_key with string operand" {
+test "Instruction: load_key with str_ref operand" {
     const inst = Instruction{
         .op = .load_key,
-        .operand = .{ .string = "foo" },
+        .operand = .{ .str_ref = .{ .offset = 0, .len = 3 } },
     };
     try std.testing.expectEqual(Instruction.Op.load_key, inst.op);
-    try std.testing.expectEqualStrings("foo", inst.operand.string);
+    try std.testing.expectEqual(@as(u32, 0), inst.operand.str_ref.offset);
+    try std.testing.expectEqual(@as(u32, 3), inst.operand.str_ref.len);
 }
 
 test "Instruction: load_index with index operand" {

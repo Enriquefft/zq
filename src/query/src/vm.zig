@@ -35,8 +35,8 @@ const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label
 const EachState = struct {
     pos: u32,
     end: u32,
-    is_object: bool,
     tape: *const Tape,
+    is_object: bool,
 };
 
 const RangeState = struct {
@@ -71,20 +71,20 @@ const LimitState = struct {
     saved_collect_len: u32,
 };
 
-const ForkAux = union {
-    none: void,
-    each_state: EachState,
-    range_state: RangeState,
-    try_handler_state: TryHandlerState,
-    label_state: LabelState,
-    limit_state: LimitState,
+const ForkAux = union(ForkType) {
+    normal: void,
+    each: EachState,
+    range: RangeState,
+    try_handler: TryHandlerState,
+    alt_handler: TryHandlerState,
+    label: LabelState,
+    limit: LimitState,
 };
 
 const Forkpoint = struct {
     saved_value_stack_len: u32,
     saved_current: Value,
     backtrack_ip: u32,
-    fork_type: ForkType,
     aux: ForkAux,
 };
 
@@ -450,50 +450,50 @@ pub const ResultIterator = struct {
         var idx = it.fork_stack.items.len;
         while (idx > 0) {
             idx -= 1;
-            const ft = it.fork_stack.items[idx].fork_type;
-            if (ft == .try_handler or ft == .alt_handler) {
-                const fp = it.fork_stack.items[idx];
-                const state = fp.aux.try_handler_state;
+            const fp = it.fork_stack.items[idx];
+            const state = switch (fp.aux) {
+                .try_handler, .alt_handler => |s| s,
+                else => continue,
+            };
 
-                // Unwind fork stack (pops generators between error and handler).
-                it.fork_stack.items.len = idx;
-                // Unwind other stacks.
-                it.value_stack.items.len = fp.saved_value_stack_len;
-                it.if_stack.items.len = state.saved_if_len;
-                // Unwind collect frames (free buffers).
-                while (it.collect_stack.items.len > state.saved_collect_len) {
-                    var cf = it.collect_stack.pop().?;
-                    cf.buffer.deinit(it.alloc);
-                }
-                it.call_stack.items.len = state.saved_call_len;
-
-                if (state.catch_ip > 0) {
-                    // Route to catch handler with error as current.
-                    if (err == error.UserError) {
-                        it.current = it.user_error_msg orelse Value{ .string = "null" };
-                        it.user_error_msg = null;
-                    } else if (err == error.TypeError and it.type_error_detail != null) {
-                        it.current = it.type_error_detail.?;
-                        it.type_error_detail = null;
-                    } else {
-                        it.current = Value{ .string = errorToString(err) };
-                    }
-                    it.ip = state.catch_ip;
-                } else {
-                    // Suppress: backtrack to next generator path.
-                    if (it.collect_stack.items.len > 0) {
-                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                        it.value_stack.items.len = cf.outer_value_depth;
-                    } else {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
-                    }
-
-                    if (!it.doBacktrack()) {
-                        it.ip = @intCast(it.instructions.len);
-                    }
-                }
-                return true;
+            // Unwind fork stack (pops generators between error and handler).
+            it.fork_stack.items.len = idx;
+            // Unwind other stacks.
+            it.value_stack.items.len = fp.saved_value_stack_len;
+            it.if_stack.items.len = state.saved_if_len;
+            // Unwind collect frames (free buffers).
+            while (it.collect_stack.items.len > state.saved_collect_len) {
+                var cf = it.collect_stack.pop().?;
+                cf.buffer.deinit(it.alloc);
             }
+            it.call_stack.items.len = state.saved_call_len;
+
+            if (state.catch_ip > 0) {
+                // Route to catch handler with error as current.
+                if (err == error.UserError) {
+                    it.current = it.user_error_msg orelse Value{ .string = "null" };
+                    it.user_error_msg = null;
+                } else if (err == error.TypeError and it.type_error_detail != null) {
+                    it.current = it.type_error_detail.?;
+                    it.type_error_detail = null;
+                } else {
+                    it.current = Value{ .string = errorToString(err) };
+                }
+                it.ip = state.catch_ip;
+            } else {
+                // Suppress: backtrack to next generator path.
+                if (it.collect_stack.items.len > 0) {
+                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                    it.value_stack.items.len = cf.outer_value_depth;
+                } else {
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                }
+
+                if (!it.doBacktrack()) {
+                    it.ip = @intCast(it.instructions.len);
+                }
+            }
+            return true;
         }
         return false;
     }
@@ -525,14 +525,15 @@ pub const ResultIterator = struct {
             .output, .iterate => unreachable,
 
             .load_key => {
+                const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
                 const result = lookupKeyInValue(
                     &it.tape,
                     it.nullAllowed(),
                     it.current,
-                    instr.operand.string,
+                    key,
                 ) catch |err| {
                     if (err == error.TypeError) {
-                        it.type_error_detail = it.buildTypeErrorMsg(it.current, instr.operand.string);
+                        it.type_error_detail = it.buildTypeErrorMsg(it.current, key);
                     }
                     return err;
                 };
@@ -616,7 +617,8 @@ pub const ResultIterator = struct {
             },
 
             .load_path => {
-                it.current = try it.doLoadPath(instr.operand.string);
+                const path = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                it.current = try it.doLoadPath(path);
                 it.ip += 1;
                 return null;
             },
@@ -629,9 +631,10 @@ pub const ResultIterator = struct {
             },
 
             .navigate_key => {
-                it.current = lookupKeyInValue(&it.tape, it.nullAllowed(), it.current, instr.operand.string) catch |err| {
+                const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                it.current = lookupKeyInValue(&it.tape, it.nullAllowed(), it.current, key) catch |err| {
                     if (err == error.TypeError) {
-                        it.type_error_detail = it.buildTypeErrorMsg(it.current, instr.operand.string);
+                        it.type_error_detail = it.buildTypeErrorMsg(it.current, key);
                     }
                     return err;
                 };
@@ -646,7 +649,8 @@ pub const ResultIterator = struct {
             },
 
             .update_key => {
-                const result = try it.doUpdateKey(instr.operand.string);
+                const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                const result = try it.doUpdateKey(key);
                 it.current = try stackValueToValue(result);
                 it.pushValue(result);
                 it.ip += 1;
@@ -744,18 +748,34 @@ pub const ResultIterator = struct {
             .alt_start, .alt_check, .try_begin, .try_end => unreachable,
 
             // ── Fork-based try/alt/pop_try ────────────────────────────────
-            .fork_try, .fork_alt => {
+            .fork_try => {
+                const handler_state = TryHandlerState{
+                    .catch_ip = @intCast(instr.operand.index),
+                    .saved_if_len = @intCast(it.if_stack.items.len),
+                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    .saved_call_len = @intCast(it.call_stack.items.len),
+                };
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
-                    .fork_type = if (instr.op == .fork_try) .try_handler else .alt_handler,
-                    .aux = .{ .try_handler_state = .{
-                        .catch_ip = @intCast(instr.operand.index),
-                        .saved_if_len = @intCast(it.if_stack.items.len),
-                        .saved_collect_len = @intCast(it.collect_stack.items.len),
-                        .saved_call_len = @intCast(it.call_stack.items.len),
-                    } },
+                    .aux = .{ .try_handler = handler_state },
+                });
+                it.ip += 1;
+                return null;
+            },
+            .fork_alt => {
+                const handler_state = TryHandlerState{
+                    .catch_ip = @intCast(instr.operand.index),
+                    .saved_if_len = @intCast(it.if_stack.items.len),
+                    .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    .saved_call_len = @intCast(it.call_stack.items.len),
+                };
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index),
+                    .aux = .{ .alt_handler = handler_state },
                 });
                 it.ip += 1;
                 return null;
@@ -766,10 +786,12 @@ pub const ResultIterator = struct {
                 var idx = it.fork_stack.items.len;
                 while (idx > 0) {
                     idx -= 1;
-                    const ft = it.fork_stack.items[idx].fork_type;
-                    if (ft == .try_handler or ft == .alt_handler) {
-                        _ = it.fork_stack.orderedRemove(idx);
-                        break;
+                    switch (it.fork_stack.items[idx].aux) {
+                        .try_handler, .alt_handler => {
+                            _ = it.fork_stack.orderedRemove(idx);
+                            break;
+                        },
+                        else => {},
                     }
                 }
                 it.ip += 1;
@@ -1062,8 +1084,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = saved_value_len,
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index), // exit_ip
-                    .fork_type = .label,
-                    .aux = .{ .label_state = .{
+                    .aux = .{ .label = .{
                         .break_token = token,
                         .exit_ip = @intCast(instr.operand.index),
                         .saved_if_len = @intCast(it.if_stack.items.len),
@@ -1080,7 +1101,7 @@ pub const ResultIterator = struct {
                 var idx = it.fork_stack.items.len;
                 while (idx > 0) {
                     idx -= 1;
-                    if (it.fork_stack.items[idx].fork_type == .label) {
+                    if (it.fork_stack.items[idx].aux == .label) {
                         _ = it.fork_stack.orderedRemove(idx);
                         break;
                     }
@@ -1100,8 +1121,8 @@ pub const ResultIterator = struct {
                 var idx = it.fork_stack.items.len;
                 while (idx > 0) {
                     idx -= 1;
-                    if (it.fork_stack.items[idx].fork_type == .label) {
-                        const state = it.fork_stack.items[idx].aux.label_state;
+                    if (it.fork_stack.items[idx].aux == .label) {
+                        const state = it.fork_stack.items[idx].aux.label;
                         if (state.break_token == token) {
                             const fp = it.fork_stack.items[idx];
                             // Unwind fork stack.
@@ -1152,8 +1173,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index), // exit_ip
-                    .fork_type = .limit,
-                    .aux = .{ .limit_state = .{
+                    .aux = .{ .limit = .{
                         .remaining = @intCast(n_i),
                         .body_start_ip = it.ip,
                         .exit_ip = @intCast(instr.operand.index),
@@ -1168,7 +1188,7 @@ pub const ResultIterator = struct {
                 var idx = it.fork_stack.items.len;
                 while (idx > 0) {
                     idx -= 1;
-                    if (it.fork_stack.items[idx].fork_type == .limit) {
+                    if (it.fork_stack.items[idx].aux == .limit) {
                         _ = it.fork_stack.orderedRemove(idx);
                         break;
                     }
@@ -1184,8 +1204,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
-                    .fork_type = .normal,
-                    .aux = .{ .none = {} },
+                    .aux = .{ .normal = {} },
                 });
                 it.ip += 1;
                 return null;
@@ -1215,8 +1234,7 @@ pub const ResultIterator = struct {
                             .saved_value_stack_len = @intCast(it.value_stack.items.len),
                             .saved_current = it.current,
                             .backtrack_ip = it.ip,
-                            .fork_type = .each,
-                            .aux = .{ .each_state = .{
+                            .aux = .{ .each = .{
                                 .pos = first,
                                 .end = end,
                                 .is_object = false,
@@ -1239,8 +1257,7 @@ pub const ResultIterator = struct {
                             .saved_value_stack_len = @intCast(it.value_stack.items.len),
                             .saved_current = it.current,
                             .backtrack_ip = it.ip,
-                            .fork_type = .each,
-                            .aux = .{ .each_state = .{
+                            .aux = .{ .each = .{
                                 .pos = first_key,
                                 .end = end,
                                 .is_object = true,
@@ -1274,8 +1291,8 @@ pub const ResultIterator = struct {
                     var li: usize = it.fork_stack.items.len;
                     while (li > 0) {
                         li -= 1;
-                        if (it.fork_stack.items[li].fork_type == .limit) {
-                            var lstate = &it.fork_stack.items[li].aux.limit_state;
+                        if (it.fork_stack.items[li].aux == .limit) {
+                            var lstate = &it.fork_stack.items[li].aux.limit;
                             if (output_ip > lstate.body_start_ip and output_ip < lstate.exit_ip) {
                                 if (it.collect_stack.items.len > lstate.saved_collect_len) {
                                     break;
@@ -4065,8 +4082,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = resume_ip,
-                    .fork_type = .range,
-                    .aux = .{ .range_state = .{
+                    .aux = .{ .range = .{
                         .current_int = 0,
                         .end_int = end_n,
                         .step_int = 1,
@@ -4088,8 +4104,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = resume_ip,
-                    .fork_type = .range,
-                    .aux = .{ .range_state = .{
+                    .aux = .{ .range = .{
                         .current_int = 0,
                         .end_int = 0,
                         .step_int = 0,
@@ -4133,8 +4148,7 @@ pub const ResultIterator = struct {
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
                 .backtrack_ip = resume_ip,
-                .fork_type = .range,
-                .aux = .{ .range_state = .{
+                .aux = .{ .range = .{
                     .current_int = 0,
                     .end_int = 0,
                     .step_int = 0,
@@ -4162,8 +4176,7 @@ pub const ResultIterator = struct {
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
                 .backtrack_ip = resume_ip,
-                .fork_type = .range,
-                .aux = .{ .range_state = .{
+                .aux = .{ .range = .{
                     .current_int = from_i,
                     .end_int = to_i,
                     .step_int = 1,
@@ -4211,8 +4224,7 @@ pub const ResultIterator = struct {
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
                 .backtrack_ip = resume_ip,
-                .fork_type = .range,
-                .aux = .{ .range_state = .{
+                .aux = .{ .range = .{
                     .current_int = 0,
                     .end_int = 0,
                     .step_int = 0,
@@ -4244,8 +4256,7 @@ pub const ResultIterator = struct {
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
                 .backtrack_ip = resume_ip,
-                .fork_type = .range,
-                .aux = .{ .range_state = .{
+                .aux = .{ .range = .{
                     .current_int = from_i,
                     .end_int = to_i,
                     .step_int = by_i,
@@ -5239,8 +5250,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = it.ip,
-                    .fork_type = .each,
-                    .aux = .{ .each_state = .{
+                    .aux = .{ .each = .{
                         .pos = first,
                         .end = end,
                         .is_object = false,
@@ -5259,8 +5269,7 @@ pub const ResultIterator = struct {
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = it.ip,
-                    .fork_type = .each,
-                    .aux = .{ .each_state = .{
+                    .aux = .{ .each = .{
                         .pos = first_key,
                         .end = end,
                         .is_object = true,
@@ -5278,7 +5287,7 @@ pub const ResultIterator = struct {
     /// Advance an each-type forkpoint to the next element.
     /// Returns true if advanced (sets it.current), false if exhausted.
     fn advanceEachForkpoint(it: *ResultIterator, fp: *Forkpoint) bool {
-        var st = &fp.aux.each_state;
+        var st = &fp.aux.each;
         const next_pos: u32 = if (st.is_object)
             skipEntry(st.tape.*, st.pos + 1) // step past value → next key
         else
@@ -5297,7 +5306,7 @@ pub const ResultIterator = struct {
     /// Advance a range-type forkpoint to the next value.
     /// Returns true if advanced (sets it.current), false if exhausted.
     fn advanceRangeForkpoint(it: *ResultIterator, fp: *Forkpoint) bool {
-        var st = &fp.aux.range_state;
+        var st = &fp.aux.range;
         if (st.is_float) {
             st.current_float += st.step_float;
             if ((st.step_float > 0 and st.current_float >= st.end_float) or
@@ -5328,7 +5337,7 @@ pub const ResultIterator = struct {
     fn backtrackToDepth(it: *ResultIterator, min_depth: u32) bool {
         while (it.fork_stack.items.len > min_depth) {
             const fp = &it.fork_stack.items[it.fork_stack.items.len - 1];
-            switch (fp.fork_type) {
+            switch (fp.aux) {
                 .normal => {
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
@@ -5360,9 +5369,8 @@ pub const ResultIterator = struct {
                     // Normal exhaustion — just pop, continue backtracking.
                     _ = it.fork_stack.pop();
                 },
-                .alt_handler => {
+                .alt_handler => |state| {
                     // Left side exhausted (all falsy or no outputs) — fire right side.
-                    const state = fp.aux.try_handler_state;
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
                     it.if_stack.items.len = state.saved_if_len;
@@ -5375,12 +5383,8 @@ pub const ResultIterator = struct {
                     _ = it.fork_stack.pop();
                     return true;
                 },
-                .label => {
-                    // Label scope completed without break — just pop.
-                    _ = it.fork_stack.pop();
-                },
-                .limit => {
-                    // Limit scope completed — just pop.
+                .label, .limit => {
+                    // Label/limit scope completed — just pop.
                     _ = it.fork_stack.pop();
                 },
             }

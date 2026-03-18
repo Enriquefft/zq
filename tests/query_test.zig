@@ -1236,6 +1236,39 @@ test ".['key']: syntax error on unterminated string" {
     try expectCompileError(".[\"unterminated]");
 }
 
+// ── Comma generator (fork) ────────────────────────────────────────────────────
+
+test "comma: 1,2 produces two outputs" {
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("1,2");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 2), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+}
+
+test "comma: 1,2,3 produces three outputs" {
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("1,2,3");
+    defer q.deinit();
+
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+
+    try std.testing.expectEqual(@as(usize, 3), vals.len);
+    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+    try std.testing.expectEqual(@as(i64, 3), vals[2].int);
+}
+
 // ── Alternative operator (//) ─────────────────────────────────────────────────
 
 test "alternative: null // literal returns literal" {

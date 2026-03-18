@@ -727,6 +727,20 @@ fn collectJsonValues(
             continue;
         }
 
+        // Between values (parser reset), skip whitespace-only chunks to avoid
+        // false "parse error" on trailing newlines in JSONL input.
+        if (!fed_any) {
+            const has_content = for (view.bytes) |c| {
+                if (c != ' ' and c != '\t' and c != '\n' and c != '\r') break true;
+            } else false;
+            if (!has_content) {
+                src.consume(view.bytes.len);
+                if (view.is_eof) break;
+                _ = try src.refill();
+                continue;
+            }
+        }
+
         fed_any = true;
         const result = parser.feed(view.bytes, view.is_eof) catch {
             printErr("zq: parse error (skipping malformed input)\n");
@@ -1054,6 +1068,20 @@ fn describeStream(
         if (view.bytes.len == 0) {
             _ = try src.refill();
             continue;
+        }
+
+        // Between values (parser reset), skip whitespace-only chunks to avoid
+        // false "parse error" on trailing newlines in JSONL input.
+        if (!fed_any) {
+            const has_content = for (view.bytes) |c| {
+                if (c != ' ' and c != '\t' and c != '\n' and c != '\r') break true;
+            } else false;
+            if (!has_content) {
+                src.consume(view.bytes.len);
+                if (view.is_eof) break;
+                _ = try src.refill();
+                continue;
+            }
         }
 
         fed_any = true;

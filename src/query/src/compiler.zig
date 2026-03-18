@@ -34,9 +34,9 @@ pub const Compiled = struct {
 
 /// Byte range within the intern buffer. Used during compilation before the
 /// buffer is finalized; converted to []const u8 slices in the final pass.
-const StrRef = struct { offset: u32, len: u32 };
+const StrRef = extern struct { offset: u32, len: u32 };
 
-const RawOp = union {
+const RawOp = extern union {
     str_ref: StrRef,
     index: i64,
     bool: bool,
@@ -46,7 +46,7 @@ const RawOp = union {
     slice_args: types.SliceArgs,
 };
 
-const RawInstr = struct {
+const RawInstr = extern struct {
     op: Instruction.Op,
     operand: RawOp,
     src_offset: u32 = 0,
@@ -5074,7 +5074,7 @@ fn fuse(
         out.* = Instruction{
             .op = r.op,
             .operand = switch (r.op) {
-                .load_key, .load_path => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
+                .load_key, .load_path => .{ .str_ref = .{ .offset = r.operand.str_ref.offset, .len = r.operand.str_ref.len } },
                 .push_string => .{ .str_ref = .{
                     .offset = r.operand.str_ref.offset,
                     .len = r.operand.str_ref.len,
@@ -5138,7 +5138,7 @@ fn fuse(
                 },
                 .pop_try => .{ .none = {} },
                 .slice => .{ .slice_args = r.operand.slice_args },
-                .navigate_key, .update_key => .{ .string = string_buf[r.operand.str_ref.offset..][0..r.operand.str_ref.len] },
+                .navigate_key, .update_key => .{ .str_ref = .{ .offset = r.operand.str_ref.offset, .len = r.operand.str_ref.len } },
                 .navigate_index, .update_index => .{ .index = r.operand.index },
                 // call_builtin: operand is BuiltinId encoded as index; pass through as-is.
                 .call_builtin => .{ .index = r.operand.index },
