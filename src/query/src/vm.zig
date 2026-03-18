@@ -160,9 +160,9 @@ pub const ResultIterator = struct {
     /// Variable storage for variable capture and reference.
     variable_store: std.ArrayList(?StackValue),
     /// Mutable runtime tape for constructing objects/arrays at query time.
+    /// TapeSpan pointers reference `runtime_tape.view`, which is auto-updated
+    /// by appendEntry/internString — no manual view sync needed.
     runtime_tape: types.RuntimeTape,
-    /// Persistent Tape view of runtime_tape for value references.
-    runtime_tape_view: types.Tape,
     /// Object construction state.
     object_construct: std.ArrayList(ObjectField),
     /// Stack of saved field counts for nested object construction.
@@ -252,12 +252,6 @@ pub const ResultIterator = struct {
         var runtime_tape = try types.RuntimeTape.init(allocator);
         errdefer runtime_tape.deinit(allocator);
 
-        // Initialize runtime tape view
-        const runtime_tape_view = types.Tape{
-            .entries = runtime_tape.entries.items,
-            .string_buf = runtime_tape.string_buf.items,
-        };
-
         return ResultIterator{
             .tape = tape,
             .instructions = instructions,
@@ -270,7 +264,6 @@ pub const ResultIterator = struct {
             .value_stack = value_stack,
             .variable_store = variable_store,
             .runtime_tape = runtime_tape,
-            .runtime_tape_view = runtime_tape_view,
             .object_construct = object_construct,
             .object_construct_depth = object_construct_depth,
             .if_stack = if_stack,
@@ -336,10 +329,7 @@ pub const ResultIterator = struct {
         it.type_error_detail = null;
         it.runtime_tape.entries.clearRetainingCapacity();
         it.runtime_tape.string_buf.clearRetainingCapacity();
-        it.runtime_tape_view = types.Tape{
-            .entries = it.runtime_tape.entries.items,
-            .string_buf = it.runtime_tape.string_buf.items,
-        };
+        it.runtime_tape.refreshView();
     }
 
     /// True when null propagation is active (globally via Opts).
@@ -521,8 +511,6 @@ pub const ResultIterator = struct {
                 it.ip += 1;
                 return null;
             },
-
-            .output, .iterate => unreachable,
 
             .load_key => {
                 const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
@@ -743,9 +731,6 @@ pub const ResultIterator = struct {
                 it.ip += 1;
                 return null;
             },
-
-            // Deprecated opcodes — kept in enum for ABI stability.
-            .alt_start, .alt_check, .try_begin, .try_end => unreachable,
 
             // ── Fork-based try/alt/pop_try ────────────────────────────────
             .fork_try => {
@@ -1358,11 +1343,9 @@ pub const ResultIterator = struct {
         });
 
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
 
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } } };
@@ -1425,10 +1408,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -1440,8 +1421,7 @@ pub const ResultIterator = struct {
                 const actual_from: usize = @intCast(from);
                 const actual_to: usize = @intCast(if (to_resolved < from) from else to_resolved);
                 const str_ref = try it.runtime_tape.internString(it.alloc, s[actual_from..actual_to]);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             // jq: slicing null yields null (not an error).
             .null_val => return .null_val,
@@ -1498,10 +1478,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = obj_start,
                     .end = obj_end_idx + 1,
                 } } };
@@ -1522,10 +1500,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = obj_start,
                     .end = obj_end_idx + 1,
                 } } };
@@ -1576,10 +1552,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -1637,8 +1611,8 @@ pub const ResultIterator = struct {
                             const concat_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
                             try it.runtime_tape.string_buf.appendSlice(it.alloc, ls);
                             try it.runtime_tape.string_buf.appendSlice(it.alloc, rs);
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                            break :blk .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[concat_off..][0..total_len] } };
+                            it.runtime_tape.refreshView();
+                            break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[concat_off..][0..total_len] } };
                         },
                         .null_val => left,
                         else => error.TypeError,
@@ -1675,10 +1649,8 @@ pub const ResultIterator = struct {
                                 .payload = .{ .none = {} },
                             });
                             it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                             break :blk .{ .tape_value = .{ .array = .{
-                                .tape = &it.runtime_tape_view,
+                                .tape = &it.runtime_tape.view,
                                 .start = arr_start,
                                 .end = arr_end_idx + 1,
                             } } };
@@ -1758,10 +1730,8 @@ pub const ResultIterator = struct {
                                 .payload = .{ .none = {} },
                             });
                             it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                             break :blk .{ .tape_value = .{ .object = .{
-                                .tape = &it.runtime_tape_view,
+                                .tape = &it.runtime_tape.view,
                                 .start = obj_start,
                                 .end = obj_end_idx + 1,
                             } } };
@@ -1837,10 +1807,8 @@ pub const ResultIterator = struct {
                                 .payload = .{ .none = {} },
                             });
                             it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                             break :blk .{ .tape_value = .{ .array = .{
-                                .tape = &it.runtime_tape_view,
+                                .tape = &it.runtime_tape.view,
                                 .start = arr_start,
                                 .end = arr_end_idx + 1,
                             } } };
@@ -1895,13 +1863,9 @@ pub const ResultIterator = struct {
         // Update object_start skip pointer to point past object_end
         it.runtime_tape.entries.items[obj_start_idx].payload.skip = obj_end_idx + 1;
 
-        // Update runtime_tape_view to point to current runtime_tape state
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-
         // Create tape view and construct object value
         return .{ .tape_value = .{ .object = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = obj_start_idx,
             .end = obj_end_idx + 1,
         } } };
@@ -2000,11 +1964,12 @@ pub const ResultIterator = struct {
             }
         }
 
-        // Reserve capacity up front so the view stays valid.
+        // Reserve capacity up front so no reallocation occurs during the copy loop.
         try it.runtime_tape.entries.ensureUnusedCapacity(it.alloc, n_entries);
         try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, n_string_bytes);
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
+        // ensureUnusedCapacity may have reallocated — refresh the view so
+        // span.tape reads (which go through runtime_tape.view) see valid memory.
+        it.runtime_tape.refreshView();
 
         const base: u32 = @intCast(it.runtime_tape.entries.items.len);
 
@@ -2040,10 +2005,6 @@ pub const ResultIterator = struct {
                 else => {},
             }
         }
-
-        // Refresh the view after modifications.
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
     }
 
     fn doMul(it: *ResultIterator) ZqError!StackValue {
@@ -2102,8 +2063,7 @@ pub const ResultIterator = struct {
         const total_len = s.len * count;
         if (total_len > 128 * 1024 * 1024) {
             const str_ref = try it.runtime_tape.internString(it.alloc, "Repeat string result too long");
-            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-            it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+            it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
             return error.UserError;
         }
         const start_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
@@ -2111,8 +2071,8 @@ pub const ResultIterator = struct {
         for (0..count) |_| {
             it.runtime_tape.string_buf.appendSliceAssumeCapacity(s);
         }
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[start_off..][0..total_len] } };
+        it.runtime_tape.refreshView();
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[start_off..][0..total_len] } };
     }
 
     /// jq: string / string = split. Splits the left string by the right separator.
@@ -2161,10 +2121,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } } };
@@ -2259,11 +2217,9 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
 
         return .{ .tape_value = .{ .object = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = obj_start,
             .end = obj_end_idx + 1,
         } } };
@@ -2612,10 +2568,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -2638,10 +2592,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -2745,8 +2697,7 @@ pub const ResultIterator = struct {
             .object => "object",
         };
         const str_ref = try it.runtime_tape.internString(it.alloc, type_str);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     fn builtinTostring(it: *ResultIterator) ZqError!?StackValue {
@@ -2754,27 +2705,23 @@ pub const ResultIterator = struct {
             .string => |s| return .{ .tape_value = .{ .string = s } },
             .null_val => {
                 const str_ref = try it.runtime_tape.internString(it.alloc, "null");
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             .bool_val => |b| {
                 const s: []const u8 = if (b) "true" else "false";
                 const str_ref = try it.runtime_tape.internString(it.alloc, s);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             .int => |n| {
                 var tmp: [32]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.TypeError;
                 const str_ref = try it.runtime_tape.internString(it.alloc, s);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             .float => |f| {
                 const formatted = types.formatJqFloat(f);
                 const str_ref = try it.runtime_tape.internString(it.alloc, formatted.slice());
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             .array, .object => {
                 // Compact JSON serialization into runtime_tape string_buf
@@ -2782,8 +2729,7 @@ pub const ResultIterator = struct {
                 defer json_buf.deinit(it.alloc);
                 try serializeValueCompact(&json_buf, it.alloc, it.current);
                 const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
         }
     }
@@ -2811,8 +2757,7 @@ pub const ResultIterator = struct {
                 try appendJsonString(&msg_buf, it.alloc, s);
                 try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a number");
                 const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+                it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
                 return error.UserError;
             },
             else => return error.TypeError,
@@ -2910,8 +2855,7 @@ pub const ResultIterator = struct {
                     try reversed.appendSlice(it.alloc, s[r.start..r.end]);
                 }
                 const str_ref = try it.runtime_tape.internString(it.alloc, reversed.items);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             else => return error.TypeError,
         }
@@ -3027,10 +2971,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -3108,10 +3050,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = obj_start,
                     .end = obj_end_idx + 1,
                 } } };
@@ -3573,10 +3513,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[outer_start].payload.skip = outer_end + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = outer_start,
             .end = outer_end + 1,
         } } };
@@ -3754,10 +3692,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = obj_start,
                     .end = obj_end_idx + 1,
                 } } };
@@ -3798,10 +3734,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = arr_start,
                     .end = arr_end_idx + 1,
                 } } };
@@ -3818,8 +3752,7 @@ pub const ResultIterator = struct {
         defer json_buf.deinit(it.alloc);
         try serializeValueCompact(&json_buf, it.alloc, it.current);
         const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @html: HTML-escape: & → &amp;, < → &lt;, > → &gt;, ' → &apos;, " → &quot;
@@ -3841,8 +3774,7 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @uri: Percent-encode all bytes except A-Za-z0-9-._~, uppercase hex (%XX)
@@ -3863,8 +3795,7 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @urid: Decode %XX sequences in a string
@@ -3890,8 +3821,7 @@ pub const ResultIterator = struct {
             i += 1;
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @sh: Wrap in single quotes, escape ' as '\''
@@ -3912,8 +3842,7 @@ pub const ResultIterator = struct {
         }
         try buf.append(it.alloc, '\'');
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @base64: Base64 encode the string
@@ -3928,8 +3857,7 @@ pub const ResultIterator = struct {
         defer it.alloc.free(buf);
         const encoded = encoder.encode(buf, s);
         const str_ref = try it.runtime_tape.internString(it.alloc, encoded);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @base64d: Base64 decode the string
@@ -3944,8 +3872,7 @@ pub const ResultIterator = struct {
         defer it.alloc.free(buf);
         decoder.decode(buf, s) catch return error.TypeError;
         const str_ref = try it.runtime_tape.internString(it.alloc, buf[0..decoded_len]);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @csv: Array → CSV row. Strings double-quoted (internal " doubled to ""),
@@ -3992,8 +3919,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// @tsv: Array → TSV row. Tab-separated, strings escape \t→\\t, \n→\\n, \r→\\r, \\→\\\\
@@ -4039,8 +3965,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// Helper: build a runtime tape array from a slice of Values.
@@ -4058,10 +3983,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } } };
@@ -4634,10 +4557,8 @@ pub const ResultIterator = struct {
                 const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
                 try it.runtime_tape.copySpan(tmp_tape.asTape(), obj_start, obj_end_idx + 1, it.alloc);
                 const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = result_start,
                     .end = result_end,
                 } };
@@ -4714,10 +4635,8 @@ pub const ResultIterator = struct {
                 const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
                 try it.runtime_tape.copySpan(tmp_tape.asTape(), arr_start, arr_end_idx + 1, it.alloc);
                 const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .array = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = result_start,
                     .end = result_end,
                 } };
@@ -4834,10 +4753,8 @@ pub const ResultIterator = struct {
                         const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
                         try it.runtime_tape.copySpan(tmp_tape.asTape(), obj_start, obj_end_idx + 1, it.alloc);
                         const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
-                        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                         return .{ .object = .{
-                            .tape = &it.runtime_tape_view,
+                            .tape = &it.runtime_tape.view,
                             .start = result_start,
                             .end = result_end,
                         } };
@@ -4889,10 +4806,8 @@ pub const ResultIterator = struct {
                         const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
                         try it.runtime_tape.copySpan(tmp_tape.asTape(), arr_start, arr_end_idx + 1, it.alloc);
                         const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
-                        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                         return .{ .array = .{
-                            .tape = &it.runtime_tape_view,
+                            .tape = &it.runtime_tape.view,
                             .start = result_start,
                             .end = result_end,
                         } };
@@ -5091,10 +5006,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } };
@@ -5740,8 +5653,7 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     fn builtinAscii(it: *ResultIterator) ZqError!?StackValue {
@@ -5754,8 +5666,7 @@ pub const ResultIterator = struct {
                 if (i < 0 or i > 127) return error.TypeError;
                 var buf: [1]u8 = .{@intCast(@as(u8, @intCast(i)))};
                 const str_ref = try it.runtime_tape.internString(it.alloc, &buf);
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-                return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             else => return error.TypeError,
         }
@@ -5808,10 +5719,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } } };
@@ -5841,8 +5750,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     // ── JSON builtins ──────────────────────────────────────────────────────
@@ -5903,10 +5811,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
         } } };
@@ -5923,10 +5829,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .object = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = obj_start,
             .end = obj_end_idx + 1,
         } } };
@@ -5989,10 +5893,8 @@ pub const ResultIterator = struct {
                     .payload = .{ .none = {} },
                 });
                 it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-                it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-                it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
                 return .{ .tape_value = .{ .object = .{
-                    .tape = &it.runtime_tape_view,
+                    .tape = &it.runtime_tape.view,
                     .start = obj_start,
                     .end = obj_end_idx + 1,
                 } } };
@@ -6145,8 +6047,7 @@ pub const ResultIterator = struct {
         }
 
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// Build a jq-compatible TypeError detail message for field access on wrong type.
@@ -6172,15 +6073,13 @@ pub const ResultIterator = struct {
         // Store in the runtime tape so the string lives as long as the iterator.
         // Note: callers must access this value before the iterator is deinitialized.
         const str_ref = it.runtime_tape.internString(it.alloc, buf.items) catch return null;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
     }
 
     /// Helper: raise a UserError with a message string.
     fn raiseUserError(it: *ResultIterator, msg: []const u8) ZqError!?StackValue {
         const str_ref = try it.runtime_tape.internString(it.alloc, msg);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        it.user_error_msg = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] };
+        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
         return error.UserError;
     }
 
@@ -6310,10 +6209,8 @@ pub const ResultIterator = struct {
 
             const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
             it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-            it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
             return .{ .tape_value = .{ .object = .{
-                .tape = &it.runtime_tape_view,
+                .tape = &it.runtime_tape.view,
                 .start = obj_start,
                 .end = obj_end_idx + 1,
             } } };
@@ -6347,8 +6244,7 @@ pub const ResultIterator = struct {
             try buf.appendSlice(it.alloc, replacement);
             try buf.appendSlice(it.alloc, input[pos + pattern.len ..]);
             const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-            it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-            return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
         }
         return .{ .tape_value = .{ .string = input } };
     }
@@ -6389,8 +6285,7 @@ pub const ResultIterator = struct {
         }
 
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-        return .{ .tape_value = .{ .string = it.runtime_tape_view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     // ── Array utility builtins ───────────────────────────────────────────────
@@ -6460,10 +6355,8 @@ pub const ResultIterator = struct {
             .payload = .{ .none = {} },
         });
         it.runtime_tape.entries.items[outer_start].payload.skip = outer_end_idx + 1;
-        it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-        it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
         return .{ .tape_value = .{ .array = .{
-            .tape = &it.runtime_tape_view,
+            .tape = &it.runtime_tape.view,
             .start = outer_start,
             .end = outer_end_idx + 1,
         } } };
@@ -6546,9 +6439,7 @@ fn parseJsonToStackValue(it: *ResultIterator, json_str: []const u8) ZqError!Stac
     var parser = JsonParser{ .src = json_str, .pos = 0, .it = it };
     const start_idx: u32 = @intCast(it.runtime_tape.entries.items.len);
     parser.writeValue() catch return error.TypeError;
-    it.runtime_tape_view.entries = it.runtime_tape.entries.items;
-    it.runtime_tape_view.string_buf = it.runtime_tape.string_buf.items;
-    return valueToStackValue(tapeEntryToValue(&it.runtime_tape_view, start_idx));
+    return valueToStackValue(tapeEntryToValue(&it.runtime_tape.view, start_idx));
 }
 
 const JsonParser = struct {

@@ -89,15 +89,24 @@ pub const Value = union(enum) {
 pub const RuntimeTape = struct {
     entries: std.ArrayList(Tape.Entry),
     string_buf: std.ArrayList(u8),
+    /// Persistent view that TapeSpan pointers reference. Auto-updated by
+    /// appendEntry/internString so it always reflects the current backing
+    /// buffer — eliminates stale-pointer bugs after ArrayList reallocations.
+    view: Tape,
 
     pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!RuntimeTape {
         var rt_tape: RuntimeTape = .{
             .entries = std.ArrayList(Tape.Entry){},
             .string_buf = std.ArrayList(u8){},
+            .view = .{ .entries = &.{}, .string_buf = &.{} },
         };
         // Pre-allocate capacity for typical object construction
         try rt_tape.entries.ensureTotalCapacity(allocator, 256);
         try rt_tape.string_buf.ensureTotalCapacity(allocator, 4096);
+        rt_tape.view = .{
+            .entries = rt_tape.entries.items,
+            .string_buf = rt_tape.string_buf.items,
+        };
         return rt_tape;
     }
 
@@ -110,6 +119,7 @@ pub const RuntimeTape = struct {
     pub fn internString(self: *RuntimeTape, allocator: std.mem.Allocator, s: []const u8) error{OutOfMemory}!Tape.StringRef {
         const offset = @as(u32, @intCast(self.string_buf.items.len));
         try self.string_buf.appendSlice(allocator, s);
+        self.view.string_buf = self.string_buf.items;
         return Tape.StringRef{
             .offset = offset,
             .len = @as(u32, @intCast(s.len)),
@@ -125,6 +135,7 @@ pub const RuntimeTape = struct {
         if (self.entries.items.len >= max_entries) return error.OutOfMemory;
         const idx = @as(u32, @intCast(self.entries.items.len));
         try self.entries.append(allocator, entry);
+        self.view.entries = self.entries.items;
         return idx;
     }
 
@@ -134,6 +145,14 @@ pub const RuntimeTape = struct {
             .entries = self.entries.items,
             .string_buf = self.string_buf.items,
         };
+    }
+
+    /// Refresh the view after direct ArrayList manipulation (e.g.
+    /// ensureUnusedCapacity). Mutation methods like appendEntry and
+    /// internString call this automatically.
+    pub fn refreshView(self: *RuntimeTape) void {
+        self.view.entries = self.entries.items;
+        self.view.string_buf = self.string_buf.items;
     }
 
     /// Copy all entries from a parsed tape into this runtime tape,
@@ -585,8 +604,6 @@ pub const Instruction = extern struct {
     operand: Operand,
 
     pub const Op = enum(u8) {
-        /// Push the current value onto the output.
-        output,
         /// Descend into an object key. operand.string = key name.
         load_key,
         /// Descend into an array index. operand.index = position.
@@ -596,8 +613,6 @@ pub const Instruction = extern struct {
         load_computed,
         /// Fused multi-level path descent. operand.string = "a.b.c".
         load_path,
-        /// Iterate: push each element of array/object.
-        iterate,
         /// Pipe: pop current, feed to next stage.
         pipe,
         /// Identity: no-op pass-through (`.`).
@@ -693,23 +708,6 @@ pub const Instruction = extern struct {
         /// Finalize collection: pop the collect frame and push the assembled array
         /// onto the value stack.
         array_collect_end,
-
-        // Alternative operator (//) — null coalescing
-        /// Begin alternative evaluation: push current to if_stack; increment alt_null_depth
-        /// so that field accesses on the left side propagate null instead of TypeError.
-        alt_start,
-        /// End of left side: decrement alt_null_depth. Pop TOS (or use current).
-        /// If truthy: pop one entry from if_stack, push val back, jump to operand.index.
-        /// If falsy: discard val, continue — restore_input fires next to pop if_stack.
-        alt_check,
-
-        // Try-catch error handling
-        /// Begin a try block. operand.index = catch handler IP (0 = no catch;
-        /// suppress error silently and terminate this output path).
-        try_begin,
-        /// End of try body (no error occurred). Pop TryFrame.
-        /// operand.index = IP after catch handler (0 = no handler, just ip+1).
-        try_end,
 
         // Builtin dispatch
         /// Call a built-in function. operand.index = BuiltinId (as i64).

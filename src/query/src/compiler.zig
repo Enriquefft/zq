@@ -1210,6 +1210,24 @@ fn isVarNameToken(tag: Token.Tag) bool {
 // function-table body-range index whose value is ≥ pos so that they still
 // address the same (now shifted) instructions.
 
+/// Rebase instruction-pointer operands in a buffer of raw instructions.
+/// Used when EXPR instructions are compiled at one position in the raw stream
+/// but later moved to a different position (e.g. reduce/foreach reorder INIT
+/// before EXPR). All internal jump/fork/ACE targets are adjusted by `offset`.
+fn rebaseExprBuf(buf: []RawInstr, offset: i64) void {
+    for (buf) |*r| {
+        switch (r.op) {
+            .jump, .jump_if_false, .array_collect_start, .limit_start, .fork, .call_function => {
+                r.operand.index += offset;
+            },
+            .fork_try, .fork_alt, .label_begin => {
+                if (r.operand.index > 0) r.operand.index += offset;
+            },
+            else => {},
+        }
+    }
+}
+
 fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!void {
     // Grow the buffer by one slot (appended dummy is overwritten below).
     try ctx.raw.append(ctx.alloc, .{ .op = .identity, .operand = .{ .none = {} } });
@@ -2771,35 +2789,23 @@ fn compileErrorArg(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    // Allocate hidden variable IDs for $arr and $acc
-    const arr_id = ctx.next_var_id;
+    // Allocate hidden variable IDs: one to save original input, one for accumulator
+    const saved_input_id = ctx.next_var_id;
     ctx.next_var_id += 1;
     const acc_id = ctx.next_var_id;
     ctx.next_var_id += 1;
 
-    // save_input — preserve original input for INIT
-    try ctx.emit(.save_input, .{ .none = {} });
+    // Save original input into a variable (survives INIT generator backtracks,
+    // unlike save_input/restore_input which uses if_stack).
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = saved_input_id });
 
-    // array_collect_start(ACE1) — collect EXPR outputs
-    const ace1_start = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
-
-    // <EXPR> — parsed with parseOr (stops before `as` keyword)
+    // <EXPR> — parsed with parseOr (stops before `as` keyword).
+    // Compiled here (source order) but emitted into a temporary buffer,
+    // then spliced into the final position after INIT.
+    const expr_start = ctx.raw.items.len;
     try parseOr(ctx);
-
-    // output
-    try ctx.emit(.yield_output, .{ .none = {} });
-
-    // ACE1: array_collect_end
-    const ace1_end: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[ace1_start].operand = .{ .index = ace1_end };
-
-    // capture_variable($arr)
-    try ctx.emit(.capture_variable, .{ .index = arr_id });
-
-    // restore_input — current = original input
-    try ctx.emit(.restore_input, .{ .none = {} });
+    const expr_end = ctx.raw.items.len;
 
     // Consume `as PATTERN`
     const as_tok = try ctx.nextToken();
@@ -2813,31 +2819,40 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const lparen = try ctx.nextToken();
     if (lparen.tag != .lparen) return ctx.syntaxErr(lparen.offset, lparen.len);
 
+    // Save the EXPR instructions and remove them from the raw stream.
+    // They'll be re-inserted after INIT so the bytecode order is:
+    // INIT → capture_acc → load_saved → pipe → fork → EXPR → loop body
+    var expr_buf = std.ArrayList(RawInstr){};
+    defer expr_buf.deinit(ctx.alloc);
+    try expr_buf.appendSlice(ctx.alloc, ctx.raw.items[expr_start..expr_end]);
+    ctx.raw.items.len = expr_start;
+
     // <INIT> — parsed with parsePipe
     try parsePipe(ctx);
 
     // capture_variable($acc) — save init value
     try ctx.emit(.capture_variable, .{ .index = acc_id });
 
-    // Consume `;`
-    const semi = try ctx.nextToken();
-    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
-
-    // load_variable($arr) — push collected array
-    try ctx.emit(.load_variable, .{ .index = arr_id });
-
-    // pipe — current = collected array
+    // Restore original input for EXPR via hidden variable
+    try ctx.emit(.load_variable, .{ .index = saved_input_id });
     try ctx.emit(.pipe, .{ .none = {} });
 
-    // array_collect_start(ACE2) — inner collect drives loop
-    const ace2_start = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    // fork L_done — sentinel: when EXPR exhausts, jump to L_done
+    const fork_pos = ctx.raw.items.len;
+    try ctx.emit(.fork, .{ .index = 0 }); // placeholder, backpatched below
 
-    // iterate — IterFrame over collected array
-    try ctx.emit(.each, .{ .none = {} });
+    // <EXPR> — re-insert the saved EXPR instructions, adjusting internal IPs
+    {
+        const new_start = ctx.raw.items.len;
+        const offset: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(expr_start));
+        rebaseExprBuf(expr_buf.items, offset);
+        try ctx.raw.appendSlice(ctx.alloc, expr_buf.items);
+    }
 
-    // Bind current element to pattern variables
-    try ctx.emit(.push_current, .{ .none = {} });
+    // Bind EXPR output to pattern variables. The EXPR result may be on
+    // value_stack (e.g., -.[] pushes negated value) or as current (e.g., .[]
+    // sets current directly). emitPatternCapture handles both via
+    // capture_variable's fallback-to-current semantics.
     try emitPatternCapture(ctx, pattern);
 
     // load_variable($acc) — push accumulator
@@ -2846,31 +2861,34 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // pipe — current = accumulator
     try ctx.emit(.pipe, .{ .none = {} });
 
+    // Consume `;`
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
     // <UPDATE> — parsed with parsePipe
     try parsePipe(ctx);
 
     // capture_variable($acc) — save updated accumulator
     try ctx.emit(.capture_variable, .{ .index = acc_id });
 
-    // output — triggers IterFrame advance
-    try ctx.emit(.yield_output, .{ .none = {} });
+    // backtrack — advance EXPR to next value (or exhaust → sentinel fires)
+    try ctx.emit(.backtrack, .{ .none = {} });
 
     // Consume `)`
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
-    // ACE2: array_collect_end — throwaway array
-    const ace2_end: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[ace2_start].operand = .{ .index = ace2_end };
+    // L_done: backpatch fork target
+    const l_done: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[fork_pos].operand = .{ .index = l_done };
 
-    // pipe — discard throwaway
-    try ctx.emit(.pipe, .{ .none = {} });
-
-    // load_variable($acc) — push final accumulator
+    // load_variable($acc) — push final accumulator as result
     try ctx.emit(.load_variable, .{ .index = acc_id });
 
-    // Cleanup: pop pattern variables in reverse order, then hidden vars
+    // Cleanup: pop pattern variables and $acc. $saved_input is intentionally
+    // NOT popped — if INIT is a generator (e.g. 0,1), the comma fork
+    // backtracks after pop_variables run, and load_variable($saved_input)
+    // must still find the saved value on the second INIT pass.
     {
         var pvar_ids = std.ArrayList(u32){};
         defer pvar_ids.deinit(ctx.alloc);
@@ -2882,7 +2900,6 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         }
     }
     try ctx.emit(.pop_variable, .{ .index = acc_id });
-    try ctx.emit(.pop_variable, .{ .index = arr_id });
 
     popScope(ctx, ctx.alloc);
 }
@@ -2893,79 +2910,58 @@ fn compileReduce(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Semantics: for each value produced by EXPR, fold with accumulator
 /// starting at INIT.  Output the accumulator (or EXTRACT applied to it)
 /// after each UPDATE step.  INIT may itself be a generator; each init
-/// value runs the full fold independently.
+/// value runs the full fold independently (via INIT's own fork mechanism).
 ///
 /// Bytecode layout (2-arg form):
-///   save_input
-///   array_collect_start(ACE1)
-///   <EXPR>
-///   output
-///   ACE1: array_collect_end
-///   capture_variable($arr)
-///   restore_input
-///   array_collect_start(ACE2)    # collect INIT outputs (may be generator)
+///   push_current
+///   capture_variable($saved)     # save original input to variable
 ///   <INIT>
-///   output
-///   ACE2: array_collect_end
-///   capture_variable($init_arr)
-///   array_collect_start(ACE3)    # collect foreach outputs
-///   load_variable($init_arr)
-///   pipe
-///   iterate                      # outer: over INIT values
 ///   capture_variable($acc)
-///   load_variable($arr)
+///   load_variable($saved)
+///   pipe                         # current = original input
+///   array_collect_start(ACE)     # collect foreach outputs
+///   fork L_done                  # sentinel: EXPR exhaustion
+///     <EXPR>                     # generators push their own forkpoints
+///     push_current
+///     emitPatternCapture($var)
+///     load_variable($acc)
+///     pipe
+///     <UPDATE>
+///     capture_variable($acc)
+///     load_variable($acc)
+///     yield_output               # buffer intermediate acc in ACE
+///     backtrack                  # advance EXPR via fork stack
+///   L_done:
+///   ACE: array_collect_end       # build array of intermediate values
 ///   pipe
-///   iterate                      # inner: over EXPR values
-///   capture_variable($var)
-///   load_variable($acc)
-///   pipe
-///   <UPDATE>
-///   capture_variable($acc)
-///   load_variable($acc)          # push for output
-///   output                       # -> ACE3 buffer
-///   ACE3: array_collect_end      # all foreach outputs as array
-///   pipe                         # current = outputs array
-///   iterate                      # emit each individually
+///   each                         # iterate as generator for downstream
+///   pop vars
 ///
 /// For 3-arg form, the output section becomes:
-///   <UPDATE>
-///   capture_variable($acc)
-///   load_variable($acc)
-///   pipe
-///   <EXTRACT>
-///   output
+///     capture_variable($acc)
+///     load_variable($acc)
+///     pipe
+///     <EXTRACT>
+///     yield_output
+///     backtrack
 fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    // Allocate hidden variable IDs
-    const arr_id = ctx.next_var_id;
-    ctx.next_var_id += 1;
-    const init_arr_id = ctx.next_var_id;
+    // Allocate hidden variable IDs: one to save original input, one for accumulator
+    const saved_input_id = ctx.next_var_id;
     ctx.next_var_id += 1;
     const acc_id = ctx.next_var_id;
     ctx.next_var_id += 1;
 
-    // save_input
-    try ctx.emit(.save_input, .{ .none = {} });
+    // Save original input into a variable (survives INIT generator backtracks,
+    // unlike save_input/restore_input which uses if_stack).
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = saved_input_id });
 
-    // array_collect_start(ACE1) — collect EXPR outputs
-    const ace1_start = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
-
-    // <EXPR> — parsed with parseOr (stops before `as`)
+    // <EXPR> — parsed with parseOr (stops before `as`).
+    // Compiled here (source order) but saved to a buffer, then spliced
+    // into the final position after INIT.
+    const expr_start = ctx.raw.items.len;
     try parseOr(ctx);
-
-    // output
-    try ctx.emit(.yield_output, .{ .none = {} });
-
-    // ACE1: array_collect_end
-    const ace1_end: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[ace1_start].operand = .{ .index = ace1_end };
-
-    // capture_variable($arr)
-    try ctx.emit(.capture_variable, .{ .index = arr_id });
-
-    // restore_input
-    try ctx.emit(.restore_input, .{ .none = {} });
+    const expr_end = ctx.raw.items.len;
 
     // Consume `as PATTERN`
     const as_tok = try ctx.nextToken();
@@ -2979,58 +2975,47 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const lparen = try ctx.nextToken();
     if (lparen.tag != .lparen) return ctx.syntaxErr(lparen.offset, lparen.len);
 
-    // array_collect_start(ACE2) — collect INIT outputs (may be generator)
-    const ace2_start = ctx.raw.items.len;
-    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    // Save the EXPR instructions and remove them from the raw stream.
+    var expr_buf = std.ArrayList(RawInstr){};
+    defer expr_buf.deinit(ctx.alloc);
+    try expr_buf.appendSlice(ctx.alloc, ctx.raw.items[expr_start..expr_end]);
+    ctx.raw.items.len = expr_start;
 
     // <INIT> — parsed with parsePipe
     try parsePipe(ctx);
 
-    // output
-    try ctx.emit(.yield_output, .{ .none = {} });
+    // capture_variable($acc) — save init value
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
 
-    // ACE2: array_collect_end
-    const ace2_end: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[ace2_start].operand = .{ .index = ace2_end };
-
-    // capture_variable($init_arr)
-    try ctx.emit(.capture_variable, .{ .index = init_arr_id });
+    // Restore original input for EXPR via hidden variable
+    try ctx.emit(.load_variable, .{ .index = saved_input_id });
+    try ctx.emit(.pipe, .{ .none = {} });
 
     // Consume `;`
     const semi = try ctx.nextToken();
     if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
 
-    // array_collect_start(ACE3) — collect foreach outputs
-    const ace3_start = ctx.raw.items.len;
+    // array_collect_start(ACE) — collect foreach intermediate outputs
+    const ace_start = ctx.raw.items.len;
     try ctx.emit(.array_collect_start, .{ .index = 0 });
 
-    // load_variable($init_arr)
-    try ctx.emit(.load_variable, .{ .index = init_arr_id });
+    // fork L_done — sentinel: when EXPR exhausts, jump to L_done
+    const fork_pos = ctx.raw.items.len;
+    try ctx.emit(.fork, .{ .index = 0 }); // placeholder, backpatched below
 
-    // pipe
-    try ctx.emit(.pipe, .{ .none = {} });
+    // <EXPR> — re-insert the saved EXPR instructions, adjusting internal IPs
+    {
+        const new_start = ctx.raw.items.len;
+        const offset: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(expr_start));
+        rebaseExprBuf(expr_buf.items, offset);
+        try ctx.raw.appendSlice(ctx.alloc, expr_buf.items);
+    }
 
-    // iterate — outer: over INIT values
-    try ctx.emit(.each, .{ .none = {} });
-
-    // capture_variable($acc)
-    try ctx.emit(.capture_variable, .{ .index = acc_id });
-
-    // load_variable($arr)
-    try ctx.emit(.load_variable, .{ .index = arr_id });
-
-    // pipe
-    try ctx.emit(.pipe, .{ .none = {} });
-
-    // iterate — inner: over EXPR values
-    try ctx.emit(.each, .{ .none = {} });
-
-    // Bind current element to pattern variables
-    try ctx.emit(.push_current, .{ .none = {} });
+    // Bind EXPR output to pattern variables (no push_current — the EXPR
+    // result may be on value_stack or as current; emitPatternCapture handles both).
     try emitPatternCapture(ctx, pattern);
 
-    // load_variable($acc)
+    // load_variable($acc) — push accumulator
     try ctx.emit(.load_variable, .{ .index = acc_id });
 
     // pipe — current = accumulator
@@ -3057,33 +3042,39 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         // <EXTRACT>
         try parsePipe(ctx);
 
-        // output -> ACE3 buffer
+        // yield_output -> ACE buffer
         try ctx.emit(.yield_output, .{ .none = {} });
     } else {
         // 2-arg form: output accumulator directly
-        // load_variable($acc)
         try ctx.emit(.load_variable, .{ .index = acc_id });
 
-        // output -> ACE3 buffer
+        // yield_output -> ACE buffer
         try ctx.emit(.yield_output, .{ .none = {} });
     }
+
+    // backtrack — advance EXPR to next value (or exhaust → sentinel fires)
+    try ctx.emit(.backtrack, .{ .none = {} });
 
     // Consume `)`
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
-    // ACE3: array_collect_end — all foreach outputs as array
-    const ace3_end: u32 = @intCast(ctx.raw.items.len);
-    try ctx.emit(.array_collect_end, .{ .none = {} });
-    ctx.raw.items[ace3_start].operand = .{ .index = ace3_end };
+    // L_done: backpatch fork target
+    const l_done: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[fork_pos].operand = .{ .index = l_done };
 
-    // pipe — current = outputs array
+    // ACE: array_collect_end — build array of intermediate values
+    const ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[ace_start].operand = .{ .index = ace_end };
+
+    // pipe — current = collected outputs array
     try ctx.emit(.pipe, .{ .none = {} });
 
-    // iterate — emit each individually (makes foreach a generator)
-    try ctx.emit(.each, .{ .none = {} });
-
-    // Cleanup: pop pattern variables in reverse order, then hidden vars
+    // Cleanup: pop pattern variables and $acc BEFORE the `each` generator,
+    // so they're only cleared once (not per-element). $saved_input is
+    // intentionally NOT popped — if INIT is a generator, the comma fork
+    // backtracks after `each` exhausts and needs $saved_input intact.
     {
         var pvar_ids = std.ArrayList(u32){};
         defer pvar_ids.deinit(ctx.alloc);
@@ -3095,8 +3086,9 @@ fn compileForeach(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         }
     }
     try ctx.emit(.pop_variable, .{ .index = acc_id });
-    try ctx.emit(.pop_variable, .{ .index = init_arr_id });
-    try ctx.emit(.pop_variable, .{ .index = arr_id });
+
+    // each — iterate collected outputs as a generator for downstream
+    try ctx.emit(.each, .{ .none = {} });
 
     popScope(ctx, ctx.alloc);
 }
@@ -5128,8 +5120,6 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .array_collect_end => .{ .none = {} },
-                // Deprecated opcodes — no longer emitted.
-                .alt_start, .alt_check, .try_begin, .try_end => unreachable,
                 // Fork-based try/alt: remap non-zero index operands (0 = sentinel).
                 .fork_try, .fork_alt => blk: {
                     const idx_usize: usize = @intCast(r.operand.index);
@@ -5166,8 +5156,6 @@ fn fuse(
                 .backtrack => .{ .none = {} },
                 .each => .{ .none = {} },
                 .yield_output => .{ .none = {} },
-                // Deprecated opcodes — no longer emitted by compiler.
-                .output, .iterate => unreachable,
             },
         };
     }
