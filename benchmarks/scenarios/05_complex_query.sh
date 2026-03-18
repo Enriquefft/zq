@@ -23,7 +23,7 @@ DISPLAY_FILE=$(display_filename "$DATA_FILE")
 FILE_SIZE=$(file_size_display "$DATA_FILE")
 LINE_COUNT=$(wc -l < "$DATA_FILE")
 
-QUERY='{id, mod3: (.id % 3), big: (.id > 7500000), kind: (.values // .meta // .data // "none" | type)}'
+QUERY='{id: .id, mod3: (.id % 3), big: (.id > 7500000), kind: (.values // .meta // .data // "none" | type)}'
 
 echo "# Scenario 5: Complex Query" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
@@ -58,7 +58,7 @@ fi
 if $HAVE_GOJQ; then
     verify_correctness "gojq" "$EXPECTED_LINES" gojq -c "$QUERY" "$DATA_FILE" || CORRECT=false
 fi
-verify_correctness "zq" "$EXPECTED_LINES" "$ZQ" "$QUERY" "$DATA_FILE" || CORRECT=false
+verify_correctness "zq" "$EXPECTED_LINES" "$ZQ" -c "$QUERY" "$DATA_FILE" || CORRECT=false
 
 if $CORRECT; then
     echo "All tools verified: $EXPECTED_LINES lines output." >> "$RESULT_FILE"
@@ -72,7 +72,6 @@ HYPERFINE_ARGS=(
     --warmup "$HYPERFINE_WARMUP" --runs "$HYPERFINE_RUNS"
     --export-markdown "$RESULTS_DIR/05_complex_query_raw.md"
     --export-json "$JSON_FILE"
-    --time-limit 120
 )
 
 if $HAVE_JQ; then
@@ -84,7 +83,7 @@ fi
 if $HAVE_GOJQ; then
     HYPERFINE_ARGS+=(--command-name gojq "gojq -c '$QUERY' '$DATA_FILE' > /dev/null")
 fi
-HYPERFINE_ARGS+=(--command-name zq "'$ZQ' '$QUERY' '$DATA_FILE' > /dev/null")
+HYPERFINE_ARGS+=(--command-name zq "'$ZQ' -c '$QUERY' '$DATA_FILE' > /dev/null")
 
 echo "" >&2
 start_phase_timer "Hyperfine benchmark (complex query comparison)"

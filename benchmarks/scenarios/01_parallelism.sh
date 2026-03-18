@@ -62,12 +62,13 @@ echo "" >> "$RESULT_FILE"
 HYPERFINE_ARGS=(
     --warmup "$BM_WARMUP" --runs "$BM_RUNS"
     --export-markdown "$BENCHMARK_DIR/results/01_parallelism_raw.md"
+    --export-json "$BENCHMARK_DIR/results/01_parallelism.json"
     --ignore-failure
 )
 
-[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=("jq '.id' '$DATA_FILE' > /dev/null")
-[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=("jaq -c '.id' '$DATA_FILE' > /dev/null")
-HYPERFINE_ARGS+=("timeout 60 '$BENCHMARK_DIR/../zig-out/bin/zq' '.id' '$DATA_FILE' > /dev/null")
+[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=(--command-name jq "jq '.id' '$DATA_FILE' > /dev/null")
+[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=(--command-name jaq "jaq -c '.id' '$DATA_FILE' > /dev/null")
+HYPERFINE_ARGS+=(--command-name zq "timeout 60 '$BENCHMARK_DIR/../zig-out/bin/zq' '.id' '$DATA_FILE' > /dev/null")
 
 echo "" >&2
 start_phase_timer "Hyperfine benchmark (parallelism comparison)"

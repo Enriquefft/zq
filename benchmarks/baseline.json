@@ -1,5 +1,11 @@
 {
   "version": "1.0",
-  "note": "Baseline not yet established. Run benchmarks on CI to populate. This file will be updated on the first passing release tag.",
-  "scenarios": {}
+  "date": "2026-03-18T09:52:30Z",
+  "scenarios": {
+    "parallelism": {"zq_mean_s": 2.13, "jq_mean_s": 37.77},
+    "memory": {"zq_mean_s": 3.59, "jq_mean_s": 83.83},
+    "startup_latency": {"zq_mean_s": 0.00238, "jq_mean_s": 0.00355},
+    "streaming": {"zq_mean_s": 2.65, "jq_mean_s": 32.59},
+    "complex_query": {"zq_mean_s": 3.64, "jq_mean_s": 91.24}
+  }
 }

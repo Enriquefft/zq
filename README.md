@@ -1,10 +1,10 @@
-# zq — 25x faster jq
+# zq — 21x faster jq
 
 <!-- badges -->
 [![CI](https://github.com/Enriquefft/zq/actions/workflows/ci.yml/badge.svg)](https://github.com/Enriquefft/zq/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Drop-in replacement for jq. Same filter syntax, 25x faster on large files, with native JSONL streaming and LLM-safe truncated JSON recovery.
+Drop-in replacement for jq. Same filter syntax, 21x faster on large files, with native JSONL streaming and LLM-safe truncated JSON recovery.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
@@ -14,23 +14,19 @@ curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
 
 ## Benchmarks
 
-**File mode — 648 MB / 15M-record JSONL**
+![zq vs jq benchmark](demo/benchmark.gif)
 
-| Tool | `.id` | `select(.id > 500000)` | RSS (`.id`) |
-|------|-------|------------------------|-------------|
-| jq | 21.4s | 41.6s | 3.7 MB |
-| jaq | 15.3s | 27.7s | 666 MB |
-| **zq** | **0.87s** | **2.9s** | **715 MB** |
+**File mode — 15M-record JSONL**
 
-**Streaming mode — `cat file | zq .id`**
+| Tool | `.id` | `select(.age > 50) \| {name, senior}` | RSS |
+|------|-------|----------------------------------------|-----|
+| jq | 35.1s | 38.0s | 3.7 MB |
+| jaq | 23.5s | — | 1312 MB |
+| **zq** | **1.67s** | **1.66s** | **1735 MB** |
 
-| Tool | Time | RSS |
-|------|------|-----|
-| jq | 22.2s | 3.7 MB |
-| **zq** | **1.4s** | **7 MB** |
+> 21x faster than jq on field extraction. 23x faster on filter + transform.
 
-**Startup time:** ~2ms (2x faster than jq)
-**Binary size:** 2.7 MB static, stripped, zero dependencies
+**Startup:** ~2ms (2x faster than jq) | **Binary:** 2.7 MB static, stripped, zero dependencies
 
 ---
 
@@ -66,9 +62,11 @@ zq '.id' massive_dataset.jsonl > ids.txt
 
 zq is designed for programmatic use. Key integration points:
 
-- **Capability discovery:** `zq -n 'builtins'` lists all built-in functions
+- **Data shape inspection:** `--describe` shows input structure before you write a filter
+- **Filter validation:** `--validate` checks syntax without executing — fail fast, no wasted runs
 - **Structured errors:** `--json-errors` outputs diagnostics as JSON on stderr
 - **Granular exit codes:** 0=success, 1=false(-e), 2=usage, 3=compile error, 4=runtime error, 5=system error
+- **Capability discovery:** `zq -n 'builtins'` lists all built-in functions
 - **jq compatible:** same filter syntax — any jq knowledge transfers directly
 - **C ABI:** embed via `zq_compile`/`zq_execute`/`zq_get_error` for structured error details
 
@@ -119,10 +117,10 @@ Requires [Zig 0.15.2](https://ziglang.org/download/). Or with Nix: `direnv allow
 
 ## Roadmap
 
-**v0.1** ✅ — Core query engine, parallel runtime, agent-ready diagnostics, CLI parity
-**v0.2** ✅ — Unified fork/backtrack VM (61% jq compat — try-catch, alternative, label/break, limit)
-**v0.5** — WASM build, Python bindings, auto-detect JSON error output
-**v1.0** — Full jq compatibility, plugin system, MCP server integration
+- **v0.1** — Core query engine, parallel runtime, agent-ready diagnostics, CLI parity
+- **v0.2** — Unified fork/backtrack VM (61% jq compat — try-catch, alternative, label/break, limit, destructuring)
+- **v0.5** — 95% jq compat, Python bindings, `--strict`, `--suggest`, `--explain`
+- **v1.0** — Full jq compatibility, plugin system, framework integrations
 
 ---
 

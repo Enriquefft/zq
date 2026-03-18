@@ -163,6 +163,62 @@ echo "" >> "$SUMMARY_FILE"
 
 echo "" >&2
 
+# Generate machine-readable summary.json from per-scenario JSON exports
+SUMMARY_JSON="$BENCHMARK_DIR/results/summary.json"
+
+# Helper: extract mean for a command from a hyperfine JSON export
+extract_mean() {
+    local json_file="$1" cmd_name="$2"
+    if [ -f "$json_file" ]; then
+        jq -r --arg cmd "$cmd_name" '.results[] | select(.command == $cmd) | .mean // empty' "$json_file" 2>/dev/null
+    fi
+}
+
+# Build summary JSON
+{
+    cat <<HEADER
+{
+  "version": "1.0",
+  "date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "scenarios": {
+HEADER
+
+    # Parallelism
+    P_ZQ=$(extract_mean "$BENCHMARK_DIR/results/01_parallelism.json" "zq")
+    P_JQ=$(extract_mean "$BENCHMARK_DIR/results/01_parallelism.json" "jq")
+    printf '    "parallelism": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${P_ZQ:-null}" "${P_JQ:-null}"
+
+    # Memory (uses wall clock time from our custom JSON)
+    M_ZQ=$(extract_mean "$BENCHMARK_DIR/results/02_memory.json" "zq")
+    M_JQ=$(extract_mean "$BENCHMARK_DIR/results/02_memory.json" "jq")
+    printf '    "memory": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${M_ZQ:-null}" "${M_JQ:-null}"
+
+    # Startup latency
+    SL_ZQ=$(extract_mean "$BENCHMARK_DIR/results/03_startup_latency.json" "zq")
+    SL_JQ=$(extract_mean "$BENCHMARK_DIR/results/03_startup_latency.json" "jq")
+    printf '    "startup_latency": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${SL_ZQ:-null}" "${SL_JQ:-null}"
+
+    # Streaming
+    ST_ZQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "zq")
+    ST_JQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "jq")
+    printf '    "streaming": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${ST_ZQ:-null}" "${ST_JQ:-null}"
+
+    # Complex query
+    CQ_ZQ=$(extract_mean "$BENCHMARK_DIR/results/05_complex_query.json" "zq")
+    CQ_JQ=$(extract_mean "$BENCHMARK_DIR/results/05_complex_query.json" "jq")
+    printf '    "complex_query": {"zq_mean_s": %s, "jq_mean_s": %s}\n' "${CQ_ZQ:-null}" "${CQ_JQ:-null}"
+
+    echo '  }'
+    echo '}'
+} > "$SUMMARY_JSON"
+
+# Validate the generated JSON
+if jq . "$SUMMARY_JSON" > /dev/null 2>&1; then
+    echo "Summary JSON validated: $SUMMARY_JSON" >&2
+else
+    echo "WARNING: summary.json is not valid JSON" >&2
+fi
+
 # Add final summary
 cat >> "$SUMMARY_FILE" << EOF
 

@@ -66,10 +66,10 @@ HYPERFINE_ARGS=(hyperfine --warmup 0 --runs "$BM_RUNS"
     --export-json "$JSON_FILE"
     --ignore-failure)
 
-[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=(--command-name jq "jq" ".a" "$TINY_FILE")
-[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=(--command-name jaq "jaq" ".a" "$TINY_FILE")
-[ "$SKIP_YQ"  != true ] && HYPERFINE_ARGS+=(--command-name yq "yq" ".a" "$TINY_FILE")
-HYPERFINE_ARGS+=(--command-name zq "$ZQ_BIN" ".a" "$TINY_FILE")
+[ "$SKIP_JQ"  != true ] && HYPERFINE_ARGS+=(--command-name jq "jq .a $TINY_FILE")
+[ "$SKIP_JAQ" != true ] && HYPERFINE_ARGS+=(--command-name jaq "jaq .a $TINY_FILE")
+[ "$SKIP_YQ"  != true ] && HYPERFINE_ARGS+=(--command-name yq "yq .a $TINY_FILE")
+HYPERFINE_ARGS+=(--command-name zq "$ZQ_BIN .a $TINY_FILE")
 
 echo "" >&2
 start_phase_timer "Hyperfine benchmark (startup latency comparison)"

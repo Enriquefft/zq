@@ -8,6 +8,7 @@ set -o pipefail
 BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_FILE="$BENCHMARK_DIR/data/huge.jsonl"
 RESULT_FILE="$BENCHMARK_DIR/results/02_memory.md"
+JSON_FILE="$BENCHMARK_DIR/results/02_memory.json"
 ZQ_BIN="$BENCHMARK_DIR/../zig-out/bin/zq"
 
 # Source shared configuration (also sources progress.sh)
@@ -53,6 +54,9 @@ echo "" >> "$RESULT_FILE"
 echo "## Results" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
+# Capture metrics for JSON export
+declare -A WALL_CLOCK RSS_KB
+
 run_memory_test() {
     local label="$1"; shift
     local cmd=("$@")
@@ -60,17 +64,49 @@ run_memory_test() {
     echo "### $label" >> "$RESULT_FILE"
     echo "\`\`\`" >> "$RESULT_FILE"
     start_phase_timer "Memory benchmark: $label"
-    (/usr/bin/time -v "${cmd[@]}" > /dev/null) 2>&1 \
+    local time_output
+    time_output=$( (/usr/bin/time -v "${cmd[@]}" > /dev/null) 2>&1 )
+    echo "$time_output" \
         | grep -E "(Maximum resident set size|User time|System time|Elapsed \(wall clock\) time)" \
         | tee -a "$RESULT_FILE"
     end_phase_timer "Memory benchmark: $label"
     echo "\`\`\`" >> "$RESULT_FILE"
     echo "" >> "$RESULT_FILE"
+
+    # Extract wall clock (m:ss.ss or h:mm:ss format) and convert to seconds
+    local wall_raw
+    wall_raw=$(echo "$time_output" | grep "Elapsed (wall clock)" | sed 's/.*: //')
+    local wall_s
+    if [[ "$wall_raw" == *:*:* ]]; then
+        wall_s=$(echo "$wall_raw" | awk -F: '{printf "%.2f", $1*3600 + $2*60 + $3}')
+    else
+        wall_s=$(echo "$wall_raw" | awk -F: '{printf "%.2f", $1*60 + $2}')
+    fi
+    WALL_CLOCK[$label]=$wall_s
+
+    # Extract RSS in kbytes
+    local rss
+    rss=$(echo "$time_output" | grep "Maximum resident set size" | awk '{print $NF}')
+    RSS_KB[$label]=$rss
 }
 
 [ "$SKIP_JQ"  != true ] && run_memory_test "jq"  jq  'select(.id > 500000)' "$DATA_FILE"
 [ "$SKIP_JAQ" != true ] && run_memory_test "jaq" jaq 'select(.id > 500000)' "$DATA_FILE"
 run_memory_test "zq" timeout 60 "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
 
+# Write JSON export
+{
+    echo '{"results":['
+    first=true
+    for label in jq jaq zq; do
+        if [ -n "${WALL_CLOCK[$label]+x}" ]; then
+            $first || echo ','
+            first=false
+            printf '{"command":"%s","mean":%s,"max_rss_kb":%s}' \
+                "$label" "${WALL_CLOCK[$label]}" "${RSS_KB[$label]}"
+        fi
+    done
+    echo ']}'
+} > "$JSON_FILE"
 
 echo "Benchmark results saved to: $RESULT_FILE" >&2

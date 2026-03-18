@@ -76,7 +76,6 @@ HYPERFINE_ARGS=(
     --warmup "$HYPERFINE_WARMUP" --runs "$HYPERFINE_RUNS"
     --export-markdown "$RESULTS_DIR/04_streaming_raw.md"
     --export-json "$JSON_FILE"
-    --time-limit 300
 )
 
 if $HAVE_JQ; then

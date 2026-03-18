@@ -27,6 +27,7 @@
             jaq
             yq
             just
+            vhs
           ];
         };
 
