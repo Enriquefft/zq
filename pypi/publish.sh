@@ -3,10 +3,17 @@ set -euo pipefail
 
 # Usage: ./pypi/publish.sh <version> <artifacts-dir>
 # Called by CI after downloading release artifacts.
+# Idempotent: skips versions already on PyPI.
 
 VERSION="${1:?Usage: publish.sh <version> <artifacts-dir>}"
 ARTIFACTS="$(cd "${2:?Usage: publish.sh <version> <artifacts-dir>}" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Check if version already exists on PyPI
+if pip index versions zq-json 2>/dev/null | grep -qF "$VERSION"; then
+  echo "zq-json ${VERSION} already on PyPI, skipping"
+  exit 0
+fi
 
 WHEEL_DIR="/tmp/zq-pypi-wheels"
 rm -rf "$WHEEL_DIR"
@@ -21,13 +28,11 @@ declare -A PLATFORM_MAP=(
   ["windows-amd64.zip"]="win_amd64:zq.exe"
 )
 
-# Normalize version for PEP 440 (no leading v, hyphens become dots)
 PEP_VERSION="${VERSION}"
 
 for glob in "${!PLATFORM_MAP[@]}"; do
   IFS=':' read -r platform_tag binary <<< "${PLATFORM_MAP[$glob]}"
 
-  # Find matching artifact
   artifact=$(find "$ARTIFACTS" -name "*${glob}" | head -1)
   if [ -z "$artifact" ]; then
     echo "Warning: no artifact for ${glob}, skipping"
@@ -36,12 +41,10 @@ for glob in "${!PLATFORM_MAP[@]}"; do
 
   echo "Building wheel for ${platform_tag}..."
 
-  # Create wheel structure
   work="/tmp/zq-wheel-${platform_tag}"
   rm -rf "$work"
   mkdir -p "$work/zq_json/_bin"
 
-  # Extract binary
   if [[ "$artifact" == *.zip ]]; then
     unzip -o "$artifact" "$binary" -d "$work/zq_json/_bin"
   else
@@ -49,12 +52,10 @@ for glob in "${!PLATFORM_MAP[@]}"; do
   fi
   chmod +x "$work/zq_json/_bin/${binary}"
 
-  # Copy Python sources and stamp version
   cp "$SCRIPT_DIR/__init__.py" "$work/zq_json/__init__.py"
   cp "$SCRIPT_DIR/__main__.py" "$work/zq_json/__main__.py"
   sed -i "s/__version__ = \"0.0.0\"/__version__ = \"${PEP_VERSION}\"/" "$work/zq_json/__init__.py"
 
-  # Create dist-info
   dist_info="$work/zq_json-${PEP_VERSION}.dist-info"
   mkdir -p "$dist_info"
 
@@ -62,7 +63,7 @@ for glob in "${!PLATFORM_MAP[@]}"; do
 Metadata-Version: 2.1
 Name: zq-json
 Version: ${PEP_VERSION}
-Summary: An agents-first jq alternative — 25x faster JSON processing
+Summary: Drop-in jq replacement — 21x faster JSON processing
 Home-page: https://github.com/Enriquefft/zq
 License: MIT
 Author: Enrique Flores
@@ -78,7 +79,7 @@ Description-Content-Type: text/markdown
 
 # zq-json
 
-An agents-first jq alternative — 25x faster JSON processing via parallelization, SIMD, and zero-allocation parsing.
+Drop-in jq replacement — 21x faster JSON processing via parallelization, SIMD, and zero-allocation parsing.
 
 ## Usage
 
@@ -103,10 +104,10 @@ zq = zq_json:main
 EOF
 
   # Generate RECORD with SHA256 hashes
-  cd "$work"
   python3 -c "
 import hashlib, base64, os
 
+os.chdir('${work}')
 record_path = '${dist_info##*/}/RECORD'
 lines = []
 for root, dirs, files in os.walk('.'):
@@ -126,11 +127,9 @@ with open(record_path, 'w') as fh:
     fh.write('\n'.join(lines) + '\n')
 "
 
-  # Build wheel (a wheel is just a zip with .whl extension)
+  # Build wheel
   wheel_name="zq_json-${PEP_VERSION}-py3-none-${platform_tag}.whl"
-  cd "$work"
-  zip -r "$WHEEL_DIR/$wheel_name" . -x '.*'
-  cd /
+  (cd "$work" && zip -r "$WHEEL_DIR/$wheel_name" . -x '.*')
 
   echo "Built: $wheel_name"
   rm -rf "$work"
@@ -140,7 +139,6 @@ echo ""
 echo "Wheels built in $WHEEL_DIR:"
 ls -la "$WHEEL_DIR"/*.whl
 
-# Upload via twine
 echo ""
 echo "Uploading to PyPI..."
 twine upload "$WHEEL_DIR"/*.whl

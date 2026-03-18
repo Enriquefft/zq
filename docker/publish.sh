@@ -5,7 +5,7 @@ set -euo pipefail
 # Called by CI after downloading release artifacts.
 
 VERSION="${1:?Usage: publish.sh <version> <artifacts-dir>}"
-ARTIFACTS="${2:?Usage: publish.sh <version> <artifacts-dir>}"
+ARTIFACTS="$(cd "${2:?Usage: publish.sh <version> <artifacts-dir>}" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REGISTRY="ghcr.io/enriquefft/zq"
 

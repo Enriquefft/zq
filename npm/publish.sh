@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Usage: ./npm/publish.sh <version> <artifacts-dir>
 # Called by CI after downloading release artifacts.
+# Idempotent: skips packages that are already published.
 
 VERSION="${1:?Usage: publish.sh <version> <artifacts-dir>}"
-ARTIFACTS="${2:?Usage: publish.sh <version> <artifacts-dir>}"
+ARTIFACTS="$(cd "${2:?Usage: publish.sh <version> <artifacts-dir>}" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Map: npm-dir -> artifact-glob -> binary-name
@@ -17,6 +18,18 @@ declare -A PLATFORM_MAP=(
   ["win32-x64"]="windows-amd64.zip:zq.exe"
   ["freebsd-x64"]="freebsd-amd64.tar.gz:zq"
 )
+
+publish_npm() {
+  local pkg_name="$1" pkg_dir="$2"
+
+  if npm view "${pkg_name}@${VERSION}" version &>/dev/null; then
+    echo "Already published ${pkg_name}@${VERSION}, skipping"
+    return 0
+  fi
+
+  echo "Publishing ${pkg_name}@${VERSION}"
+  npm publish "$pkg_dir" --access public
+}
 
 for platform in "${!PLATFORM_MAP[@]}"; do
   IFS=':' read -r glob binary <<< "${PLATFORM_MAP[$platform]}"
@@ -42,8 +55,7 @@ for platform in "${!PLATFORM_MAP[@]}"; do
   # Stamp version
   sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" "${pkg_dir}/package.json"
 
-  echo "Publishing @zqjson/${platform}@${VERSION}"
-  npm publish "$pkg_dir" --access public
+  publish_npm "@zqjson/${platform}" "$pkg_dir"
 done
 
 # Publish main package
@@ -52,5 +64,4 @@ sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" "${main_dir}/package
 # Update optionalDependencies versions
 sed -i "s/\": \"[0-9][^\"]*\"/\": \"${VERSION}\"/g" "${main_dir}/package.json"
 
-echo "Publishing @zqjson/zq@${VERSION}"
-npm publish "$main_dir" --access public
+publish_npm "@zqjson/zq" "$main_dir"
