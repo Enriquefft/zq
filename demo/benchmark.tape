@@ -13,10 +13,12 @@ Set Theme "Dracula"
 Set TypingSpeed 30ms
 Set Padding 20
 
-# Setup: clean prompt, PATH, generate data — then clear screen
+# Setup: clean prompt, PATH, generate data (hidden from recording)
+Hide
 Type `export PS1="$ " PATH="/home/hybridz/Projects/zq/zig-out/bin:$PATH" && awk 'BEGIN{for(i=1;i<=1000000;i++) printf "{\"id\":%d,\"name\":\"user_%d\",\"active\":true}\n",i,i}' > /tmp/bench.jsonl && clear`
 Enter
 Sleep 3s
+Show
 
 # --- Act 1: Feel the difference ---
 Type "# 1M records  |  45 MB  |  .id extraction"

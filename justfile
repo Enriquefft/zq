@@ -20,6 +20,10 @@ run *ARGS:
 bench:
     zig build -Doptimize=ReleaseFast && ./zig-out/bin/microbench
 
+# Record the benchmark demo GIF
+demo:
+    vhs demo/benchmark.tape
+
 # Show available commands
 help:
     @just --list
