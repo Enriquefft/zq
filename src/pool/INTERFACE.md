@@ -190,7 +190,14 @@ pub const Pool = struct {
   (useful for testing and single-core environments). All invariants still hold.
 - **Serialized path memory savings**: For per-record scalar queries, arena holds only
   serialized bytes (e.g. "42\n" = 3 bytes) instead of OwnedValue structs + tape copies.
-  With 32 in-flight chunks: ~50 MB vs ~700 MB for a 648 MB file.
+  Peak RSS: 396 MB for a 1277 MB file with `.id` (0.31x input).
 - **Adaptive sizing is transparent.** On >=4 GB machines with files that fit in budget,
   parameters are identical to the previous hardcoded defaults (chunk_factor=4,
   in_flight_factor=2, stream_batch_size=256K). Only constrained environments see changes.
+- **`job.data` must not be accessed after `sequencer.post()`.** File-mode workers call
+  `madvise(MADV_DONTNEED)` on the mmap chunk immediately after posting, releasing
+  physical pages from RSS. The invariant holds because: (a) the serialized path stores
+  output bytes in the arena, never pointers into `job.data`; (b) the structured path
+  calls `own_value()` to deep-copy all tape spans and strings into the arena, and
+  `parser.reset()` after each record. Violating this invariant causes silent disk
+  re-reads (performance regression), not data corruption. Linux-only; no-op elsewhere.

@@ -446,6 +446,15 @@ fn worker_fn(ctx: WorkerCtx) void {
 
     while (ctx.queue.pop()) |job| {
         defer if (job.owns_data) job.allocator.free(job.data);
+        // INVARIANT: job.data must not be accessed after sequencer.post().
+        // Serialized path: output bytes are in the arena, not in job.data.
+        // Structured path: own_value() copies all tape spans + strings into the
+        // arena before post(); parser.reset() clears the tape after each record.
+        // Violating this invariant causes silent disk re-reads, not corruption.
+        //
+        // MADV_DONTNEED releases the physical pages immediately (Linux only),
+        // bounding mmap RSS to O(in_flight × chunk_size) instead of O(file_size).
+        defer if (!job.owns_data) madvise_dontneed_chunk(job.data);
 
         // Per-chunk arena: all OwnedValue / serialized-byte memory is allocated here.
         // Freed atomically by collect()/collect_bytes() after the chunk is exhausted.
@@ -1065,6 +1074,24 @@ fn hasNonEmptyLine(data: []const u8) bool {
         rem = if (nl < rem.len) rem[nl + 1 ..] else &.{};
     }
     return false;
+}
+
+/// Release physical pages for a processed file-mode mmap chunk (Linux only).
+///
+/// Inward-aligns to page boundaries so pages shared with adjacent chunks are
+/// left untouched. Only middle (fully-owned) pages are freed.
+fn madvise_dontneed_chunk(data: []const u8) void {
+    if (comptime @import("builtin").os.tag != .linux) return;
+    const page = std.heap.pageSize();
+    const addr = @intFromPtr(data.ptr);
+    const start = std.mem.alignForward(usize, addr, page);
+    const end = std.mem.alignBackward(usize, addr + data.len, page);
+    if (end <= start) return;
+    std.posix.madvise(
+        @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(start)),
+        end - start,
+        std.posix.MADV.DONTNEED,
+    ) catch {};
 }
 
 // ── SharedCtx — heap-allocated, ref-counted pool state ────────────────────────

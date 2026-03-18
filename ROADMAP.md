@@ -30,7 +30,7 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ## Quick Status (Updated 2026-03-18)
 
-**Last updated:** Streaming reduce/foreach (fork-based, O(1) memory) + auto-updating RuntimeTape view
+**Last updated:** Memory audit — madvise(MADV_DONTNEED) on processed mmap chunks; RSS reduced from 1.29x to 0.31–0.64x input
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
@@ -39,14 +39,20 @@ Compat tests:       327/533 passing (61.4%)
 Startup:            ~2 ms (2x faster than jq)
 Cold start:         sub-3ms
 
-Parallel (file arg, .id, 15M-record JSONL):
-  jq   35.1s   3.7 MB RSS
-  jaq  23.5s   1312 MB RSS
-  zq    1.67s  1735 MB RSS  <- 21x faster than jq
+Parallel (file arg, .id, 15M-record JSONL, 1.3 GB):
+  jq   37.8s   3.7 MB RSS
+  jaq  25.0s   1312 MB RSS
+  zq    1.44s   396 MB RSS  <- 26x faster than jq, 0.31x input RSS
 
-Parallel (file arg, select(.age > 50) | {name, senior}):
-  jq   38.0s   3.7 MB RSS
-  zq    1.66s  1735 MB RSS  <- 23x faster than jq
+Parallel (file arg, select(.id > 500000), 15M-record JSONL, 1.3 GB):
+  jq   69.8s   3.6 MB RSS
+  jaq  39.0s   1312 MB RSS
+  zq    2.21s   820 MB RSS  <- 32x faster than jq, 0.64x input RSS
+
+Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
+  jq   91.2s   3.7 MB RSS
+  jaq 178.3s   1312 MB RSS
+  zq    3.64s   543 MB RSS  <- 25x faster than jq, 0.42x input RSS
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
@@ -67,7 +73,7 @@ Parallel (file arg, select(.age > 50) | {name, senior}):
 - [ ] All P0/P1 query features below are implemented
 - [x] `zq` binary under 3 MB static (2.7 MB stripped)
 - [ ] Zero known crashes on valid JSON input
-- [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 1.10x for `.id`)
+- [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 0.31x for `.id`, 0.64x for `select()`)
 - [x] Startup time < 3ms (achieved: ~2ms)
 - [x] `--json-errors` produces structured error output
 - [x] `--describe` shows input data shape
@@ -151,8 +157,8 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 ### Memory optimization — P0
 
-Current state: **715 MB RSS** for 648 MB JSONL `.id` query **(1.10x input)**. Target < 2x: **achieved**.
-Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
+Current state: **396 MB RSS** for 1277 MB JSONL `.id` query **(0.31x input)**. Target < 2x: **achieved**. Target ~1x: **achieved**.
+Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 
 | | Item | Detail |
 |---|------|--------|
@@ -161,8 +167,12 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [x] | **Batched stream mode** | stdin routes through parallel pool via `submit_stream()`. IO thread accumulates lines into 256 KB batches. InFlightLimiter backpressure added. **Result: streaming 215s -> 1.6s (120x faster); RSS ~8 MB.** |
 | [x] | **2 MiB thread stacks** | Reduced from 16 MiB default. Workers use heap-allocated parse/query stacks. **Result: ~224 MB saved (22 threads x 14 MiB).** |
 | [x] | **Contiguous serialized chunks** | One contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B). Format-aware pre-alloc reduces arena page leaks. **Result: 1053 MB -> 715 MB (-32%) for `.id`; 2203 MB -> 1980 MB (-10%) for `select()`.** |
+| [x] | **`madvise(MADV_DONTNEED)` on processed chunks** | After workers serialize a chunk's output into the arena buffer, call `madvise(MADV_DONTNEED)` on the mmap pages. Releases physical pages immediately, bounding mmap RSS to `in_flight × chunk_size` instead of `file_size`. Linux-only; no-op elsewhere. **Result: 1648 MB -> 396 MB for `.id` (-76%); 0.31x input RSS.** |
 
-**Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved for `.id` (1.10x).** `select()` at 3.1x due to pretty-format output expansion — acceptable since output size exceeds input size.
+**Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved and exceeded:**
+- `.id`: **0.31x input** (396 MB for 1277 MB file)
+- `select(.id > 500000)`: **0.64x input** (820 MB) — higher because output ≈ input for high-selectivity filters
+- Complex transform: **0.42x input** (543 MB)
 
 ### Infrastructure
 
@@ -239,7 +249,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
 | [x] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
 | [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
-| [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 1.10x for `.id`.** Total reduction: -76%. |
+| [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 0.31x for `.id`, 0.64x for `select()`.** Total reduction: -87%. |
 
 ### CLI — remaining flags
 
@@ -343,6 +353,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 |---|------|--------|
 | [x] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
 | [x] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
+| [x] | **`madvise(MADV_DONTNEED)` page reclaim** | Workers call `madvise(MADV_DONTNEED)` on mmap chunk pages after serializing output. Bounds mmap RSS to `in_flight × chunk_size`. **Result: 0.31x RSS for `.id`, 0.64x for `select()`.** |
 
 ### Documentation
 
@@ -496,7 +507,8 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Throughput vs jq (parallel, `select() + transform`) | **23x** (1.66s vs 38.0s) | -- | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB | < 3 MB | < 5 MB |
-| Memory (648 MB JSONL, `.id`) | **715 MB** (1.10x) | < 2x | < 2x | < 2x |
+| Memory (1277 MB JSONL, `.id`) | **396 MB** (0.31x) | < 2x | < 2x | < 2x |
+| Memory (1277 MB JSONL, `select()`) | **820 MB** (0.64x) | < 2x | < 2x | < 2x |
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
 | Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | -- | -- | 10x |
 | Test count | **302 compat + module** | 400+ | 800+ | 1000+ |
