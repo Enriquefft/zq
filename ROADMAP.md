@@ -196,7 +196,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
-- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 21x on `.id`, 23x on `select() + transform`)
+- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 26x on `.id`, 32x on `select()`)
 - [ ] `--strict` + `--suggest` + `--explain` all working
 - [ ] WASM build for sandboxed agent environments
 - [ ] Python bindings for programmatic agent use
@@ -245,7 +245,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 | | Item | Detail |
 |---|------|--------|
 | [ ] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
-| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **21x vs jq, 14x vs jaq** on 15M-record JSONL `.id`. |
+| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **26x vs jq, 17x vs jaq** on 15M-record JSONL `.id`. |
 | [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
 | [x] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
 | [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
@@ -503,8 +503,8 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
 | jq compat test pass rate | **61.4%** (327/533) | 60% | 95% | 100% |
-| Throughput vs jq (parallel, `.id`) | **21x** (1.67s vs 35.1s) | > 1x | 5x | 10x |
-| Throughput vs jq (parallel, `select() + transform`) | **23x** (1.66s vs 38.0s) | -- | 15x | 20x |
+| Throughput vs jq (parallel, `.id`) | **26x** (1.44s vs 37.8s) | > 1x | 5x | 10x |
+| Throughput vs jq (parallel, `select()`) | **32x** (2.21s vs 69.8s) | -- | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB | < 3 MB | < 5 MB |
 | Memory (1277 MB JSONL, `.id`) | **396 MB** (0.31x) | < 2x | < 2x | < 2x |

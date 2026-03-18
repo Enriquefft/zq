@@ -1,10 +1,10 @@
-# zq — 21x faster jq
+# zq — 26x faster jq
 
 <!-- badges -->
 [![CI](https://github.com/Enriquefft/zq/actions/workflows/ci.yml/badge.svg)](https://github.com/Enriquefft/zq/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Drop-in replacement for jq. Same filter syntax, 21x faster on large files, with native JSONL streaming and LLM-safe truncated JSON recovery.
+Drop-in replacement for jq. Same filter syntax, 26x faster on large files, with native JSONL streaming and LLM-safe truncated JSON recovery.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
@@ -16,15 +16,15 @@ curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
 
 ![zq vs jq benchmark](demo/benchmark.gif)
 
-**File mode — 15M-record JSONL**
+**File mode — 15M-record JSONL (1.3 GB)**
 
-| Tool | `.id` | `select(.age > 50) \| {name, senior}` | RSS |
-|------|-------|----------------------------------------|-----|
-| jq | 35.1s | 38.0s | 3.7 MB |
-| jaq | 23.5s | — | 1312 MB |
-| **zq** | **1.67s** | **1.66s** | **1735 MB** |
+| Tool | `.id` | `select(.id > 500000)` | RSS |
+|------|-------|------------------------|-----|
+| jq | 37.8s | 69.8s | 3.6 MB |
+| jaq | 25.0s | 39.0s | 1312 MB |
+| **zq** | **1.44s** | **2.21s** | **396 MB** |
 
-> 21x faster than jq on field extraction. 23x faster on filter + transform.
+> 26x faster than jq on field extraction. 32x faster on filter queries. **0.31x input RSS** — uses less RAM than the file itself.
 
 **Startup:** ~2ms (2x faster than jq) | **Binary:** 2.7 MB static, stripped, zero dependencies
 
