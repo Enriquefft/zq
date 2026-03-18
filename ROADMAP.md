@@ -130,7 +130,7 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [x] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
 | [x] | **`getpath`/`setpath`/`delpaths`/`paths`/`leaf_paths`** | Path algebra | Medium |
 | [x] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
-| [ ] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
+| [x] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
 | [x] | **Builtin overloads** (`any/all(gen;cond)`, `flatten(depth)`, `range(a;b;c)`) | Complete multi-arg signatures | Low |
 | [x] | **`contains` on strings** | `"foobar" \| contains("foo")` | Low |
 | [x] | **`@base64`/`@base64d`/`@uri`/`@html`/`@csv`/`@tsv`/`@json`/`@text`/`@sh`** | Format strings | Low |
