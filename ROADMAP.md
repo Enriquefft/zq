@@ -28,30 +28,25 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-17)
+## Quick Status (Updated 2026-03-18)
 
-**Last updated:** PyPI distribution (`pip install zq-json`) + LSP server (`zq --lsp`)
+**Last updated:** Streaming reduce/foreach (fork-based, O(1) memory) + auto-updating RuntimeTape view
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       310/533 passing (58.2%)
-  +-- 220 skipped/failing
+Compat tests:       327/533 passing (61.4%)
+  +-- 203 failing, 3 skipped
 Startup:            ~2 ms (2x faster than jq)
 Cold start:         sub-3ms
 
-Parallel (file arg, .id, 648 MB JSONL):
-  jq   21.4s   3.7 MB RSS
-  jaq  15.3s   666 MB RSS
-  zq    0.87s  715 MB RSS   <- 25x faster than jq, 1.10x input size
+Parallel (file arg, .id, 15M-record JSONL):
+  jq   35.1s   3.7 MB RSS
+  jaq  23.5s   1312 MB RSS
+  zq    1.67s  1735 MB RSS  <- 21x faster than jq
 
-Parallel (file arg, select(.id > 500000)):
-  jq   41.6s   3.7 MB RSS
-  jaq  27.7s   666 MB RSS
-  zq    2.9s   1980 MB RSS  <- 15x faster than jq
-
-Streaming (cat | zq .id):
-  jq   22.2s   3.7 MB RSS
-  zq    1.4s   7 MB RSS     <- 16x faster than jq
+Parallel (file arg, select(.age > 50) | {name, senior}):
+  jq   38.0s   3.7 MB RSS
+  zq    1.66s  1735 MB RSS  <- 23x faster than jq
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
@@ -68,7 +63,7 @@ Streaming (cat | zq .id):
 
 ### Milestone criteria
 
-- [ ] 60%+ of migrated jq compat tests pass
+- [x] 60%+ of migrated jq compat tests pass (achieved: 61.4%, 327/533)
 - [ ] All P0/P1 query features below are implemented
 - [x] `zq` binary under 3 MB static (2.7 MB stripped)
 - [ ] Zero known crashes on valid JSON input
@@ -130,11 +125,11 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 |---|---------|-------|------------|
 | [x] | **`def`** (user-defined functions, including recursion) | Composability | High |
 | [x] | **`while`/`until`/`repeat`** | Loop constructs | Low |
-| [ ] | **`label`/`break`** | Non-local exit from generators | High |
+| [x] | **`label`/`break`** | Non-local exit from generators | High |
 | [x] | **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
 | [x] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
 | [x] | **`getpath`/`setpath`/`delpaths`/`paths`/`leaf_paths`** | Path algebra | Medium |
-| [ ] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
+| [x] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
 | [ ] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
 | [x] | **Builtin overloads** (`any/all(gen;cond)`, `flatten(depth)`, `range(a;b;c)`) | Complete multi-arg signatures | Low |
 | [x] | **`contains` on strings** | `"foobar" \| contains("foo")` | Low |
@@ -191,7 +186,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
-- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 25x on 15M-record JSONL `.id`, 15x on `select()`)
+- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 21x on `.id`, 23x on `select() + transform`)
 - [ ] `--strict` + `--suggest` + `--explain` all working
 - [ ] WASM build for sandboxed agent environments
 - [ ] Python bindings for programmatic agent use
@@ -240,9 +235,9 @@ Progress: 2998 MB -> 1702 MB -> 701 MB (-77% total).
 | | Item | Detail |
 |---|------|--------|
 | [ ] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
-| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **25x vs jq, 18x vs jaq** on 15M-record JSONL `.id`. |
+| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **21x vs jq, 14x vs jaq** on 15M-record JSONL `.id`. |
 | [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
-| [ ] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq vs gojq. |
+| [x] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
 | [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
 | [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 1.10x for `.id`.** Total reduction: -76%. |
 
@@ -496,9 +491,9 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **58.2%** (310/533) | 60% | 95% | 100% |
-| Throughput vs jq (parallel, `.id`) | **25x** (0.87s vs 21.4s) | > 1x | 5x | 10x |
-| Throughput vs jq (parallel, `select()`) | **15x** (2.9s vs 41.6s) | -- | 15x | 20x |
+| jq compat test pass rate | **61.4%** (327/533) | 60% | 95% | 100% |
+| Throughput vs jq (parallel, `.id`) | **21x** (1.67s vs 35.1s) | > 1x | 5x | 10x |
+| Throughput vs jq (parallel, `select() + transform`) | **23x** (1.66s vs 38.0s) | -- | 15x | 20x |
 | Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB | < 3 MB | < 5 MB |
 | Memory (648 MB JSONL, `.id`) | **715 MB** (1.10x) | < 2x | < 2x | < 2x |
