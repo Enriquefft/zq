@@ -32,27 +32,27 @@ echo "" >&2
 # Check prerequisites
 echo "Checking prerequisites..." >&2
 
-MISSING_TOOLS=()
+MISSING_REQUIRED=()
 
 if ! command -v hyperfine &> /dev/null; then
-    MISSING_TOOLS+=("hyperfine (install: cargo install hyperfine)")
+    MISSING_REQUIRED+=("hyperfine (install: cargo install hyperfine)")
 fi
 
 if ! command -v jq &> /dev/null; then
-    MISSING_TOOLS+=("jq (install: package manager)")
+    MISSING_REQUIRED+=("jq (install: package manager)")
 fi
 
-if ! command -v jaq &> /dev/null; then
-    MISSING_TOOLS+=("jaq (install: package manager)")
-fi
-
-if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
-    echo "Missing tools:" >&2
-    for tool in "${MISSING_TOOLS[@]}"; do
+if [ ${#MISSING_REQUIRED[@]} -gt 0 ]; then
+    echo "Missing required tools:" >&2
+    for tool in "${MISSING_REQUIRED[@]}"; do
         echo "  - $tool" >&2
     done
     exit 1
 fi
+
+# Optional comparison tools — warn but continue
+command -v jaq &> /dev/null || echo "Note: jaq not found, skipping jaq comparisons." >&2
+command -v gojq &> /dev/null || echo "Note: gojq not found, skipping gojq comparisons." >&2
 
 echo "All prerequisites found!" >&2
 echo "" >&2
