@@ -351,6 +351,12 @@ pub const BuiltinId = enum(u16) {
     endswith_, // endswith(str) — test suffix
     ltrimstr_, // ltrimstr(str) — remove prefix
     rtrimstr_, // rtrimstr(str) — remove suffix
+    trimstr_, // trimstr(str) — remove str from both ends (ltrimstr | rtrimstr)
+
+    // Unicode whitespace trim builtins (zero-arg)
+    trim_, // trim — remove leading and trailing Unicode whitespace
+    ltrim_, // ltrim — remove leading Unicode whitespace
+    rtrim_, // rtrim — remove trailing Unicode whitespace
     test_, // test(regex) — simplified substring match
     match_, // match(regex) — simplified match details
     sub_, // sub(regex; replacement) — replace first
@@ -359,6 +365,10 @@ pub const BuiltinId = enum(u16) {
     // Array utility builtins
     transpose_, // transpose — transpose array of arrays (zero-arg)
     bsearch_, // bsearch(x) — binary search in sorted array (one-arg)
+
+    // String conversion builtins
+    toboolean, // parse "true"/"false" strings or pass booleans through
+    utf8bytelength, // byte length of a UTF-8 string
 
     // Misc builtins
     not_, // logical negation
@@ -374,6 +384,14 @@ pub const BuiltinId = enum(u16) {
     isempty_, // isempty(f) — true if f produces no output
     first_, // first(expr)
     last_, // last(expr)
+
+    // Date/time builtins
+    now_, // now — current Unix timestamp as float
+    gmtime_, // gmtime — Unix timestamp -> broken-down time array [year, month(0-based), mday, hour, min, sec, wday, yday]
+    mktime_, // mktime — broken-down time array -> Unix timestamp
+    strftime_, // strftime(fmt) — format broken-down time (or timestamp) to string
+    strptime_, // strptime(fmt) — parse string to broken-down time array
+    strflocaltime_, // strflocaltime(fmt) — same as strftime (UTC, since we have no TZ info)
 
     const JqEntry = struct { name: []const u8, arity: u8 };
 
@@ -508,6 +526,14 @@ pub const BuiltinId = enum(u16) {
             .format_base64,
             .format_base64d,
             .error_,
+            .toboolean,
+            .utf8bytelength,
+            .trim_,
+            .ltrim_,
+            .rtrim_,
+            .now_,
+            .gmtime_,
+            .mktime_,
             => 0,
 
             // 1-arity: one explicit argument
@@ -532,6 +558,7 @@ pub const BuiltinId = enum(u16) {
             .endswith_,
             .ltrimstr_,
             .rtrimstr_,
+            .trimstr_,
             .test_,
             .match_,
             .bsearch_,
@@ -541,6 +568,9 @@ pub const BuiltinId = enum(u16) {
             .last_,
             .halt_error_,
             .range,
+            .strftime_,
+            .strptime_,
+            .strflocaltime_,
             => 1,
 
             // 2-arity: two explicit arguments
@@ -718,6 +748,11 @@ pub const Instruction = extern struct {
         /// Handles .[from:to], .[from:], .[:to], .[:] patterns.
         /// Negative indices count from the end; bounds are clamped to [0, length].
         slice,
+        /// Computed slice: bounds are runtime values (e.g. .[nan:1] or .[expr1:expr2]).
+        /// operand.slice_args.has_from/has_to indicate which bounds are on the stack.
+        /// Pops `to` first (if has_to), then `from` (if has_from), then pops base from if_stack.
+        /// NaN/Inf bounds: NaN `from` → 0, NaN `to` → array length; Inf treated as limit.
+        slice_computed,
 
         // Update assignment (|=, +=, -=, *=, /=, %=, //=)
         /// Navigate to object field for update: sets current to field value without

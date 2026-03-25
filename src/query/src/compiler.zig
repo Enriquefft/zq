@@ -96,6 +96,9 @@ const Ctx = struct {
     // Label variable IDs for compile-time break validation
     label_var_ids: std.ArrayList(u32) = std.ArrayList(u32){},
 
+    // Length of the PRELUDE string prepended to user source (for $__loc__ line counting).
+    prelude_len: u32 = 0,
+
     // Source offset tracking for error diagnostics
     last_tok_offset: u32 = 0,
     error_offset: u32 = 0,
@@ -1268,7 +1271,43 @@ pub const CompileResult = union(enum) {
     err: err_mod.CompileError,
 };
 
+/// Standard library functions compiled as a prelude before the user's query.
+/// Kept in a single string to avoid allocations; must end with ";" so the
+/// trailing user query is valid jq.
+const PRELUDE =
+    \\def skip($n; g): if $n < 0 then error("skip doesn't support negative count") else foreach g as $x ($n; . - 1; if . < 0 then $x else empty end) end;
+    \\def nth($n; g): if $n < 0 then error("nth doesn't support negative count") else last(limit($n + 1; g)) end;
+    \\def add(f): reduce f as $x (null; . + $x);
+    \\def walk(f): . as $in | if type == "array" then map(walk(f)) | f elif type == "object" then with_entries(.value |= walk(f)) | f else f end;
+    \\def pick(f): . as $in | reduce path(f) as $p (null; setpath($p; $in | getpath($p)));
+    \\def INDEX(stream; idx_expr): reduce stream as $row ({}; . + {(($row | idx_expr) | tostring): $row});
+    \\def INDEX(idx_expr): INDEX(.[]; idx_expr);
+    \\def IN(s): . as $x | first((s == $x), false);
+    \\def IN(source; s): first((source == s), false);
+    \\def JOIN(idx; f): [., (f | tostring) as $k | if idx | has($k) then idx[$k] else null end];
+    \\def combinations: if length == 0 then [] else . as $dot | .[0][] as $x | ([$dot[1:]] | combinations) as $rest | [$x] + $rest end;
+    \\def combinations(n): [limit(n; repeat(.))] | combinations;
+    \\def splits(re): . / re | .[];
+    \\def splits(re; flags): . / re | .[];
+    \\def scan(re): match(re) | .string;
+    \\def capture(re): match(re) | .captures | map(select(.name != null) | {(.name): .string}) | add;
+    \\def finites: .[] | select(isinfinite | not) | select(isnan | not);
+    \\def todate: strftime("%Y-%m-%dT%H:%M:%SZ");
+    \\def fromdate: strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
+    \\def todateiso8601: todate;
+    \\def fromdateiso8601: fromdate;
+    \\def dateadd(f;x): . + x * f | . + 0;
+    \\def datesub(f;x): . - x * f | . + 0;
+    \\def modulemeta: {"version": 0, "deps": [], "defs": []};
+    \\
+;
+
 pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: std.mem.Allocator) error{OutOfMemory}!CompileResult {
+    // Prepend standard library definitions so user queries can call skip/nth/add(f).
+    const full_src = try std.mem.concat(alloc, u8, &.{ PRELUDE, src });
+    defer alloc.free(full_src);
+    const prelude_len: u32 = @intCast(PRELUDE.len);
+
     const scope = try alloc.create(VariableScope);
     scope.* = VariableScope{
         .variables = std.ArrayList(VariableEntry){},
@@ -1276,8 +1315,8 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     };
 
     var ctx = Ctx{
-        .src = src,
-        .lex = Lexer.init(src),
+        .src = full_src,
+        .lex = Lexer.init(full_src),
         .raw = std.ArrayList(RawInstr){},
         .intern = std.ArrayList(u8){},
         .alloc = alloc,
@@ -1285,6 +1324,7 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         .function_table = std.ArrayList(FunctionEntry){},
         .next_var_id = 0,
         .next_func_id = 0,
+        .prelude_len = prelude_len,
     };
     defer ctx.raw.deinit(alloc); // always freed; fuse() copies what it needs
     defer {
@@ -1324,7 +1364,7 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     // source identifiers may be interned multiple times (once per expansion),
     // so we allocate generously to minimize reallocations. StrRef uses offsets
     // (not pointers), so reallocation is safe for correctness.
-    try ctx.intern.ensureTotalCapacity(alloc, src.len * 8 + 256);
+    try ctx.intern.ensureTotalCapacity(alloc, full_src.len * 8 + 256);
 
     // Pre-declare external variables in root scope
     var ext_var_ids = try alloc.alloc(u32, external_vars.len);
@@ -1344,17 +1384,25 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         };
     }
 
+    // Subtract the prelude length from error offsets so they reference positions
+    // in the user's original query string, not the prepended full_src.
+    const adjOff = struct {
+        fn f(off: u32, plen: u32) u32 {
+            return if (off >= plen) off - plen else 0;
+        }
+    }.f;
+
     parseFilter(&ctx) catch |e| {
         switch (e) {
             error.QuerySyntaxError => return .{ .err = .{
                 .kind = .query_syntax_error,
-                .offset = ctx.error_offset,
+                .offset = adjOff(ctx.error_offset, prelude_len),
                 .len = ctx.error_len,
             } },
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .err = .{
                 .kind = err_mod.kindFromZqError(@as(err_mod.ZqError, @errorCast(e))),
-                .offset = @intCast(@min(ctx.lex.pos, if (src.len > 0) src.len - 1 else 0)),
+                .offset = adjOff(@intCast(@min(ctx.lex.pos, if (full_src.len > 0) full_src.len - 1 else 0)), prelude_len),
                 .len = 0,
             } },
         }
@@ -1365,14 +1413,14 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .err = .{
                 .kind = err_mod.kindFromZqError(@as(err_mod.ZqError, @errorCast(e))),
-                .offset = @intCast(@min(ctx.lex.pos, if (src.len > 0) src.len - 1 else 0)),
+                .offset = adjOff(@intCast(@min(ctx.lex.pos, if (full_src.len > 0) full_src.len - 1 else 0)), prelude_len),
                 .len = 0,
             } },
         }
     };
     if (tail.tag != .eof) return .{ .err = .{
         .kind = .query_syntax_error,
-        .offset = tail.offset,
+        .offset = adjOff(tail.offset, prelude_len),
         .len = tail.len,
     } };
 
@@ -1632,6 +1680,26 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         return;
     }
     try parseComma(ctx);
+
+    // Handle `expr as PATTERN` — moves from parseLogical to parsePipe so that
+    // the entire comma expression (not just the last element) is the generator.
+    // jq semantics: each value produced by `expr` is bound to PATTERN and
+    // `body` evaluates once per value.  Using scanAndDeclarePatternWithComputed
+    // also fixes computed-key destructuring (e.g. `as {("a"+"b"): $v}`).
+    {
+        const t2 = try ctx.lex.peek();
+        if (t2.tag == .as_kw) {
+            _ = try ctx.nextToken(); // consume 'as'
+            const first_pattern = try scanAndDeclarePatternWithComputed(ctx);
+            if (try peekIsDestructAlt(ctx)) {
+                try parseDestructAlt(ctx, first_pattern);
+            } else {
+                try emitPatternCapture(ctx, first_pattern);
+            }
+            // Fall through: the `| body` pipe is consumed by the while loop below.
+        }
+    }
+
     while (true) {
         const t = try ctx.lex.peek();
         if (t.tag != .pipe) break;
@@ -1651,6 +1719,23 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         // No distribution needed — generators naturally backtrack.
         try ctx.emit(.pipe, .{ .none = {} });
         try parseComma(ctx);
+
+        // Each pipe segment may itself be followed by `as PATTERN`, e.g.
+        // `a | b as $x | c`.  Handle it here so the full right-hand comma
+        // expression is the generator (not just its last logical operand).
+        {
+            const t2 = try ctx.lex.peek();
+            if (t2.tag == .as_kw) {
+                _ = try ctx.nextToken(); // consume 'as'
+                const first_pattern = try scanAndDeclarePatternWithComputed(ctx);
+                if (try peekIsDestructAlt(ctx)) {
+                    try parseDestructAlt(ctx, first_pattern);
+                } else {
+                    try emitPatternCapture(ctx, first_pattern);
+                }
+                // Fall through: `| body` consumed by next iteration.
+            }
+        }
     }
 }
 
@@ -1792,29 +1877,10 @@ fn parseAlternative(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// parseLogical: `or`, `and` (lowest precedence)
-/// Also handles `expr as PATTERN` suffix where PATTERN can be:
-///   $var           — simple variable binding
-///   [$a, $b, ...]  — array destructuring
-///   {key: $var}    — object destructuring (with static or computed keys)
 fn parseLogical(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseOr(ctx);
-
-    // Check for `as PATTERN` suffix
-    const t = try ctx.lex.peek();
-    if (t.tag == .as_kw) {
-        _ = try ctx.nextToken(); // consume 'as'
-
-        // Scan the first pattern (declare variables, no bytecode emission yet).
-        const first_pattern = try scanAndDeclarePattern(ctx);
-
-        // Check for `?//` (destructuring alternative operator).
-        if (try peekIsDestructAlt(ctx)) {
-            try parseDestructAlt(ctx, first_pattern);
-        } else {
-            // Normal `as PATTERN` — emit capture bytecode now.
-            try emitPatternCapture(ctx, first_pattern);
-        }
-    }
+    // Note: `as PATTERN` is handled at parsePipe level, not here, so that the
+    // entire comma expression is the generator (correct jq semantics).
 }
 
 /// Returns true if the next two tokens are `?` followed by `//`,
@@ -2055,6 +2121,11 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "empty")) return .empty;
     if (std.mem.eql(u8, name, "tostring")) return .tostring;
     if (std.mem.eql(u8, name, "tonumber")) return .tonumber;
+    if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+    if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+    if (std.mem.eql(u8, name, "trim")) return .trim_;
+    if (std.mem.eql(u8, name, "ltrim")) return .ltrim_;
+    if (std.mem.eql(u8, name, "rtrim")) return .rtrim_;
     if (std.mem.eql(u8, name, "error")) return .error_;
     if (std.mem.eql(u8, name, "add")) return .add;
     if (std.mem.eql(u8, name, "sort")) return .sort;
@@ -2142,6 +2213,11 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "halt")) return .halt_;
     if (std.mem.eql(u8, name, "halt_error")) return .halt_error_;
 
+    // Date/time builtins (zero-arg)
+    if (std.mem.eql(u8, name, "now")) return .now_;
+    if (std.mem.eql(u8, name, "gmtime")) return .gmtime_;
+    if (std.mem.eql(u8, name, "mktime")) return .mktime_;
+
     return null;
 }
 
@@ -2195,11 +2271,14 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "endswith") or
         std.mem.eql(u8, name, "ltrimstr") or
         std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "trimstr") or
         std.mem.eql(u8, name, "test") or
         std.mem.eql(u8, name, "match") or
         std.mem.eql(u8, name, "sub") or
         std.mem.eql(u8, name, "gsub") or
         std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "strftime") or
+        std.mem.eql(u8, name, "strptime") or
         std.mem.eql(u8, name, "error");
 }
 
@@ -3875,6 +3954,14 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileValueArgBuiltin1(ctx, .ltrimstr_);
                 } else if (std.mem.eql(u8, ident_name, "rtrimstr")) {
                     try compileValueArgBuiltin1(ctx, .rtrimstr_);
+                } else if (std.mem.eql(u8, ident_name, "trimstr")) {
+                    try compileValueArgBuiltin1(ctx, .trimstr_);
+                } else if (std.mem.eql(u8, ident_name, "strftime")) {
+                    try compileValueArgBuiltin1(ctx, .strftime_);
+                } else if (std.mem.eql(u8, ident_name, "strptime")) {
+                    try compileValueArgBuiltin1(ctx, .strptime_);
+                } else if (std.mem.eql(u8, ident_name, "strflocaltime")) {
+                    try compileValueArgBuiltin1(ctx, .strflocaltime_);
                 } else if (std.mem.eql(u8, ident_name, "test")) {
                     try compileValueArgBuiltin1(ctx, .test_);
                 } else if (std.mem.eql(u8, ident_name, "match")) {
@@ -4403,12 +4490,44 @@ fn parseArrayConstruct(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     ctx.raw.items[start_pos].operand = .{ .index = end_pos };
 }
 
+/// Emit bytecode for $__loc__: constructs {"file":"<top-level>","line":N}.
+/// tok_offset is the source offset of the `$__loc__` token (in full_src including prelude).
+fn emitLocObject(ctx: *Ctx, tok_offset: u32) error{OutOfMemory}!void {
+    // Compute 1-based line number in user source (excluding prelude).
+    const user_offset: usize = if (tok_offset >= ctx.prelude_len)
+        tok_offset - ctx.prelude_len
+    else
+        0;
+    var line: i64 = 1;
+    const user_src = ctx.src[ctx.prelude_len..];
+    var i: usize = 0;
+    while (i < @min(user_offset, user_src.len)) : (i += 1) {
+        if (user_src[i] == '\n') line += 1;
+    }
+    try ctx.emit(.object_construct_start, .{ .none = {} });
+    const file_key_ref = try internStr(&ctx.intern, ctx.alloc, "file");
+    try ctx.emit(.push_string, .{ .str_ref = file_key_ref });
+    const file_val_ref = try internStr(&ctx.intern, ctx.alloc, "<top-level>");
+    try ctx.emit(.push_string, .{ .str_ref = file_val_ref });
+    try ctx.emit(.object_key, .{ .none = {} });
+    const line_key_ref = try internStr(&ctx.intern, ctx.alloc, "line");
+    try ctx.emit(.push_string, .{ .str_ref = line_key_ref });
+    try ctx.emit(.push_int, .{ .int = line });
+    try ctx.emit(.object_key, .{ .none = {} });
+    try ctx.emit(.object_construct_end, .{ .none = {} });
+}
+
 /// Parse a variable reference: $var
 fn parseVariableReference(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const ident = try ctx.nextToken();
     if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
 
-    const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+    const name = ident.slice(ctx.src);
+    if (std.mem.eql(u8, name, "__loc__")) {
+        return try emitLocObject(ctx, ident.offset);
+    }
+
+    const name_ref = try internStr(&ctx.intern, ctx.alloc, name);
     const var_id = lookupVariable(ctx, name_ref) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
 
     try ctx.emit(.load_variable, .{ .index = var_id });
@@ -4607,6 +4726,12 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// Parse an object literal: {key1: value1, key2: value2, ...}
+/// Supports:
+///   {ident}            — shorthand for {"ident": .ident}
+///   {"str"}            — shorthand for {"str": .str} (static strings only)
+///   {ident: expr}      — explicit key-value
+///   {(.expr): expr}    — computed key
+///   {k: a | b}         — pipe is allowed inside object values
 fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.object_construct_start, .{ .none = {} });
 
@@ -4617,18 +4742,62 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             break;
         }
 
-        // Parse key (literal or dynamic)
-        try parseObjectKey(ctx);
+        // Handle {$var} and {$var: value} shorthand.
+        if (peek.tag == .dollar) {
+            _ = try ctx.nextToken(); // consume '$'
+            const var_tok = try ctx.nextToken();
+            if (!isVarNameToken(var_tok.tag)) return ctx.syntaxErr(var_tok.offset, var_tok.len);
+            const var_name = var_tok.slice(ctx.src);
 
-        // Parse colon
-        const colon = try ctx.nextToken();
-        if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+            const after_dollar = try ctx.lex.peek();
+            if (std.mem.eql(u8, var_name, "__loc__")) {
+                // {$__loc__} shorthand — key = "__loc__", value = $__loc__ object
+                const key_ref = try internStr(&ctx.intern, ctx.alloc, "__loc__");
+                try ctx.emit(.push_string, .{ .str_ref = key_ref });
+                try emitLocObject(ctx, var_tok.offset);
+                try ctx.emit(.object_key, .{ .none = {} });
+            } else {
+                const name_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
+                const var_id = lookupVariable(ctx, name_ref) orelse return ctx.syntaxErr(var_tok.offset, var_tok.len);
 
-        // Parse value expression — allow `//` (alternative) inside object values
-        // so that `{z: null // 3}` works.
-        try parseAlternative(ctx);
+                if (after_dollar.tag == .colon) {
+                    // {$var: value} — use value of $var as dynamic key (convert to string).
+                    // Save current input, compute string key from $var, restore for value expr.
+                    _ = try ctx.nextToken(); // consume ':'
+                    try ctx.emit(.save_input, .{ .none = {} });
+                    try ctx.emit(.load_variable, .{ .index = var_id });
+                    try ctx.emit(.pipe, .{ .none = {} });
+                    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.tostring) });
+                    try ctx.emit(.restore_input, .{ .none = {} });
+                    try parseObjectValue(ctx);
+                } else {
+                    // {$var} shorthand — key = "var_name", value = $var
+                    const key_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
+                    try ctx.emit(.push_string, .{ .str_ref = key_ref });
+                    try ctx.emit(.load_variable, .{ .index = var_id });
+                }
+                try ctx.emit(.object_key, .{ .none = {} });
+            }
+        } else {
+            // Parse key; returns the static key ref for shorthand use (null for computed keys).
+            const key_ref = try parseObjectKey(ctx);
 
-        try ctx.emit(.object_key, .{ .none = {} });
+            const after_key = try ctx.lex.peek();
+            if (after_key.tag == .colon) {
+                _ = try ctx.nextToken(); // consume ':'
+                // Parse value expression; `|` is allowed so {x: -.|abs} works.
+                try parseObjectValue(ctx);
+            } else if ((after_key.tag == .comma or after_key.tag == .rbrace) and key_ref != null) {
+                // Shorthand: {ident} or {"str"} — expand to {"key": .key}
+                // The key string is already on the stack from parseObjectKey.
+                // Emit .key_name as the value (accesses current input's field).
+                try ctx.emit(.load_key, .{ .str_ref = key_ref.? });
+            } else {
+                return ctx.syntaxErr(after_key.offset, after_key.len);
+            }
+
+            try ctx.emit(.object_key, .{ .none = {} });
+        }
 
         // Check for comma
         const comma = try ctx.lex.peek();
@@ -4640,8 +4809,24 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.object_construct_end, .{ .none = {} });
 }
 
-/// Parse an object key: ident or string literal, or parenthesized expression for dynamic keys
-fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+/// Parse an object value expression: `alternative` optionally followed by `| alternative`
+/// repetitions (restricted pipe — does not consume `,` or `as`).
+/// This allows `{x: -.|abs}` where the pipe continues inside the value expression.
+fn parseObjectValue(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    try parseAlternative(ctx);
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .pipe) break;
+        _ = try ctx.nextToken();
+        try ctx.emit(.pipe, .{ .none = {} });
+        try parseAlternative(ctx);
+    }
+}
+
+/// Parse an object key: ident or string literal, or parenthesized expression for dynamic keys.
+/// Returns the static StrRef for the key when the key is a plain identifier or static string
+/// (so the caller can use it for shorthand expansion).  Returns null for computed keys.
+fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!?StrRef {
     const peek = try ctx.lex.peek();
 
     if (peek.tag == .lparen) {
@@ -4651,6 +4836,7 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
         const rparen = try ctx.nextToken();
         if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+        return null; // computed — no static key ref for shorthand
     } else if (peek.tag == .string_lit) {
         // Quoted string key: strip surrounding double-quotes, decode escape sequences.
         const key = try ctx.nextToken();
@@ -4658,6 +4844,7 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const content = raw[1 .. raw.len - 1];
         const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
         try ctx.emit(.push_string, .{ .str_ref = ref });
+        return ref; // static string — available for shorthand
     } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
         peek.tag == .true_kw or peek.tag == .false_kw or
         peek.tag == .if_kw or peek.tag == .then_kw or peek.tag == .elif_kw or
@@ -4666,11 +4853,11 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         peek.tag == .as_kw or peek.tag == .reduce_kw or
         peek.tag == .label_kw or peek.tag == .break_kw)
     {
-        // Literal key - push as string value for object construction
+        // Identifier or keyword used as key name.
         const key = try ctx.nextToken();
         const ref = try internStr(&ctx.intern, ctx.alloc, key.slice(ctx.src));
-        // Push string value directly to stack for object construction
         try ctx.emit(.push_string, .{ .str_ref = ref });
+        return ref; // static — available for shorthand
     } else {
         return ctx.syntaxErr(ctx.last_tok_offset, 0);
     }
@@ -4779,20 +4966,32 @@ fn parseSuffixes(ctx: *Ctx, start_pos: usize) (ZqError || error{OutOfMemory})!vo
 
 /// Parse an optional integer (possibly negative: `-` followed by int_lit) used
 /// in slice/index contexts. Returns the integer value if present, or null.
+/// Float literals are accepted and truncated to integers (jq compat: .[1.2:3.5] == .[1:3]).
 fn tryParseIndexInt(ctx: *Ctx) (ZqError || error{OutOfMemory})!?i64 {
     const peek = try ctx.lex.peek();
     if (peek.tag == .int_lit) {
         const tok = try ctx.nextToken();
         return std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
     }
+    if (peek.tag == .float_lit) {
+        // jq truncates float slice indices to integers
+        const tok = try ctx.nextToken();
+        const f = std.fmt.parseFloat(f64, tok.slice(ctx.src)) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
+        return @intFromFloat(@trunc(f));
+    }
     if (peek.tag == .minus) {
-        // Peek one more token to see if it's an int_lit (unary minus in index context)
+        // Peek one more token to see if it's an int_lit/float_lit (unary minus in index context)
         _ = try ctx.nextToken(); // consume minus
         const after = try ctx.lex.peek();
         if (after.tag == .int_lit) {
             const tok = try ctx.nextToken();
             const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
             return -n;
+        }
+        if (after.tag == .float_lit) {
+            const tok = try ctx.nextToken();
+            const f = std.fmt.parseFloat(f64, tok.slice(ctx.src)) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
+            return -@as(i64, @intFromFloat(@trunc(f)));
         }
         // Not a number after minus — this is a syntax error in index context
         return ctx.syntaxErr(ctx.last_tok_offset, 0);
@@ -4808,8 +5007,8 @@ fn parseSliceTail(ctx: *Ctx, has_from: bool, from: i32) (ZqError || error{OutOfM
     var to: i32 = 0;
     if (try tryParseIndexInt(ctx)) |n| {
         has_to = true;
-        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
-        to = @intCast(n);
+        // Clamp out-of-range values (e.g. 4294967295 or -4294967296) to i32 bounds.
+        to = @intCast(std.math.clamp(n, std.math.minInt(i32), std.math.maxInt(i32)));
     }
     const close = try ctx.nextToken();
     if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
@@ -4821,6 +5020,11 @@ fn parseSliceTail(ctx: *Ctx, has_from: bool, from: i32) (ZqError || error{OutOfM
     } });
 }
 
+/// Returns true if `tag` is the start of a static slice bound (int/float/minus) or `]`.
+fn isStaticSliceBoundOrEnd(tag: Token.Tag) bool {
+    return tag == .int_lit or tag == .float_lit or tag == .minus or tag == .rbracket;
+}
+
 /// Parse the body of `[...]` (the opening `[` has already been consumed).
 fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const t = try ctx.lex.peek();
@@ -4830,18 +5034,43 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             try ctx.emit(.each, .{ .none = {} });
         },
         .colon => {
-            // .[:n] or .[:] — slice with no left bound
+            // .[:n] or .[:] or .[:expr] — slice with no left bound
             _ = try ctx.nextToken(); // consume ':'
-            try parseSliceTail(ctx, false, 0);
+            const to_peek = try ctx.lex.peek();
+            if (isStaticSliceBoundOrEnd(to_peek.tag)) {
+                try parseSliceTail(ctx, false, 0);
+            } else {
+                // Computed to-bound: .[:expr]
+                try ctx.emit(.save_input, .{ .none = {} });
+                try parsePipe(ctx);
+                const close = try ctx.nextToken();
+                if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
+                try ctx.emit(.slice_computed, .{ .slice_args = types.SliceArgs{
+                    .from = 0, .to = 0, .has_from = false, .has_to = true,
+                } });
+            }
         },
-        .int_lit, .minus => {
+        .int_lit, .float_lit, .minus => {
             const n = (try tryParseIndexInt(ctx)) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
             const after = try ctx.lex.peek();
             if (after.tag == .colon) {
-                // .[n:...] — slice with left bound (negative allowed)
                 _ = try ctx.nextToken(); // consume ':'
-                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                try parseSliceTail(ctx, true, @intCast(n));
+                const to_peek = try ctx.lex.peek();
+                if (isStaticSliceBoundOrEnd(to_peek.tag)) {
+                    // Static slice: .[n:m], .[n:], .[n:float]
+                    const n_clamped: i32 = @intCast(std.math.clamp(n, std.math.minInt(i32), std.math.maxInt(i32)));
+                    try parseSliceTail(ctx, true, n_clamped);
+                } else {
+                    // Computed to-bound: .[n:expr]
+                    try ctx.emit(.save_input, .{ .none = {} });
+                    try ctx.emit(.push_int, .{ .int = n });
+                    try parsePipe(ctx);
+                    const close = try ctx.nextToken();
+                    if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
+                    try ctx.emit(.slice_computed, .{ .slice_args = types.SliceArgs{
+                        .from = 0, .to = 0, .has_from = true, .has_to = true,
+                    } });
+                }
             } else {
                 // .[n] — index access (negative allowed)
                 if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
@@ -4864,13 +5093,30 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             try ctx.emit(.load_key, .{ .str_ref = ref });
         },
         else => {
-            // Computed access .[expr]: save base to if_stack, evaluate expr,
-            // then load_computed pops base and applies current/top-of-stack as key.
+            // Computed access .[expr] or computed slice .[expr:expr].
+            // Save base to if_stack, evaluate from-expr, then check for ':'.
             try ctx.emit(.save_input, .{ .none = {} });
             try parsePipe(ctx);
-            const close = try ctx.nextToken();
-            if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
-            try ctx.emit(.load_computed, .{ .none = {} });
+            const after_expr = try ctx.lex.peek();
+            if (after_expr.tag == .colon) {
+                _ = try ctx.nextToken(); // consume ':'
+                // .[expr:...] — computed slice. Evaluate optional to-expr.
+                const to_peek = try ctx.lex.peek();
+                var has_to = false;
+                if (to_peek.tag != .rbracket) {
+                    try parsePipe(ctx);
+                    has_to = true;
+                }
+                const close = try ctx.nextToken();
+                if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
+                try ctx.emit(.slice_computed, .{ .slice_args = types.SliceArgs{
+                    .from = 0, .to = 0, .has_from = true, .has_to = has_to,
+                } });
+            } else {
+                const close = try ctx.nextToken();
+                if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
+                try ctx.emit(.load_computed, .{ .none = {} });
+            }
         },
     }
 }

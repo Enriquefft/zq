@@ -310,4 +310,19 @@ pub fn build(b: *std.Build) void {
 
     const compat_tests = b.addTest(.{ .root_module = compat_test_mod });
     test_step.dependOn(&b.addRunArtifact(compat_tests).step);
+
+    // ── Isolated steps for faster iteration ──────────────────────────────
+    const test_compat_step = b.step("test-compat", "Run jq compat tests only");
+    test_compat_step.dependOn(&b.addRunArtifact(compat_tests).step);
+
+    const query_tests2_mod = b.createModule(.{
+        .root_source_file = b.path("tests/query_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    query_tests2_mod.addImport("query", query_module);
+    query_tests2_mod.addImport("types", types_module);
+    const query_tests2 = b.addTest(.{ .root_module = query_tests2_mod });
+    const test_query_step = b.step("test-query", "Run query unit tests only");
+    test_query_step.dependOn(&b.addRunArtifact(query_tests2).step);
 }
