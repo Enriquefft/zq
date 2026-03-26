@@ -2488,6 +2488,18 @@ pub const ResultIterator = struct {
             .isempty_ => return try it.builtinIsempty(),
             .first_ => return try it.builtinFirst(),
             .last_ => return try it.builtinLast(),
+
+            // Date/time builtins
+            .now_ => return try it.builtinNow(),
+            .gmtime_ => return try it.builtinGmtime(),
+            .mktime_ => return try it.builtinMktime(),
+            .strftime_ => return try it.builtinStrftimeImpl("strftime"),
+            .strptime_ => return try it.builtinStrptime(),
+            .strflocaltime_ => return try it.builtinStrftimeImpl("strflocaltime"),
+            .todate_ => return try it.builtinTodate(),
+            .fromdate_ => return try it.builtinFromdate(),
+            .todateiso8601_ => return try it.builtinTodate(),
+            .fromdateiso8601_ => return try it.builtinFromdate(),
         }
     }
 
@@ -6429,6 +6441,188 @@ pub const ResultIterator = struct {
         // Not found: return -1 - lo (insertion point)
         return .{ .int = -1 - lo };
     }
+
+    // ── Date/time builtin implementations ───────────────────────────────
+
+    fn builtinNow(_: *ResultIterator) ZqError!?StackValue {
+        const ts = std.posix.clock_gettime(.REALTIME) catch return error.TypeError;
+        const secs: f64 = @floatFromInt(ts.sec);
+        const nsecs: f64 = @floatFromInt(ts.nsec);
+        return .{ .float = secs + nsecs / 1_000_000_000.0 };
+    }
+
+    fn builtinGmtime(it: *ResultIterator) ZqError!?StackValue {
+        var ts_int: i64 = undefined;
+        var sec_frac: f64 = 0.0;
+        switch (it.current) {
+            .int => |n| ts_int = n,
+            .float => |f| {
+                if (std.math.isNan(f) or std.math.isInf(f)) return error.TypeError;
+                ts_int = @intFromFloat(@floor(f));
+                sec_frac = f - @floor(f);
+                if (sec_frac < 0) sec_frac = 0;
+            },
+            else => return error.TypeError,
+        }
+        const bd = unixToDatetime(ts_int, sec_frac);
+        // Build 8-element array. Seconds field preserves fractional part.
+        var elems: [8]Value = undefined;
+        elems[0] = .{ .int = bd.year };
+        elems[1] = .{ .int = bd.month };
+        elems[2] = .{ .int = bd.mday };
+        elems[3] = .{ .int = bd.hour };
+        elems[4] = .{ .int = bd.min };
+        if (bd.sec_frac > 0.0) {
+            elems[5] = .{ .float = @as(f64, @floatFromInt(bd.sec)) + bd.sec_frac };
+        } else {
+            elems[5] = .{ .int = bd.sec };
+        }
+        elems[6] = .{ .int = bd.wday };
+        elems[7] = .{ .int = bd.yday };
+        return try it.buildRuntimeArray(&elems);
+    }
+
+    fn builtinMktime(it: *ResultIterator) ZqError!?StackValue {
+        const span = switch (it.current) {
+            .array => |s| s,
+            else => return try it.raiseUserError("mktime requires parsed datetime inputs"),
+        };
+        // Extract up to 8 numeric elements; missing defaults to 0.
+        var fields = [_]i64{0} ** 8;
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var idx: usize = 0;
+        while (pos < end and idx < 8) : (idx += 1) {
+            const v = tapeEntryToValue(span.tape, pos);
+            switch (v) {
+                .int => |n| fields[idx] = n,
+                .float => |f| fields[idx] = @intFromFloat(@trunc(f)),
+                else => return try it.raiseUserError("mktime requires parsed datetime inputs"),
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+        const ts = datetimeToUnix(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]);
+        return .{ .int = ts };
+    }
+
+    /// Shared implementation for strftime and strflocaltime.
+    fn builtinStrftimeImpl(it: *ResultIterator, comptime name: []const u8) ZqError!?StackValue {
+        // Pop format argument
+        const fmt_sv = try it.popValue();
+        const fmt_val = try stackValueToValue(fmt_sv);
+        const fmt = switch (fmt_val) {
+            .string => |s| s,
+            else => return try it.raiseUserError(name ++ "/1 requires a string format"),
+        };
+        // Convert current value to BrokenDownTime
+        const bd = currentToBdt(it) catch {
+            return try it.raiseUserError(name ++ "/1 requires parsed datetime inputs");
+        };
+        // Format
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        formatDatetime(&buf, it.alloc, fmt, bd) catch return error.OutOfMemory;
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    fn builtinStrptime(it: *ResultIterator) ZqError!?StackValue {
+        // Pop format argument
+        const fmt_sv = try it.popValue();
+        const fmt_val = try stackValueToValue(fmt_sv);
+        const fmt = switch (fmt_val) {
+            .string => |s| s,
+            else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
+        };
+        const bd = parseDatetime(input, fmt) catch {
+            return try it.raiseUserError("strptime/1 requires string inputs and arguments");
+        };
+        // Build 8-element array
+        var elems: [8]Value = undefined;
+        elems[0] = .{ .int = bd.year };
+        elems[1] = .{ .int = bd.month };
+        elems[2] = .{ .int = bd.mday };
+        elems[3] = .{ .int = bd.hour };
+        elems[4] = .{ .int = bd.min };
+        elems[5] = .{ .int = bd.sec };
+        elems[6] = .{ .int = bd.wday };
+        elems[7] = .{ .int = bd.yday };
+        return try it.buildRuntimeArray(&elems);
+    }
+
+    fn builtinTodate(it: *ResultIterator) ZqError!?StackValue {
+        const bd = currentToBdt(it) catch {
+            return try it.raiseUserError("strftime/1 requires parsed datetime inputs");
+        };
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        formatDatetime(&buf, it.alloc, "%Y-%m-%dT%H:%M:%SZ", bd) catch return error.OutOfMemory;
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    fn builtinFromdate(it: *ResultIterator) ZqError!?StackValue {
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
+        };
+        const bd = parseDatetime(input, "%Y-%m-%dT%H:%M:%SZ") catch {
+            return try it.raiseUserError("strptime/1 requires string inputs and arguments");
+        };
+        const ts = datetimeToUnix(bd.year, bd.month, bd.mday, bd.hour, bd.min, bd.sec);
+        return .{ .int = ts };
+    }
+
+    /// Convert current value to BrokenDownTime: accepts int, float, or array.
+    fn currentToBdt(it: *ResultIterator) error{ TypeError, OutOfMemory }!BrokenDownTime {
+        switch (it.current) {
+            .int => |n| return unixToDatetime(n, 0.0),
+            .float => |f| {
+                if (std.math.isNan(f) or std.math.isInf(f)) return error.TypeError;
+                const ts_int: i64 = @intFromFloat(@floor(f));
+                var sec_frac = f - @floor(f);
+                if (sec_frac < 0) sec_frac = 0;
+                return unixToDatetime(ts_int, sec_frac);
+            },
+            .array => |span| {
+                var fields = [_]i64{0} ** 8;
+                var sec_frac: f64 = 0.0;
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var idx: usize = 0;
+                while (pos < end and idx < 8) : (idx += 1) {
+                    const v = tapeEntryToValue(span.tape, pos);
+                    switch (v) {
+                        .int => |n| fields[idx] = n,
+                        .float => |fv| {
+                            fields[idx] = @intFromFloat(@trunc(fv));
+                            if (idx == 5) sec_frac = fv - @trunc(fv);
+                        },
+                        else => return error.TypeError,
+                    }
+                    pos = skipEntry(span.tape.*, pos);
+                }
+                // Recompute wday/yday from parsed fields
+                const days = daysFromCivil(fields[0], fields[1] + 1, fields[2]);
+                return .{
+                    .year = fields[0],
+                    .month = fields[1],
+                    .mday = fields[2],
+                    .hour = fields[3],
+                    .min = fields[4],
+                    .sec = fields[5],
+                    .sec_frac = sec_frac,
+                    .wday = dayOfWeek(days),
+                    .yday = dayOfYear(fields[0], fields[1], fields[2]),
+                };
+            },
+            else => return error.TypeError,
+        }
+    }
 };
 
 /// Simple JSON parser for fromjson builtin.
@@ -7225,4 +7419,424 @@ fn writeValueToTape(tape: *types.RuntimeTape, alloc: std.mem.Allocator, val: Val
             try tape.copySpan(span.tape.*, span.start, span.end, alloc);
         },
     }
+}
+
+// ── Date/time builtins ──────────────────────────────────────────────────────
+
+const BrokenDownTime = struct {
+    year: i64,
+    month: i64, // 0-based (0=Jan, 11=Dec)
+    mday: i64, // 1-based (1-31)
+    hour: i64, // 0-23
+    min: i64, // 0-59
+    sec: i64, // 0-59 (integer part)
+    sec_frac: f64, // fractional seconds (0.0–0.999…)
+    wday: i64, // 0=Sunday, 6=Saturday
+    yday: i64, // 0-based day of year
+};
+
+/// Hinnant civil_from_days: convert days since Unix epoch → (year, month 1-based, day).
+/// Handles negative days (pre-1970) correctly.
+/// Reference: https://howardhinnant.github.io/date_algorithms.html
+fn civilFromDays(days_in: i64) struct { year: i64, month: i64, day: i64 } {
+    // Shift to a March-based epoch (March 1, 0000).
+    const z: i64 = days_in + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: i64 = z - era * 146097; // [0, 146096]
+    const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
+    const y: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0, 365]
+    const mp: i64 = @divFloor(5 * doy + 2, 153); // [0, 11]
+    const d: i64 = doy - @divFloor(153 * mp + 2, 5) + 1; // [1, 31]
+    const m: i64 = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
+    const yr: i64 = if (m <= 2) y + 1 else y;
+    return .{ .year = yr, .month = m, .day = d };
+}
+
+/// Hinnant days_from_civil: convert (year, month 1-based, day) → days since Unix epoch.
+fn daysFromCivil(year_in: i64, month_in: i64, day: i64) i64 {
+    const y: i64 = if (month_in <= 2) year_in - 1 else year_in;
+    const m: i64 = if (month_in <= 2) month_in + 9 else month_in - 3; // March-based [0, 11]
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: i64 = y - era * 400; // [0, 399]
+    const doy: i64 = @divFloor(153 * m + 2, 5) + day - 1; // [0, 365]
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy; // [0, 146096]
+    return era * 146097 + doe - 719468;
+}
+
+fn isLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+const days_in_months = [12]i64{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+fn dayOfYear(year: i64, month_0: i64, mday: i64) i64 {
+    var yday: i64 = 0;
+    var m: i64 = 0;
+    while (m < month_0 and m < 12) : (m += 1) {
+        yday += days_in_months[@intCast(@mod(m, 12))];
+        if (m == 1 and isLeapYear(year)) yday += 1;
+    }
+    return yday + mday - 1;
+}
+
+/// Day of week: 0=Sunday, 1=Monday, … 6=Saturday.
+fn dayOfWeek(days_since_epoch: i64) i64 {
+    // 1970-01-01 was Thursday (4). Add 4 and mod 7.
+    return @mod(days_since_epoch + 4, 7);
+}
+
+fn unixToDatetime(ts: i64, frac: f64) BrokenDownTime {
+    const days = @divFloor(ts, 86400);
+    const rem = @mod(ts, 86400);
+    const civil = civilFromDays(days);
+    const month_0 = civil.month - 1; // Convert to 0-based
+    return .{
+        .year = civil.year,
+        .month = month_0,
+        .mday = civil.day,
+        .hour = @divFloor(rem, 3600),
+        .min = @mod(@divFloor(rem, 60), 60),
+        .sec = @mod(rem, 60),
+        .sec_frac = frac,
+        .wday = dayOfWeek(days),
+        .yday = dayOfYear(civil.year, month_0, civil.day),
+    };
+}
+
+fn datetimeToUnix(year: i64, month_0: i64, mday: i64, hour: i64, min: i64, sec: i64) i64 {
+    const month_1 = month_0 + 1; // Convert to 1-based
+    const days = daysFromCivil(year, month_1, mday);
+    return days * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+const weekday_names = [7][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+const weekday_abbrs = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const month_names = [12][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+const month_abbrs = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+fn formatDatetime(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, fmt: []const u8, bd: BrokenDownTime) !void {
+    var tmp: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] != '%') {
+            try buf.append(alloc, fmt[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= fmt.len) break;
+        const spec = fmt[i];
+        i += 1;
+        switch (spec) {
+            'Y' => {
+                if (bd.year >= 0) {
+                    const s = std.fmt.bufPrint(&tmp, "{:0>4}", .{@as(u64, @intCast(bd.year))}) catch unreachable;
+                    try buf.appendSlice(alloc, s);
+                } else {
+                    // Negative year (BCE)
+                    try buf.append(alloc, '-');
+                    const s = std.fmt.bufPrint(&tmp, "{:0>4}", .{@as(u64, @intCast(-bd.year))}) catch unreachable;
+                    try buf.appendSlice(alloc, s);
+                }
+            },
+            'y' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(@mod(bd.year, 100)))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'C' => {
+                const c = @divFloor(bd.year, 100);
+                if (c >= 0) {
+                    const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(c))}) catch unreachable;
+                    try buf.appendSlice(alloc, s);
+                } else {
+                    try buf.append(alloc, '-');
+                    const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(-c))}) catch unreachable;
+                    try buf.appendSlice(alloc, s);
+                }
+            },
+            'm' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(bd.month + 1))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'd' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(bd.mday))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'e' => {
+                const s = std.fmt.bufPrint(&tmp, "{:>2}", .{@as(u64, @intCast(bd.mday))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'H' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(bd.hour))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'I' => {
+                const h = @mod(bd.hour + 11, 12) + 1;
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(h))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'M' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(bd.min))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'S' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(bd.sec))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'j' => {
+                const s = std.fmt.bufPrint(&tmp, "{:0>3}", .{@as(u64, @intCast(bd.yday + 1))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'A' => try buf.appendSlice(alloc, weekday_names[@intCast(@mod(bd.wday, 7))]),
+            'a' => try buf.appendSlice(alloc, weekday_abbrs[@intCast(@mod(bd.wday, 7))]),
+            'B' => try buf.appendSlice(alloc, month_names[@intCast(@mod(bd.month, 12))]),
+            'b', 'h' => try buf.appendSlice(alloc, month_abbrs[@intCast(@mod(bd.month, 12))]),
+            'w' => {
+                const s = std.fmt.bufPrint(&tmp, "{}", .{@as(u64, @intCast(@mod(bd.wday, 7)))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'u' => {
+                const u = if (bd.wday == 0) @as(i64, 7) else bd.wday;
+                const s = std.fmt.bufPrint(&tmp, "{}", .{@as(u64, @intCast(u))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'p' => try buf.appendSlice(alloc, if (bd.hour < 12) "AM" else "PM"),
+            'P' => try buf.appendSlice(alloc, if (bd.hour < 12) "am" else "pm"),
+            'Z' => try buf.appendSlice(alloc, "UTC"),
+            'z' => try buf.appendSlice(alloc, "+0000"),
+            'n' => try buf.append(alloc, '\n'),
+            't' => try buf.append(alloc, '\t'),
+            '%' => try buf.append(alloc, '%'),
+            // Composite specifiers
+            'D' => try formatDatetime(buf, alloc, "%m/%d/%y", bd),
+            'F' => try formatDatetime(buf, alloc, "%Y-%m-%d", bd),
+            'T' => try formatDatetime(buf, alloc, "%H:%M:%S", bd),
+            'R' => try formatDatetime(buf, alloc, "%H:%M", bd),
+            'c' => try formatDatetime(buf, alloc, "%a %b %e %T %Y", bd),
+            'x' => try formatDatetime(buf, alloc, "%m/%d/%y", bd),
+            'X' => try formatDatetime(buf, alloc, "%H:%M:%S", bd),
+            'U' => {
+                // Week of year (Sunday start)
+                const w = @divFloor(bd.yday + 7 - @mod(bd.wday, 7), 7);
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(w))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            'W' => {
+                // Week of year (Monday start)
+                const w = @divFloor(bd.yday + 7 - @mod(bd.wday + 6, 7), 7);
+                const s = std.fmt.bufPrint(&tmp, "{:0>2}", .{@as(u64, @intCast(w))}) catch unreachable;
+                try buf.appendSlice(alloc, s);
+            },
+            else => {
+                // Unknown specifier: output literally
+                try buf.append(alloc, '%');
+                try buf.append(alloc, spec);
+            },
+        }
+    }
+}
+
+fn parseDigits(input: []const u8, start: usize, max_digits: usize) struct { val: i64, end: usize } {
+    var end = start;
+    const limit = @min(start + max_digits, input.len);
+    while (end < limit and input[end] >= '0' and input[end] <= '9') : (end += 1) {}
+    if (end == start) return .{ .val = 0, .end = start };
+    var val: i64 = 0;
+    for (input[start..end]) |ch| {
+        val = val * 10 + @as(i64, ch - '0');
+    }
+    return .{ .val = val, .end = end };
+}
+
+fn parseDatetime(input: []const u8, fmt: []const u8) error{ParseError}!BrokenDownTime {
+    var bd = BrokenDownTime{
+        .year = 0,
+        .month = 0,
+        .mday = 0,
+        .hour = 0,
+        .min = 0,
+        .sec = 0,
+        .sec_frac = 0.0,
+        .wday = 0,
+        .yday = 0,
+    };
+    var fi: usize = 0;
+    var ii: usize = 0;
+    while (fi < fmt.len) {
+        if (fmt[fi] != '%') {
+            // Literal match
+            if (ii >= input.len or input[ii] != fmt[fi]) return error.ParseError;
+            fi += 1;
+            ii += 1;
+            continue;
+        }
+        fi += 1;
+        if (fi >= fmt.len) break;
+        const spec = fmt[fi];
+        fi += 1;
+        switch (spec) {
+            'Y' => {
+                const r = parseDigits(input, ii, 4);
+                if (r.end == ii) return error.ParseError;
+                bd.year = r.val;
+                ii = r.end;
+            },
+            'y' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.year = if (r.val >= 69) 1900 + r.val else 2000 + r.val;
+                ii = r.end;
+            },
+            'm' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.month = r.val - 1;
+                ii = r.end;
+            },
+            'd', 'e' => {
+                // Skip leading spaces for %e
+                while (ii < input.len and input[ii] == ' ') ii += 1;
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.mday = r.val;
+                ii = r.end;
+            },
+            'H' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.hour = r.val;
+                ii = r.end;
+            },
+            'I' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.hour = r.val;
+                ii = r.end;
+            },
+            'M' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.min = r.val;
+                ii = r.end;
+            },
+            'S' => {
+                const r = parseDigits(input, ii, 2);
+                if (r.end == ii) return error.ParseError;
+                bd.sec = r.val;
+                ii = r.end;
+            },
+            'j' => {
+                const r = parseDigits(input, ii, 3);
+                if (r.end == ii) return error.ParseError;
+                bd.yday = r.val - 1;
+                ii = r.end;
+            },
+            'Z' => {
+                // Skip timezone name
+                while (ii < input.len and input[ii] != ' ' and input[ii] != '+' and input[ii] != '-' and !(input[ii] >= '0' and input[ii] <= '9')) ii += 1;
+            },
+            'z' => {
+                // Skip timezone offset (+0000 or +00:00)
+                if (ii < input.len and (input[ii] == '+' or input[ii] == '-')) {
+                    ii += 1;
+                    const r = parseDigits(input, ii, 4);
+                    ii = r.end;
+                    if (ii < input.len and input[ii] == ':') {
+                        ii += 1;
+                        const r2 = parseDigits(input, ii, 2);
+                        ii = r2.end;
+                    }
+                }
+            },
+            'n' => {
+                if (ii < input.len and input[ii] == '\n') ii += 1;
+            },
+            't' => {
+                if (ii < input.len and (input[ii] == '\t' or input[ii] == ' ')) ii += 1;
+            },
+            '%' => {
+                if (ii >= input.len or input[ii] != '%') return error.ParseError;
+                ii += 1;
+            },
+            'A', 'a' => {
+                // Match weekday name — find match
+                var found = false;
+                for (weekday_names, 0..) |name, idx| {
+                    if (ii + name.len <= input.len and std.mem.eql(u8, input[ii..][0..name.len], name)) {
+                        bd.wday = @intCast(idx);
+                        ii += name.len;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    for (weekday_abbrs, 0..) |name, idx| {
+                        if (ii + name.len <= input.len and std.mem.eql(u8, input[ii..][0..name.len], name)) {
+                            bd.wday = @intCast(idx);
+                            ii += name.len;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) return error.ParseError;
+            },
+            'B', 'b', 'h' => {
+                var found = false;
+                for (month_names, 0..) |name, idx| {
+                    if (ii + name.len <= input.len and std.mem.eql(u8, input[ii..][0..name.len], name)) {
+                        bd.month = @intCast(idx);
+                        ii += name.len;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    for (month_abbrs, 0..) |name, idx| {
+                        if (ii + name.len <= input.len and std.mem.eql(u8, input[ii..][0..name.len], name)) {
+                            bd.month = @intCast(idx);
+                            ii += name.len;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) return error.ParseError;
+            },
+            'p', 'P' => {
+                if (ii + 2 <= input.len) {
+                    const tok = input[ii..][0..2];
+                    if (std.mem.eql(u8, tok, "PM") or std.mem.eql(u8, tok, "pm")) {
+                        if (bd.hour < 12) bd.hour += 12;
+                        ii += 2;
+                    } else if (std.mem.eql(u8, tok, "AM") or std.mem.eql(u8, tok, "am")) {
+                        if (bd.hour == 12) bd.hour = 0;
+                        ii += 2;
+                    }
+                }
+            },
+            'w' => {
+                const r = parseDigits(input, ii, 1);
+                bd.wday = r.val;
+                ii = r.end;
+            },
+            'u' => {
+                const r = parseDigits(input, ii, 1);
+                bd.wday = if (r.val == 7) 0 else r.val;
+                ii = r.end;
+            },
+            else => {
+                // Unknown specifier — skip one char
+                if (ii < input.len) ii += 1;
+            },
+        }
+    }
+    // Recompute wday and yday from parsed year/month/mday
+    if (bd.year != 0 and bd.mday != 0) {
+        const days = daysFromCivil(bd.year, bd.month + 1, bd.mday);
+        bd.wday = dayOfWeek(days);
+        bd.yday = dayOfYear(bd.year, bd.month, bd.mday);
+    }
+    return bd;
 }

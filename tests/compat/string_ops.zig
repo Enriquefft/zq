@@ -321,7 +321,7 @@ test "jq:L1838 strftime(_%A, %B %d, %Y_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Tuesday,June 30,2015\"", results[0]);
+    try std.testing.expectEqualStrings("\"Tuesday, June 30, 2015\"", results[0]);
 }
 
 test "jq:L1842 strftime(_%Y-%m-%dT%H:%M:%SZ_)" {

@@ -375,6 +375,18 @@ pub const BuiltinId = enum(u16) {
     first_, // first(expr)
     last_, // last(expr)
 
+    // Date/time builtins
+    now_, // now — current Unix timestamp as float (sub-second precision)
+    gmtime_, // gmtime — Unix timestamp -> broken-down time array [year, month(0-based), mday, hour, min, sec, wday, yday]
+    mktime_, // mktime — broken-down time array -> Unix timestamp
+    strftime_, // strftime(fmt) — format broken-down time (or timestamp) to string
+    strptime_, // strptime(fmt) — parse string to broken-down time array
+    strflocaltime_, // strflocaltime(fmt) — like strftime but local time (UTC in zq, no TZ support)
+    todate_, // todate — shorthand for strftime("%Y-%m-%dT%H:%M:%SZ")
+    fromdate_, // fromdate — shorthand for strptime("%Y-%m-%dT%H:%M:%SZ") | mktime
+    todateiso8601_, // todateiso8601 — alias for todate
+    fromdateiso8601_, // fromdateiso8601 — alias for fromdate
+
     const JqEntry = struct { name: []const u8, arity: u8 };
 
     /// Return the jq-visible "name/arity" entry for this builtin, or null for
@@ -508,6 +520,13 @@ pub const BuiltinId = enum(u16) {
             .format_base64,
             .format_base64d,
             .error_,
+            .now_,
+            .gmtime_,
+            .mktime_,
+            .todate_,
+            .fromdate_,
+            .todateiso8601_,
+            .fromdateiso8601_,
             => 0,
 
             // 1-arity: one explicit argument
@@ -541,6 +560,9 @@ pub const BuiltinId = enum(u16) {
             .last_,
             .halt_error_,
             .range,
+            .strftime_,
+            .strptime_,
+            .strflocaltime_,
             => 1,
 
             // 2-arity: two explicit arguments

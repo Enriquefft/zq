@@ -2142,6 +2142,15 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "halt")) return .halt_;
     if (std.mem.eql(u8, name, "halt_error")) return .halt_error_;
 
+    // Date/time builtins (zero-arg)
+    if (std.mem.eql(u8, name, "now")) return .now_;
+    if (std.mem.eql(u8, name, "gmtime")) return .gmtime_;
+    if (std.mem.eql(u8, name, "mktime")) return .mktime_;
+    if (std.mem.eql(u8, name, "todate")) return .todate_;
+    if (std.mem.eql(u8, name, "fromdate")) return .fromdate_;
+    if (std.mem.eql(u8, name, "todateiso8601")) return .todateiso8601_;
+    if (std.mem.eql(u8, name, "fromdateiso8601")) return .fromdateiso8601_;
+
     return null;
 }
 
@@ -2200,6 +2209,9 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "sub") or
         std.mem.eql(u8, name, "gsub") or
         std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "strftime") or
+        std.mem.eql(u8, name, "strptime") or
+        std.mem.eql(u8, name, "strflocaltime") or
         std.mem.eql(u8, name, "error");
 }
 
@@ -3887,6 +3899,12 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileValueArgBuiltin1(ctx, .bsearch_);
                 } else if (std.mem.eql(u8, ident_name, "error")) {
                     try compileErrorArg(ctx);
+                } else if (std.mem.eql(u8, ident_name, "strftime")) {
+                    try compileValueArgBuiltin1(ctx, .strftime_);
+                } else if (std.mem.eql(u8, ident_name, "strptime")) {
+                    try compileValueArgBuiltin1(ctx, .strptime_);
+                } else if (std.mem.eql(u8, ident_name, "strflocaltime")) {
+                    try compileValueArgBuiltin1(ctx, .strflocaltime_);
                 }
                 return;
             }
