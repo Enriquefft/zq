@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/Enriquefft/zq/main/install.sh | sh
 
 ## Benchmarks
 
-![zq vs jq benchmark](demo/benchmark.gif)
+![zq vs jq benchmark](demo/benchmark/benchmark.gif)
 
 **File mode — 15M-record JSONL (1.3 GB)**
 
