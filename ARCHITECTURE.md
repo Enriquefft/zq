@@ -325,16 +325,18 @@ Version defined in `build.zig` with `-Dversion` override for release CI. Install
 
 ## Performance Snapshot
 
-648 MB / 15M-record JSONL, `.id` query:
+1.3 GB / 15M-record JSONL:
 
 ```
-File mode:     0.87s,  715 MB RSS  (25x faster than jq, 1.10x input size)
-Stream mode:   1.4s,     7 MB RSS  (16x faster than jq)
-Startup:       ~2 ms               (2x faster than jq)
-Binary:        2.7 MB              (static, stripped, zero deps)
+File mode (.id):      1.05s,  403 MB RSS  (31x faster than jq, 0.31x input size)
+File mode (select):   1.90s,  831 MB RSS  (37x faster than jq, 0.64x input size)
+File mode (complex):  2.22s               (43x faster than jq)
+Stream mode (.id):    3.47s,    7 MB RSS  (9x faster than jq)
+Startup:              ~2.4 ms             (1.5x faster than jq)
+Binary:               2.7 MB             (static, stripped, zero deps)
 ```
 
-Memory optimization progression:
+Memory optimization progression (historical — measured on 648 MB file, pre-SIMD):
 ```
 Initial (all chunks live):        2998 MB
 + InFlightLimiter:                1764 MB  (-41%)

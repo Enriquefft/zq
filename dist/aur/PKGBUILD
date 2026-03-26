@@ -2,7 +2,7 @@
 pkgname=zq-bin
 pkgver=PKGVER_PLACEHOLDER
 pkgrel=1
-pkgdesc='A drop-in replacement for jq, 26x faster, written in Zig'
+pkgdesc='A drop-in replacement for jq, 31x faster, written in Zig'
 arch=('x86_64' 'aarch64')
 url='https://github.com/Enriquefft/zq'
 license=('MIT')

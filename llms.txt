@@ -1,6 +1,6 @@
 # zq
 
-> zq is a high-performance JSON processor compatible with jq filter syntax. It is a drop-in jq replacement that runs 25x faster on large files via automatic parallelization. It produces structured JSON errors, machine-readable data shape descriptions, and uses documented exit codes — designed for reliable use by AI agents and automated workflows.
+> zq is a high-performance JSON processor compatible with jq filter syntax. It is a drop-in jq replacement that runs 31x faster on large files via automatic parallelization. It produces structured JSON errors, machine-readable data shape descriptions, and uses documented exit codes — designed for reliable use by AI agents and automated workflows.
 
 ## Installation
 

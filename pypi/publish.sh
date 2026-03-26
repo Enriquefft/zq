@@ -63,7 +63,7 @@ for glob in "${!PLATFORM_MAP[@]}"; do
 Metadata-Version: 2.1
 Name: zq-json
 Version: ${PEP_VERSION}
-Summary: Drop-in jq replacement — 26x faster JSON processing
+Summary: Drop-in jq replacement — 31x faster JSON processing
 Home-page: https://github.com/Enriquefft/zq
 License: MIT
 Author: Enrique Flores
@@ -79,7 +79,7 @@ Description-Content-Type: text/markdown
 
 # zq-json
 
-Drop-in jq replacement — 26x faster JSON processing via parallelization, SIMD, and zero-allocation parsing.
+Drop-in jq replacement — 31x faster JSON processing via parallelization, SIMD, and zero-allocation parsing.
 
 ## Usage
 

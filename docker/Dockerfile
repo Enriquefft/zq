@@ -3,7 +3,7 @@ FROM scratch
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="zq" \
-      org.opencontainers.image.description="A drop-in jq replacement — 25x faster JSON processing" \
+      org.opencontainers.image.description="A drop-in jq replacement — 31x faster JSON processing" \
       org.opencontainers.image.url="https://github.com/Enriquefft/zq" \
       org.opencontainers.image.source="https://github.com/Enriquefft/zq" \
       org.opencontainers.image.licenses="MIT"
