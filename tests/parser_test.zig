@@ -545,3 +545,155 @@ test "tape.getString resolves StringRef" {
     try std.testing.expectEqualStrings("key", k);
     try std.testing.expectEqualStrings("val", v);
 }
+
+// ── SIMD fast-path edge cases ────────────────────────────────────────────────
+
+test "simd: long ASCII string (> 32 bytes)" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const inner = "abcdefghijklmnopqrstuvwxyz0123456789ABCDE";
+    const tape = try parseAll(&p, "\"" ++ inner ++ "\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings(inner, s);
+}
+
+test "simd: string exactly 32 bytes" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const inner = "A" ** 32;
+    const tape = try parseAll(&p, "\"" ++ inner ++ "\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings(inner, s);
+}
+
+test "simd: string exactly 33 bytes" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const inner = "A" ** 33;
+    const tape = try parseAll(&p, "\"" ++ inner ++ "\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings(inner, s);
+}
+
+test "simd: escape at vector boundary (byte 31)" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // 31 safe bytes, then \n escape
+    const inner = "A" ** 31 ++ "\\n" ++ "B" ** 10;
+    const tape = try parseAll(&p, "\"" ++ inner ++ "\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings("A" ** 31 ++ "\n" ++ "B" ** 10, s);
+}
+
+test "simd: UTF-8 multibyte at vector boundary" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // 31 ASCII bytes, then a 2-byte UTF-8 char (é = C3 A9)
+    const inner = "A" ** 31 ++ "\xC3\xA9";
+    const tape = try parseAll(&p, "\"" ++ inner ++ "\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings(inner, s);
+}
+
+test "simd: large whitespace run before value" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // 70 spaces then a value
+    const input = " " ** 70 ++ "42";
+    const tape = try parseAll(&p, input);
+    try std.testing.expectEqual(types.Tape.Tag.int, tape.entries[0].tag);
+    try std.testing.expectEqual(@as(i64, 42), tape.entries[0].payload.int);
+}
+
+test "simd: mixed whitespace types" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const input = " \t\n\r \t\n\r \t\n\r \t\n\r \t\n\r \t\n\r \t\n\r \t\n\r true";
+    const tape = try parseAll(&p, input);
+    try std.testing.expectEqual(types.Tape.Tag.true_val, tape.entries[0].tag);
+}
+
+test "simd: whitespace in object with long keys and values" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const input = "  {  \"" ++ "k" ** 40 ++ "\"  :  \"" ++ "v" ** 40 ++ "\"  }  ";
+    const tape = try parseAll(&p, input);
+    try std.testing.expectEqual(@as(usize, 4), tape.entries.len);
+    const k = tape.getString(tape.entries[1].payload.string);
+    const v = tape.getString(tape.entries[2].payload.string);
+    try std.testing.expectEqualStrings("k" ** 40, k);
+    try std.testing.expectEqualStrings("v" ** 40, v);
+}
+
+test "simd: repeated parse/reset with long strings" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+
+    for (0..10) |round| {
+        _ = round;
+        const tape = try parseAll(&p, "\"" ++ "x" ** 100 ++ "\"");
+        const s = tape.getString(tape.entries[0].payload.string);
+        try std.testing.expectEqualStrings("x" ** 100, s);
+        p.reset();
+    }
+}
+
+test "simd: all-whitespace input returns need_more" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    const result = try p.feed(" " ** 64, true);
+    try std.testing.expectEqual(FeedResult.need_more, result);
+}
+
+test "simd: cross-chunk string scanning" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // Start a string in chunk 1, finish in chunk 2.
+    // 34 safe ASCII bytes split across two feed() calls.
+    const r1 = try p.feed("\"" ++ "A" ** 34, false);
+    try std.testing.expectEqual(FeedResult.need_more, r1);
+    const r2 = try p.feed("B" ** 34 ++ "\"", true);
+    switch (r2) {
+        .done => |d| {
+            const s = d.tape.getString(d.tape.entries[0].payload.string);
+            try std.testing.expectEqualStrings("A" ** 34 ++ "B" ** 34, s);
+        },
+        .need_more => return error.UnexpectedNeedMore,
+    }
+}
+
+test "simd: surrogate guard prevents scanning during surrogate pair" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // \uD83D\uDC08 = U+1F408 (cat emoji). The surrogate guard must prevent
+    // SIMD scanning between the high and low surrogate escapes.
+    const tape = try parseAll(&p, "\"\\uD83D\\uDC08\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings("\xF0\x9F\x90\x88", s);
+}
+
+test "simd: string of only escape sequences" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // Every byte is a backslash or escape char — SIMD returns 0 each time.
+    const tape = try parseAll(&p, "\"\\\\\\n\\t\\r\"");
+    const s = tape.getString(tape.entries[0].payload.string);
+    try std.testing.expectEqualStrings("\\\n\t\r", s);
+}
+
+test "simd: UTF-8 continuation bytes across feed chunks" {
+    var p = try Parser.init(std.testing.allocator);
+    defer p.deinit();
+    // 3-byte UTF-8 char (€ = E2 82 AC) split: lead byte in chunk 1, continuations in chunk 2.
+    // The utf8_pending guard must prevent SIMD scanning on the continuation bytes.
+    const r1 = try p.feed("\"abc\xE2", false);
+    try std.testing.expectEqual(FeedResult.need_more, r1);
+    const r2 = try p.feed("\x82\xAC\"", true);
+    switch (r2) {
+        .done => |d| {
+            const s = d.tape.getString(d.tape.entries[0].payload.string);
+            try std.testing.expectEqualStrings("abc\xE2\x82\xAC", s);
+        },
+        .need_more => return error.UnexpectedNeedMore,
+    }
+}

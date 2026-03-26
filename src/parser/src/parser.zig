@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types");
 const err_mod = @import("error");
+const simd = @import("simd.zig");
 
 pub const ZqError = err_mod.ZqError;
 pub const Tape = types.Tape;
@@ -157,10 +158,34 @@ pub const Parser = struct {
         input: []const u8,
         is_eof: bool,
     ) (ZqError || error{OutOfMemory})!FeedResult {
-        for (input, 0..) |byte, i| {
-            try p.processByte(byte);
+        var i: usize = 0;
+        while (i < input.len) {
+            // ── SIMD fast paths ──────────────────────────────
+            switch (p.state) {
+                .in_string => {
+                    // Only safe when not mid-UTF8 sequence or surrogate pair.
+                    if (p.utf8_pending == 0 and p.unicode_surrogate == 0) {
+                        const safe = simd.scanStringBody(input[i..]);
+                        if (safe > 0) {
+                            try p.string_buf.appendSlice(p.allocator, input[i..][0..safe]);
+                            i += safe;
+                            continue;
+                        }
+                    }
+                },
+                .want_value, .want_key, .want_colon, .after_value => {
+                    const skip = simd.skipWhitespace(input[i..]);
+                    i += skip;
+                    if (i >= input.len) break;
+                },
+                else => {},
+            }
+
+            // ── Scalar fallback ──────────────────────────────
+            try p.processByte(input[i]);
+            i += 1;
             if (p.state == .top_done) {
-                return .{ .done = .{ .tape = p.makeTape(), .consumed = i + 1 } };
+                return .{ .done = .{ .tape = p.makeTape(), .consumed = i } };
             }
         }
         if (is_eof) return p.processEof();
