@@ -1,6 +1,6 @@
 # zq Roadmap
 
-> The JSON tool agents reach for first — 25x faster than jq, with structured errors,
+> The JSON tool agents reach for first — 31x faster than jq, with structured errors,
 > machine-readable interfaces, and seamless integration into automated workflows.
 
 ---
@@ -28,31 +28,31 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-18)
+## Quick Status (Updated 2026-03-26)
 
-**Last updated:** Memory audit — madvise(MADV_DONTNEED) on processed mmap chunks; RSS reduced from 1.29x to 0.31–0.64x input
+**Last updated:** SIMD parser (AVX2/NEON) + date/time builtins; benchmarks re-run
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       327/533 passing (61.4%)
-  +-- 203 failing, 3 skipped
-Startup:            ~2 ms (2x faster than jq)
+Compat tests:       339/533 passing (63.6%)
+  +-- 191 failing, 3 skipped
+Startup:            ~2.4 ms (1.5x faster than jq)
 Cold start:         sub-3ms
 
 Parallel (file arg, .id, 15M-record JSONL, 1.3 GB):
-  jq   37.8s   3.7 MB RSS
-  jaq  25.0s   1312 MB RSS
-  zq    1.44s   396 MB RSS  <- 26x faster than jq, 0.31x input RSS
+  jq   32.3s   3.7 MB RSS
+  jaq  20.9s   1312 MB RSS
+  zq    1.05s   403 MB RSS  <- 31x faster than jq, 0.31x input RSS
 
 Parallel (file arg, select(.id > 500000), 15M-record JSONL, 1.3 GB):
-  jq   69.8s   3.6 MB RSS
-  jaq  39.0s   1312 MB RSS
-  zq    2.21s   820 MB RSS  <- 32x faster than jq, 0.64x input RSS
+  jq   70.2s   3.6 MB RSS
+  jaq  38.7s   1312 MB RSS
+  zq    1.90s   831 MB RSS  <- 37x faster than jq, 0.64x input RSS
 
 Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
-  jq   91.2s   3.7 MB RSS
-  jaq 178.3s   1312 MB RSS
-  zq    3.64s   543 MB RSS  <- 25x faster than jq, 0.42x input RSS
+  jq   94.8s   3.7 MB RSS
+  jaq 163.0s   1312 MB RSS
+  zq    2.22s              <- 43x faster than jq
 ```
 
 **Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
@@ -69,7 +69,7 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
 
 ### Milestone criteria
 
-- [x] 60%+ of migrated jq compat tests pass (achieved: 61.4%, 327/533)
+- [x] 60%+ of migrated jq compat tests pass (achieved: 63.6%, 339/533)
 - [ ] All P0/P1 query features below are implemented
 - [x] `zq` binary under 3 MB static (2.7 MB stripped)
 - [ ] Zero known crashes on valid JSON input
@@ -157,8 +157,8 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 
 ### Memory optimization — P0
 
-Current state: **396 MB RSS** for 1277 MB JSONL `.id` query **(0.31x input)**. Target < 2x: **achieved**. Target ~1x: **achieved**.
-Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
+Current state: **403 MB RSS** for 1.3 GB JSONL `.id` query **(0.31x input)**. Target < 2x: **achieved**. Target ~1x: **achieved**.
+Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 
 | | Item | Detail |
 |---|------|--------|
@@ -170,9 +170,8 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 | [x] | **`madvise(MADV_DONTNEED)` on processed chunks** | After workers serialize a chunk's output into the arena buffer, call `madvise(MADV_DONTNEED)` on the mmap pages. Releases physical pages immediately, bounding mmap RSS to `in_flight × chunk_size` instead of `file_size`. Linux-only; no-op elsewhere. **Result: 1648 MB -> 396 MB for `.id` (-76%); 0.31x input RSS.** |
 
 **Target:** RSS < 2x input size for per-record queries (`.id`, `select()`, `{a,b}`). **Achieved and exceeded:**
-- `.id`: **0.31x input** (396 MB for 1277 MB file)
-- `select(.id > 500000)`: **0.64x input** (820 MB) — higher because output ≈ input for high-selectivity filters
-- Complex transform: **0.42x input** (543 MB)
+- `.id`: **0.31x input** (403 MB for 1.3 GB file)
+- `select(.id > 500000)`: **0.64x input** (831 MB) — higher because output ≈ input for high-selectivity filters
 
 ### Infrastructure
 
@@ -196,7 +195,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
-- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 26x on `.id`, 32x on `select()`)
+- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 31x on `.id`, 37x on `select()`)
 - [ ] `--strict` + `--suggest` + `--explain` all working
 - [ ] WASM build for sandboxed agent environments
 - [ ] Python bindings for programmatic agent use
@@ -234,7 +233,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 | [x] | **Env** | `env`, `builtins` |
 | [ ] | **Env (remaining)** | `$ENV`, `$__loc__` |
 | [ ] | **SQL-style** | `INDEX`, `IN`, `JOIN`, `GROUP_BY` |
-| [ ] | **Date/time** | `now`, `gmtime`, `mktime`, `strftime`, `strptime`, `strflocaltime`, `todate`, `fromdate`, `todateiso8601`, `fromdateiso8601` |
+| [x] | **Date/time** | `now`, `gmtime`, `mktime`, `strftime`, `strptime`, `strflocaltime`, `todate`, `fromdate`, `todateiso8601`, `fromdateiso8601` |
 | [x] | **Type selectors** | `arrays`, `objects`, `iterables`, `booleans`, `numbers`, `strings`, `nulls`, `normals`, `scalars`, `values` |
 | [ ] | **Type selectors (remaining)** | `finites` |
 | [x] | **Misc** | `isempty`, `ascii`, `first`, `last` |
@@ -244,12 +243,12 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 
 | | Item | Detail |
 |---|------|--------|
-| [ ] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. Already architected in parser — needs the actual intrinsics. |
-| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **26x vs jq, 17x vs jaq** on 15M-record JSONL `.id`. |
+| [x] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. String scanning and whitespace skipping via SIMD fast paths. |
+| [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **31x vs jq, 20x vs jaq** on 15M-record JSONL `.id`. |
 | [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
 | [x] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
 | [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
-| [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 0.31x for `.id`, 0.64x for `select()`.** Total reduction: -87%. |
+| [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 0.31x for `.id`, 0.64x for `select()` on 1.3 GB file.** Total reduction: -87%. |
 
 ### CLI — remaining flags
 
@@ -353,7 +352,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 396 MB (-87% total).
 |---|------|--------|
 | [x] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
 | [x] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
-| [x] | **`madvise(MADV_DONTNEED)` page reclaim** | Workers call `madvise(MADV_DONTNEED)` on mmap chunk pages after serializing output. Bounds mmap RSS to `in_flight × chunk_size`. **Result: 0.31x RSS for `.id`, 0.64x for `select()`.** |
+| [x] | **`madvise(MADV_DONTNEED)` page reclaim** | Workers call `madvise(MADV_DONTNEED)` on mmap chunk pages after serializing output. Bounds mmap RSS to `in_flight × chunk_size`. **Result: 0.31x RSS for `.id`, 0.64x for `select()` on 1.3 GB file.** |
 
 ### Documentation
 
@@ -502,16 +501,17 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **61.4%** (327/533) | 60% | 95% | 100% |
-| Throughput vs jq (parallel, `.id`) | **26x** (1.44s vs 37.8s) | > 1x | 5x | 10x |
-| Throughput vs jq (parallel, `select()`) | **32x** (2.21s vs 69.8s) | -- | 15x | 20x |
-| Startup time | **~2ms** | < 3ms | < 3ms | < 3ms |
+| jq compat test pass rate | **63.6%** (339/533) | 60% | 95% | 100% |
+| Throughput vs jq (parallel, `.id`) | **31x** (1.05s vs 32.3s) | > 1x | 5x | 10x |
+| Throughput vs jq (parallel, `select()`) | **37x** (1.90s vs 70.2s) | -- | 15x | 20x |
+| Throughput vs jq (parallel, complex) | **43x** (2.22s vs 94.8s) | -- | -- | -- |
+| Startup time | **~2.4ms** | < 3ms | < 3ms | < 3ms |
 | Binary size (static, stripped) | **2.7 MB** | < 3 MB | < 3 MB | < 5 MB |
-| Memory (1277 MB JSONL, `.id`) | **396 MB** (0.31x) | < 2x | < 2x | < 2x |
-| Memory (1277 MB JSONL, `select()`) | **820 MB** (0.64x) | < 2x | < 2x | < 2x |
+| Memory (1.3 GB JSONL, `.id`) | **403 MB** (0.31x) | < 2x | < 2x | < 2x |
+| Memory (1.3 GB JSONL, `select()`) | **831 MB** (0.64x) | < 2x | < 2x | < 2x |
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
-| Throughput vs jq (streaming, `.id`) | **16x** (1.4s vs 22.2s) | -- | -- | 10x |
-| Test count | **302 compat + module** | 400+ | 800+ | 1000+ |
+| Throughput vs jq (streaming, `.id`) | **9x** (3.47s vs 32.6s) | -- | -- | 10x |
+| Test count | **339 compat + 442 module** | 400+ | 800+ | 1000+ |
 | Agent integration | **--json-errors, --describe, --validate, exit codes, C ABI errors, llms.txt, 134 builtins, LSP, npm, PyPI** | -- | Python bindings, WASM | Framework integrations, MCP |
 
 ---
