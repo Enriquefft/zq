@@ -1,7 +1,7 @@
 {
   "name": "@zqjson/zq",
   "version": "0.1.0",
-  "description": "A drop-in replacement for jq, 25x faster — SIMD-accelerated JSON processor",
+  "description": "A drop-in replacement for jq, 26x faster — SIMD-accelerated JSON processor",
   "license": "MIT",
   "repository": {
     "type": "git",

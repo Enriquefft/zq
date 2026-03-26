@@ -1,5 +1,5 @@
 class Zq < Formula
-  desc "A drop-in replacement for jq, 25x faster"
+  desc "A drop-in replacement for jq, 26x faster"
   homepage "https://github.com/Enriquefft/zq"
   version "0.1.0"
   license "MIT"

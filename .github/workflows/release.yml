@@ -179,7 +179,7 @@ jobs:
           SHA_AARCH64=$(grep "linux-arm64" checksums.txt | awk '{print $1}')
 
           printf 'pkgbase = zq-bin\n' > .SRCINFO
-          printf '\tpkgdesc = A drop-in replacement for jq, 25x faster, written in Zig\n' >> .SRCINFO
+          printf '\tpkgdesc = A drop-in replacement for jq, 26x faster, written in Zig\n' >> .SRCINFO
           printf '\tpkgver = %s\n' "$VERSION" >> .SRCINFO
           printf '\tpkgrel = 1\n' >> .SRCINFO
           printf '\turl = https://github.com/Enriquefft/zq\n' >> .SRCINFO
