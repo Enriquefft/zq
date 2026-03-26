@@ -6445,10 +6445,8 @@ pub const ResultIterator = struct {
     // ── Date/time builtin implementations ───────────────────────────────
 
     fn builtinNow(_: *ResultIterator) ZqError!?StackValue {
-        const ts = std.posix.clock_gettime(.REALTIME) catch return error.TypeError;
-        const secs: f64 = @floatFromInt(ts.sec);
-        const nsecs: f64 = @floatFromInt(ts.nsec);
-        return .{ .float = secs + nsecs / 1_000_000_000.0 };
+        const ns = std.time.nanoTimestamp();
+        return .{ .float = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0 };
     }
 
     fn builtinGmtime(it: *ResultIterator) ZqError!?StackValue {
