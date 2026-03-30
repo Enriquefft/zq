@@ -77,6 +77,16 @@ The regression checker (`check_regression.sh`) uses **ratio-based comparison**: 
 
 A regression is flagged when the ratio degrades by more than 15%.
 
+## CI Baseline System
+
+CI does **not** use the committed `baseline.json` (that file is a developer-machine reference only). Instead, it maintains a self-tracking baseline via GitHub Actions cache:
+
+- **Bootstrap run**: No cached baseline exists yet. The regression check is skipped and current results are saved as the new baseline.
+- **Subsequent runs on `main`**: Current results are compared against the cached baseline from the last passing run. If no regression is detected, current results replace the baseline.
+- **Pull requests**: Compare against `main`'s baseline but never update it. This prevents a regression introduced in a PR from becoming the new normal.
+
+Cache keys use a `benchmark-baseline-main-<run_id>` pattern. GitHub Actions caches are immutable, so each passing run creates a new entry. The `restore-keys` prefix match finds the most recent one, and GitHub's LRU eviction handles cleanup.
+
 ## CI/CD Integration
 
 The GitHub Actions workflow (`.github/workflows/benchmark.yml`) installs hyperfine v1.18.0 from GitHub releases to ensure `--shell=none` support and consistent behavior across runs.

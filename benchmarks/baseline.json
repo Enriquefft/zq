@@ -1,5 +1,6 @@
 {
   "version": "1.0",
+  "_note": "Reference only — recorded on a developer machine. CI maintains its own baseline via GitHub Actions cache (ci-baseline.json).",
   "date": "2026-03-18T09:52:30Z",
   "scenarios": {
     "parallelism": {"zq_mean_s": 2.13, "jq_mean_s": 37.77},

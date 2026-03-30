@@ -1,10 +1,17 @@
 name: Benchmark Regression
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 6 AM UTC
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   benchmark:
@@ -38,6 +45,16 @@ jobs:
           mv "gojq_v${GOJQ_VERSION}_linux_amd64/gojq" /usr/local/bin/gojq
           chmod +x /usr/local/bin/gojq
 
+      - name: Restore baseline from cache
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: benchmarks/ci-baseline.json
+          key: benchmark-baseline-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            benchmark-baseline-${{ github.ref_name }}-
+            benchmark-baseline-main-
+
       - name: Build zq
         run: zig build -Doptimize=ReleaseFast
 
@@ -60,7 +77,18 @@ jobs:
       - name: Check regression
         run: |
           cd benchmarks
-          bash check_regression.sh results/summary.json baseline.json
+          bash check_regression.sh results/summary.json ci-baseline.json
+
+      - name: Update baseline from current results
+        if: github.ref == 'refs/heads/main' && success()
+        run: cp benchmarks/results/summary.json benchmarks/ci-baseline.json
+
+      - name: Save baseline to cache
+        if: github.ref == 'refs/heads/main' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: benchmarks/ci-baseline.json
+          key: benchmark-baseline-main-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         if: always()

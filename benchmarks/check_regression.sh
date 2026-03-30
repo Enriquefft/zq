@@ -23,9 +23,13 @@ if [ ! -f "$CURRENT" ]; then
 fi
 
 if [ ! -f "$BASELINE" ]; then
-    echo "No baseline found at $BASELINE — skipping regression check (first run)" >&2
+    echo "No baseline found at $BASELINE — skipping regression check (bootstrap run)"
     exit 0
 fi
+
+BASELINE_DATE=$(jq -r '.date // "unknown"' "$BASELINE" 2>/dev/null)
+echo "Baseline from: $BASELINE_DATE"
+echo ""
 
 FAILED=0
 
