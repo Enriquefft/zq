@@ -86,15 +86,6 @@ jobs:
             artifacts/zq-*.zip
             artifacts/checksums-sha256.txt
 
-      - name: Publish to npm
-        if: "!contains(github.ref_name, '-')"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-          VERSION="${GITHUB_REF_NAME#v}"
-          bash npm/publish.sh "$VERSION" artifacts
-
       - name: Publish to PyPI
         if: "!contains(github.ref_name, '-')"
         env:
@@ -113,6 +104,31 @@ jobs:
           repository: Enriquefft/homebrew-zq
           event-type: release
           client-payload: '{"version": "${{ github.ref_name }}"}'
+
+  npm:
+    name: Publish npm
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: "!contains(github.ref_name, '-')"
+    permissions:
+      contents: read
+      id-token: write
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish to npm
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash npm/publish.sh "$VERSION" artifacts
 
   docker:
     name: Publish Docker

@@ -28,7 +28,7 @@ publish_npm() {
   fi
 
   echo "Publishing ${pkg_name}@${VERSION}"
-  npm publish "$pkg_dir" --access public
+  npm publish "$pkg_dir" --provenance --access public
 }
 
 for platform in "${!PLATFORM_MAP[@]}"; do

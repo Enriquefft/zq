@@ -28,6 +28,7 @@
             yq
             just
             vhs
+            nodejs
           ];
         };
 
