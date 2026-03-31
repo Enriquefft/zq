@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'benchmarks/**'
   pull_request:
     branches: [main]
   workflow_dispatch:
