@@ -17,7 +17,7 @@ practical JSON query tools actually use.
 
 ## Proposed Contribution
 
-This thesis designs, implements, and evaluates **compiler-driven query-aware
+This paper designs, implements, and evaluates **compiler-driven query-aware
 parsing** in zq, a parallel JSON processor with a SIMD-accelerated tape-based
 parser and a bytecode-VM query engine. The core idea: the query compiler
 analyzes the filter program and emits a **parse plan** — a compact
