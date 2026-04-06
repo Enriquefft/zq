@@ -30,7 +30,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip };
 
 const EachState = struct {
     pos: u32,
@@ -71,6 +71,25 @@ const LimitState = struct {
     saved_collect_len: u32,
 };
 
+/// State for path(f) tracking. Pushed by path_begin, popped by path_end.
+const PathFrame = struct {
+    components: std.ArrayList(Value),
+    /// value_stack depth at path_begin — restored at path_end to discard
+    /// only the value(s) pushed by the body, not prior state.
+    saved_value_stack_len: u32,
+
+    fn deinit(self: *PathFrame, alloc: std.mem.Allocator) void {
+        self.components.deinit(alloc);
+    }
+};
+
+const SkipState = struct {
+    remaining: u64,
+    body_start_ip: u32,
+    exit_ip: u32,
+    saved_collect_len: u32,
+};
+
 const ForkAux = union(ForkType) {
     normal: void,
     each: EachState,
@@ -79,6 +98,7 @@ const ForkAux = union(ForkType) {
     alt_handler: TryHandlerState,
     label: LabelState,
     limit: LimitState,
+    skip: SkipState,
 };
 
 const Forkpoint = struct {
@@ -176,6 +196,8 @@ pub const ResultIterator = struct {
     call_stack: std.ArrayList(CallFrame),
     /// Fork stack for unified backtracking (comma, iteration, range, try, alt, label, limit).
     fork_stack: std.ArrayList(Forkpoint),
+    /// Path tracking stack for path(f). Pushed by path_begin, popped by path_end.
+    path_stack: std.ArrayList(PathFrame),
     /// Monotonically increasing counter for generating unique break tokens.
     next_break_token: u32,
     /// Value stored by the `error` builtin so the catch handler can retrieve it.
@@ -248,6 +270,10 @@ pub const ResultIterator = struct {
         errdefer fork_stack.deinit(allocator);
         try fork_stack.ensureTotalCapacity(allocator, max_stack_depth);
 
+        var path_stack = std.ArrayList(PathFrame){};
+        errdefer path_stack.deinit(allocator);
+        try path_stack.ensureTotalCapacity(allocator, 4);
+
         // Initialize runtime tape
         var runtime_tape = try types.RuntimeTape.init(allocator);
         errdefer runtime_tape.deinit(allocator);
@@ -270,6 +296,7 @@ pub const ResultIterator = struct {
             .collect_stack = collect_stack,
             .call_stack = call_stack,
             .fork_stack = fork_stack,
+            .path_stack = path_stack,
             .next_break_token = 0,
             .user_error_msg = null,
             .type_error_detail = null,
@@ -292,6 +319,8 @@ pub const ResultIterator = struct {
         it.collect_stack.deinit(it.alloc);
         it.call_stack.deinit(it.alloc);
         it.fork_stack.deinit(it.alloc);
+        for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
+        it.path_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
     }
 
@@ -324,6 +353,8 @@ pub const ResultIterator = struct {
         it.collect_stack.clearRetainingCapacity();
         it.call_stack.clearRetainingCapacity();
         it.fork_stack.clearRetainingCapacity();
+        for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
+        it.path_stack.clearRetainingCapacity();
         it.next_break_token = 0;
         it.user_error_msg = null;
         it.type_error_detail = null;
@@ -525,6 +556,11 @@ pub const ResultIterator = struct {
                     }
                     return err;
                 };
+                // Record path component if path tracking is active.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    try frame.components.append(it.alloc, .{ .string = key });
+                }
                 // Push result to value stack. Do NOT update it.current here — the
                 // pipe opcode (or explicit | between stages) is responsible for
                 // advancing it.current. This ensures both operands of .a + .b see
@@ -536,7 +572,17 @@ pub const ResultIterator = struct {
             },
 
             .load_index => {
-                const idx_result = try it.doLoadIndex(instr.operand.index);
+                const idx = instr.operand.index;
+                // In path-tracking mode, negative indices are errors (jq semantics).
+                if (it.path_stack.items.len > 0 and idx < 0) {
+                    it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                    return error.TypeError;
+                }
+                const idx_result = try it.doLoadIndex(idx);
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    try frame.components.append(it.alloc, .{ .int = idx });
+                }
                 it.pushValue(try valueToStackValue(idx_result));
                 it.ip += 1;
                 return null;
@@ -606,6 +652,13 @@ pub const ResultIterator = struct {
 
             .load_path => {
                 const path = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    var segs = std.mem.splitScalar(u8, path, '.');
+                    while (segs.next()) |seg| {
+                        try frame.components.append(it.alloc, .{ .string = seg });
+                    }
+                }
                 it.current = try it.doLoadPath(path);
                 it.ip += 1;
                 return null;
@@ -1182,6 +1235,100 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .skip_start, .nth_start => {
+                const is_nth = instr.op == .nth_start;
+                const n_sv = try it.popValue();
+                const n_i: i64 = switch (n_sv) {
+                    .int => |i| i,
+                    .float => |f| @intFromFloat(@round(f)),
+                    else => return error.TypeError,
+                };
+                if (n_i < 0) {
+                    it.user_error_msg = .{ .string = if (is_nth)
+                        "nth doesn't support negative indices"
+                    else
+                        "skip doesn't support negative count" };
+                    return error.UserError;
+                }
+                // n==0 means pass through all outputs (no skip frame needed).
+                // Just continue to the body.
+                if (n_i == 0) {
+                    it.ip += 1;
+                    return null;
+                }
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = @intCast(instr.operand.index), // exit_ip
+                    .aux = .{ .skip = .{
+                        .remaining = @intCast(n_i),
+                        .body_start_ip = it.ip,
+                        .exit_ip = @intCast(instr.operand.index),
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    } },
+                });
+                it.ip += 1;
+                return null;
+            },
+            .skip_end => {
+                // Pop the skip forkpoint if present.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].aux == .skip) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
+                }
+                it.ip += 1;
+                return null;
+            },
+
+            // ── Path tracking opcodes ──────────────────────────────────────
+
+            .path_begin => {
+                try it.path_stack.append(it.alloc, PathFrame{
+                    .components = std.ArrayList(Value){},
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                });
+                it.ip += 1;
+                return null;
+            },
+
+            .path_end => {
+                if (it.path_stack.items.len == 0) return error.TypeError;
+                var frame = it.path_stack.pop().?;
+                defer frame.deinit(it.alloc);
+                // Discard only values pushed by the body — restore to saved depth.
+                it.value_stack.items.len = frame.saved_value_stack_len;
+                // path(f) returns the path array, not the value f produced.
+                const path_arr = try it.buildPathArray(frame.components.items);
+                it.pushValue(try valueToStackValue(path_arr));
+                it.ip += 1;
+                return null;
+            },
+
+            // ── Walk opcodes ───────────────────────────────────────────────
+
+            .walk_start => {
+                // Recursively walk children bottom-up, then let the body (f)
+                // execute on the walked result via normal instruction flow.
+                const exit_ip: u32 = @intCast(instr.operand.index);
+                const body_start = it.ip + 1;
+                const body_end = exit_ip - 1; // walk_end is at exit_ip - 1
+
+                const walked = try it.walkChildren(it.current, body_start, body_end, 0);
+                it.current = walked;
+                // Fall through to the body instructions (f)
+                it.ip = body_start;
+                return null;
+            },
+
+            .walk_end => {
+                it.ip += 1;
+                return null;
+            },
+
             // ── Fork stack opcodes ──────────────────────────────────────────
 
             .fork => {
@@ -1269,6 +1416,31 @@ pub const ResultIterator = struct {
                     try stackValueToValue(try it.popValue())
                 else
                     it.current;
+
+                // Check skip counter via fork_stack.
+                // If a skip frame is active and counter > 0, suppress this output.
+                {
+                    const output_ip = it.ip;
+                    var si: usize = it.fork_stack.items.len;
+                    while (si > 0) {
+                        si -= 1;
+                        if (it.fork_stack.items[si].aux == .skip) {
+                            var sstate = &it.fork_stack.items[si].aux.skip;
+                            if (output_ip > sstate.body_start_ip and output_ip < sstate.exit_ip) {
+                                if (it.collect_stack.items.len > sstate.saved_collect_len) {
+                                    break;
+                                }
+                                if (sstate.remaining > 0) {
+                                    sstate.remaining -= 1;
+                                    // Suppress this output — backtrack to get next value from generator.
+                                    it.ip = @intCast(it.instructions.len);
+                                    return null;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 // Check limit counter via fork_stack.
                 {
@@ -2451,6 +2623,7 @@ pub const ResultIterator = struct {
             .endswith_ => return try it.builtinEndswith(),
             .ltrimstr_ => return try it.builtinLtrimstr(),
             .rtrimstr_ => return try it.builtinRtrimstr(),
+            .trimstr_ => return try it.builtinTrimstr(),
             .test_ => return try it.builtinTest(),
             .match_ => return try it.builtinMatch(),
             .sub_ => return try it.builtinSub(),
@@ -2500,6 +2673,15 @@ pub const ResultIterator = struct {
             .fromdate_ => return try it.builtinFromdate(),
             .todateiso8601_ => return try it.builtinTodate(),
             .fromdateiso8601_ => return try it.builtinFromdate(),
+
+            // Conversion / inspection builtins
+            .toboolean => return try it.builtinToboolean(),
+            .utf8bytelength => return try it.builtinUtf8bytelength(),
+
+            // Trim builtins
+            .trim_ => return try it.builtinTrim(.both),
+            .ltrim_ => return try it.builtinTrim(.left),
+            .rtrim_ => return try it.builtinTrim(.right),
         }
     }
 
@@ -2774,6 +2956,97 @@ pub const ResultIterator = struct {
             },
             else => return error.TypeError,
         }
+    }
+
+    /// `toboolean`: convert string "true"/"false" to bool, pass through bools.
+    fn builtinToboolean(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .bool_val => |b| return .{ .bool_val = b },
+            .string => |s| {
+                if (std.mem.eql(u8, s, "true")) return .{ .bool_val = true };
+                if (std.mem.eql(u8, s, "false")) return .{ .bool_val = false };
+                // Invalid string — produce typed error
+                return try it.raiseTobooleanError();
+            },
+            else => return try it.raiseTobooleanError(),
+        }
+    }
+
+    /// Build error message: "TYPE (VALUE) cannot be parsed as a boolean"
+    fn raiseTobooleanError(it: *ResultIterator) ZqError!?StackValue {
+        var msg_buf = std.ArrayList(u8){};
+        defer msg_buf.deinit(it.alloc);
+        try appendTypeName(&msg_buf, it.alloc, it.current);
+        try msg_buf.appendSlice(it.alloc, " (");
+        try serializeValueCompact(&msg_buf, it.alloc, it.current);
+        try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a boolean");
+        const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.UserError;
+    }
+
+    /// `utf8bytelength`: return byte length of a string.
+    fn builtinUtf8bytelength(it: *ResultIterator) ZqError!?StackValue {
+        switch (it.current) {
+            .string => |s| return .{ .int = @intCast(s.len) },
+            else => {
+                var msg_buf = std.ArrayList(u8){};
+                defer msg_buf.deinit(it.alloc);
+                try appendTypeName(&msg_buf, it.alloc, it.current);
+                try msg_buf.appendSlice(it.alloc, " (");
+                try serializeValueCompact(&msg_buf, it.alloc, it.current);
+                try msg_buf.appendSlice(it.alloc, ") only strings have UTF-8 byte length");
+                const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                return error.UserError;
+            },
+        }
+    }
+
+    const TrimSide = enum { left, right, both };
+
+    /// `trim`, `ltrim`, `rtrim`: trim Unicode whitespace.
+    fn builtinTrim(it: *ResultIterator, side: TrimSide) ZqError!?StackValue {
+        const s = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("trim input must be a string"),
+        };
+
+        var start: usize = 0;
+        var end: usize = s.len;
+
+        // Trim from left
+        if (side == .left or side == .both) {
+            while (start < end) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(s[start]) catch break;
+                if (start + seq_len > end) break;
+                const cp = std.unicode.utf8Decode(s[start..][0..seq_len]) catch break;
+                if (!isUnicodeWhitespace(cp)) break;
+                start += seq_len;
+            }
+        }
+
+        // Trim from right
+        if (side == .right or side == .both) {
+            while (end > start) {
+                // Walk backwards to find the start of the last codepoint
+                var back: usize = 1;
+                while (back < end - start and back < 4) : (back += 1) {
+                    // Continuation bytes have the form 10xxxxxx
+                    if (s[end - back] & 0xC0 != 0x80) break;
+                }
+                const cp_start = end - back;
+                const seq_len = std.unicode.utf8ByteSequenceLength(s[cp_start]) catch break;
+                if (cp_start + seq_len != end) break;
+                const cp = std.unicode.utf8Decode(s[cp_start..][0..seq_len]) catch break;
+                if (!isUnicodeWhitespace(cp)) break;
+                end = cp_start;
+            }
+        }
+
+        const trimmed = s[start..end];
+        const str_ref = try it.runtime_tape.internString(it.alloc, trimmed);
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
     }
 
     /// `add` builtin: fold array elements with +. Empty array → null.
@@ -4989,6 +5262,171 @@ pub const ResultIterator = struct {
         }
     }
 
+    /// Recursively walk children of a value bottom-up for walk(f).
+    /// For arrays: walk each element, collect first outputs into new array.
+    /// For objects: walk each value, collect first outputs into new object.
+    /// For scalars: return as-is (f is applied by the caller via normal instruction flow).
+    ///
+    /// The body range [body_start..body_end) contains the instructions for f.
+    /// At each recursive level, the full walk range (walk_start..walk_end inclusive)
+    /// is re-executed on the child, and only the first output is kept.
+    const max_walk_depth: u32 = 1000;
+
+    fn walkChildren(it: *ResultIterator, val: Value, body_start: u32, body_end: u32, depth: u32) ZqError!Value {
+        if (depth > max_walk_depth) {
+            it.user_error_msg = .{ .string = "walk recursion depth limit exceeded" };
+            return error.UserError;
+        }
+        switch (val) {
+            .array => |span| {
+                var walked_elems = std.ArrayList(Value){};
+                defer walked_elems.deinit(it.alloc);
+
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const elem = tapeEntryToValue(span.tape, pos);
+                    const walked_elem = try it.walkApplyBody(elem, body_start, body_end, depth + 1);
+                    try walked_elems.append(it.alloc, walked_elem);
+                    pos = skipEntry(span.tape.*, pos);
+                }
+
+                const arr_sv = try it.buildRuntimeArray(walked_elems.items);
+                return try stackValueToValue(arr_sv);
+            },
+            .object => |span| {
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
+                    const key_ref = try it.runtime_tape.internString(it.alloc, key_str);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .key,
+                        .payload = .{ .string = key_ref },
+                    });
+
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    const walked_val = try it.walkApplyBody(child_val, body_start, body_end, depth + 1);
+                    try it.stackValueToRuntimeTapeEntry(try valueToStackValue(walked_val));
+
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+
+                const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+
+                return Value{ .object = .{
+                    .tape = &it.runtime_tape.view,
+                    .start = obj_start,
+                    .end = obj_end_idx + 1,
+                } };
+            },
+            else => return val,
+        }
+    }
+
+    /// Execute walk(f) on a value and return the first output.
+    /// This recursively walks children, then executes the body f, capturing
+    /// only the first result. Used by walkChildren for recursive child processing.
+    fn walkApplyBody(it: *ResultIterator, val: Value, body_start: u32, body_end: u32, depth: u32) ZqError!Value {
+        // First, recursively walk children of this value.
+        const walked = try it.walkChildren(val, body_start, body_end, depth);
+
+        // Execute the body f on the walked value, capturing the first output.
+        const saved_ip = it.ip;
+        const saved_current = it.current;
+        const saved_input = it.input_value;
+        const saved_value_len: u32 = @intCast(it.value_stack.items.len);
+        const saved_if_len: u32 = @intCast(it.if_stack.items.len);
+        const saved_fork_len: u32 = @intCast(it.fork_stack.items.len);
+        const saved_collect_len: u32 = @intCast(it.collect_stack.items.len);
+        const saved_path_len: u32 = @intCast(it.path_stack.items.len);
+
+        it.current = walked;
+        it.input_value = walked;
+        it.ip = body_start;
+
+        var result: ?Value = null;
+        while (it.ip < it.instructions.len and it.ip != body_end) {
+            const body_instr = it.instructions[it.ip];
+
+            if (it.execOne(body_instr)) |maybe_val| {
+                if (maybe_val) |v| {
+                    result = v;
+                    break;
+                }
+            } else |err| {
+                if (!it.handleError(err)) {
+                    it.ip = saved_ip;
+                    it.current = saved_current;
+                    it.input_value = saved_input;
+                    it.value_stack.items.len = saved_value_len;
+                    it.if_stack.items.len = saved_if_len;
+                    while (it.collect_stack.items.len > saved_collect_len) {
+                        var cf = it.collect_stack.pop().?;
+                        cf.buffer.deinit(it.alloc);
+                    }
+                    it.fork_stack.items.len = saved_fork_len;
+                    while (it.path_stack.items.len > saved_path_len) {
+                        var pf = it.path_stack.pop().?;
+                        pf.deinit(it.alloc);
+                    }
+                    return err;
+                }
+                if (it.done) break;
+            }
+
+            if (it.ip >= it.instructions.len) {
+                if (it.fork_stack.items.len > saved_fork_len) {
+                    if (it.backtrackToDepth(saved_fork_len)) {
+                        continue;
+                    }
+                }
+                if (it.collect_stack.items.len > saved_collect_len) {
+                    var completed = it.collect_stack.pop().?;
+                    defer completed.buffer.deinit(it.alloc);
+                    const arr_val = try it.buildCollectedArray(&completed);
+                    it.pushValue(arr_val);
+                    it.if_stack.items.len = completed.outer_if_depth;
+                    it.ip = completed.end_ip + 1;
+                    continue;
+                }
+                break;
+            }
+        }
+
+        if (result == null and it.value_stack.items.len > saved_value_len) {
+            result = try stackValueToValue(try it.popValue());
+        }
+
+        while (it.collect_stack.items.len > saved_collect_len) {
+            var cf = it.collect_stack.pop().?;
+            cf.buffer.deinit(it.alloc);
+        }
+        it.fork_stack.items.len = saved_fork_len;
+        it.if_stack.items.len = saved_if_len;
+        it.value_stack.items.len = saved_value_len;
+        while (it.path_stack.items.len > saved_path_len) {
+            var pf = it.path_stack.pop().?;
+            pf.deinit(it.alloc);
+        }
+
+        it.ip = saved_ip;
+        it.current = saved_current;
+        it.input_value = saved_input;
+        it.done = false;
+
+        return result orelse walked;
+    }
+
     /// Build a path array (e.g. ["a", 0, "b"]) on the runtime tape.
     fn buildPathArray(it: *ResultIterator, components: []const Value) ZqError!Value {
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -5308,8 +5746,8 @@ pub const ResultIterator = struct {
                     _ = it.fork_stack.pop();
                     return true;
                 },
-                .label, .limit => {
-                    // Label/limit scope completed — just pop.
+                .label, .limit, .skip => {
+                    // Label/limit/skip scope completed — just pop.
                     _ = it.fork_stack.pop();
                 },
             }
@@ -6159,6 +6597,29 @@ pub const ResultIterator = struct {
             return .{ .tape_value = .{ .string = input[0 .. input.len - suffix.len] } };
         }
         return .{ .tape_value = .{ .string = input } };
+    }
+
+    /// `trimstr(str)`: remove prefix and suffix if present.
+    fn builtinTrimstr(it: *ResultIterator) ZqError!?StackValue {
+        const arg_sv = try it.popValue();
+        const arg = try stackValueToValue(arg_sv);
+        const affix = switch (arg) {
+            .string => |s| s,
+            else => return try it.raiseUserError("trimstr() requires string inputs"),
+        };
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return try it.raiseUserError("trimstr() requires string inputs"),
+        };
+        // Apply ltrimstr then rtrimstr
+        const after_prefix = if (std.mem.startsWith(u8, input, affix))
+            input[affix.len..]
+        else
+            input;
+        if (affix.len > 0 and std.mem.endsWith(u8, after_prefix, affix)) {
+            return .{ .tape_value = .{ .string = after_prefix[0 .. after_prefix.len - affix.len] } };
+        }
+        return .{ .tape_value = .{ .string = after_prefix } };
     }
 
     /// `test(regex)`: simplified — test if string contains substring.
@@ -7269,6 +7730,32 @@ fn serializeValueCompact(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val:
             try buf.append(alloc, '}');
         },
     }
+}
+
+/// Append the jq type name for a Value to a buffer.
+fn appendTypeName(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value) error{OutOfMemory}!void {
+    const name: []const u8 = switch (val) {
+        .null_val => "null",
+        .bool_val => "boolean",
+        .int, .float => "number",
+        .string => "string",
+        .array => "array",
+        .object => "object",
+    };
+    try buf.appendSlice(alloc, name);
+}
+
+/// Check if a Unicode codepoint is whitespace per jq's trim definition.
+/// Matches: \t \n \v \f \r \x20 \u0085 \u00A0 \u1680 \u2000-\u200A
+///          \u2028 \u2029 \u202F \u205F \u3000
+fn isUnicodeWhitespace(cp: u21) bool {
+    return switch (cp) {
+        '\t', '\n', 0x0B, 0x0C, '\r', ' ' => true,
+        0x0085, 0x00A0, 0x1680 => true,
+        0x2000...0x200A => true,
+        0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
 }
 
 /// Convert a StackValue to a Value for output.

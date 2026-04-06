@@ -1216,14 +1216,10 @@ fn isVarNameToken(tag: Token.Tag) bool {
 /// before EXPR). All internal jump/fork/ACE targets are adjusted by `offset`.
 fn rebaseExprBuf(buf: []RawInstr, offset: i64) void {
     for (buf) |*r| {
-        switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .limit_start, .fork, .call_function => {
-                r.operand.index += offset;
-            },
-            .fork_try, .fork_alt, .label_begin => {
-                if (r.operand.index > 0) r.operand.index += offset;
-            },
-            else => {},
+        if (r.op.hasIpOperand()) {
+            r.operand.index += offset;
+        } else if (r.op.hasSentinelIpOperand()) {
+            if (r.operand.index > 0) r.operand.index += offset;
         }
     }
 }
@@ -1240,16 +1236,10 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
     // Fix up jump targets whose value is at or past the insertion point.
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
-        switch (r.op) {
-            .jump, .jump_if_false, .array_collect_start, .limit_start, .fork => {
-                if (r.operand.index >= p) r.operand.index += 1;
-            },
-            // fork_try/fork_alt/label_begin use 0 as a sentinel (no handler / unpatched),
-            // so only fix up non-zero indices.
-            .fork_try, .fork_alt, .label_begin => {
-                if (r.operand.index > 0 and r.operand.index >= p) r.operand.index += 1;
-            },
-            else => {},
+        if (r.op.hasIpOperand()) {
+            if (r.operand.index >= p) r.operand.index += 1;
+        } else if (r.op.hasSentinelIpOperand()) {
+            if (r.operand.index > 0 and r.operand.index >= p) r.operand.index += 1;
         }
     }
     // Fix up recursive function body IPs in the function table.
@@ -2142,6 +2132,15 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "halt")) return .halt_;
     if (std.mem.eql(u8, name, "halt_error")) return .halt_error_;
 
+    // Conversion / inspection builtins
+    if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+    if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+
+    // Trim builtins
+    if (std.mem.eql(u8, name, "trim")) return .trim_;
+    if (std.mem.eql(u8, name, "ltrim")) return .ltrim_;
+    if (std.mem.eql(u8, name, "rtrim")) return .rtrim_;
+
     // Date/time builtins (zero-arg)
     if (std.mem.eql(u8, name, "now")) return .now_;
     if (std.mem.eql(u8, name, "gmtime")) return .gmtime_;
@@ -2161,6 +2160,7 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "has") or
         std.mem.eql(u8, name, "in") or
         std.mem.eql(u8, name, "range") or
+        std.mem.eql(u8, name, "add") or
         std.mem.eql(u8, name, "flatten") or
         std.mem.eql(u8, name, "contains") or
         std.mem.eql(u8, name, "inside") or
@@ -2204,6 +2204,7 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "endswith") or
         std.mem.eql(u8, name, "ltrimstr") or
         std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "trimstr") or
         std.mem.eql(u8, name, "test") or
         std.mem.eql(u8, name, "match") or
         std.mem.eql(u8, name, "sub") or
@@ -2212,7 +2213,15 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "strftime") or
         std.mem.eql(u8, name, "strptime") or
         std.mem.eql(u8, name, "strflocaltime") or
-        std.mem.eql(u8, name, "error");
+        std.mem.eql(u8, name, "error") or
+        std.mem.eql(u8, name, "skip") or
+        std.mem.eql(u8, name, "nth") or
+        std.mem.eql(u8, name, "INDEX") or
+        std.mem.eql(u8, name, "IN") or
+        std.mem.eql(u8, name, "JOIN") or
+        std.mem.eql(u8, name, "walk") or
+        std.mem.eql(u8, name, "path") or
+        std.mem.eql(u8, name, "pick");
 }
 
 /// Compile a single-arg value builtin that must support generator expressions (commas)
@@ -3420,6 +3429,52 @@ fn compileAnyAll(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory}
     );
 }
 
+/// Compile `add(expr)`: collect all generator results into an array, then call `add`.
+/// Desugars to `[expr] | add`. The existing zero-arg `add` builtin handles the array.
+///
+/// Emits: save_input, array_collect_start, <expr>, yield_output,
+///        array_collect_end, pipe, call_builtin(.add), restore_input.
+/// save_input/restore_input preserve `current` across the pipe so that
+/// surrounding expressions (e.g. `.sum = add(.arr[])`) still see the
+/// original input after the add result is placed on the value stack.
+fn compileAddExpr(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Preserve original input — restored after call_builtin so that
+    // current is unchanged for surrounding expressions.
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    // Collect generator outputs into an array: [expr]
+    const start_pos = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    // Parse the generator expression
+    try parsePipe(ctx);
+
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // array_collect_end — pushes collected array onto value_stack
+    const end_pos: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[start_pos].operand = .{ .index = end_pos };
+
+    // pipe: pops array from value_stack, sets current = array
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // call_builtin(.add): operates on current (the collected array),
+    // pushes add result onto value_stack
+    try ctx.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.add) },
+    );
+
+    // Restore original input so current is unmodified for callers
+    try ctx.emit(.restore_input, .{ .none = {} });
+}
+
 /// Compile `first(f)`: desugar to `[f] | .[0]`.
 /// Actually, more efficient: just collect first output. For now, use `[f] | .[0]`.
 fn compileFirst(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
@@ -3518,6 +3573,802 @@ fn compileLimit(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     // for scope membership checks.
     ctx.raw.items[limit_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
 
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `path(f)`: enter path-tracking mode, evaluate f, exit and collect path.
+fn compilePath(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    const begin_ip = ctx.raw.items.len;
+    try ctx.emit(.path_begin, .{ .index = 0 });
+
+    try parsePipe(ctx);
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    try ctx.emit(.path_end, .{ .none = {} });
+    ctx.raw.items[begin_ip].operand = .{ .index = @intCast(ctx.raw.items.len - 1) };
+}
+
+/// Compile `pick(pathexps)`: desugar to
+///   `. as $in | reduce path(pathexps) as $p (null; setpath($p; $in | getpath($p)))`
+fn compilePick(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    const in_var_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const p_var_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const arr_var_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // Save original input as $in
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = in_var_id });
+
+    // Collect [path(f)] into an array
+    const ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    const path_begin_ip = ctx.raw.items.len;
+    try ctx.emit(.path_begin, .{ .index = 0 });
+
+    try parsePipe(ctx);
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    try ctx.emit(.path_end, .{ .none = {} });
+    ctx.raw.items[path_begin_ip].operand = .{ .index = @intCast(ctx.raw.items.len - 1) };
+
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    const ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[ace_start].operand = .{ .index = ace_end };
+
+    // Save collected paths array
+    try ctx.emit(.capture_variable, .{ .index = arr_var_id });
+
+    // INIT: null (reduce accumulator)
+    try ctx.emit(.push_null, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+
+    // Iterate over collected paths
+    try ctx.emit(.load_variable, .{ .index = arr_var_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var_id });
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // UPDATE body: setpath($p; $in | getpath($p))
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var_id });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = in_var_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var_id });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.getpath) });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    // Discard throwaway array, load final accumulator
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+
+    try ctx.emit(.pop_variable, .{ .index = p_var_id });
+    try ctx.emit(.pop_variable, .{ .index = acc_id });
+    try ctx.emit(.pop_variable, .{ .index = arr_var_id });
+    try ctx.emit(.pop_variable, .{ .index = in_var_id });
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `walk(f)`: recursive bottom-up transform.
+///
+/// jq semantics (jq 1.7+):
+///   def walk(f): def w: if type == "array" then map(w) elif type == "object" then map_values(w) else . end | f; w;
+///
+/// Recurse into children first (taking only the first output of f at each child
+/// level, since map/map_values use update semantics), then apply f to the rebuilt
+/// container. At the top level, f can produce multiple outputs (generators).
+///
+/// Bytecode layout:
+///   walk_start(exit_ip)   — operand = IP past walk_end
+///   <f>                   — body expression
+///   walk_end
+fn compileWalk(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // walk_start: operand = exit_ip (backpatched after walk_end)
+    const walk_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.walk_start, .{ .index = 0 });
+
+    // Parse body expression f
+    try parsePipe(ctx);
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // walk_end
+    try ctx.emit(.walk_end, .{ .none = {} });
+
+    // Backpatch walk_start operand to point past walk_end
+    ctx.raw.items[walk_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
+}
+
+/// Compile `skip(n;f)`: streaming implementation using skip_start/skip_end opcodes.
+/// `skip(3; .[])` on [1,2,3,4,5] → 4,5 (skip first 3 outputs)
+/// `skip(0,2,3,4; .[])` on [1,2,3] → 1,2,3,3 (for each n: skip n, emit rest)
+fn compileSkip(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save original input to a variable
+    const input_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    try pushScope(ctx, ctx.alloc);
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = input_var });
+
+    // Collect n values into array (handles generators like 0,2,3,4)
+    try parseArgToArray(ctx);
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // Iterate over n values
+    try ctx.emit(.each, .{ .none = {} });
+
+    // Push current n to value_stack for skip_start
+    try ctx.emit(.push_current, .{ .none = {} });
+    // Set current to original input for body evaluation
+    try ctx.emit(.load_variable, .{ .index = input_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // skip_start: pops n from value_stack, sets up streaming counter
+    const skip_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.skip_start, .{ .index = 0 }); // backpatch exit_ip
+
+    // Parse body expression f
+    try parsePipe(ctx);
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // Emit output inside the skip scope — the skip counter in the output handler
+    // will decrement for each value and suppress until exhausted.
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    // exit_ip points past the inner output (end of the skip scope).
+    ctx.raw.items[skip_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `nth(n;f)`: get the nth output from generator f (0-indexed).
+/// `nth(1; 0,1,error("foo"))` → 1 (skip index 0, return index 1, short-circuit)
+/// Desugars to: skip(n; f) | limit(1; f) — but uses combined skip+limit approach.
+/// For each n: skip n outputs, then take 1 (using limit).
+fn compileNth(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save original input to a variable
+    const input_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    try pushScope(ctx, ctx.alloc);
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = input_var });
+
+    // Collect n values into array (handles generators like 0,5,9)
+    try parseArgToArray(ctx);
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // Iterate over n values
+    try ctx.emit(.each, .{ .none = {} });
+
+    // Push current n to value_stack for nth_start
+    try ctx.emit(.push_current, .{ .none = {} });
+    // Set current to original input for body evaluation
+    try ctx.emit(.load_variable, .{ .index = input_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // nth_start: like skip_start but with nth-specific error message
+    const skip_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.nth_start, .{ .index = 0 }); // backpatch exit_ip
+
+    // Push n=1 for limit_start (take exactly 1 after skipping)
+    try ctx.emit(.push_int, .{ .int = 1 });
+    const limit_ip: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.limit_start, .{ .index = 0 }); // backpatch exit_ip
+
+    // Parse body expression f
+    try parsePipe(ctx);
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // Emit output
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    // exit_ip for limit scope
+    ctx.raw.items[limit_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // exit_ip for skip scope
+    ctx.raw.items[skip_ip].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `INDEX(stream; idx_expr)`: build an index object from a generator.
+/// Desugars to: reduce stream as $x ({}; . + {($x | idx_expr | tostring): $x})
+fn compileINDEX(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Allocate hidden variable IDs
+    const saved_input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const x_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // Save original input
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = saved_input_id });
+
+    // Parse STREAM expression (up to semicolon — parsePipe stops at ';')
+    const expr_start = ctx.raw.items.len;
+    try parsePipe(ctx);
+    const expr_end = ctx.raw.items.len;
+
+    // Save STREAM instructions, remove from raw stream
+    var expr_buf = std.ArrayList(RawInstr){};
+    defer expr_buf.deinit(ctx.alloc);
+    try expr_buf.appendSlice(ctx.alloc, ctx.raw.items[expr_start..expr_end]);
+    ctx.raw.items.len = expr_start;
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Save IDX_EXPR source position for re-parsing
+    const idx_expr_src_start = ctx.lex.pos;
+
+    // Skip IDX_EXPR tokens (parse and discard to advance lexer)
+    {
+        const idx_start = ctx.raw.items.len;
+        try parsePipe(ctx);
+        ctx.raw.items.len = idx_start; // discard
+    }
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    const after_rparen = ctx.lex.pos;
+
+    // INIT: push empty object {}
+    try ctx.emit(.object_construct_start, .{ .none = {} });
+    try ctx.emit(.object_construct_end, .{ .none = {} });
+
+    // capture_variable($acc)
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+
+    // Restore original input for STREAM
+    try ctx.emit(.load_variable, .{ .index = saved_input_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // fork L_done
+    const fork_pos = ctx.raw.items.len;
+    try ctx.emit(.fork, .{ .index = 0 });
+
+    // Re-insert STREAM instructions
+    {
+        const new_start = ctx.raw.items.len;
+        const offset: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(expr_start));
+        rebaseExprBuf(expr_buf.items, offset);
+        try ctx.raw.appendSlice(ctx.alloc, expr_buf.items);
+    }
+
+    // capture_variable($x) — bind current element
+    try ctx.emit(.capture_variable, .{ .index = x_id });
+
+    // load_variable($acc) — push accumulator
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // UPDATE body: . + {($x | idx_expr | tostring): $x}
+    // Save current (accumulator) for the + operation
+    try ctx.emit(.push_current, .{ .none = {} });
+
+    // Build {($x | idx_expr | tostring): $x}
+    try ctx.emit(.object_construct_start, .{ .none = {} });
+    // Key: $x | idx_expr | tostring
+    try ctx.emit(.load_variable, .{ .index = x_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // Re-parse idx_expr
+    {
+        const saved_lex_pos = ctx.lex.pos;
+        ctx.lex.pos = idx_expr_src_start;
+        try parsePipe(ctx);
+        ctx.lex.pos = saved_lex_pos;
+    }
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.tostring) });
+    // Value: $x
+    try ctx.emit(.load_variable, .{ .index = x_id });
+    try ctx.emit(.object_key, .{ .none = {} });
+    try ctx.emit(.object_construct_end, .{ .none = {} });
+
+    // Now value_stack has [acc, {key: $x}], current = {key: $x}
+    // Binary + operator: pops two values from value_stack, pushes result
+    try ctx.emit(.add, .{ .none = {} });
+
+    // capture_variable($acc)
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+
+    // backtrack — advance STREAM
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    // L_done
+    const l_done: u32 = @intCast(ctx.raw.items.len);
+    ctx.raw.items[fork_pos].operand = .{ .index = l_done };
+
+    // load_variable($acc) — push final result
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+
+    ctx.lex.pos = after_rparen;
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `IN(s)` (1-arg) or `IN(s; t)` (2-arg) — membership test.
+/// 1-arg: . as $x | first(if s == $x then true else empty end) // false
+/// 2-arg: reduce s as $x (false; . or ($x | IN(t)))
+fn compileIN(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Check if 2-arg (has semicolon at paren depth 1)
+    const saved_pos = ctx.lex.pos;
+    var paren_depth: u32 = 1;
+    var has_semi = false;
+    while (paren_depth > 0) {
+        const scan = try ctx.lex.next();
+        switch (scan.tag) {
+            .lparen => paren_depth += 1,
+            .rparen => paren_depth -= 1,
+            .semicolon => {
+                if (paren_depth == 1) has_semi = true;
+            },
+            .eof => break,
+            else => {},
+        }
+    }
+    ctx.lex.pos = saved_pos;
+
+    if (has_semi) {
+        try compileIN2(ctx);
+    } else {
+        try compileIN1(ctx);
+    }
+}
+
+/// Compile 1-arg `IN(s)`: membership test using reduce pattern.
+///
+/// Uses: reduce s as $y (false; if . then . elif $y == $x then true else . end)
+/// This short-circuits on truthiness (once true, stays true and doesn't compare).
+fn compileIN1(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Save input as $x
+    const x_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const y_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const saved_input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // Save input as $x
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = x_id });
+
+    // Save original input for generator evaluation
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = saved_input_id });
+
+    // Parse s (generator argument) into temp buffer
+    const expr_start = ctx.raw.items.len;
+    try parsePipe(ctx);
+    const expr_end = ctx.raw.items.len;
+
+    var expr_buf = std.ArrayList(RawInstr){};
+    defer expr_buf.deinit(ctx.alloc);
+    try expr_buf.appendSlice(ctx.alloc, ctx.raw.items[expr_start..expr_end]);
+    ctx.raw.items.len = expr_start;
+
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // INIT: false
+    try ctx.emit(.push_bool, .{ .bool = false });
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+
+    // Restore input for generator
+    try ctx.emit(.load_variable, .{ .index = saved_input_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // fork L_done
+    const fork_pos = ctx.raw.items.len;
+    try ctx.emit(.fork, .{ .index = 0 });
+
+    // Re-insert s instructions
+    {
+        const new_start = ctx.raw.items.len;
+        const offset: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(expr_start));
+        rebaseExprBuf(expr_buf.items, offset);
+        try ctx.raw.appendSlice(ctx.alloc, expr_buf.items);
+    }
+
+    // capture $y
+    try ctx.emit(.capture_variable, .{ .index = y_id });
+
+    // load acc
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // UPDATE: if . then . elif $y == $x then true else . end
+    // Check if acc is already true (short-circuit)
+    try ctx.emit(.push_current, .{ .none = {} });
+    const jf_already_true = ctx.raw.items.len;
+    try ctx.emit(.jump_if_false, .{ .index = 0 });
+    // Already true — keep it (no-op, current stays true)
+    const jump_to_capture = ctx.raw.items.len;
+    try ctx.emit(.jump, .{ .index = 0 });
+
+    // Not yet true — check $y == $x
+    ctx.raw.items[jf_already_true].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    try ctx.emit(.load_variable, .{ .index = y_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = x_id });
+    try ctx.emit(.eq, .{ .none = {} });
+    // Result is on value_stack — move to current
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    ctx.raw.items[jump_to_capture].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // capture_variable($acc)
+    try ctx.emit(.capture_variable, .{ .index = acc_id });
+
+    // backtrack
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    // L_done
+    ctx.raw.items[fork_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // load_variable($acc)
+    try ctx.emit(.load_variable, .{ .index = acc_id });
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile 2-arg `IN(s; t)`: `reduce s as $x (false; . or ($x | IN(t)))`
+///
+/// For each value from generator s, check if it's IN(t) using a nested reduce.
+/// Short-circuit: once true, stays true.
+fn compileIN2(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Allocate hidden variables
+    const saved_input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const outer_acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const x_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // Save original input
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = saved_input_id });
+
+    // Parse s (generator, first arg up to ';' — parsePipe stops at ';')
+    const expr_start = ctx.raw.items.len;
+    try parsePipe(ctx);
+    const expr_end = ctx.raw.items.len;
+
+    // Save s instructions
+    var expr_buf = std.ArrayList(RawInstr){};
+    defer expr_buf.deinit(ctx.alloc);
+    try expr_buf.appendSlice(ctx.alloc, ctx.raw.items[expr_start..expr_end]);
+    ctx.raw.items.len = expr_start;
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Save t source position for re-parsing
+    const t_src_start = ctx.lex.pos;
+
+    // Skip t tokens
+    {
+        const t_start = ctx.raw.items.len;
+        try parsePipe(ctx);
+        ctx.raw.items.len = t_start;
+    }
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    const after_rparen = ctx.lex.pos;
+
+    // INIT: push false
+    try ctx.emit(.push_bool, .{ .bool = false });
+    try ctx.emit(.capture_variable, .{ .index = outer_acc_id });
+
+    // Restore original input for s
+    try ctx.emit(.load_variable, .{ .index = saved_input_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // fork L_done
+    const fork_pos = ctx.raw.items.len;
+    try ctx.emit(.fork, .{ .index = 0 });
+
+    // Re-insert s instructions
+    {
+        const new_start = ctx.raw.items.len;
+        const offset: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(expr_start));
+        rebaseExprBuf(expr_buf.items, offset);
+        try ctx.raw.appendSlice(ctx.alloc, expr_buf.items);
+    }
+
+    // capture_variable($x) — bind each element of s
+    try ctx.emit(.capture_variable, .{ .index = x_id });
+
+    // load acc
+    try ctx.emit(.load_variable, .{ .index = outer_acc_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // UPDATE: if . then . else ($x | IN(t)) end
+    // Short-circuit: if acc is already true, keep it
+    try ctx.emit(.push_current, .{ .none = {} });
+    const jf_already_true = ctx.raw.items.len;
+    try ctx.emit(.jump_if_false, .{ .index = 0 });
+    // Already true — keep current (true)
+    const jump_to_capture = ctx.raw.items.len;
+    try ctx.emit(.jump, .{ .index = 0 });
+
+    // Not yet true — compute $x | IN(t) using inner reduce
+    ctx.raw.items[jf_already_true].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    {
+        // Inner IN(t) for $x: reduce t as $y (false; if . then . elif $y == $x then true else . end)
+        const inner_acc_id = ctx.next_var_id;
+        ctx.next_var_id += 1;
+        const y_id = ctx.next_var_id;
+        ctx.next_var_id += 1;
+
+        // INIT: false
+        try ctx.emit(.push_bool, .{ .bool = false });
+        try ctx.emit(.capture_variable, .{ .index = inner_acc_id });
+
+        // Restore input for t
+        try ctx.emit(.load_variable, .{ .index = saved_input_id });
+        try ctx.emit(.pipe, .{ .none = {} });
+
+        // fork L_inner_done
+        const inner_fork = ctx.raw.items.len;
+        try ctx.emit(.fork, .{ .index = 0 });
+
+        // t
+        {
+            const saved_lex_pos = ctx.lex.pos;
+            ctx.lex.pos = t_src_start;
+            try parsePipe(ctx);
+            ctx.lex.pos = saved_lex_pos;
+        }
+
+        // capture $y
+        try ctx.emit(.capture_variable, .{ .index = y_id });
+
+        // load inner acc
+        try ctx.emit(.load_variable, .{ .index = inner_acc_id });
+        try ctx.emit(.pipe, .{ .none = {} });
+
+        // if . then . elif $y == $x then true else . end
+        try ctx.emit(.push_current, .{ .none = {} });
+        const inner_jf = ctx.raw.items.len;
+        try ctx.emit(.jump_if_false, .{ .index = 0 });
+        const inner_jt = ctx.raw.items.len;
+        try ctx.emit(.jump, .{ .index = 0 });
+
+        ctx.raw.items[inner_jf].operand = .{ .index = @intCast(ctx.raw.items.len) };
+        try ctx.emit(.load_variable, .{ .index = y_id });
+        try ctx.emit(.pipe, .{ .none = {} });
+        try ctx.emit(.push_current, .{ .none = {} });
+        try ctx.emit(.load_variable, .{ .index = x_id });
+        try ctx.emit(.eq, .{ .none = {} });
+        try ctx.emit(.pipe, .{ .none = {} });
+
+        ctx.raw.items[inner_jt].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+        // capture inner acc
+        try ctx.emit(.capture_variable, .{ .index = inner_acc_id });
+        try ctx.emit(.backtrack, .{ .none = {} });
+
+        // L_inner_done
+        ctx.raw.items[inner_fork].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+        // load inner acc as result
+        try ctx.emit(.load_variable, .{ .index = inner_acc_id });
+        try ctx.emit(.pipe, .{ .none = {} });
+    }
+
+    ctx.raw.items[jump_to_capture].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // capture outer acc
+    try ctx.emit(.capture_variable, .{ .index = outer_acc_id });
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    // L_done
+    ctx.raw.items[fork_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // load outer acc
+    try ctx.emit(.load_variable, .{ .index = outer_acc_id });
+
+    ctx.lex.pos = after_rparen;
+    popScope(ctx, ctx.alloc);
+}
+
+/// Compile `JOIN($idx; idx_expr)`:
+/// `[.[] | [., $idx[idx_expr|tostring]]]`
+/// For each element of input array, pair it with the lookup from $idx.
+///
+/// Approach: Use map pattern with nested pair construction.
+/// For each element, construct a 2-element array [elem, $idx[key]].
+fn compileJOIN(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    // Save the input array
+    const input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const idx_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // Save original input (the array to iterate)
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = input_id });
+
+    // Parse $idx (first argument — a value, not a generator)
+    try parsePipe(ctx);
+    try ctx.emit(.capture_variable, .{ .index = idx_id });
+
+    // Consume ';'
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    // Save idx_expr source position
+    const idx_expr_src_start = ctx.lex.pos;
+    {
+        const tmp_start = ctx.raw.items.len;
+        try parsePipe(ctx);
+        ctx.raw.items.len = tmp_start;
+    }
+
+    // Consume ')'
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+    const after_rparen = ctx.lex.pos;
+
+    // Restore input array
+    try ctx.emit(.load_variable, .{ .index = input_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // [.[] | [., $idx[idx_expr|tostring]]]
+    // Outer array collect: map(.[] | pair_construction)
+    const outer_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    // .[] — iterate over input array elements
+    try ctx.emit(.each, .{ .none = {} });
+
+    // For each element: build [element, $idx[element|idx_expr|tostring]]
+    // Save current element
+    const elem_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = elem_id });
+
+    // Compute the lookup key: element | idx_expr | tostring
+    const key_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    {
+        const saved_lex_pos = ctx.lex.pos;
+        ctx.lex.pos = idx_expr_src_start;
+        try parsePipe(ctx);
+        ctx.lex.pos = saved_lex_pos;
+    }
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.tostring) });
+    // Save the key string
+    try ctx.emit(.capture_variable, .{ .index = key_id });
+
+    // Now do: $idx | .[key] — save $idx to if_stack, push key, load_computed
+    try ctx.emit(.load_variable, .{ .index = idx_id });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} }); // push $idx to if_stack
+
+    try ctx.emit(.load_variable, .{ .index = key_id }); // push key to value_stack
+
+    // Wrap in try to get null for missing keys (like .["5"] on an object without "5")
+    const try_pos = ctx.raw.items.len;
+    try ctx.emit(.fork_try, .{ .index = 0 }); // catch -> null
+
+    try ctx.emit(.load_computed, .{ .none = {} }); // pops key from value_stack, base from if_stack
+
+    try ctx.emit(.pop_try, .{ .none = {} });
+    const jump_past_null = ctx.raw.items.len;
+    try ctx.emit(.jump, .{ .index = 0 });
+
+    // Catch: push null
+    ctx.raw.items[try_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    try ctx.emit(.push_null, .{ .none = {} });
+
+    ctx.raw.items[jump_past_null].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    // Now we have the lookup result on value_stack (or current).
+    // Save it
+    const lookup_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    try ctx.emit(.capture_variable, .{ .index = lookup_id });
+
+    // Build inner [element, lookup_result] using nested array collect
+    const inner_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    try ctx.emit(.load_variable, .{ .index = elem_id });
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    try ctx.emit(.load_variable, .{ .index = lookup_id });
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    const inner_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_start].operand = .{ .index = inner_end };
+
+    // yield inner array to outer collect
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    // End outer array
+    const outer_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[outer_start].operand = .{ .index = outer_end };
+
+    ctx.lex.pos = after_rparen;
     popScope(ctx, ctx.alloc);
 }
 
@@ -3793,6 +4644,8 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             if (peek.tag == .lparen and isArgBuiltin(ident_name)) {
                 if (std.mem.eql(u8, ident_name, "map")) {
                     try compileMap(ctx);
+                } else if (std.mem.eql(u8, ident_name, "add")) {
+                    try compileAddExpr(ctx);
                 } else if (std.mem.eql(u8, ident_name, "select")) {
                     try compileSelect(ctx);
                 } else if (std.mem.eql(u8, ident_name, "has")) {
@@ -3887,6 +4740,8 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileValueArgBuiltin1(ctx, .ltrimstr_);
                 } else if (std.mem.eql(u8, ident_name, "rtrimstr")) {
                     try compileValueArgBuiltin1(ctx, .rtrimstr_);
+                } else if (std.mem.eql(u8, ident_name, "trimstr")) {
+                    try compileValueArgBuiltin1(ctx, .trimstr_);
                 } else if (std.mem.eql(u8, ident_name, "test")) {
                     try compileValueArgBuiltin1(ctx, .test_);
                 } else if (std.mem.eql(u8, ident_name, "match")) {
@@ -3905,6 +4760,22 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try compileValueArgBuiltin1(ctx, .strptime_);
                 } else if (std.mem.eql(u8, ident_name, "strflocaltime")) {
                     try compileValueArgBuiltin1(ctx, .strflocaltime_);
+                } else if (std.mem.eql(u8, ident_name, "skip")) {
+                    try compileSkip(ctx);
+                } else if (std.mem.eql(u8, ident_name, "nth")) {
+                    try compileNth(ctx);
+                } else if (std.mem.eql(u8, ident_name, "INDEX")) {
+                    try compileINDEX(ctx);
+                } else if (std.mem.eql(u8, ident_name, "IN")) {
+                    try compileIN(ctx);
+                } else if (std.mem.eql(u8, ident_name, "JOIN")) {
+                    try compileJOIN(ctx);
+                } else if (std.mem.eql(u8, ident_name, "walk")) {
+                    try compileWalk(ctx);
+                } else if (std.mem.eql(u8, ident_name, "path")) {
+                    try compilePath(ctx);
+                } else if (std.mem.eql(u8, ident_name, "pick")) {
+                    try compilePick(ctx);
                 }
                 return;
             }
@@ -4426,10 +5297,40 @@ fn parseVariableReference(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     const ident = try ctx.nextToken();
     if (!isVarNameToken(ident.tag)) return ctx.syntaxErr(ident.offset, ident.len);
 
-    const name_ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
+    const var_name = ident.slice(ctx.src);
+
+    // Special variable: $__loc__ — evaluates to {"file":"<top-level>","line":1}
+    if (std.mem.eql(u8, var_name, "__loc__")) {
+        try emitLocObject(ctx);
+        return;
+    }
+
+    const name_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
     const var_id = lookupVariable(ctx, name_ref) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
 
     try ctx.emit(.load_variable, .{ .index = var_id });
+}
+
+/// Emit instructions to construct the $__loc__ object: {"file":"<top-level>","line":1}
+fn emitLocObject(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    try ctx.emit(.object_construct_start, .{ .none = {} });
+
+    // Key: "file"
+    const file_key = try internStr(&ctx.intern, ctx.alloc, "file");
+    try ctx.emit(.push_string, .{ .str_ref = file_key });
+    // Value: "<top-level>"
+    const file_val = try internStr(&ctx.intern, ctx.alloc, "<top-level>");
+    try ctx.emit(.push_string, .{ .str_ref = file_val });
+    try ctx.emit(.object_key, .{ .none = {} });
+
+    // Key: "line"
+    const line_key = try internStr(&ctx.intern, ctx.alloc, "line");
+    try ctx.emit(.push_string, .{ .str_ref = line_key });
+    // Value: 1
+    try ctx.emit(.push_int, .{ .int = 1 });
+    try ctx.emit(.object_key, .{ .none = {} });
+
+    try ctx.emit(.object_construct_end, .{ .none = {} });
 }
 
 /// Parse a function definition: def name(params): body
@@ -4635,18 +5536,67 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             break;
         }
 
-        // Parse key (literal or dynamic)
-        try parseObjectKey(ctx);
+        // Check for $var shorthand: {$x} means {"x": $x}
+        if (peek.tag == .dollar) {
+            _ = try ctx.nextToken(); // consume '$'
+            const var_tok = try ctx.nextToken();
+            if (!isVarNameToken(var_tok.tag)) return ctx.syntaxErr(var_tok.offset, var_tok.len);
+            const var_name = var_tok.slice(ctx.src);
 
-        // Parse colon
-        const colon = try ctx.nextToken();
-        if (colon.tag != .colon) return ctx.syntaxErr(colon.offset, colon.len);
+            // Check if followed by ':' (explicit value) or not (shorthand)
+            const after = try ctx.lex.peek();
+            if (after.tag == .colon) {
+                // {$y: 4} — key is the VALUE of $y (evaluated), value is explicit
+                if (std.mem.eql(u8, var_name, "__loc__")) {
+                    try emitLocObject(ctx);
+                } else {
+                    const name_ref_k = try internStr(&ctx.intern, ctx.alloc, var_name);
+                    const var_id_k = lookupVariable(ctx, name_ref_k) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
+                    try ctx.emit(.load_variable, .{ .index = var_id_k });
+                }
+                _ = try ctx.nextToken(); // consume ':'
+                try parseAlternative(ctx);
+            } else {
+                // {$x} shorthand — key is "x", value is $x
+                const key_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
+                try ctx.emit(.push_string, .{ .str_ref = key_ref });
+                // Value: load the variable (or special variable)
+                if (std.mem.eql(u8, var_name, "__loc__")) {
+                    try emitLocObject(ctx);
+                } else {
+                    const name_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
+                    const var_id = lookupVariable(ctx, name_ref) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
+                    try ctx.emit(.load_variable, .{ .index = var_id });
+                }
+            }
+            try ctx.emit(.object_key, .{ .none = {} });
+        } else {
+            // Parse key (literal or dynamic). Returns string ref for literal keys.
+            const key_start = ctx.raw.items.len;
+            const key_ref = try parseObjectKey(ctx);
 
-        // Parse value expression — allow `//` (alternative) inside object values
-        // so that `{z: null // 3}` works.
-        try parseAlternative(ctx);
+            const after_key = try ctx.lex.peek();
+            if (after_key.tag == .colon) {
+                _ = try ctx.nextToken();
+                try parseAlternative(ctx);
+            } else if (key_ref) |ref| {
+                // Literal shorthand: {a} is equivalent to {a: .a}
+                try ctx.emit(.load_key, .{ .str_ref = ref });
+            } else {
+                // Dynamic shorthand: {(expr)} or {"key\(expr)"}
+                // Replay key-producing instructions with save_input/load_computed.
+                const key_end = ctx.raw.items.len;
+                const key_instrs = try ctx.alloc.dupe(RawInstr, ctx.raw.items[key_start..key_end]);
+                defer ctx.alloc.free(key_instrs);
+                try ctx.emit(.save_input, .{ .none = {} });
+                for (key_instrs) |ki| {
+                    try ctx.raw.append(ctx.alloc, ki);
+                }
+                try ctx.emit(.load_computed, .{ .none = {} });
+            }
 
-        try ctx.emit(.object_key, .{ .none = {} });
+            try ctx.emit(.object_key, .{ .none = {} });
+        }
 
         // Check for comma
         const comma = try ctx.lex.peek();
@@ -4659,7 +5609,10 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 }
 
 /// Parse an object key: ident or string literal, or parenthesized expression for dynamic keys
-fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+/// Parse an object key: ident or string literal, or parenthesized expression for dynamic keys.
+/// Returns the interned string reference for literal keys (ident, keyword, plain string),
+/// or null for dynamic/computed keys (parenthesized expressions, string interpolation).
+fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!?StrRef {
     const peek = try ctx.lex.peek();
 
     if (peek.tag == .lparen) {
@@ -4669,6 +5622,7 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 
         const rparen = try ctx.nextToken();
         if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+        return null;
     } else if (peek.tag == .string_lit) {
         // Quoted string key: strip surrounding double-quotes, decode escape sequences.
         const key = try ctx.nextToken();
@@ -4676,6 +5630,13 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         const content = raw[1 .. raw.len - 1];
         const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
         try ctx.emit(.push_string, .{ .str_ref = ref });
+        return ref;
+    } else if (peek.tag == .string_part) {
+        // String interpolation key: "prefix\(expr)suffix" — dynamic
+        const str_tok = try ctx.nextToken();
+        const raw_content = ctx.src[str_tok.offset..][0..str_tok.len];
+        try compileStringInterpolation(ctx, raw_content, null);
+        return null;
     } else if (peek.tag == .ident or peek.tag == .int_lit or peek.tag == .float_lit or
         peek.tag == .true_kw or peek.tag == .false_kw or
         peek.tag == .if_kw or peek.tag == .then_kw or peek.tag == .elif_kw or
@@ -4687,8 +5648,8 @@ fn parseObjectKey(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         // Literal key - push as string value for object construction
         const key = try ctx.nextToken();
         const ref = try internStr(&ctx.intern, ctx.alloc, key.slice(ctx.src));
-        // Push string value directly to stack for object construction
         try ctx.emit(.push_string, .{ .str_ref = ref });
+        return ref;
     } else {
         return ctx.syntaxErr(ctx.last_tok_offset, 0);
     }
@@ -5165,6 +6126,19 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .limit_end => .{ .none = {} },
+                // Skip: skip_start carries exit_ip that needs remapping.
+                .path_begin => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .path_end => .{ .none = {} },
+                .skip_start, .nth_start, .walk_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .skip_end, .walk_end => .{ .none = {} },
                 // Fork stack opcodes: fork carries backtrack IP that needs remapping.
                 .fork => blk: {
                     const idx_usize: usize = @intCast(r.operand.index);

@@ -351,6 +351,7 @@ pub const BuiltinId = enum(u16) {
     endswith_, // endswith(str) — test suffix
     ltrimstr_, // ltrimstr(str) — remove prefix
     rtrimstr_, // rtrimstr(str) — remove suffix
+    trimstr_, // trimstr(str) — remove prefix and suffix
     test_, // test(regex) — simplified substring match
     match_, // match(regex) — simplified match details
     sub_, // sub(regex; replacement) — replace first
@@ -386,6 +387,15 @@ pub const BuiltinId = enum(u16) {
     fromdate_, // fromdate — shorthand for strptime("%Y-%m-%dT%H:%M:%SZ") | mktime
     todateiso8601_, // todateiso8601 — alias for todate
     fromdateiso8601_, // fromdateiso8601 — alias for fromdate
+
+    // Conversion / inspection builtins (zero-arg)
+    toboolean, // toboolean — parse string to bool or pass through bool
+    utf8bytelength, // utf8bytelength — byte length of a string
+
+    // Trim builtins (zero-arg)
+    trim_, // trim — trim Unicode whitespace from both ends
+    ltrim_, // ltrim — trim Unicode whitespace from left
+    rtrim_, // rtrim — trim Unicode whitespace from right
 
     const JqEntry = struct { name: []const u8, arity: u8 };
 
@@ -527,6 +537,11 @@ pub const BuiltinId = enum(u16) {
             .fromdate_,
             .todateiso8601_,
             .fromdateiso8601_,
+            .toboolean,
+            .utf8bytelength,
+            .trim_,
+            .ltrim_,
+            .rtrim_,
             => 0,
 
             // 1-arity: one explicit argument
@@ -551,6 +566,7 @@ pub const BuiltinId = enum(u16) {
             .endswith_,
             .ltrimstr_,
             .rtrimstr_,
+            .trimstr_,
             .test_,
             .match_,
             .bsearch_,
@@ -774,6 +790,26 @@ pub const Instruction = extern struct {
         /// End of limit scope. Pops LimitFrame.
         limit_end,
 
+        /// Begin a skip(n;f) scope. Pops n from value_stack.
+        /// If n < 0: raises "skip doesn't support negative count".
+        /// n==0 passes through all outputs.
+        /// Otherwise pushes SkipFrame that counts and suppresses first n outputs.
+        /// operand.index = exit_ip (backpatched).
+        skip_start,
+        /// Like skip_start but for nth(n;f) — error message says
+        /// "nth doesn't support negative indices" on n < 0.
+        nth_start,
+        /// End of skip/nth scope. Pops SkipFrame.
+        skip_end,
+
+        /// Begin a walk(f) scope. operand.index = IP past walk_end (exit_ip).
+        /// Recursively walks children (arrays/objects) bottom-up, applying the
+        /// body f at each level. Only the first output of f is used when rebuilding
+        /// children; at the top level, f can produce multiple outputs (generators).
+        walk_start,
+        /// End of walk(f) scope. The VM jumps here after executing the body.
+        walk_end,
+
         // Fork stack opcodes (unified backtracking)
         /// Push a forkpoint for backtracking. operand.index = backtrack target IP.
         fork,
@@ -790,6 +826,51 @@ pub const Instruction = extern struct {
         fork_alt,
         /// Remove the nearest try_handler or alt_handler from the fork stack.
         pop_try,
+
+        // Path tracking (for path(f) builtin)
+        /// Enter path-tracking mode. operand.index = end IP (path_end).
+        /// Pushes a PathFrame onto path_stack. While active, load_key/load_index/
+        /// load_path append path components instead of only doing value lookup.
+        path_begin,
+        /// Exit path-tracking mode. Pops PathFrame, builds path array from tracked
+        /// components and pushes it to value_stack.
+        path_end,
+
+        /// Whether this opcode's `operand.index` is an instruction-pointer that
+        /// must be unconditionally rebased when instructions are shifted.
+        ///
+        /// Opcodes that use 0 as an "unpatched / no-handler" sentinel
+        /// (`fork_try`, `fork_alt`, `label_begin`) are NOT included —
+        /// they require a conditional check and are handled via `hasSentinelIpOperand`.
+        pub fn hasIpOperand(self: Op) bool {
+            return switch (self) {
+                .jump,
+                .jump_if_false,
+                .array_collect_start,
+                .limit_start,
+                .skip_start,
+                .nth_start,
+                .walk_start,
+                .path_begin,
+                .fork,
+                .call_function,
+                => true,
+                else => false,
+            };
+        }
+
+        /// Whether this opcode's `operand.index` is an instruction-pointer that
+        /// uses 0 as a sentinel value (meaning "unpatched" or "no handler").
+        /// These IPs must only be rebased when their value is > 0.
+        pub fn hasSentinelIpOperand(self: Op) bool {
+            return switch (self) {
+                .fork_try,
+                .fork_alt,
+                .label_begin,
+                => true,
+                else => false,
+            };
+        }
     };
 
     pub const Operand = extern union {
