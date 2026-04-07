@@ -28,14 +28,16 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-03-26)
+## Quick Status (Updated 2026-04-07)
 
-**Last updated:** SIMD parser (AVX2/NEON) + date/time builtins; benchmarks re-run
+**Last updated:** General update assignment + fork-aware path tracking. Refactored `parseUpdateAssign` and added new `compilePathExprUpdate` that mirrors jq's `_modify`/`_assign` desugar. VM `Forkpoint` now captures `PathSnapshot` and restores it on backtrack so `path(.[1,2])`, `.[] |= f`, `(EXPR) |= f`, function-based LHS (`def x: .[1,2]; x=10`), and per-path empty deletion (`.[] |= select(. > 5)`) all work. New grammar level `parseCommaOperand` puts assignment between `,` and `//` (matches jq precedence) so `.[] += 2, .[] *= 2` parses correctly. Negative index in assignment + sparse array creation on null base + jq-compatible "Out of bounds negative array index" / "Array index too large" error messages.
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       339/533 passing (63.6%)
-  +-- 191 failing, 3 skipped
+Compat tests:       416/533 passing (78.0%)   <- jq compatibility suite
+  +-- 117 failing, 3 skipped
+Own tests:          442/442 passing (100%)    <- internal regression suite
+Total:              858/975 passing (88.0%)
 Startup:            ~2.4 ms (1.5x faster than jq)
 Cold start:         sub-3ms
 
@@ -69,7 +71,9 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
 
 ### Milestone criteria
 
-- [x] 60%+ of migrated jq compat tests pass (achieved: 63.6%, 339/533)
+- [x] 60%+ of migrated jq compat tests pass (achieved: 78.0%, 416/533)
+- [x] 100% of internal regression tests pass (achieved: 442/442)
+- [ ] 75%+ compat **with parity** for assignment, paths, error semantics (achieved: assignment + paths complete, error message parity remaining)
 - [ ] All P0/P1 query features below are implemented
 - [x] `zq` binary under 3 MB static (2.7 MB stripped)
 - [ ] Zero known crashes on valid JSON input
@@ -110,7 +114,7 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [x] | **Array construction** (`[expr]`) | Compiler + VM | Collect generator outputs into array. `[.[] \| .name]`. |
 | [x] | **String interpolation** (`"hello \(.name)"`) | Lexer + Compiler + VM | Very common in practice. Required for readable output. |
 | [x] | **Recursive descent** (`..`) | Compiler + VM | Deep search. `.. \| .name?` |
-| [x] | **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index |
+| [x] | **Pipe expressions in brackets** (`.[.foo]`, `.["key"]`) | Lexer + Compiler | String key access, computed index. Comma generators (`.[0,1,2]`), variable-based pattern handles arbitrary inner expressions including generators. |
 
 ### Query language — P1
 
@@ -120,10 +124,10 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [x] | **Try/catch** (`try expr catch expr`) | Compiler + VM | Error recovery. The LLM streaming use case. |
 | [x] | **Optional operator** (`expr?`) | Compiler + VM | Suppress errors on missing keys. `.foo?` |
 | [x] | **Slicing** (`.[2:4]`, `.[2:]`, `.[:4]`) | Compiler + VM | Array and string slicing |
-| [x] | **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. `.foo \|= . + 1` |
-| [x] | **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing |
+| [x] | **Update assignment** (`\|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`) | Compiler + VM | In-place modification. Mirrors jq's `_modify`/`_assign` desugar exactly. Handles: `.foo \|= . + 1`, `.[] += 2`, `def inc(x): x \|= .+1; inc(.[].a)`, generator lhs (`def x: .[1,2]; x=10`), `\|= empty` deletion, `(.[] \| select(...)) \|= empty` paren-grouped. Per-path empty detection routes through `delpaths` automatically. |
+| [x] | **Negative indexing** (`.[-1]`, `.[-2:]`) | VM | Last element, tail slicing. Works in both read and assignment contexts. Sparse array creation on null base (`null \| .[2] = 5` → `[null,null,5]`). jq-compatible error messages: "Out of bounds negative array index", "Array index too large". |
 | [x] | **Core builtins (tier 1)** | VM builtins table | `length`, `keys`, `values`, `has`, `in`, `type`, `empty`, `select`, `map`, `add`, `not`, `error`, `null`, `true`, `false`, `tostring`, `tonumber`, `range`, `keys_unsorted` |
-| [x] | **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit`, `first`, `last`, `indices`, `index`, `rindex` |
+| [~] | **Core builtins (tier 2)** | VM builtins table | `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `reverse`, `flatten`, `min`, `max`, `min_by`, `max_by`, `to_entries`, `from_entries`, `with_entries`, `del`, `contains`, `inside`, `any`, `all`, `limit`, `first`, `last`, `indices`, `index`, `rindex`. **Partial:** `del` fails with multiple/complex args (slices, generators, nan); `contains` fails on deep nested objects; `any`/`all` don't short-circuit on error; `first`/`last` with generator args fail. |
 
 ### Query language — P2
 
@@ -135,7 +139,7 @@ These are table-stakes. Without them, zq cannot process real-world filters.
 | [x] | **`reduce`** (`reduce expr as $x (init; update)`) | Aggregation | Medium |
 | [x] | **`foreach`** (`foreach expr as $x (init; update; extract)`) | Stateful iteration | Medium |
 | [x] | **`getpath`/`setpath`/`delpaths`/`paths`/`leaf_paths`** | Path algebra | Medium |
-| [x] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium |
+| [~] | **Variable destructuring** (`as [$a,$b]`, `as {a: $x}`) | Pattern matching in bindings | Medium | **Partial:** simple patterns work; complex patterns (`. as {$a, $b:[$c, $d]}`, computed key destructuring) fail. |
 | [x] | **`?//`** (destructuring alternative operator) | Pattern match with fallback | Medium |
 | [x] | **Builtin overloads** (`any/all(gen;cond)`, `flatten(depth)`, `range(a;b;c)`) | Complete multi-arg signatures | Low |
 | [x] | **`contains` on strings** | `"foobar" \| contains("foo")` | Low |
@@ -223,21 +227,46 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 | | Category | Functions |
 |---|----------|-----------|
 | [x] | **String** | `split`, `join`, `test`, `match`, `sub`, `gsub`, `startswith`, `endswith`, `ltrimstr`, `rtrimstr`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tojson`, `fromjson` |
-| [ ] | **String (remaining)** | `capture`, `scan`, `trim`, `ltrim`, `rtrim`, `trimstr` |
+| [ ] | **String (remaining)** | `capture`, `scan` |
+| [x] | **String (new)** | `trim`, `ltrim`, `rtrim`, `trimstr`, `toboolean` |
 | [x] | **Math** | `floor`, `ceil`, `round`, `sqrt`, `pow`, `log`, `log2`, `exp`, `exp2`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `abs`, `significand`, `logb`, `cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `hypot`, `remainder`, `tgamma`, `lgamma`, `j0`, `j1`, `nearbyint`, `rint`, `trunc`, `scalb`, `scalbln`, `ldexp`, `fma`, `drem`, `exp10`, `log10` |
 | [x] | **Array** | `transpose`, `bsearch`, `recurse` |
-| [ ] | **Array (remaining)** | `nth`, `combinations`, `walk` |
+| [ ] | **Array (remaining)** | `combinations` |
+| [x] | **Array (new)** | `nth`, `walk`, `skip` |
 | [x] | **Object** | `paths`, `leaf_paths`, `map_values`, `getpath`, `setpath`, `delpaths` |
-| [ ] | **Object (remaining)** | `pick` |
+| [x] | **Object (new)** | `pick`, `path` |
 | [x] | **I/O** | `input`, `inputs`, `debug`, `stderr`, `halt`, `halt_error` |
 | [x] | **Env** | `env`, `builtins` |
-| [ ] | **Env (remaining)** | `$ENV`, `$__loc__` |
-| [ ] | **SQL-style** | `INDEX`, `IN`, `JOIN`, `GROUP_BY` |
+| [ ] | **Env (remaining)** | `$ENV` |
+| [x] | **Env (new)** | `$__loc__` |
+| [ ] | **SQL-style (remaining)** | `GROUP_BY` |
+| [x] | **SQL-style (new)** | `INDEX`, `IN`, `JOIN` |
 | [x] | **Date/time** | `now`, `gmtime`, `mktime`, `strftime`, `strptime`, `strflocaltime`, `todate`, `fromdate`, `todateiso8601`, `fromdateiso8601` |
 | [x] | **Type selectors** | `arrays`, `objects`, `iterables`, `booleans`, `numbers`, `strings`, `nulls`, `normals`, `scalars`, `values` |
 | [ ] | **Type selectors (remaining)** | `finites` |
 | [x] | **Misc** | `isempty`, `ascii`, `first`, `last` |
-| [ ] | **Misc (remaining)** | `utf8bytelength`, `splits`, `repeat`, `skip`, `until`, `while`, `limit/2` |
+| [ ] | **Misc (remaining)** | `splits`, `repeat`, `limit/2` |
+| [x] | **Misc (new)** | `utf8bytelength`, `add(expr)` |
+
+### Query language — compat gaps (78% jq-compat pass rate)
+
+Issues found during compat test analysis. These are gaps in features marked
+complete above, tracked here for visibility. Goal is **75%+ compat tests** and
+**100% internal tests** — both currently met.
+
+| | Feature | Tests blocked | Detail |
+|---|---------|---------------|--------|
+| [x] | **Assignment with complex lhs** | ~15 fixed | All forms now work: `.[-1] = 5`, `.[] += 2`, `.[2][3] = 1`, `.foo[2].bar = 1`, `def inc(x): x \|= .+1`, `\|= empty`, generator lhs (`def x: .[1,2]; x=10`), paren-grouped (`(.[] \| select(...)) \|= empty`), per-path deletion (`.[] \|= select(. > 5)`). Implementation: fork-aware path tracking + general `compilePathExprUpdate` desugaring to jq's `_modify`/`_assign`. |
+| [x] | **Comma generators in brackets** | ~5 fixed | `.[0,1,2]`, `.[-4,-3,-2,-1,0,1,2,3]`, `path(.foo[0,1])` all work. New `compileComputedBracket` uses a variable-based pattern that survives generator iteration. Path tracking with generators now records one path per fork output. |
+| [ ] | **`path_intact` validation** | ~3 | `try ((map(select(.a == 1))[].a) \|= .+1) catch .` should error with "Invalid path expression near attempt to iterate through ...". jq tracks `value_at_path` identity to detect when a non-path-preserving operation (`map`, `+`, `reverse`, `length`, etc.) intervenes inside a `path()` scope. Requires VM addition: per-fork `value_at_path` snapshot + `path_intact` check at INDEX/EACH/PATH_END. |
+| [ ] | **`del()` with complex args** | ~6 | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Current `compileDel` handles single static keys/indices only. Should desugar to canonical `delpaths([path(arg)])` to use the new path-tracking infrastructure. |
+| [ ] | **Number output formatting** | ~10 | `1+1` outputs `2.0` instead of `2`. Integer results of float arithmetic should display without decimal. Affects tests across builtins, numbers, unary_negation categories. |
+| [ ] | **Float index truncation** | ~5 | `.[1.5]` should truncate to `.[1]`, `.[nan]` should error, `.[1.2:3.5]` should truncate slice bounds. (`load_computed` already handles `.[nan]` for path tracking; runtime truncation for slice bounds is the remaining piece.) |
+| [ ] | **Error message compatibility** | ~8 | `try (1/0) catch .`, `try -. catch .` — error strings don't match jq's exact wording. |
+| [ ] | **`contains` deep comparison** | ~2 | Nested object containment check fails. |
+| [ ] | **`any`/`all` short-circuit** | ~2 | `any(true, error; .)` should not evaluate error. |
+| [ ] | **User function scoping** | ~5 | Nested `def` shadowing, closure capture in complex contexts. |
+| [ ] | **JSON parser: extended literals** | ~3 | `Infinity`, `-Infinity`, `NaN`, `-NaN` as input JSON literals are not accepted. jq accepts these as extension. Affects `.[] = 1` test on `[1,null,Infinity,...]`. |
 
 ### Performance
 

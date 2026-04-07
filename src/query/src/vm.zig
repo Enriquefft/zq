@@ -30,13 +30,17 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, path_scope };
 
 const EachState = struct {
     pos: u32,
     end: u32,
     tape: *const Tape,
     is_object: bool,
+    /// Logical index/iteration count, used to record path components for
+    /// path() over `.[]`. For arrays this is the array index; for objects
+    /// the key is recorded directly so this remains a counter.
+    index: u32 = 0,
 };
 
 const RangeState = struct {
@@ -99,6 +103,25 @@ const ForkAux = union(ForkType) {
     label: LabelState,
     limit: LimitState,
     skip: SkipState,
+    /// Sentinel forkpoint pushed by `path_begin`. Holds no extra state — its
+    /// sole purpose is to pop the matching path frame when execution
+    /// backtracks past the path() expression scope.
+    path_scope: void,
+};
+
+/// Snapshot of the path-tracking state at the time a fork was created.
+/// On backtrack, the snapshot is restored so each generator iteration
+/// starts with a fresh path frame state (matching jq's per-output paths).
+///
+/// Outside of `path(...)` expressions, both fields are 0 — restoration is a
+/// no-op and adds no overhead.
+const PathSnapshot = struct {
+    /// Path-stack depth at fork time. Inner frames pushed after the fork are
+    /// torn down on backtrack.
+    stack_len: u32 = 0,
+    /// Components.items.len of the innermost path frame at fork time, or 0
+    /// if there was no active frame.
+    components_len: u32 = 0,
 };
 
 const Forkpoint = struct {
@@ -106,6 +129,10 @@ const Forkpoint = struct {
     saved_current: Value,
     backtrack_ip: u32,
     aux: ForkAux,
+    /// Path tracking state at fork time. Restored on backtrack so generator
+    /// iterations inside `path(...)` produce one path per iteration rather
+    /// than accumulating components across all iterations.
+    saved_path: PathSnapshot = .{},
 };
 
 /// State for one active function call (used for recursive user-defined functions).
@@ -379,6 +406,52 @@ pub const ResultIterator = struct {
         return it.value_stack.pop() orelse unreachable;
     }
 
+    /// Snapshot the current path-tracking state (for fork capture).
+    /// Returns zero-initialized snapshot if no path frame is active — that
+    /// means restoration is a no-op for forks outside `path(...)` scopes.
+    fn snapshotPathState(it: *const ResultIterator) PathSnapshot {
+        if (it.path_stack.items.len == 0) return .{};
+        const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+        return .{
+            .stack_len = @intCast(it.path_stack.items.len),
+            .components_len = @intCast(frame.components.items.len),
+        };
+    }
+
+    /// Restore the path-tracking state to a previously captured snapshot.
+    /// Pops frames pushed after the snapshot, then truncates the innermost
+    /// frame's components to the saved length.
+    ///
+    /// `stack_len == 0` means "no path frame was active at fork time" — in
+    /// that case, we still tear down any inner frames added in the meantime
+    /// to keep the path stack consistent.
+    fn restorePathState(it: *ResultIterator, snap: PathSnapshot) void {
+        while (it.path_stack.items.len > snap.stack_len) {
+            var frame = it.path_stack.pop().?;
+            frame.deinit(it.alloc);
+        }
+        if (it.path_stack.items.len > 0) {
+            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+            if (frame.components.items.len > snap.components_len) {
+                frame.components.shrinkRetainingCapacity(snap.components_len);
+            }
+        }
+    }
+
+    /// Push a forkpoint, automatically capturing the current path state and
+    /// the current value stack length so backtrack can restore both correctly.
+    /// All callers should use this helper rather than appending to fork_stack
+    /// directly so path tracking inside generators stays consistent.
+    fn pushFork(it: *ResultIterator, backtrack_ip: u32, aux: ForkAux) void {
+        it.fork_stack.appendAssumeCapacity(.{
+            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+            .saved_current = it.current,
+            .backtrack_ip = backtrack_ip,
+            .aux = aux,
+            .saved_path = it.snapshotPathState(),
+        });
+    }
+
     fn peekValue(it: *ResultIterator) ZqError!StackValue {
         if (it.value_stack.items.len == 0) return error.TypeError;
         return it.value_stack.items[it.value_stack.items.len - 1];
@@ -599,35 +672,62 @@ pub const ResultIterator = struct {
                 const base = it.if_stack.pop().?;
                 it.current = switch (key_sv) {
                     .tape_value => |tv| switch (tv) {
-                        .string => |s| switch (base) {
-                            .object => |span| lookupKey(span.tape, span, s) orelse
-                                if (it.nullAllowed()) @as(Value, .null_val) else return error.TypeError,
-                            .null_val => if (it.nullAllowed()) @as(Value, .null_val) else return error.TypeError,
-                            else => return error.TypeError,
-                        },
-                        else => return error.TypeError,
-                    },
-                    .int => |i| switch (base) {
-                        .array => |span| blk: {
-                            const resolved_idx = if (i < 0) blk2: {
-                                const len = arrayLength(span.tape, span);
-                                const neg_idx = @as(i64, @intCast(len)) + i;
-                                if (neg_idx < 0 or neg_idx > std.math.maxInt(u32)) break :blk @as(Value, .null_val);
-                                break :blk2 @as(u32, @intCast(neg_idx));
-                            } else blk3: {
-                                if (i > std.math.maxInt(u32)) break :blk @as(Value, .null_val);
-                                break :blk3 @as(u32, @intCast(i));
+                        .string => |s| blk: {
+                            // Record path component if path tracking is active.
+                            if (it.path_stack.items.len > 0) {
+                                const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                                try frame.components.append(it.alloc, .{ .string = s });
+                            }
+                            break :blk switch (base) {
+                                .object => |span| lookupKey(span.tape, span, s) orelse @as(Value, .null_val),
+                                .null_val => @as(Value, .null_val),
+                                else => return error.TypeError,
                             };
-                            break :blk lookupIndex(span.tape, span, resolved_idx) orelse .null_val;
                         },
-                        .null_val => if (it.nullAllowed()) @as(Value, .null_val) else return error.TypeError,
                         else => return error.TypeError,
                     },
-                    // jq: float index on array truncates to int; nan/inf → null
+                    .int => |i| blk: {
+                        // Record path component if path tracking is active.
+                        if (it.path_stack.items.len > 0) {
+                            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                            try frame.components.append(it.alloc, .{ .int = i });
+                        }
+                        break :blk switch (base) {
+                            .array => |span| blk2: {
+                                const resolved_idx = if (i < 0) blk3: {
+                                    const len = arrayLength(span.tape, span);
+                                    const neg_idx = @as(i64, @intCast(len)) + i;
+                                    if (neg_idx < 0 or neg_idx > std.math.maxInt(u32)) break :blk2 @as(Value, .null_val);
+                                    break :blk3 @as(u32, @intCast(neg_idx));
+                                } else blk4: {
+                                    if (i > std.math.maxInt(u32)) break :blk2 @as(Value, .null_val);
+                                    break :blk4 @as(u32, @intCast(i));
+                                };
+                                break :blk2 lookupIndex(span.tape, span, resolved_idx) orelse .null_val;
+                            },
+                            // jq: indexing null with an integer yields null.
+                            .null_val => @as(Value, .null_val),
+                            else => return error.TypeError,
+                        };
+                    },
+                    // jq: float index on array truncates to int; nan/inf → null.
+                    // Path tracking: nan/inf are recorded as `null` components
+                    // (matching jq's `path(.[nan])` → `[null]`).
                     .float => |f| switch (base) {
                         .array => |span| blk: {
-                            if (std.math.isNan(f) or std.math.isInf(f)) break :blk @as(Value, .null_val);
+                            if (std.math.isNan(f) or std.math.isInf(f)) {
+                                if (it.path_stack.items.len > 0) {
+                                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                                    try frame.components.append(it.alloc, .null_val);
+                                }
+                                break :blk @as(Value, .null_val);
+                            }
                             const i: i64 = @intFromFloat(@trunc(f));
+                            // Record path component if path tracking is active.
+                            if (it.path_stack.items.len > 0) {
+                                const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                                try frame.components.append(it.alloc, .{ .int = i });
+                            }
                             const resolved_idx = if (i < 0) blk2: {
                                 const len = arrayLength(span.tape, span);
                                 const neg_idx = @as(i64, @intCast(len)) + i;
@@ -642,8 +742,16 @@ pub const ResultIterator = struct {
                         .null_val => if (it.nullAllowed()) @as(Value, .null_val) else return error.TypeError,
                         else => return error.TypeError,
                     },
-                    // jq: null index on anything returns null
-                    .null_val => @as(Value, .null_val),
+                    // jq: null index on anything returns null. Path tracking
+                    // records `null` as the component to match jq's
+                    // `path(.[null])` → `[null]`.
+                    .null_val => blk: {
+                        if (it.path_stack.items.len > 0) {
+                            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                            try frame.components.append(it.alloc, .null_val);
+                        }
+                        break :blk @as(Value, .null_val);
+                    },
                     else => return error.TypeError,
                 };
                 it.ip += 1;
@@ -665,7 +773,15 @@ pub const ResultIterator = struct {
             },
 
             .slice => {
-                const result = try it.doSlice(instr.operand.slice_args);
+                const args = instr.operand.slice_args;
+                // Record slice path component if path tracking is active.
+                // jq stores literal bounds (negative allowed, missing bound = null).
+                if (it.path_stack.items.len > 0) {
+                    const slice_obj = try it.buildSlicePathComponent(args);
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    try frame.components.append(it.alloc, slice_obj);
+                }
+                const result = try it.doSlice(args);
                 it.pushValue(result);
                 it.ip += 1;
                 return null;
@@ -798,6 +914,7 @@ pub const ResultIterator = struct {
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .try_handler = handler_state },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -814,6 +931,7 @@ pub const ResultIterator = struct {
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .alt_handler = handler_state },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -1129,6 +1247,7 @@ pub const ResultIterator = struct {
                         .saved_collect_len = @intCast(it.collect_stack.items.len),
                         .saved_call_len = @intCast(it.call_stack.items.len),
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -1217,6 +1336,7 @@ pub const ResultIterator = struct {
                         .exit_ip = @intCast(instr.operand.index),
                         .saved_collect_len = @intCast(it.collect_stack.items.len),
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -1266,6 +1386,7 @@ pub const ResultIterator = struct {
                         .exit_ip = @intCast(instr.operand.index),
                         .saved_collect_len = @intCast(it.collect_stack.items.len),
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -1287,9 +1408,25 @@ pub const ResultIterator = struct {
             // ── Path tracking opcodes ──────────────────────────────────────
 
             .path_begin => {
+                // Push a fresh path frame for component recording.
                 try it.path_stack.append(it.alloc, PathFrame{
                     .components = std.ArrayList(Value){},
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                });
+                // Push a sentinel forkpoint that pops the frame when the
+                // outer scope backtracks past this point. Without this,
+                // generators inside path(...) would leak the frame after
+                // exhaustion. The sentinel's saved_path captures the OUTER
+                // path state so backtrack-through cleans up correctly.
+                try it.fork_stack.append(it.alloc, .{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = 0, // unused for path_scope
+                    .aux = .{ .path_scope = {} },
+                    .saved_path = .{
+                        .stack_len = @intCast(it.path_stack.items.len - 1),
+                        .components_len = 0,
+                    },
                 });
                 it.ip += 1;
                 return null;
@@ -1297,8 +1434,12 @@ pub const ResultIterator = struct {
 
             .path_end => {
                 if (it.path_stack.items.len == 0) return error.TypeError;
-                var frame = it.path_stack.pop().?;
-                defer frame.deinit(it.alloc);
+                // Build the path array from accumulated components, but DO
+                // NOT pop the frame — generators inside path(...) need it
+                // alive across backtracks. The frame is popped by the
+                // matching path_scope sentinel forkpoint when execution
+                // backtracks out of the scope.
+                const frame = &it.path_stack.items[it.path_stack.items.len - 1];
                 // Discard only values pushed by the body — restore to saved depth.
                 it.value_stack.items.len = frame.saved_value_stack_len;
                 // path(f) returns the path array, not the value f produced.
@@ -1337,6 +1478,7 @@ pub const ResultIterator = struct {
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .normal = {} },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.ip += 1;
                 return null;
@@ -1371,8 +1513,15 @@ pub const ResultIterator = struct {
                                 .end = end,
                                 .is_object = false,
                                 .tape = span.tape,
+                                .index = 0,
                             } },
+                            .saved_path = it.snapshotPathState(),
                         });
+                        // Record path component (the array index 0).
+                        if (it.path_stack.items.len > 0) {
+                            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                            try frame.components.append(it.alloc, .{ .int = 0 });
+                        }
                         it.current = tapeEntryToValue(span.tape, first);
                         it.ip += 1;
                     },
@@ -1394,8 +1543,17 @@ pub const ResultIterator = struct {
                                 .end = end,
                                 .is_object = true,
                                 .tape = span.tape,
+                                .index = 0,
                             } },
+                            .saved_path = it.snapshotPathState(),
                         });
+                        // Record path component (the object key).
+                        if (it.path_stack.items.len > 0) {
+                            const key_entry = span.tape.entries[first_key];
+                            const key = span.tape.getString(key_entry.payload.string);
+                            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                            try frame.components.append(it.alloc, .{ .string = key });
+                        }
                         it.current = tapeEntryToValue(span.tape, first_key + 1);
                         it.ip += 1;
                     },
@@ -1691,47 +1849,124 @@ pub const ResultIterator = struct {
         if (it.if_stack.items.len == 0) return error.TypeError;
         const base = it.if_stack.pop().?;
 
+        // jq's MAX_ARRAY_INDEX threshold (INT_MAX/4 in jq's jv_array.c).
+        // Indices above this are rejected with "Array index too large".
+        const max_array_index: i64 = std.math.maxInt(i32) >> 2;
+
         switch (base) {
             .array => |span| {
-                const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_start,
-                    .payload = .{ .skip = 0 },
-                });
-                var pos = span.start + 1;
-                const end = span.end - 1;
-                var i: u32 = 0;
+                const len = arrayLength(span.tape, span);
                 const resolved_idx = if (idx < 0) blk: {
-                    const len = arrayLength(span.tape, span);
                     const neg_idx = @as(i64, @intCast(len)) + idx;
-                    if (neg_idx < 0 or neg_idx > std.math.maxInt(u32)) return error.IndexOutOfBounds;
+                    if (neg_idx < 0) {
+                        it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                        return error.TypeError;
+                    }
+                    if (neg_idx > max_array_index) {
+                        it.type_error_detail = .{ .string = "Array index too large" };
+                        return error.TypeError;
+                    }
                     break :blk @as(u32, @intCast(neg_idx));
                 } else blk: {
-                    if (idx > std.math.maxInt(u32)) return error.IndexOutOfBounds;
+                    if (idx > max_array_index) {
+                        it.type_error_detail = .{ .string = "Array index too large" };
+                        return error.TypeError;
+                    }
                     break :blk @as(u32, @intCast(idx));
                 };
-                while (pos < end) {
-                    if (i == resolved_idx) {
-                        try it.stackValueToRuntimeTapeEntry(new_val);
-                    } else {
-                        const orig_val = tapeEntryToValue(span.tape, pos);
-                        try it.stackValueToRuntimeTapeEntry(try valueToStackValue(orig_val));
-                    }
-                    pos = skipEntry(span.tape.*, pos);
-                    i += 1;
-                }
-                const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .array_end,
-                    .payload = .{ .none = {} },
-                });
-                it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-                return .{ .tape_value = .{ .array = .{
-                    .tape = &it.runtime_tape.view,
-                    .start = arr_start,
-                    .end = arr_end_idx + 1,
-                } } };
+                return try it.buildUpdatedArray(span, len, resolved_idx, new_val);
             },
-            else => return error.TypeError,
+            .null_val => {
+                // Updating an index on null creates a fresh array. Negative
+                // indices are an error because there is no length to wrap around.
+                if (idx < 0) {
+                    it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                    return error.TypeError;
+                }
+                if (idx > max_array_index) {
+                    it.type_error_detail = .{ .string = "Array index too large" };
+                    return error.TypeError;
+                }
+                return try it.buildNewArrayAtIndex(@intCast(idx), new_val);
+            },
+            else => {
+                it.type_error_detail = it.buildTypeErrorMsg(base, "number");
+                return error.TypeError;
+            },
         }
+    }
+
+    /// Build a new array equal to `span` with `target_idx` replaced by `new_val`,
+    /// extending with nulls if `target_idx >= len`.
+    fn buildUpdatedArray(
+        it: *ResultIterator,
+        span: types.Value.TapeSpan,
+        len: u32,
+        target_idx: u32,
+        new_val: StackValue,
+    ) ZqError!StackValue {
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        var pos = span.start + 1;
+        const end = span.end - 1;
+        var i: u32 = 0;
+        // Copy existing elements, replacing the target index.
+        while (pos < end) : (i += 1) {
+            if (i == target_idx) {
+                try it.stackValueToRuntimeTapeEntry(new_val);
+            } else {
+                const orig_val = tapeEntryToValue(span.tape, pos);
+                try it.stackValueToRuntimeTapeEntry(try valueToStackValue(orig_val));
+            }
+            pos = skipEntry(span.tape.*, pos);
+        }
+        // Pad with nulls if target_idx is beyond the original length.
+        if (target_idx >= len) {
+            while (i < target_idx) : (i += 1) {
+                try it.stackValueToRuntimeTapeEntry(.{ .null_val = {} });
+            }
+            try it.stackValueToRuntimeTapeEntry(new_val);
+        }
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape.view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
+    }
+
+    /// Build a fresh array of length `target_idx + 1`, with all entries null
+    /// except position `target_idx` set to `new_val`.
+    fn buildNewArrayAtIndex(
+        it: *ResultIterator,
+        target_idx: u32,
+        new_val: StackValue,
+    ) ZqError!StackValue {
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        var i: u32 = 0;
+        while (i < target_idx) : (i += 1) {
+            try it.stackValueToRuntimeTapeEntry(.{ .null_val = {} });
+        }
+        try it.stackValueToRuntimeTapeEntry(new_val);
+        const arr_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape.view,
+            .start = arr_start,
+            .end = arr_end_idx + 1,
+        } } };
     }
 
     fn doLoadPath(it: *ResultIterator, path: []const u8) ZqError!Value {
@@ -4299,6 +4534,7 @@ pub const ResultIterator = struct {
                         .step_float = 0,
                         .is_float = false,
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.current = .{ .int = 0 };
                 it.ip = resume_ip;
@@ -4321,6 +4557,7 @@ pub const ResultIterator = struct {
                         .step_float = 1,
                         .is_float = true,
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.current = .{ .float = 0 };
                 it.ip = resume_ip;
@@ -4365,6 +4602,7 @@ pub const ResultIterator = struct {
                     .step_float = 1,
                     .is_float = true,
                 } },
+                .saved_path = it.snapshotPathState(),
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4393,6 +4631,7 @@ pub const ResultIterator = struct {
                     .step_float = 0,
                     .is_float = false,
                 } },
+                .saved_path = it.snapshotPathState(),
             });
             it.current = .{ .int = from_i };
         }
@@ -4441,6 +4680,7 @@ pub const ResultIterator = struct {
                     .step_float = by_f,
                     .is_float = true,
                 } },
+                .saved_path = it.snapshotPathState(),
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4473,6 +4713,7 @@ pub const ResultIterator = struct {
                     .step_float = 0,
                     .is_float = false,
                 } },
+                .saved_path = it.snapshotPathState(),
             });
             it.current = .{ .int = from_i };
         }
@@ -5427,7 +5668,8 @@ pub const ResultIterator = struct {
         return result orelse walked;
     }
 
-    /// Build a path array (e.g. ["a", 0, "b"]) on the runtime tape.
+    /// Build a path array (e.g. ["a", 0, "b", {"start":2,"end":4}]) on the
+    /// runtime tape. Components may be strings, ints, or slice objects.
     fn buildPathArray(it: *ResultIterator, components: []const Value) ZqError!Value {
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .array_start,
@@ -5448,6 +5690,11 @@ pub const ResultIterator = struct {
                         .payload = .{ .int = i },
                     });
                 },
+                .object => |span| {
+                    // Slice path component: copy the {"start":..,"end":..}
+                    // object span into the path array.
+                    try it.runtime_tape.copySpan(span.tape.*, span.start, span.end, it.alloc);
+                },
                 else => return error.TypeError,
             }
         }
@@ -5460,6 +5707,61 @@ pub const ResultIterator = struct {
             .tape = &it.runtime_tape.view,
             .start = arr_start,
             .end = arr_end_idx + 1,
+        } };
+    }
+
+    /// Build a slice path component `{"start": from?, "end": to?}` on the
+    /// runtime tape and return it as a Value. Stores literal bounds as in jq:
+    /// missing bounds become null, negative bounds are preserved verbatim.
+    fn buildSlicePathComponent(it: *ResultIterator, args: types.SliceArgs) ZqError!Value {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        const start_key_ref = try it.runtime_tape.internString(it.alloc, "start");
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .key,
+            .payload = .{ .string = start_key_ref },
+        });
+        if (args.has_from) {
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .int,
+                .payload = .{ .int = args.from },
+            });
+        } else {
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .null_val,
+                .payload = .{ .none = {} },
+            });
+        }
+
+        const end_key_ref = try it.runtime_tape.internString(it.alloc, "end");
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .key,
+            .payload = .{ .string = end_key_ref },
+        });
+        if (args.has_to) {
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .int,
+                .payload = .{ .int = args.to },
+            });
+        } else {
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .null_val,
+                .payload = .{ .none = {} },
+            });
+        }
+
+        const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
+        return .{ .object = .{
+            .tape = &it.runtime_tape.view,
+            .start = obj_start,
+            .end = obj_end_idx + 1,
         } };
     }
 
@@ -5619,6 +5921,7 @@ pub const ResultIterator = struct {
                         .is_object = false,
                         .tape = span.tape,
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.current = tapeEntryToValue(span.tape, first);
                 it.ip += 1;
@@ -5638,6 +5941,7 @@ pub const ResultIterator = struct {
                         .is_object = true,
                         .tape = span.tape,
                     } },
+                    .saved_path = it.snapshotPathState(),
                 });
                 it.current = tapeEntryToValue(span.tape, first_key + 1);
                 it.ip += 1;
@@ -5659,10 +5963,24 @@ pub const ResultIterator = struct {
         if (next_pos >= st.end) return false;
 
         st.pos = next_pos;
+        st.index += 1;
         it.current = if (st.is_object)
             tapeEntryToValue(st.tape, next_pos + 1) // value after key
         else
             tapeEntryToValue(st.tape, next_pos);
+        // Record path component for the new iteration. The fork's saved_path
+        // restoration in backtrackToDepth will have already truncated the
+        // previous iteration's component, so we append fresh here.
+        if (it.path_stack.items.len > 0) {
+            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+            if (st.is_object) {
+                const key_entry = st.tape.entries[next_pos];
+                const key = st.tape.getString(key_entry.payload.string);
+                frame.components.append(it.alloc, .{ .string = key }) catch return false;
+            } else {
+                frame.components.append(it.alloc, .{ .int = @intCast(st.index) }) catch return false;
+            }
+        }
         return true;
     }
 
@@ -5705,10 +6023,16 @@ pub const ResultIterator = struct {
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
                     it.ip = fp.backtrack_ip;
+                    const saved_path = fp.saved_path;
                     _ = it.fork_stack.pop();
+                    it.restorePathState(saved_path);
                     return true;
                 },
                 .each => {
+                    // Restore path state BEFORE advancing — advanceEachForkpoint
+                    // appends the new iteration's path component, which would
+                    // be wiped out if we restored after.
+                    it.restorePathState(fp.saved_path);
                     if (it.advanceEachForkpoint(fp)) {
                         it.value_stack.items.len = fp.saved_value_stack_len;
                         it.ip = fp.backtrack_ip + 1; // resume AFTER the each instruction
@@ -5719,6 +6043,7 @@ pub const ResultIterator = struct {
                     _ = it.fork_stack.pop();
                 },
                 .range => {
+                    it.restorePathState(fp.saved_path);
                     if (it.advanceRangeForkpoint(fp)) {
                         it.value_stack.items.len = fp.saved_value_stack_len;
                         it.ip = fp.backtrack_ip;
@@ -5730,7 +6055,9 @@ pub const ResultIterator = struct {
                 },
                 .try_handler => {
                     // Normal exhaustion — just pop, continue backtracking.
+                    const saved_path = fp.saved_path;
                     _ = it.fork_stack.pop();
+                    it.restorePathState(saved_path);
                 },
                 .alt_handler => |state| {
                     // Left side exhausted (all falsy or no outputs) — fire right side.
@@ -5743,11 +6070,24 @@ pub const ResultIterator = struct {
                     }
                     it.call_stack.items.len = state.saved_call_len;
                     it.ip = fp.backtrack_ip; // right side IP
+                    const saved_path = fp.saved_path;
                     _ = it.fork_stack.pop();
+                    it.restorePathState(saved_path);
                     return true;
                 },
                 .label, .limit, .skip => {
                     // Label/limit/skip scope completed — just pop.
+                    const saved_path = fp.saved_path;
+                    _ = it.fork_stack.pop();
+                    it.restorePathState(saved_path);
+                },
+                .path_scope => {
+                    // Path() scope is exiting due to backtrack from outside —
+                    // pop the matching path frame to clean up.
+                    if (it.path_stack.items.len > 0) {
+                        var frame = it.path_stack.pop().?;
+                        frame.deinit(it.alloc);
+                    }
                     _ = it.fork_stack.pop();
                 },
             }

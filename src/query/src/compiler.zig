@@ -1399,43 +1399,49 @@ fn parseFilter(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
 /// Lookahead: returns true if the token stream starts with a path expression
 /// followed by an update-assignment operator (|=, +=, -=, *=, /=, %=, //=).
 /// Pure scan — no instructions emitted, lexer position restored via defer.
+/// Detect whether the next expression is an update assignment by scanning
+/// forward from the current lex position, looking for an assignment operator
+/// at depth 0 (outside any nested parens/brackets/braces). Stops at the first
+/// token that ends an expression (`|`, `,`, `;`, EOF, closing brackets, or
+/// keywords like `def`/`as`/`then`/etc.) — if we hit one of those before an
+/// assignment op, it's not an update assignment.
+///
+/// This intentionally over-accepts: it allows things like `1+2 = 3` through
+/// the parser. Such invalid LHS expressions are caught at runtime via the
+/// path_intact check, matching jq's behavior.
 fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
     const saved_pos = ctx.lex.pos;
     defer ctx.lex.pos = saved_pos;
 
-    const first = try ctx.nextToken();
-    if (first.tag != .dot) return false;
-
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var brace_depth: u32 = 0;
     while (true) {
-        const t = try ctx.lex.peek();
+        const t = try ctx.nextToken();
+        if (paren_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+            switch (t.tag) {
+                .eq_assign, .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => return true,
+                .pipe, .comma, .semicolon, .eof => return false,
+                .rparen, .rbracket, .rbrace => return false,
+                .def_kw, .as_kw, .then_kw, .else_kw, .elif_kw, .end_kw, .catch_kw => return false,
+                else => {},
+            }
+        }
         switch (t.tag) {
-            .ident => {
-                _ = try ctx.nextToken();
-                const sep = try ctx.lex.peek();
-                if (sep.tag == .dot) _ = try ctx.nextToken();
+            .lparen => paren_depth += 1,
+            .rparen => if (paren_depth > 0) {
+                paren_depth -= 1;
             },
-            .lbracket => {
-                _ = try ctx.nextToken();
-                const inner = try ctx.lex.peek();
-                switch (inner.tag) {
-                    .int_lit, .string_lit => {
-                        _ = try ctx.nextToken();
-                        const close = try ctx.nextToken();
-                        if (close.tag != .rbracket) return false;
-                        const sep = try ctx.lex.peek();
-                        if (sep.tag == .dot) _ = try ctx.nextToken();
-                    },
-                    .rbracket => {
-                        // .[] — iterate update
-                        _ = try ctx.nextToken();
-                        const sep = try ctx.lex.peek();
-                        if (sep.tag == .dot) _ = try ctx.nextToken();
-                    },
-                    else => return false,
-                }
+            .lbracket => bracket_depth += 1,
+            .rbracket => if (bracket_depth > 0) {
+                bracket_depth -= 1;
             },
-            .eq_assign, .pipe_eq, .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .double_slash_eq => return true,
-            else => return false,
+            .lbrace => brace_depth += 1,
+            .rbrace => if (brace_depth > 0) {
+                brace_depth -= 1;
+            },
+            .eof => return false,
+            else => {},
         }
     }
 }
@@ -1448,6 +1454,18 @@ fn peekIsUpdateAssign(ctx: *Ctx) ZqError!bool {
 /// For `=`: RHS is evaluated against the original input (before navigation).
 /// For `+=`, `-=`, etc.: navigated_value OP rhs, where rhs is evaluated against original input.
 fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    // Save lex position at the start so we can restore for path-expression update
+    // if we detect a complex LHS (multi-index brackets, iteration, etc.).
+    const start_pos = ctx.lex.pos;
+
+    // Anything that doesn't start with a leading `.` is a general expression
+    // LHS — dispatch to compilePathExprUpdate which re-parses the entire LHS
+    // via parseAlternative inside path_begin/path_end.
+    const first_peek = try ctx.lex.peek();
+    if (first_peek.tag != .dot) {
+        return try compilePathExprUpdate(ctx);
+    }
+
     // Consume the leading dot
     _ = try ctx.nextToken();
 
@@ -1469,15 +1487,26 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 _ = try ctx.nextToken();
                 const inner = try ctx.lex.peek();
                 switch (inner.tag) {
-                    .int_lit => {
-                        const tok = try ctx.nextToken();
-                        const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                        const close = try ctx.nextToken();
-                        if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
-                        try path_steps.append(ctx.alloc, PathStep{ .kind = .index, .index = n });
-                        const sep = try ctx.lex.peek();
-                        if (sep.tag == .dot) _ = try ctx.nextToken();
+                    .int_lit, .minus => {
+                        // Try to parse as a single integer index (possibly negative).
+                        const maybe_n = try tryParseIndexInt(ctx);
+                        if (maybe_n) |n| {
+                            const after = try ctx.lex.peek();
+                            if (after.tag == .rbracket) {
+                                // Simple single index: .[n] or .[-n]
+                                _ = try ctx.nextToken();
+                                if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
+                                try path_steps.append(ctx.alloc, PathStep{ .kind = .index, .index = n });
+                                const sep = try ctx.lex.peek();
+                                if (sep.tag == .dot) _ = try ctx.nextToken();
+                                continue;
+                            }
+                        }
+                        // Not a simple single index (has commas, etc.) —
+                        // switch to path-expression-based update. Restore to the
+                        // start of the LHS so we re-parse the entire path expression.
+                        ctx.lex.pos = start_pos;
+                        return try compilePathExprUpdate(ctx);
                     },
                     .string_lit => {
                         const tok = try ctx.nextToken();
@@ -1489,6 +1518,12 @@ fn parseUpdateAssign(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                         try path_steps.append(ctx.alloc, PathStep{ .kind = .key, .key = ref });
                         const sep = try ctx.lex.peek();
                         if (sep.tag == .dot) _ = try ctx.nextToken();
+                    },
+                    .rbracket, .ident => {
+                        // .[] iteration or .[ident] computed access — switch to
+                        // path-expression-based update.
+                        ctx.lex.pos = start_pos;
+                        return try compilePathExprUpdate(ctx);
                     },
                     else => return ctx.syntaxErr(ctx.last_tok_offset, 0),
                 }
@@ -1616,11 +1651,523 @@ fn emitUpdateChain(ctx: *Ctx, steps: []const PathStep) error{OutOfMemory}!void {
     }
 }
 
-fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
-    if (try peekIsUpdateAssign(ctx)) {
-        try parseUpdateAssign(ctx);
+/// Compile a general update assignment whose LHS is any path expression
+/// (multi-index brackets, `.[]` iteration, paren-grouped, function-based).
+///
+/// Mirrors jq's `_modify` / `_assign` desugar exactly:
+///   `LHS |= f`  →  `. as $orig | reduce path(LHS) as $p ($orig; ...)` where
+///                  the reduce body either setpaths (if `f` produced output)
+///                  or accumulates a delete path (if `f` produced empty).
+///                  After the loop, `delpaths` is applied in one shot so
+///                  index shifting is handled correctly.
+///   `LHS = v`   →  `. as $orig | $orig | reduce path(LHS) as $p (.; setpath($p; v))`
+///                  with `v` evaluated once against the original input.
+///   `LHS op= v` →  `(v) as $tmp | _modify(LHS; . op $tmp)` — the RHS is
+///                  evaluated once against the original input, then each
+///                  navigated value is combined with $tmp via the arithmetic op.
+///
+/// On entry the lex position is at the leading '.' (or any other valid LHS
+/// start token). Path tracking with generators (the VM's fork-aware path frame
+/// snapshot) ensures `path(LHS)` produces one path per LHS output.
+fn compilePathExprUpdate(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const orig_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const paths_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const dels_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const p_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const r_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // $orig = current input. Used for RHS evaluation contexts and as the
+    // initial accumulator value.
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = orig_var });
+
+    // $paths = [path(LHS)]
+    try emitPathCollection(ctx);
+    try ctx.emit(.capture_variable, .{ .index = paths_var });
+
+    // Parse the assignment operator.
+    const assign_tok = try ctx.nextToken();
+    ctx.last_tok_offset = assign_tok.offset;
+
+    // Capture the RHS into a buffer so we can re-emit it inside the reduce
+    // body (and potentially detect the `|= empty` special case).
+    const rhs_start = ctx.raw.items.len;
+    try parseAlternative(ctx);
+    const rhs_end = ctx.raw.items.len;
+
+    // Special case: `|= empty` desugars directly to `delpaths($paths)` since
+    // setpath(p; empty) cannot delete and the reduce body would no-op.
+    if (assign_tok.tag == .pipe_eq and isEmptyBuiltinCall(ctx.raw.items[rhs_start..rhs_end])) {
+        ctx.raw.items.len = rhs_start;
+        try ctx.emit(.load_variable, .{ .index = orig_var });
+        try ctx.emit(.pipe, .{ .none = {} });
+        try ctx.emit(.load_variable, .{ .index = paths_var });
+        try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.delpaths) });
+        popScope(ctx, ctx.alloc);
         return;
     }
+
+    const captured = try captureAndTruncate(ctx, rhs_start, rhs_end);
+    defer ctx.alloc.free(captured.instrs);
+
+    switch (assign_tok.tag) {
+        .pipe_eq => {
+            // General `|= f`. Body: collect [getpath($p) | f] into $r,
+            // dispatch on whether $r is empty (→ delete) or non-empty (→ setpath).
+            try emitGeneralPipeEqUpdate(ctx, orig_var, paths_var, acc_var, dels_var, p_var, r_var, captured);
+        },
+        .eq_assign => {
+            // General `= v`. The RHS is evaluated once against $orig and the
+            // result is assigned at every path. No delete handling needed since
+            // `=` always produces a value.
+            try emitGeneralEqUpdate(ctx, orig_var, paths_var, acc_var, p_var, captured);
+        },
+        .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq => {
+            const arith_op: Instruction.Op = switch (assign_tok.tag) {
+                .plus_eq => .add,
+                .minus_eq => .sub,
+                .star_eq => .mul,
+                .slash_eq => .div,
+                .percent_eq => .mod,
+                else => unreachable,
+            };
+            try emitGeneralCompoundUpdate(ctx, orig_var, paths_var, acc_var, p_var, arith_op, captured);
+        },
+        .double_slash_eq => {
+            // `//= f` : alternative-assignment. The body for each path is
+            // `getpath($p) // f` — only updates if the existing value is null
+            // or false. Routes through the general `|= f` machinery using
+            // the alternative composition.
+            try emitGeneralAlternativeUpdate(ctx, orig_var, paths_var, acc_var, dels_var, p_var, r_var, captured);
+        },
+        else => return ctx.syntaxErr(assign_tok.offset, assign_tok.len),
+    }
+
+    popScope(ctx, ctx.alloc);
+}
+
+/// Detect whether a captured raw instruction buffer is exactly a single
+/// `call_builtin(empty)` instruction. Used to special-case `|= empty`.
+fn isEmptyBuiltinCall(buf: []const RawInstr) bool {
+    return buf.len == 1 and
+        buf[0].op == .call_builtin and
+        buf[0].operand.index == @intFromEnum(types.BuiltinId.empty);
+}
+
+/// Emit `[path(LHS)]` — collects all paths from the LHS expression into an
+/// array on the value stack. The LHS is parsed by `parseAlternative` which
+/// stops at the assignment operator (since `=`/`|=` are not in the expression
+/// grammar).
+fn emitPathCollection(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    const path_begin_ip = ctx.raw.items.len;
+    try ctx.emit(.path_begin, .{ .index = 0 });
+
+    try parseAlternative(ctx);
+
+    try ctx.emit(.path_end, .{ .none = {} });
+    ctx.raw.items[path_begin_ip].operand = .{ .index = @intCast(ctx.raw.items.len - 1) };
+
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    const ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[ace_start].operand = .{ .index = ace_end };
+}
+
+/// Emit a `for $p in $paths_var` loop using array_collect_start/each/backtrack/
+/// array_collect_end. The body of the loop is emitted by `emit_body`.
+///
+/// On entry to the body: current = $p (the loop variable), $p_var holds the
+/// path. The body must capture its result into $acc_var (or otherwise drive
+/// state forward) and end naturally so `backtrack` can advance the iterator.
+fn emitPathLoop(
+    ctx: *Ctx,
+    paths_var: u32,
+    p_var: u32,
+    body: *const fn (ctx_inner: *Ctx) (ZqError || error{OutOfMemory})!void,
+) (ZqError || error{OutOfMemory})!void {
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var });
+
+    try body(ctx);
+
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    // Discard the throwaway collected array.
+    try ctx.emit(.pipe, .{ .none = {} });
+}
+
+/// Emit the general `LHS |= f` update.
+///
+/// Bytecode shape (per path):
+///   $acc as current; $r = [getpath($p) | f];
+///   if $r | length == 0 then $dels = $dels + [$p]
+///                       else $acc = setpath($acc; $p; $r[0])
+fn emitGeneralPipeEqUpdate(
+    ctx: *Ctx,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    dels_var: u32,
+    p_var: u32,
+    r_var: u32,
+    rhs: CapturedRhs,
+) (ZqError || error{OutOfMemory})!void {
+    // $acc = $orig
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    // $dels = []
+    try emitEmptyArray(ctx);
+    try ctx.emit(.capture_variable, .{ .index = dels_var });
+
+    // For each $p in $paths:
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var });
+
+    // Compute $r = [ ($acc | getpath($p)) | f ]
+    // - Start with current = $acc
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // - getpath($p): pushes path, calls builtin (uses current as base, pops path)
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.getpath) });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // - Collect [body(current) outputs]
+    const r_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try appendRebasedInstrsCopy(ctx, rhs);
+    try ctx.emit(.yield_output, .{ .none = {} });
+    const r_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[r_ace_start].operand = .{ .index = r_ace_end };
+    try ctx.emit(.capture_variable, .{ .index = r_var });
+
+    // if length($r) == 0 then add $p to $dels else $acc = setpath($acc; $p; $r[0])
+    try ctx.emit(.load_variable, .{ .index = r_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.length) });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.push_int, .{ .int = 0 });
+    try ctx.emit(.eq, .{ .none = {} });
+
+    const jif_pos = ctx.raw.items.len;
+    try ctx.emit(.jump_if_false, .{ .index = 0 }); // patched to ELSE
+
+    // THEN: $dels = $dels + [$p]
+    try ctx.emit(.load_variable, .{ .index = dels_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.push_current, .{ .none = {} });
+    // Build [$p]
+    const p_arr_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.yield_output, .{ .none = {} });
+    const p_arr_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[p_arr_start].operand = .{ .index = p_arr_end };
+    // value_stack now has [$dels, [$p]]; add them
+    try ctx.emit(.add, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = dels_var });
+    const jump_end_pos = ctx.raw.items.len;
+    try ctx.emit(.jump, .{ .index = 0 }); // patched to END
+
+    // ELSE: $acc = setpath($acc; $p; $r[0])
+    ctx.raw.items[jif_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // Stage path
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    // Stage value: $r[0]
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = r_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_index, .{ .index = 0 });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    // END:
+    ctx.raw.items[jump_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    // Discard the throwaway loop array.
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    // Apply pending deletions: $acc | delpaths($dels)
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = dels_var });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.delpaths) });
+}
+
+/// Emit the general `LHS = v` update.
+///
+/// Bytecode shape: `($orig | v) as $value | reduce $paths[] as $p ($orig; setpath($p; $value))`.
+fn emitGeneralEqUpdate(
+    ctx: *Ctx,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    rhs: CapturedRhs,
+) (ZqError || error{OutOfMemory})!void {
+    const value_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    // $value = $orig | v   (RHS evaluated once against original input)
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try appendRebasedInstrsCopy(ctx, rhs);
+    try ctx.emit(.capture_variable, .{ .index = value_var });
+
+    // $acc = $orig
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    // For each $p in $paths: $acc = setpath($acc; $p; $value)
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var });
+
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = value_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+}
+
+/// Emit the general `LHS op= v` compound update.
+///
+/// Bytecode shape: `($orig | v) as $tmp | _modify(LHS; . op $tmp)`.
+/// In our flattened form: for each $p, $acc = setpath($acc; $p; getpath($acc; $p) op $tmp).
+fn emitGeneralCompoundUpdate(
+    ctx: *Ctx,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    op: Instruction.Op,
+    rhs: CapturedRhs,
+) (ZqError || error{OutOfMemory})!void {
+    const tmp_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    // $tmp = $orig | v
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try appendRebasedInstrsCopy(ctx, rhs);
+    try ctx.emit(.capture_variable, .{ .index = tmp_var });
+
+    // $acc = $orig
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    // For each $p in $paths: $acc = setpath($acc; $p; getpath($acc; $p) op $tmp)
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var });
+
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // Stage path
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    // Stage value: getpath($acc; $p) op $tmp
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.getpath) });
+    try ctx.emit(.load_variable, .{ .index = tmp_var });
+    try ctx.emit(op, .{ .none = {} });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+}
+
+/// Emit `LHS //= f`. The semantics: for each path, if the current value at
+/// that path is truthy keep it; otherwise replace with `$orig | f`.
+fn emitGeneralAlternativeUpdate(
+    ctx: *Ctx,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    dels_var: u32,
+    p_var: u32,
+    r_var: u32,
+    rhs: CapturedRhs,
+) (ZqError || error{OutOfMemory})!void {
+    _ = dels_var;
+    _ = r_var;
+    const tmp_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    // $tmp = $orig | f
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try appendRebasedInstrsCopy(ctx, rhs);
+    try ctx.emit(.capture_variable, .{ .index = tmp_var });
+
+    // $acc = $orig
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    // For each $p: if getpath($acc; $p) is truthy keep, else setpath with $tmp.
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+
+    const inner_ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    try ctx.emit(.each, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = p_var });
+
+    // current = getpath($acc; $p)
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.getpath) });
+    try ctx.emit(.pipe, .{ .none = {} });
+    // jump_if_false → ELSE branch
+    try ctx.emit(.push_current, .{ .none = {} });
+    const jif_pos = ctx.raw.items.len;
+    try ctx.emit(.jump_if_false, .{ .index = 0 });
+    // THEN: keep — no change to $acc, just backtrack
+    const jump_end_pos = ctx.raw.items.len;
+    try ctx.emit(.jump, .{ .index = 0 });
+
+    // ELSE: $acc = setpath($acc; $p; $tmp)
+    ctx.raw.items[jif_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = p_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = tmp_var });
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.setpath) });
+    try ctx.emit(.capture_variable, .{ .index = acc_var });
+
+    ctx.raw.items[jump_end_pos].operand = .{ .index = @intCast(ctx.raw.items.len) };
+
+    try ctx.emit(.backtrack, .{ .none = {} });
+
+    const inner_ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = acc_var });
+}
+
+/// Emit `[]` (empty array literal) onto the value stack.
+fn emitEmptyArray(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+    const end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[start].operand = .{ .index = end };
+}
+
+/// Copy raw instructions from `[start, end)` into a heap-allocated buffer and
+/// truncate the raw stream back to `start`. Caller must free the returned slice.
+fn captureAndTruncate(ctx: *Ctx, start: usize, end: usize) error{OutOfMemory}!CapturedRhs {
+    const slice = ctx.raw.items[start..end];
+    const buf = try ctx.alloc.alloc(RawInstr, slice.len);
+    @memcpy(buf, slice);
+    ctx.raw.items.len = start;
+    return .{ .instrs = buf, .original_start = @intCast(start) };
+}
+
+/// A captured buffer of raw instructions with the original IP base they were
+/// emitted at. Needed so we can rebase internal jump targets when re-emitting
+/// the buffer at a different position in the raw stream.
+const CapturedRhs = struct {
+    instrs: []RawInstr,
+    original_start: u32,
+};
+
+/// Append the captured RHS by first copying it (so the original buffer is
+/// preserved for subsequent appends with the same logical original_start).
+fn appendRebasedInstrsCopy(ctx: *Ctx, captured: CapturedRhs) error{OutOfMemory}!void {
+    const new_start: i64 = @intCast(ctx.raw.items.len);
+    const offset: i64 = new_start - @as(i64, @intCast(captured.original_start));
+    const copy = try ctx.alloc.alloc(RawInstr, captured.instrs.len);
+    defer ctx.alloc.free(copy);
+    @memcpy(copy, captured.instrs);
+    rebaseExprBuf(copy, offset);
+    try ctx.raw.appendSlice(ctx.alloc, copy);
+}
+
+fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseComma(ctx);
     while (true) {
         const t = try ctx.lex.peek();
@@ -1642,6 +2189,18 @@ fn parsePipe(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         try ctx.emit(.pipe, .{ .none = {} });
         try parseComma(ctx);
     }
+}
+
+/// Parse one operand of a `,` expression. This is the precedence level that
+/// recognizes update assignment operators (`=`, `|=`, `+=`, etc.) — they bind
+/// TIGHTER than `|` and `,` but LOOSER than `//` and arithmetic. Matches jq's
+/// grammar where `Exp '=' Exp` is at this precedence level.
+fn parseCommaOperand(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    if (try peekIsUpdateAssign(ctx)) {
+        try parseUpdateAssign(ctx);
+        return;
+    }
+    try parseAlternative(ctx);
 }
 
 /// parseComma: `,` generator operator.
@@ -1668,7 +2227,7 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     defer jump_fixups.deinit(ctx.alloc);
 
     var left_start: usize = ctx.raw.items.len;
-    try parseAlternative(ctx);
+    try parseCommaOperand(ctx);
 
     // Track the position of the previous FORK so we can fix its target after
     // the next insertRawInstr (which auto-adjusts it one past the new FORK,
@@ -1707,7 +2266,7 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             _ = try ctx.nextToken(); // consume 'def'
             try parseFunctionDef(ctx);
         } else {
-            try parseAlternative(ctx);
+            try parseCommaOperand(ctx);
         }
 
         // Backpatch FORK target to the start of the right side.
@@ -5814,6 +6373,7 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             try parseSliceTail(ctx, false, 0);
         },
         .int_lit, .minus => {
+            const saved_lex = ctx.lex.pos;
             const n = (try tryParseIndexInt(ctx)) orelse return ctx.syntaxErr(ctx.last_tok_offset, 0);
             const after = try ctx.lex.peek();
             if (after.tag == .colon) {
@@ -5821,15 +6381,19 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 _ = try ctx.nextToken(); // consume ':'
                 if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
                 try parseSliceTail(ctx, true, @intCast(n));
-            } else {
-                // .[n] — index access (negative allowed)
+            } else if (after.tag == .rbracket) {
+                // .[n] — simple index access (negative allowed)
+                _ = try ctx.nextToken();
                 if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                const close = try ctx.nextToken();
-                if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
                 try ctx.emit(
                     .load_index,
                     .{ .index = n },
                 );
+            } else {
+                // Complex expression (commas, etc.) — fall back to computed access.
+                // Restore lex to before the integer so parsePipe re-parses the full expression.
+                ctx.lex.pos = saved_lex;
+                try compileComputedBracket(ctx);
             }
         },
         .string_lit => {
@@ -5843,15 +6407,51 @@ fn parseBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             try ctx.emit(.load_key, .{ .str_ref = ref });
         },
         else => {
-            // Computed access .[expr]: save base to if_stack, evaluate expr,
-            // then load_computed pops base and applies current/top-of-stack as key.
-            try ctx.emit(.save_input, .{ .none = {} });
-            try parsePipe(ctx);
-            const close = try ctx.nextToken();
-            if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
-            try ctx.emit(.load_computed, .{ .none = {} });
+            // Computed access .[expr] — handles both single-value and generator
+            // expressions (e.g. `.[1,2,3]`).
+            try compileComputedBracket(ctx);
         },
     }
+}
+
+/// Compile computed bracket access `[<expr>]` where the lex is positioned at
+/// the first token inside the brackets. Consumes the closing `]`.
+///
+/// Uses a variable-based pattern that survives generator iteration: the base
+/// (current input) is captured into a variable BEFORE evaluating the bracket
+/// expression, so it remains accessible across fork backtracks. After the
+/// expression yields each output, the per-iteration code re-saves the base
+/// to the if_stack and runs `load_computed`, ensuring the save/load pair is
+/// balanced for every output.
+fn compileComputedBracket(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    const base_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const key_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try pushScope(ctx, ctx.alloc);
+
+    // $base = current
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = base_var });
+
+    // Evaluate the bracket expression. May be a generator that produces
+    // multiple outputs via fork/backtrack.
+    try parsePipe(ctx);
+
+    const close = try ctx.nextToken();
+    if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
+
+    // Per-iteration code: capture key, restore base, perform lookup.
+    // This block re-runs for every fork output produced by the bracket expr.
+    try ctx.emit(.capture_variable, .{ .index = key_var });
+    try ctx.emit(.load_variable, .{ .index = base_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = key_var });
+    try ctx.emit(.load_computed, .{ .none = {} });
+
+    popScope(ctx, ctx.alloc);
 }
 
 // ── String interning ──────────────────────────────────────────────────────────
