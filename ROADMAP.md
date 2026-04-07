@@ -661,16 +661,9 @@ behavior is considered a bug, a footgun, or a missed opportunity.
    (and agents) will not switch if their existing scripts break. But compatibility
    serves agent adoption — agents already know jq syntax.
 
-3. **Measure everything.** No performance claim without a reproducible benchmark.
-   "Faster" means a published number, not a feeling.
-
 4. **One module at a time.** The deep modules architecture means each module can
    evolve independently. The query VM is the critical path for v0.1 — everything
    else is already in place.
 
 5. **Test against jq, not against ourselves.** The compat test suite is the source
    of truth. A feature is done when jq's own tests pass.
-
-6. **Ship early.** v0.1 with 60% compat, `--json-errors`, and `--describe` is more
-   valuable than a perfect v1.0 that never ships. Agents can start choosing zq
-   for simple workflows immediately.
