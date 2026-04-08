@@ -2717,7 +2717,7 @@ pub const ResultIterator = struct {
 
     /// Dispatch to individual builtin implementations.
     /// Returns a StackValue to push (or null for empty/generators that set ip).
-    fn doBuiltin(it: *ResultIterator, bid: BuiltinId) ZqError!?StackValue {
+    noinline fn doBuiltin(it: *ResultIterator, bid: BuiltinId) ZqError!?StackValue {
         switch (bid) {
             .length => return try it.builtinLength(),
             .keys => return try it.builtinKeys(true),
@@ -2725,7 +2725,7 @@ pub const ResultIterator = struct {
             .values => return try it.builtinValues(),
             .has => return try it.builtinHas(),
             .in_ => return try it.builtinIn(),
-            .type_ => return try it.builtinType(),
+            .type_ => return it.builtinType(),
             .empty => {
                 // `empty` produces no output — backtrack to next generator path.
                 if (!it.doBacktrack()) {
@@ -3116,7 +3116,9 @@ pub const ResultIterator = struct {
         }
     }
 
-    fn builtinType(it: *ResultIterator) ZqError!?StackValue {
+    fn builtinType(it: *ResultIterator) ?StackValue {
+        // All type names are compile-time string literals with static lifetime;
+        // no need to intern them into the runtime tape's string buffer.
         const type_str: []const u8 = switch (it.current) {
             .null_val => "null",
             .bool_val => "boolean",
@@ -3125,22 +3127,15 @@ pub const ResultIterator = struct {
             .array => "array",
             .object => "object",
         };
-        const str_ref = try it.runtime_tape.internString(it.alloc, type_str);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return .{ .tape_value = .{ .string = type_str } };
     }
 
     fn builtinTostring(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .string => |s| return .{ .tape_value = .{ .string = s } },
-            .null_val => {
-                const str_ref = try it.runtime_tape.internString(it.alloc, "null");
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
-            },
-            .bool_val => |b| {
-                const s: []const u8 = if (b) "true" else "false";
-                const str_ref = try it.runtime_tape.internString(it.alloc, s);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
-            },
+            // null → "null" and bool → "true"/"false" are static literals; no interning needed.
+            .null_val => return .{ .tape_value = .{ .string = "null" } },
+            .bool_val => |b| return .{ .tape_value = .{ .string = if (b) "true" else "false" } },
             .int => |n| {
                 var tmp: [32]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.TypeError;

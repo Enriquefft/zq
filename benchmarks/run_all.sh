@@ -8,8 +8,9 @@ BENCHMARK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUMMARY_FILE="$BENCHMARK_DIR/results/SUMMARY.md"
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 
-# Parse flags
-ZQ_QUICK=0
+# Parse flags — honor the environment variable if already set, then allow
+# the --quick command-line flag to override.
+ZQ_QUICK="${ZQ_QUICK:-0}"
 for arg in "$@"; do
     case "$arg" in
         --quick) ZQ_QUICK=1 ;;
