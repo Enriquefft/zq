@@ -510,106 +510,24 @@ capability and extends it for the LLM streaming workflow.
 
 ## Research-Backed Optimizations
 
-> Goal: Engineering improvements that simultaneously advance zq's performance.
-> Each item is grounded in verified codebase analysis and positioned against
-> existing literature.
->
-> **Engineering verdict:** Each item is tagged with one of:
-> - **Implement** — unconditional engineering win, do regardless of paper
-> - **Profile first** — promising but needs workload data before committing
-> - **Paper only** — academic value but not worth the engineering complexity
->
-> **Summary: 9 implement, 5 profile first, 6 paper only.**
+Research-tracked optimizations and the paper portfolio they feed have moved
+to **[RESEARCH_ROADMAP.md](RESEARCH_ROADMAP.md)** — a parallel roadmap that
+organizes the same engineering work around defensible publishable papers,
+with shared infrastructure (the harness, the parse-plan IR, the workload
+corpus) so the engineering and research tracks reinforce each other instead
+of duplicating.
 
----
+The research roadmap is engineering-first: every item must produce shippable
+engineering value, and items tagged as unconditional engineering wins
+(projection pushdown, predicate pushdown, object key indexing, cached length,
+COW strings, constant folding, extended fuse pass, streaming/file gap
+closure) will land in main regardless of whether any paper ships. Items
+tagged "profile first" or "paper only" are gated on workload data and
+explicit data-driven decisions, not pre-committed.
 
-### Track A: Push Query Semantics into the Parser
-
-zq currently parses every field in every record, even when
-the query touches one field. These optimizations fuse query knowledge into the parsing
-stage, eliminating work before values are ever constructed.
-
-**Prior art:** Mison (VLDB 2017), Sparser (VLDB 2018), simdjson On-Demand (SPE 2024), dsJSON (SIGMOD 2023)
-
-| | Item | What it does | Why it's publishable | Verified bottleneck |
-|---|------|-------------|---------------------|---------------------|
-| [ ] | **Projection pushdown** | `.id` on a 50-field object skips parsing 49 fields. Build SIMD structural index (colon/comma bitmaps per nesting level) to jump directly to queried fields. Fuse pass already identifies needed fields — feed that back to parser. | Mison showed 3.6-10.2x speedup. Novel integration: projection pushdown in a parallel tape-based system with SIMD structural indexing. No prior work combines all three. | `lookupKey()` iterates linearly through all object entries (`vm.zig`). Full tape always built regardless of query. | **Implement** |
-| [ ] | **Raw byte pre-filtering (Sparser-style)** | For `select(.status == "active")`, scan raw bytes for `"active"` with SIMD before any parsing. Records that don't contain the substring are skipped entirely. False positives are cheap (just parse normally); false negatives are impossible. Cascade multiple cheap filters for compound predicates. | Sparser showed 22x over Mison on high-selectivity queries. zq already has SIMD infrastructure — adding raw filters is a natural extension. Novel: Sparser + chunk-parallel architecture. | `select()` parses entire record then evaluates in VM (`compiler.zig`). No early rejection. | **Profile first** — only helps high-selectivity on large records. Adds complexity for a narrow case. |
-| [ ] | **Predicate pushdown into parser** | For `select(.age > 30)`, evaluate the predicate during parsing. Once `.age` is found and its value parsed, reject immediately without constructing the rest of the tape. Requires compiler to emit "parse-and-filter" plans for simple predicates on top-level fields. | dsJSON (SIGMOD 2023) introduced projection trees for distributed JSON. Fusing predicate evaluation with tape construction in a bytecode VM is novel. | Full tape constructed before any filtering. VM evaluates predicate on complete value. | **Implement** |
-| [ ] | **Speculative schema caching** | JSONL records typically share structure. Cache field byte-offsets from record N, speculatively jump directly to that offset in record N+1. Validate with a single comparison. Cache miss falls back to structural index traversal. | Mison introduced speculation (10.2x with vs 3.6x without). Novel: speculation in a multi-threaded chunk-parallel system where each worker maintains its own speculative cache. | Records parsed independently. No cross-record optimization. | **Profile first** — fragile; one heterogeneous dataset breaks the cache. Measure schema stability on real workloads before committing. |
-| [ ] | **On-demand / lazy materialization** | After structural indexing, don't build tape entries for fields the query doesn't access. Materialize values lazily on first access. For `.id` on wide objects, only one tape entry is created. | simdjson On-Demand (SPE 2024) showed this outperforms both DOM and SAX. Novel: lazy materialization integrated with parallel pool + sequencer architecture. | Full tape always constructed in parser (`parser.zig`). | **Paper only** — massive tape format refactor for marginal gain once projection pushdown exists. They solve the same problem; projection pushdown is simpler. |
-
-**Implementation order:** Projection pushdown first (clearest gain, simplest to measure), then predicate pushdown (compounds with projection). Sparser and speculation only after profiling on real workloads justifies them. On-demand is paper-track only.
-
-**Expected combined gain:** 2-5x for selective queries (`.id`, `select()`, `has()`) on wide objects.
-
----
-
-### Track B: Adaptive Execution
-
-zq has two fast execution modes (streaming, parallel file) but no principled mechanism
-to choose between strategies or adapt mid-execution. Academic work on adaptive query
-processing (Eddies, Spark AQE) shows runtime adaptation outperforms static plans on
-heterogeneous workloads.
-
-**Prior art:** Eddies (SIGMOD 2000), Adaptive Query Processing survey (FnT Databases 2007), Spark AQE (2020), Learned Cost Models (SIGMOD 2020-2025)
-
-| | Item | What it does | Why it's publishable | Verified bottleneck |
-|---|------|-------------|---------------------|---------------------|
-| [ ] | **Per-chunk adaptive strategy** | After processing the first N chunks, measure actual selectivity and parse cost. If selectivity is low (<5% of records pass), switch remaining chunks to Sparser-style raw filtering. If records are simpler than expected, adjust chunk sizing. | Per-chunk granularity is novel — Eddies operates per-tuple, Spark AQE per-stage. Chunk-level is the natural unit for parallel JSON processing. | `computeParams()` uses static memory-based formula. No runtime adaptation. Strategy fixed at query start. | **Profile first** — switching logic itself adds overhead. Only worth it if workloads are genuinely heterogeneous within a single run. |
-| [ ] | **Cost model for mode selection** | Predict optimal execution mode (single-threaded / pool-file / pool-stream) and parameters (chunk size, batch size, in-flight limit) from input characteristics (size, record density, query complexity). Even a simple heuristic model, if well-evaluated, is a contribution. | Cross-engine cost models (SIGMOD 2025) showed 25-30% gains from learned routing. Novel: applying cost model principles to a specialized JSON processor's mode selection. | `MemoryBudget` considers only memory, not query cost or record complexity. Stream batch size (256 KB) has no sensitivity analysis. | **Paper only** — a few `if` statements on file size and query type gets 95% of the way. A formal model is over-engineering. |
-| [ ] | **Close the streaming/file gap** | Streaming is 3.3x slower than file mode (3.47s vs 1.05s). Root causes: single IO thread serializes all reading, per-batch heap allocation (`allocator.dupe` per 256KB batch), `JobQueue.signal()` wakes only one thread. Fix: multiple IO threads, zero-copy batch handoff, `broadcast()` on queue drain. | Systematic analysis of streaming vs mmap performance in a real system, with principled fixes, is a systems contribution. | Single IO thread (`pool/root.zig` io_thread_fn). Per-batch `dupe()` allocation. File mode is zero-copy from mmap. | **Implement** |
-
-**Expected combined gain:** 1.5-3x on streaming workloads; smarter strategy selection across diverse inputs.
-
----
-
-### Track C: Compiler Optimizations for JSON Query Bytecode
-
-zq's compiler emits bytecode with a single fuse pass (collapsing `.a | .b | .c`). Standard
-compiler optimizations — constant folding, CSE, specialized instruction emission — are
-entirely absent. Applying these to a JSON query bytecode VM is a novel domain.
-
-**Prior art:** Compiled vs Vectorized Queries (PVLDB 2018), general compiler optimization literature
-
-| | Item | What it does | Why it's publishable | Verified bottleneck |
-|---|------|-------------|---------------------|---------------------|
-| [ ] | **Constant folding** | `.x + 5 - 2` compiles to `.x + 3` (saves 2 instructions). `select(true)` becomes identity. `expr and false` short-circuits. Boolean/arithmetic simplification at compile time. | Standard optimization applied to novel domain. Combined with other compiler opts, forms coherent "optimizing compiler for JSON queries" story. | No constant folding. Literals emitted as separate push instructions. | **Implement** |
-| [ ] | **Common subexpression elimination** | `(.x + .y) + (.x + .y)` computes `.x + .y` once, reuses result. Build expression DAG during compilation, detect duplicates. | CSE on a filter-language bytecode is novel. 10-20% instruction reduction on complex filters. | Each subexpression compiled independently. No DAG or deduplication. | **Paper only** — JSON queries are rarely complex enough. Implementation cost (expression DAG) far exceeds gain on real filters. |
-| [ ] | **Monomorphic selector specialization** | Detect `select(.field == literal)` at compile time. Emit specialized bytecode that branches on field value directly, eliminating generic comparison dispatch + fork setup. | JIT-like specialization for interpreted JSON queries. 10-30% speedup on filter-heavy workloads. | `select()` compiles as: save_input, evaluate predicate generically, jump_if_false, restore (`compiler.zig`). | **Profile first** — nice but adds compiler complexity for one pattern. |
-| [ ] | **Extended fuse pass** | Fuse `.key \| has()` → `key_exists` opcode. Fuse `.key \| length` → `key_length`. Fuse `.key \| type` → `key_type`. Current fuse pass only handles consecutive `load_key` chains. | Systematic instruction fusion for JSON query VMs — generalizes simdjson's on-demand approach to bytecode. | Fuse pass limited to `.a \| .b \| .c` → `load_path` (`compiler.zig`). | **Implement** |
-| [ ] | **Tail call optimization** | Recursive `def` functions (e.g., `def fact(n): if n <= 1 then 1 else n * fact(n-1) end`) converted to loops. Detect tail-position calls, eliminate call frames. | TCO for a JSON query language. 80-90% speedup on recursive user-defined functions. | No TCO. Each recursive call allocates a full call frame. | **Paper only** — very few people write recursive `def` in jq. Not an engineering priority. |
-
-**Expected combined gain:** 15-35% on complex queries; eliminates pathological performance on recursive functions.
-
----
-
-### Track D: Data Structure Optimizations
-
-Targeted improvements to the tape format, value representation, and hot builtin
-implementations. Individually small, but collectively significant and measurable.
-
-| | Item | What it does | Expected gain | Verified bottleneck |
-|---|------|-------------|---------------|---------------------|
-| [ ] | **Object key indexing** | For objects with >N keys (e.g., N=16), build a compact hash table mapping keys to tape offsets during parsing. `has()`, `lookupKey()`, field access become O(1) instead of O(fields). | 20-40% on `has()`/field access for wide objects | `lookupKey()` linear scans all entries (`vm.zig`). `has()` also linear (`vm.zig`). | **Implement** |
-| [ ] | **Cached array/object length** | Store element count in tape during parsing. `length` builtin returns cached value instead of re-walking tape. Zero cost at parse time (counter already maintained). | 8-15% on `length`-heavy queries | `length` re-walks tape on every call (`vm.zig`). | **Implement** |
-| [ ] | **String deduplication** | Build per-chunk hash map of `{string bytes → string_buf offset}`. Reuse offsets for duplicate keys/values. High impact on logs/configs with repeated field names. | 10-30% memory on repetitive data | Strings always copied to string_buf. No deduplication (`parser.zig`). | **Profile first** — hash table per chunk adds CPU cost. Only wins on highly repetitive data (logs). |
-| [ ] | **COW strings** | For unescaped strings, store pointer into input buffer instead of copying to string_buf. Only copy strings that need escape processing. Requires input buffer to outlive tape (already true for mmap). | 20-30% memory on large-string JSON; ~5% parse speed | All strings copied regardless of escape status (`parser.zig`). | **Implement** |
-| [ ] | **Inline small strings** | Embed strings <=8 bytes directly in the tape entry payload. Eliminates string_buf indirection for short keys like `"id"`, `"name"`, `"type"`. | 10-15% on short-key-heavy JSON | All strings go through string_buf indirection (`types.zig`). | **Paper only** — changes tape layout for marginal cache improvement. High blast radius. |
-| [ ] | **Type-aware arithmetic opcodes** | `add_int`, `add_float`, `add_string` instead of generic `add` with runtime type dispatch. Compiler detects operand types, emits specialized opcode. | 5-8% on numeric-heavy queries | Generic `add` dispatches through type switch every call. | **Paper only** — adds opcode count + compiler complexity for 5-8% on numeric queries that barely exist in practice. |
-
----
-
-### Track E: Evaluation Infrastructure
-
-No paper without rigorous evaluation. This track is table-stakes.
-
-| | Item | What it does | Why it matters |
-|---|------|-------------|---------------|
-| [ ] | **Multi-system benchmark suite** | Compare against jq, jaq, gojq, simdjson (with custom query layer), DuckDB `read_json`, ClickHouse JSON, Polars JSON. Varied workloads: wide records, deep nesting, high/low selectivity, small/large files, streaming vs file. | No rigorous academic benchmark exists for this space. Filling this gap is itself a contribution. Current benchmarks only compare jq and jaq. | **Implement** |
-| [ ] | **Microbenchmark harness** | Isolate and measure individual components: parse time, field lookup, predicate evaluation, serialization, thread coordination. Before/after for each optimization. | Reviewers want to see where time goes, not just end-to-end numbers. Required to attribute gains to specific optimizations. | **Implement** |
-| [ ] | **Workload characterization** | Curate diverse JSON datasets: API responses (GitHub, Twitter), logs (CloudWatch, ELK), configs (package.json, Terraform), geospatial (GeoJSON), scientific (nested arrays). Characterize record width, nesting depth, string ratio, schema stability. | Optimization effectiveness varies by workload. A paper needs to show gains aren't cherry-picked. | **Implement** |
-| [ ] | **Scalability analysis** | Measure throughput as function of: core count (1-64), file size (1MB-100GB), record size (50B-50KB), selectivity (0.1%-100%), nesting depth (1-20). | Establishes where zq's architecture excels and where it breaks down. Required for a systems paper. | **Implement** |
+See [RESEARCH_ROADMAP.md](RESEARCH_ROADMAP.md) for the full portfolio,
+phase plan, decision log, and the explicit list of killed items (with
+reasons).
 
 ---
 
