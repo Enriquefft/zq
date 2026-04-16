@@ -71,14 +71,16 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
 
 ### Milestone criteria
 
-- [x] 60%+ of migrated jq compat tests pass (achieved: 80.0%, 426/533)
-- [x] 100% of internal regression tests pass (achieved: 443/443)
-- [x] 75%+ compat **with parity** for assignment, paths, error semantics (achieved: 80.0%; remaining gaps are decnum-dependent — require jq's arbitrary-precision build)
+*Goals — pure checklist. For live numbers see Quick Status above and Success Metrics below.*
+
+- [x] 60%+ of migrated jq compat tests pass
+- [x] 100% of internal regression tests pass
+- [x] 75%+ compat **with parity** for assignment, paths, error semantics — remaining gaps are decnum-dependent (require jq's arbitrary-precision build)
 - [ ] All P0/P1 query features below are implemented
-- [x] `zq` binary under 3 MB static (2.7 MB stripped)
+- [x] `zq` binary under 3 MB static
 - [ ] Zero known crashes on valid JSON input
-- [x] Memory: RSS < 2x input size for per-record queries on file mode (achieved: 0.31x for `.id`, 0.64x for `select()`)
-- [x] Startup time < 3ms (achieved: ~2ms)
+- [x] Memory: RSS < 2x input size for per-record queries on file mode
+- [x] Startup time < 3ms
 - [x] `--json-errors` produces structured error output
 - [x] `--describe` shows input data shape
 - [x] `--validate` checks filter syntax without executing
@@ -199,7 +201,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 
 - [ ] 95%+ of migrated jq compat tests pass
 - [ ] Published benchmark suite with reproducible results
-- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq (achieved 31x on `.id`, 37x on `select()`)
+- [x] Demonstrated 10x+ throughput on JSONL workloads vs jq
 - [ ] `--strict` + `--suggest` + `--explain` all working
 - [ ] WASM build for sandboxed agent environments
 - [ ] Python bindings for programmatic agent use
