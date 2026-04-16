@@ -1233,19 +1233,23 @@ fn insertRawInstr(ctx: *Ctx, pos: usize, instr: RawInstr) error{OutOfMemory}!voi
         ctx.raw.items[i] = ctx.raw.items[i - 1];
     }
     ctx.raw.items[pos] = instr;
-    // Fix up jump targets whose value is at or past the insertion point.
+    // Fix up jump targets whose value is STRICTLY past the insertion point.
+    // A target equal to `pos` refers to the newly-inserted instruction (e.g.
+    // a jump emitted earlier with target = end-of-block, where a new fork is
+    // now being inserted right at that boundary). Shifting it would cause the
+    // jump to land past the new instruction, skipping it.
     const p = @as(u32, @intCast(pos));
     for (ctx.raw.items) |*r| {
         if (r.op.hasIpOperand()) {
-            if (r.operand.index >= p) r.operand.index += 1;
+            if (r.operand.index > p) r.operand.index += 1;
         } else if (r.op.hasSentinelIpOperand()) {
-            if (r.operand.index > 0 and r.operand.index >= p) r.operand.index += 1;
+            if (r.operand.index > 0 and r.operand.index > p) r.operand.index += 1;
         }
     }
     // Fix up recursive function body IPs in the function table.
     for (ctx.function_table.items) |*func| {
-        if (func.recursive_body_ip > 0 and func.recursive_body_ip >= p) func.recursive_body_ip += 1;
-        if (func.recursive_body_end_ip > 0 and func.recursive_body_end_ip >= p) func.recursive_body_end_ip += 1;
+        if (func.recursive_body_ip > 0 and func.recursive_body_ip > p) func.recursive_body_ip += 1;
+        if (func.recursive_body_end_ip > 0 and func.recursive_body_end_ip > p) func.recursive_body_end_ip += 1;
     }
 }
 
@@ -2242,11 +2246,8 @@ fn parseComma(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
         // Insert FORK before the left subtree — target placeholder.
         try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
 
-        // Fix previous FORK: insertRawInstr auto-adjusted its target from
-        // left_start to left_start+1 (because the old branch start shifted),
-        // but we want it to point AT left_start (this new FORK) for correct
-        // chaining: backtracking to the previous FORK should land on this FORK
-        // which sets up the next branch's forkpoint.
+        // Point previous FORK at this new FORK so backtracking from an earlier
+        // branch lands here and sets up the next branch's forkpoint.
         if (prev_fork_pos) |pfp| {
             ctx.raw.items[pfp].operand.index = @intCast(left_start);
         }
@@ -2631,6 +2632,8 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "infinite")) return .infinite_;
     if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_;
     if (std.mem.eql(u8, name, "isnan")) return .isnan_;
+    if (std.mem.eql(u8, name, "have_decnum")) return .have_decnum_;
+    if (std.mem.eql(u8, name, "have_literal_numbers")) return .have_decnum_;
     if (std.mem.eql(u8, name, "isnormal")) return .isnormal_;
     if (std.mem.eql(u8, name, "exp")) return .exp_;
     if (std.mem.eql(u8, name, "exp2")) return .exp2_;

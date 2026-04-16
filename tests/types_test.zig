@@ -296,6 +296,8 @@ test "copySpan: strings are re-interned at new offsets" {
 
 test "formatJqFloat: integer-valued floats" {
     const f = formatJqFloat;
+    // jq's jvp_dtoa_fmt uses the same decpt threshold for all values; small
+    // integer-valued floats fall into the decimal-with-trailing-zeros branch.
     try std.testing.expectEqualStrings("2", f(2.0).slice());
     try std.testing.expectEqualStrings("100", f(100.0).slice());
     try std.testing.expectEqualStrings("0", f(0.0).slice());
@@ -313,19 +315,22 @@ test "formatJqFloat: simple decimals" {
 
 test "formatJqFloat: scientific notation" {
     const f = formatJqFloat;
-    // 1e17 fits in i64, so it's formatted as integer
-    try std.testing.expectEqualStrings("100000000000000000", f(1e17).slice());
+    // jq threshold: decpt > nd + 15 → scientific. 1e17 has nd=1, decpt=18,
+    // so 18 > 16 → "1e+17" (not the integer "100000000000000000").
+    try std.testing.expectEqualStrings("1e+17", f(1e17).slice());
     // Non-integer floats use shortest representation with jq thresholds
     try std.testing.expectEqualStrings("1.1e-19", f(1.1e-19).slice());
     try std.testing.expectEqualStrings("1.05e-19", f(1.05e-19).slice());
     try std.testing.expectEqualStrings("1.7976931348623157e+308", f(1.7976931348623157e+308).slice());
-    // Large integer-valued floats that overflow i64 use jvp_dtoa_fmt
     try std.testing.expectEqualStrings("1e+20", f(1e20).slice());
 }
 
 test "formatJqFloat: NaN and Inf" {
     const f = formatJqFloat;
+    // NaN is the only "invalid" number in jq; it serialises as null.
     try std.testing.expectEqualStrings("null", f(std.math.nan(f64)).slice());
-    try std.testing.expectEqualStrings("null", f(std.math.inf(f64)).slice());
-    try std.testing.expectEqualStrings("null", f(-std.math.inf(f64)).slice());
+    // jq clamps ±Inf to ±DBL_MAX before formatting (jv_print.c), yielding
+    // the largest finite magnitude in scientific notation.
+    try std.testing.expectEqualStrings("1.7976931348623157e+308", f(std.math.inf(f64)).slice());
+    try std.testing.expectEqualStrings("-1.7976931348623157e+308", f(-std.math.inf(f64)).slice());
 }

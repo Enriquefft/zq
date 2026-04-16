@@ -145,10 +145,18 @@ test "compact: float 0.0" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), parsed, 1e-15);
 }
 
-test "compact: float infinity renders as null" {
+test "compact: float infinity renders as clamped DBL_MAX" {
+    // jq clamps ±Inf to ±DBL_MAX before formatting (jv_print.c). Previously
+    // zq emitted "null" here, diverging from jq's non-decnum behaviour.
     const s = try renderValue(.{ .float = std.math.inf(f64) }, .compact);
     defer alloc.free(s);
-    try std.testing.expectEqualStrings("null", s);
+    try std.testing.expectEqualStrings("1.7976931348623157e+308", s);
+}
+
+test "compact: float -infinity renders as clamped -DBL_MAX" {
+    const s = try renderValue(.{ .float = -std.math.inf(f64) }, .compact);
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("-1.7976931348623157e+308", s);
 }
 
 test "compact: float nan renders as null" {

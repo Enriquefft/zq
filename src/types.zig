@@ -287,6 +287,7 @@ pub const BuiltinId = enum(u16) {
     isinfinite_, // true if input is infinite
     isnan_, // true if input is NaN
     isnormal_, // true if input is a normal number
+    have_decnum_, // always false — zq uses f64, not jq's decimal numbers
     exp_, // e^x
     exp2_, // 2^x
     exp10_, // 10^x
@@ -480,6 +481,7 @@ pub const BuiltinId = enum(u16) {
             .isinfinite_,
             .isnan_,
             .isnormal_,
+            .have_decnum_,
             .exp_,
             .exp2_,
             .exp10_,
@@ -916,42 +918,46 @@ pub const FormattedFloat = struct {
 
 /// Format a f64 for JSON output using jq's non-decnum formatting rules.
 ///
-/// Rules (matching jq's jvp_dtoa_fmt):
-///   1. NaN and Inf → "null"
-///   2. Integer-valued floats in i64 range → integer format (no decimal point)
-///   3. Otherwise: Ryu shortest representation, then:
-///      - If decpt <= -4 or decpt > ndigits + 15 → scientific notation (e.g. 1.05e-19)
-///      - If decpt <= 0 → decimal with leading zeros (e.g. 0.001)
-///      - Else → decimal with point inserted (e.g. 123.45)
+/// Matches jq's `jvp_dtoa_fmt` (jv_dtoa.c) exactly:
+///   1. NaN → "null" (jq: jv_dump_term emits null for NaN).
+///   2. ±Inf → clamp to ±DBL_MAX, then format normally (jq: jv_print.c clamps
+///      inf to DBL_MAX before calling dtoa_fmt; so 1E+1000 → 1.7976931348623157e+308).
+///   3. Otherwise, Ryu shortest representation gives digits + decpt, then:
+///        - decpt <= -4 or decpt > nd + 15 → scientific notation
+///        - decpt <= 0                     → decimal with leading zeros (0.000…digits)
+///        - else                           → decimal, point inserted at decpt
+///
+/// Note: jq's dtoa_fmt has NO integer-valued fast path. Values like 1e17 must
+/// hit the scientific-notation branch (decpt=18 > nd+15=16), otherwise
+/// `1 / 1e-17` would print as `100000000000000000` instead of jq's `1e+17`.
 pub fn formatJqFloat(f: f64) FormattedFloat {
     var result: FormattedFloat = .{ .buf = undefined, .len = 0 };
 
-    // NaN and Infinity → "null"
-    if (std.math.isNan(f) or std.math.isInf(f)) {
+    // NaN → "null"
+    if (std.math.isNan(f)) {
         @memcpy(result.buf[0..4], "null");
         result.len = 4;
         return result;
     }
 
-    // Integer-valued floats → format as integer (no decimal point)
-    if (f == @trunc(f)) {
-        // Check if it fits in i64 range
-        if (f >= @as(f64, @floatFromInt(@as(i64, std.math.minInt(i64)))) and
-            f <= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i64)))))
-        {
-            const i: i64 = @intFromFloat(f);
-            const s = std.fmt.bufPrint(&result.buf, "{d}", .{i}) catch unreachable;
-            result.len = s.len;
-            return result;
-        }
-        // Large integer-valued float outside i64 range — fall through to scientific
+    // ±0 → "0" (jq's IGNORE_ZERO_SIGN in jvp_dtoa_fmt suppresses -0).
+    if (f == 0.0) {
+        result.buf[0] = '0';
+        result.len = 1;
+        return result;
     }
 
-    // Non-integer (or out-of-range integer-valued) float:
+    // Inf → clamp to ±DBL_MAX (matches jq jv_print.c behaviour).
+    // DBL_MAX = 0x1.fffffffffffffp+1023 = 1.7976931348623157e+308.
+    var fx: f64 = f;
+    if (std.math.isInf(fx)) {
+        fx = if (fx > 0) std.math.floatMax(f64) else -std.math.floatMax(f64);
+    }
+
     // Use Zig's Ryu-based {e} format to get the shortest representation
     // in scientific notation: e.g. "1.05e-19", "5e-1", "1.23e5"
     var ryu_buf: [64]u8 = undefined;
-    const ryu = std.fmt.bufPrint(&ryu_buf, "{e}", .{f}) catch unreachable;
+    const ryu = std.fmt.bufPrint(&ryu_buf, "{e}", .{fx}) catch unreachable;
 
     // Parse the Ryu output to extract:
     //   - sign (if negative)

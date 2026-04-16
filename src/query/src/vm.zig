@@ -133,6 +133,14 @@ const Forkpoint = struct {
     /// iterations inside `path(...)` produce one path per iteration rather
     /// than accumulating components across all iterations.
     saved_path: PathSnapshot = .{},
+    /// Snapshot of value-stack entries above the enclosing collect frame's
+    /// outer_value_depth at fork time. When a generator iteration emits a
+    /// value via yield_output, the stack is truncated to outer_value_depth;
+    /// setting items.len back up to saved_value_stack_len on backtrack would
+    /// otherwise expose stale slots. Restoring from this snapshot preserves
+    /// left-operand slots (e.g. `. * (a,b)` keeps `.` for the second branch).
+    /// Null when no collect frame is active (the stack isn't truncated then).
+    saved_stack: ?[]StackValue = null,
 };
 
 /// State for one active function call (used for recursive user-defined functions).
@@ -345,6 +353,9 @@ pub const ResultIterator = struct {
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
         it.call_stack.deinit(it.alloc);
+        for (it.fork_stack.items) |*fp| {
+            if (fp.saved_stack) |snap| it.alloc.free(snap);
+        }
         it.fork_stack.deinit(it.alloc);
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
         it.path_stack.deinit(it.alloc);
@@ -379,6 +390,9 @@ pub const ResultIterator = struct {
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
         it.call_stack.clearRetainingCapacity();
+        for (it.fork_stack.items) |*fp| {
+            if (fp.saved_stack) |snap| it.alloc.free(snap);
+        }
         it.fork_stack.clearRetainingCapacity();
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
         it.path_stack.clearRetainingCapacity();
@@ -438,18 +452,18 @@ pub const ResultIterator = struct {
         }
     }
 
-    /// Push a forkpoint, automatically capturing the current path state and
-    /// the current value stack length so backtrack can restore both correctly.
-    /// All callers should use this helper rather than appending to fork_stack
-    /// directly so path tracking inside generators stays consistent.
-    fn pushFork(it: *ResultIterator, backtrack_ip: u32, aux: ForkAux) void {
-        it.fork_stack.appendAssumeCapacity(.{
-            .saved_value_stack_len = @intCast(it.value_stack.items.len),
-            .saved_current = it.current,
-            .backtrack_ip = backtrack_ip,
-            .aux = aux,
-            .saved_path = it.snapshotPathState(),
-        });
+    /// Truncate the fork stack to `new_len`, freeing any `saved_stack`
+    /// snapshots on the forkpoints being discarded.
+    fn truncateForkStack(it: *ResultIterator, new_len: usize) void {
+        var i = it.fork_stack.items.len;
+        while (i > new_len) {
+            i -= 1;
+            if (it.fork_stack.items[i].saved_stack) |snap| {
+                it.alloc.free(snap);
+                it.fork_stack.items[i].saved_stack = null;
+            }
+        }
+        it.fork_stack.items.len = new_len;
     }
 
     fn peekValue(it: *ResultIterator) ZqError!StackValue {
@@ -551,7 +565,7 @@ pub const ResultIterator = struct {
             };
 
             // Unwind fork stack (pops generators between error and handler).
-            it.fork_stack.items.len = idx;
+            it.truncateForkStack(idx);
             // Unwind other stacks.
             it.value_stack.items.len = fp.saved_value_stack_len;
             it.if_stack.items.len = state.saved_if_len;
@@ -1283,7 +1297,7 @@ pub const ResultIterator = struct {
                         if (state.break_token == token) {
                             const fp = it.fork_stack.items[idx];
                             // Unwind fork stack.
-                            it.fork_stack.items.len = idx;
+                            it.truncateForkStack(idx);
                             // Unwind other stacks.
                             it.value_stack.items.len = fp.saved_value_stack_len;
                             it.if_stack.items.len = state.saved_if_len;
@@ -1473,12 +1487,27 @@ pub const ResultIterator = struct {
             // ── Fork stack opcodes ──────────────────────────────────────────
 
             .fork => {
+                // Capture stack snapshot when inside a collect frame so the
+                // comma backtrack can restore left-operand slots consumed by
+                // the first iteration's binop (e.g. `[. * (a,b)]`).
+                var saved_stack: ?[]StackValue = null;
+                if (it.collect_stack.items.len > 0) {
+                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                    const outer: usize = cf.outer_value_depth;
+                    const cur_len = it.value_stack.items.len;
+                    if (cur_len > outer) {
+                        const slice = try it.alloc.alloc(StackValue, cur_len - outer);
+                        @memcpy(slice, it.value_stack.items[outer..cur_len]);
+                        saved_stack = slice;
+                    }
+                }
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .normal = {} },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = saved_stack,
                 });
                 it.ip += 1;
                 return null;
@@ -1615,7 +1644,7 @@ pub const ResultIterator = struct {
                                 lstate.remaining -= 1;
                                 if (lstate.remaining == 0) {
                                     // Exhausted: unwind fork stack to this limit.
-                                    it.fork_stack.items.len = li;
+                                    it.truncateForkStack(li);
                                     if (it.collect_stack.items.len > 0) {
                                         const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
                                         try cf.buffer.append(it.alloc, try valueToStackValue(val));
@@ -2435,7 +2464,11 @@ pub const ResultIterator = struct {
                 .int => |ri| .{ .float = lf * @as(f64, @floatFromInt(ri)) },
                 .float => |rf| .{ .float = lf * rf },
                 .tape_value => |rtv| switch (rtv) {
-                    .string => |s| try it.doStringRepeat(s, @intFromFloat(@floor(lf))),
+                    // jq: float * string with non-finite count yields null.
+                    .string => |s| if (std.math.isNan(lf) or std.math.isInf(lf))
+                        .null_val
+                    else
+                        try it.doStringRepeat(s, @intFromFloat(@floor(lf))),
                     else => error.TypeError,
                 },
                 else => error.TypeError,
@@ -2450,7 +2483,14 @@ pub const ResultIterator = struct {
                 },
                 .string => |s| switch (right) {
                     .int => |ri| try it.doStringRepeat(s, ri),
-                    .float => |rf| try it.doStringRepeat(s, @intFromFloat(@floor(rf))),
+                    // jq: string * nan or string * ±inf yields null (matches
+                    // jq's dtoi-based repeat-count: dtoi(nan) = 0 → null; and
+                    // "string and string cannot be multiplied" semantics fall
+                    // through to the typeerror→null path for non-finite).
+                    .float => |rf| if (std.math.isNan(rf) or std.math.isInf(rf))
+                        .null_val
+                    else
+                        try it.doStringRepeat(s, @intFromFloat(@floor(rf))),
                     else => error.TypeError,
                 },
                 else => error.TypeError,
@@ -2685,7 +2725,12 @@ pub const ResultIterator = struct {
             try it.popValue()
         else
             try valueToStackValue(it.current);
-        // If either operand is a float (including inf/nan), use float modulo
+        // If either operand is a float, use jq's binop_mod semantics
+        // (builtin.c: nan → nan; else coerce both via dtoi and integer-%):
+        //   dtoi(x) = x < INT64_MIN ? INT64_MIN
+        //           : -x <= INT64_MIN ? INT64_MAX
+        //           : (i64)x
+        // If bi == -1, result is 0 (avoids UB on INT64_MIN % -1).
         const left_is_float = switch (left) {
             .float => true,
             else => false,
@@ -2705,11 +2750,19 @@ pub const ResultIterator = struct {
                 .float => |f| f,
                 else => return error.TypeError,
             };
-            return .{ .float = @rem(lf, rf) };
+            if (std.math.isNan(lf) or std.math.isNan(rf)) {
+                return .{ .float = std.math.nan(f64) };
+            }
+            const bi = dtoiClamp(rf);
+            if (bi == 0) return error.TypeError; // modulo by zero
+            if (bi == -1) return .{ .int = 0 };
+            const ai = dtoiClamp(lf);
+            return .{ .int = @rem(ai, bi) };
         }
         const left_int = try toInt(left);
         const right_int = try toInt(right);
         if (right_int == 0) return error.TypeError; // modulo by zero
+        if (right_int == -1) return .{ .int = 0 };
         return .{ .int = @rem(left_int, right_int) };
     }
 
@@ -2798,6 +2851,8 @@ pub const ResultIterator = struct {
             .isinfinite_ => return it.builtinIsinfinite(),
             .isnan_ => return it.builtinIsnan(),
             .isnormal_ => return it.builtinIsnormal(),
+            // zq uses f64 exclusively; no jq-style decimal (decnum) support.
+            .have_decnum_ => return .{ .bool_val = false },
             .exp_ => return it.builtinExp(),
             .exp2_ => return it.builtinExp2(),
             .exp10_ => return it.builtinExp10(),
@@ -5615,7 +5670,7 @@ pub const ResultIterator = struct {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
                     }
-                    it.fork_stack.items.len = saved_fork_len;
+                    it.truncateForkStack(saved_fork_len);
                     while (it.path_stack.items.len > saved_path_len) {
                         var pf = it.path_stack.pop().?;
                         pf.deinit(it.alloc);
@@ -5652,7 +5707,7 @@ pub const ResultIterator = struct {
             var cf = it.collect_stack.pop().?;
             cf.buffer.deinit(it.alloc);
         }
-        it.fork_stack.items.len = saved_fork_len;
+        it.truncateForkStack(saved_fork_len);
         it.if_stack.items.len = saved_if_len;
         it.value_stack.items.len = saved_value_len;
         while (it.path_stack.items.len > saved_path_len) {
@@ -5772,6 +5827,18 @@ pub const ResultIterator = struct {
             .float => |f| @intFromFloat(@round(f)),
             else => error.TypeError,
         };
+    }
+
+    /// jq's `dtoi` macro (builtin.c): saturating f64→i64 cast.
+    ///   x < INT64_MIN (as f64) → INT64_MIN
+    ///   -x <= INT64_MIN        → INT64_MAX   (covers +inf and large positives)
+    ///   else                   → (i64)x      (truncation toward zero)
+    /// Caller must ensure x is not NaN.
+    fn dtoiClamp(x: f64) i64 {
+        const i64_min_f: f64 = @floatFromInt(std.math.minInt(i64));
+        if (x < i64_min_f) return std.math.minInt(i64);
+        if (-x <= i64_min_f) return std.math.maxInt(i64);
+        return @intFromFloat(x);
     }
 
     fn toFloat(val: StackValue) ZqError!f64 {
@@ -6020,7 +6087,20 @@ pub const ResultIterator = struct {
             const fp = &it.fork_stack.items[it.fork_stack.items.len - 1];
             switch (fp.aux) {
                 .normal => {
-                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    // If we captured a stack snapshot (fork nested in a
+                    // collect), restore the values that yield_output may have
+                    // truncated. Otherwise just restore the length.
+                    if (fp.saved_stack) |snap| {
+                        const outer: usize = if (it.collect_stack.items.len > 0)
+                            it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
+                        else
+                            0;
+                        it.value_stack.items.len = outer;
+                        it.value_stack.appendSliceAssumeCapacity(snap);
+                        it.alloc.free(snap);
+                    } else {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                    }
                     it.current = fp.saved_current;
                     it.ip = fp.backtrack_ip;
                     const saved_path = fp.saved_path;

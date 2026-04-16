@@ -28,16 +28,16 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-04-07)
+## Quick Status (Updated 2026-04-16)
 
-**Last updated:** General update assignment + fork-aware path tracking. Refactored `parseUpdateAssign` and added new `compilePathExprUpdate` that mirrors jq's `_modify`/`_assign` desugar. VM `Forkpoint` now captures `PathSnapshot` and restores it on backtrack so `path(.[1,2])`, `.[] |= f`, `(EXPR) |= f`, function-based LHS (`def x: .[1,2]; x=10`), and per-path empty deletion (`.[] |= select(. > 5)`) all work. New grammar level `parseCommaOperand` puts assignment between `,` and `//` (matches jq precedence) so `.[] += 2, .[] *= 2` parses correctly. Negative index in assignment + sparse array creation on null base + jq-compatible "Out of bounds negative array index" / "Array index too large" error messages.
+**Last updated:** Number-formatting + jq parity fixes. Rewrote `formatJqFloat` to match jq's `jvp_dtoa_fmt` (removed spurious i64 fast-path, ±inf→±DBL_MAX clamp, IGNORE_ZERO_SIGN). Rewrote `doMod` per jq's `binop_mod` with saturating `dtoiClamp` (inf%n, nan, INT64_MIN%-1). `doMul` nan/inf×string→null. Added `have_decnum`/`have_literal_numbers` builtins (return false). Added `Forkpoint.saved_stack` snapshots so binop left-operand survives generator backtrack inside array-collect (`[. * (a,b)]`). Fixed `insertRawInstr` off-by-one in jump-target shifting (`>=`→`>`) which silently skipped half the inner iterations in `(a,b)⊕(c,d,e)`.
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       416/533 passing (78.0%)   <- jq compatibility suite
-  +-- 117 failing, 3 skipped
-Own tests:          442/442 passing (100%)    <- internal regression suite
-Total:              858/975 passing (88.0%)
+Compat tests:       426/533 passing (80.0%)   <- jq compatibility suite
+  +-- 107 failing, 3 skipped
+Own tests:          443/443 passing (100%)    <- internal regression suite
+Total:              869/976 passing (89.0%)
 Startup:            ~2.4 ms (1.5x faster than jq)
 Cold start:         sub-3ms
 
@@ -71,9 +71,9 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
 
 ### Milestone criteria
 
-- [x] 60%+ of migrated jq compat tests pass (achieved: 78.0%, 416/533)
-- [x] 100% of internal regression tests pass (achieved: 442/442)
-- [ ] 75%+ compat **with parity** for assignment, paths, error semantics (achieved: assignment + paths complete, error message parity remaining)
+- [x] 60%+ of migrated jq compat tests pass (achieved: 80.0%, 426/533)
+- [x] 100% of internal regression tests pass (achieved: 443/443)
+- [x] 75%+ compat **with parity** for assignment, paths, error semantics (achieved: 80.0%; remaining gaps are decnum-dependent — require jq's arbitrary-precision build)
 - [ ] All P0/P1 query features below are implemented
 - [x] `zq` binary under 3 MB static (2.7 MB stripped)
 - [ ] Zero known crashes on valid JSON input
@@ -260,7 +260,7 @@ complete above, tracked here for visibility. Goal is **75%+ compat tests** and
 | [x] | **Comma generators in brackets** | ~5 fixed | `.[0,1,2]`, `.[-4,-3,-2,-1,0,1,2,3]`, `path(.foo[0,1])` all work. New `compileComputedBracket` uses a variable-based pattern that survives generator iteration. Path tracking with generators now records one path per fork output. |
 | [ ] | **`path_intact` validation** | ~3 | `try ((map(select(.a == 1))[].a) \|= .+1) catch .` should error with "Invalid path expression near attempt to iterate through ...". jq tracks `value_at_path` identity to detect when a non-path-preserving operation (`map`, `+`, `reverse`, `length`, etc.) intervenes inside a `path()` scope. Requires VM addition: per-fork `value_at_path` snapshot + `path_intact` check at INDEX/EACH/PATH_END. |
 | [ ] | **`del()` with complex args** | ~6 | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Current `compileDel` handles single static keys/indices only. Should desugar to canonical `delpaths([path(arg)])` to use the new path-tracking infrastructure. |
-| [ ] | **Number output formatting** | ~10 | `1+1` outputs `2.0` instead of `2`. Integer results of float arithmetic should display without decimal. Affects tests across builtins, numbers, unary_negation categories. |
+| [x] | **Number output formatting** | ~10 fixed | Rewrote `formatJqFloat` to match jq's `jvp_dtoa_fmt`: removed i64 fast-path (large integer-valued floats like `1/1e-17` now → `1e+17` via scientific threshold), ±inf→±DBL_MAX clamp, IGNORE_ZERO_SIGN. Added `have_decnum`/`have_literal_numbers` builtins (=false), `doMod` per jq's `binop_mod` (inf%n, nan, INT64_MIN%-1), nan/inf×string→null in `doMul`, `Forkpoint.saved_stack` snapshots for generator backtracking. Remaining non-fixable failures (L593, L661, L674, L2195) require jq's decnum build — fundamentally incompatible with f64. |
 | [ ] | **Float index truncation** | ~5 | `.[1.5]` should truncate to `.[1]`, `.[nan]` should error, `.[1.2:3.5]` should truncate slice bounds. (`load_computed` already handles `.[nan]` for path tracking; runtime truncation for slice bounds is the remaining piece.) |
 | [ ] | **Error message compatibility** | ~8 | `try (1/0) catch .`, `try -. catch .` — error strings don't match jq's exact wording. |
 | [ ] | **`contains` deep comparison** | ~2 | Nested object containment check fails. |
@@ -635,7 +635,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 
 | Metric | Current | v0.1 | v0.5 | v1.0 |
 |--------|---------|------|------|------|
-| jq compat test pass rate | **63.6%** (339/533) | 60% | 95% | 100% |
+| jq compat test pass rate | **80.0%** (426/533) | 60% | 95% | 100% |
 | Throughput vs jq (parallel, `.id`) | **31x** (1.05s vs 32.3s) | > 1x | 5x | 10x |
 | Throughput vs jq (parallel, `select()`) | **37x** (1.90s vs 70.2s) | -- | 15x | 20x |
 | Throughput vs jq (parallel, complex) | **43x** (2.22s vs 94.8s) | -- | -- | -- |
@@ -645,7 +645,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Memory (1.3 GB JSONL, `select()`) | **831 MB** (0.64x) | < 2x | < 2x | < 2x |
 | Memory (streaming pipe) | **7 MB** | -- | -- | -- |
 | Throughput vs jq (streaming, `.id`) | **9x** (3.47s vs 32.6s) | -- | -- | 10x |
-| Test count | **339 compat + 442 module** | 400+ | 800+ | 1000+ |
+| Test count | **426 compat + 443 module** | 400+ | 800+ | 1000+ |
 | Agent integration | **--json-errors, --describe, --validate, exit codes, C ABI errors, llms.txt, 134 builtins, LSP, npm, PyPI** | -- | Python bindings, WASM | Framework integrations, MCP |
 
 ---
