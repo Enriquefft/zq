@@ -181,7 +181,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 
 | | Item | Priority |
 |---|------|----------|
-| [x] | jq compat test suite fully migrated (539 tests) | P0 |
+| [x] | jq compat test suite fully migrated (533 tests) | P0 |
 | [x] | CI: `zig build test` on every commit | P0 |
 | [x] | Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
 | [x] | Expanded `--help` with filter syntax, format strings, examples, exit codes, and builtins discovery | P1 |
@@ -248,11 +248,11 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 | [ ] | **Misc (remaining)** | `splits`, `repeat`, `limit/2` |
 | [x] | **Misc (new)** | `utf8bytelength`, `add(expr)` |
 
-### Query language — compat gaps (78% jq-compat pass rate)
+### Query language — compat gaps
 
 Issues found during compat test analysis. These are gaps in features marked
 complete above, tracked here for visibility. Goal is **75%+ compat tests** and
-**100% internal tests** — both currently met.
+**100% internal tests** — both currently met (see Quick Status for live numbers).
 
 | | Feature | Tests blocked | Detail |
 |---|---------|---------------|--------|
@@ -275,8 +275,9 @@ complete above, tracked here for visibility. Goal is **75%+ compat tests** and
 | [x] | **SIMD structural scanner** | AVX2 (x86_64), NEON (aarch64). Classify bytes 32/16 at a time. String scanning and whitespace skipping via SIMD fast paths. |
 | [x] | **Parallel file mode** | mmap + chunk-based workers. Auto-enabled in CLI. Achieved **31x vs jq, 20x vs jaq** on 15M-record JSONL `.id`. |
 | [ ] | **Parallel single-file arrays** | Detect top-level `[{...}, {...}, ...]`. Scan for object boundaries at bracket depth 1, split across workers. |
-| [x] | **Benchmark suite** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
-| [x] | **Startup time** | Target < 3ms cold start. Achieved: 0.8ms (6x faster than jq). |
+| [x] | **Benchmark suite (code)** | `benchmarks/` directory. Hyperfine scripts comparing zq vs jq vs jaq. 5 scenarios: parallelism, memory, startup, streaming, complex query. |
+| [ ] | **Benchmark suite (published)** | Reproducible published results — PR/post with comparison tables, methodology, datasets. |
+| [x] | **Startup time** | Target < 3ms cold start. Achieved: ~2.4ms (1.5x faster than jq); sub-ms without shell overhead. |
 | [x] | **Memory efficiency** | Target < 2x input size. **Achieved: 0.31x for `.id`, 0.64x for `select()` on 1.3 GB file.** Total reduction: -87%. |
 
 ### CLI — remaining flags
@@ -377,11 +378,9 @@ complete above, tracked here for visibility. Goal is **75%+ compat tests** and
 
 ### Memory optimization
 
-| | Item | Detail |
-|---|------|--------|
-| [x] | **Adaptive chunk sizing** | Fewer, larger chunks on memory-constrained systems. Detect available memory and adjust chunk count accordingly. |
-| [x] | **Two-path execution** | Per-record queries use streaming output — emit and free immediately. Aggregation queries necessarily buffer. |
-| [x] | **`madvise(MADV_DONTNEED)` page reclaim** | Workers call `madvise(MADV_DONTNEED)` on mmap chunk pages after serializing output. Bounds mmap RSS to `in_flight × chunk_size`. **Result: 0.31x RSS for `.id`, 0.64x for `select()` on 1.3 GB file.** |
+All v1.0 memory targets met in v0.1 — see v0.1 "Memory optimization — P0" for
+the full breakdown (bounded chunks, ordered ring buffer, batched streaming,
+madvise page reclaim, 0.31x/0.64x RSS on 1.3 GB).
 
 ### Documentation
 
