@@ -16,9 +16,9 @@ dev:
 run *ARGS:
     zig build -Doptimize=ReleaseFast && ./zig-out/bin/zq {{ARGS}}
 
-# Run performance microbench
+# Run regex latency probe (Phase 0 will expand this to a full microbench)
 bench:
-    zig build -Doptimize=ReleaseFast && ./zig-out/bin/microbench
+    zig build bench-regex -Doptimize=ReleaseFast
 
 # Record the benchmark demo GIF
 demo:

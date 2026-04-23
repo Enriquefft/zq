@@ -23,15 +23,9 @@ it turns into a named defect) as it matures. Delete entries as they resolve.
    representation (see `CLAUDE.md` §3). Tracked further in the auto-memory
    under "Pending (Phase 2)".
 
-3. **`just bench` / microbench target is broken.**
-   `justfile:21` references `./zig-out/bin/microbench`; the target is absent
-   from `build.zig` and `src/microbench/` does not exist. Noted in auto-memory
-   on 2026-04-07 and still unresolved. Phase 0 of the research roadmap
-   rebuilds it from zero — see `research/phase-0-design.md` §4.
-
-4. **107 pre-existing jq compat failures.**
-   Unrelated to regex work, unrelated to AST/LSP work. Present on `main` at
-   `ac5e02a` and have not regressed. Not individually tracked in `bugs.md`,
-   not scoped as a `ROADMAP.md` item. Per ROADMAP's Quick Status the likely
-   clusters are literals, iteration, and object-merge paths. Needs triage
-   into either per-class `bugs.md` entries or a scoped `ROADMAP.md` item.
+3. **Phase 0 full microbench.**
+   `just bench` currently routes to the regex latency probe (`zig build
+   bench-regex`), which covers one class of work. Phase 0 of the research
+   roadmap rebuilds a full per-stage microbench covering parse / lookup /
+   predicate / serialize / coord — see `research/phase-0-design.md` §4.
+   Noted in auto-memory on 2026-04-07.
