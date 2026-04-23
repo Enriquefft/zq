@@ -94,7 +94,7 @@ Ranked by observed agent usage.
 | | Feature | Tests blocked | Impact | Detail |
 |---|---------|---------------|--------|--------|
 | [x] | **`del()` with complex args** | ~6 | High | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Desugared to `. as $orig \| [path(f)] as $paths \| $orig \| delpaths($paths)`. |
-| [ ] | **`contains` deep comparison** | ~2 | High | Nested object containment check fails. `{foo:{baz:12}} \| contains({foo:{baz:12}})` should return `true`. |
+| [x] | **`contains` deep comparison** | ~2 | High | Root cause was object-literal evaluation: `object_construct_start`/`object_key` clobbered `it.current` with `it.input_value`, so any object literal preceded by a pipe (including `contains()`'s argument) lost its `.`. Fix: per-frame `it.current` snapshot stack mirroring `object_construct_depth`. |
 | [~] | **Variable destructuring — complex patterns** | ~5 | Medium | Simple patterns work; complex patterns (`. as {$a, $b:[$c, $d]}`, computed key destructuring) fail. |
 | [ ] | **`any`/`all` short-circuit** | ~2 | Medium | `any(true, error; .)` should not evaluate the error expression. Eager evaluation today. |
 | [~] | **Core builtins — generator args** | ~4 | Medium | `first`/`last` with generator-expression arguments fail; single-value arguments work. |
