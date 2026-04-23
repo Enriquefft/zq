@@ -26,6 +26,35 @@ const types_mod = @import("types");
 
 const default_iterations: u32 = 1000;
 
+/// Portable current-PID helper. `std.os.linux.getpid()` on Linux (where this
+/// harness runs in CI), fallback to a compile-time zero on other OSes — the
+/// fuzz target gates on Linux regex support anyway, so non-Linux builds
+/// never reach the jq-compare path.
+fn currentPid() i32 {
+    if (@import("builtin").os.tag == .linux) return std.os.linux.getpid();
+    return 0;
+}
+
+/// Ensure `jq` is invocable on this machine before starting a fuzz run.
+/// Without this, a missing jq would make every `runJq` call return an error
+/// which the loop body silently swallows — the test would report 0/0
+/// iterations and pass vacuously. That regression already bit us once (M6).
+fn requireJqOnPath(alloc: std.mem.Allocator) !void {
+    var child = std.process.Child.init(
+        &.{ std.posix.getenv("ZQ_JQ") orelse "jq", "--version" },
+        alloc,
+    );
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return error.SkipZigTest;
+    const term = child.wait() catch return error.SkipZigTest;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+}
+
 const Pattern = struct {
     pat: []u8,
     /// True when the pattern uses a feature zq deliberately rejects (backref,
@@ -139,9 +168,20 @@ fn jsonEscapeInto(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const 
 /// trailing newline. Uses `/tmp` for a scratch file to avoid wrestling with
 /// pipe-write semantics that changed between Zig versions — fuzz harness is
 /// slow-path code, correctness first.
+///
+/// The scratch path embeds the current PID so concurrent `zig build fuzz-regex`
+/// runs (or parallel test steps) don't stomp on each other's inputs. Without
+/// this, two processes racing on `/tmp/zq_fuzz_regex_input.json` could see
+/// each other's data and emit spurious "divergences".
 fn runJq(alloc: std.mem.Allocator, filter: []const u8, input: []const u8) ![]u8 {
-    // Write `input` to a temp file.
-    const tmp_path = "/tmp/zq_fuzz_regex_input.json";
+    // Write `input` to a per-process temp file. PID suffix keeps concurrent
+    // fuzz runs from colliding.
+    var path_buf: [64]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(
+        &path_buf,
+        "/tmp/zq_fuzz_regex_input_{d}.json",
+        .{currentPid()},
+    );
     {
         var f = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
         defer f.close();
@@ -179,6 +219,7 @@ fn runJq(alloc: std.mem.Allocator, filter: []const u8, input: []const u8) ![]u8 
 
 test "regex fuzz: small grammar 100 iters" {
     if (!regex.enabled) return error.SkipZigTest;
+    try requireJqOnPath(std.testing.allocator);
     // 100 inside `zig build test`; 1000+ via ZQ_FUZZ_ITERS override. Keep the
     // default low so the main test step stays fast — the larger soak is what
     // `zig build fuzz-regex` is for.
@@ -255,6 +296,10 @@ test "regex fuzz: small grammar 100 iters" {
         "regex fuzz: {d}/{d} compiled, {d} diffed, {d} divergences\n",
         .{ compile_ok, n, checked, divergences },
     );
+    // Guard against vacuous passes: if `jq` is missing or every iteration
+    // skipped the diff (bad grammar, jq reject, whatever), the test must
+    // fail loudly rather than silently pass with 0 comparisons.
+    try std.testing.expect(checked > 0);
     try std.testing.expectEqual(@as(u32, 0), divergences);
 }
 
@@ -414,6 +459,7 @@ fn genRecord(
 
 test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
     if (!regex.enabled) return error.SkipZigTest;
+    try requireJqOnPath(std.testing.allocator);
 
     const iter_env = std.posix.getenv("ZQ_FUZZ_ITERS");
     const n: u32 = if (iter_env) |s|
@@ -504,5 +550,7 @@ test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
         "prefilter fuzz: {d}/{d} ran, {d} divergences\n",
         .{ checked, n, divergences },
     );
+    // Same rationale as the grammar fuzz: no vacuous passes.
+    try std.testing.expect(checked > 0);
     try std.testing.expectEqual(@as(u32, 0), divergences);
 }
