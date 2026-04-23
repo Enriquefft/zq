@@ -43,6 +43,40 @@
           targets.x86_64-pc-windows-gnu.stable.rust-std
           targets.x86_64-unknown-freebsd.stable.rust-std
         ];
+
+        zqRegexShim = pkgs.rustPlatform.buildRustPackage {
+          pname = "zq-regex-shim";
+          version = "0.1.0";
+          src = ./third_party/zq-regex-shim;
+
+          # Vendor strictly from the checked-in lockfile. Nix fetches each crate
+          # via fixed-output derivations; the in-repo vendor/ dir is ignored here.
+          cargoLock = {
+            lockFile = ./third_party/zq-regex-shim/Cargo.lock;
+          };
+
+          doCheck = false;
+          # staticlib consumed downstream by zig's linker — leave archive untouched.
+          dontStrip = true;
+
+          # buildRustPackage's default installPhase targets [[bin]] crates. For a
+          # staticlib we install the archive explicitly. Use a glob under target/
+          # because native builds may or may not place artifacts under a triple
+          # subdir depending on whether CARGO_BUILD_TARGET is exported.
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/lib
+            archive=$(find target -type f -name libzq_regex_shim.a -path '*/release/*' | head -n1)
+            if [ -z "$archive" ]; then
+              echo "libzq_regex_shim.a not found under target/" >&2
+              exit 1
+            fi
+            install -m 0644 "$archive" $out/lib/libzq_regex_shim.a
+            runHook postInstall
+          '';
+
+          meta.description = "Static C ABI shim over regex-automata for zq";
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -66,20 +100,35 @@
 
         packages.default = pkgs.stdenv.mkDerivation {
           pname = "zq";
-          version = "0.1.0-dev";
+          version = "0.2.3";
           src = ./.;
 
-          nativeBuildInputs = with pkgs; [ zig ];
+          nativeBuildInputs = [ pkgs.zig ];
+          # Insurance: Rust panic=unwind requires libunwind symbols at final link.
+          # zig 0.15 bundles the sysroot but `-lunwind` resolution goes through the
+          # linker's -L search, which inside the sandbox sees only buildInputs. If
+          # zig resolves its bundled copy first, pkgs.libunwind is unused.
+          buildInputs = [ pkgs.libunwind ];
 
           buildPhase = ''
+            runHook preBuild
             export HOME=$TMPDIR
-            zig build -Doptimize=ReleaseSafe
+            export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
+            zig build \
+              -Doptimize=ReleaseSafe \
+              -Dshim-archive=${zqRegexShim}/lib/libzq_regex_shim.a \
+              --prefix $out
+            runHook postBuild
           '';
 
-          installPhase = ''
-            mkdir -p $out/bin
-            cp zig-out/bin/zq $out/bin/
-          '';
+          # zig build --prefix $out already ran `install`; no nix install needed.
+          dontInstall = true;
+
+          meta = {
+            description = "jq-compatible JSON query tool (Zig)";
+            mainProgram = "zq";
+            license = pkgs.lib.licenses.mit;
+          };
         };
       }
     );
