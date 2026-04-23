@@ -833,3 +833,143 @@ test "readCgroupFile: max string returns null" {
     const result = pool_mod.readCgroupFile(path);
     try std.testing.expectEqual(@as(?u64, null), result);
 }
+
+// ── Sparser prefilter integration (Phase F) ──────────────────────────────────
+
+const regex_mod = @import("regex");
+
+test "prefilter: select(.field|test(literal)) skips non-matching records" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // 5 records, only 2 contain "alpha" — prefilter should skip the other 3.
+    const input =
+        \\{"name":"alpha-one"}
+        \\{"name":"beta-two"}
+        \\{"name":"alpha-three"}
+        \\{"name":"gamma-four"}
+        \\{"name":"delta-five"}
+        \\
+    ;
+    var cq = try compile("select(.name | test(\"alpha\"))");
+    defer cq.deinit();
+
+    // Prefilter must be populated for this filter shape.
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    pool_mod.prefilter_stats.reset();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    // Two matching records -> two serialized outputs.
+    try std.testing.expectEqualStrings(
+        \\{"name":"alpha-one"}
+        \\{"name":"alpha-three"}
+        \\
+    , out.data);
+
+    // Prefilter evaluated each of the 5 records; skipped the 3 misses.
+    try std.testing.expectEqual(@as(u64, 5), pool_mod.prefilter_stats.evaluated());
+    try std.testing.expectEqual(@as(u64, 3), pool_mod.prefilter_stats.skipped());
+}
+
+test "prefilter: alternation pattern uses OR-semantics" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    const input =
+        \\{"tag":"apple"}
+        \\{"tag":"banana"}
+        \\{"tag":"carrot"}
+        \\{"tag":"date"}
+        \\
+    ;
+    var cq = try compile("select(.tag | test(\"apple|carrot\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    pool_mod.prefilter_stats.reset();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    try std.testing.expectEqualStrings(
+        \\{"tag":"apple"}
+        \\{"tag":"carrot"}
+        \\
+    , out.data);
+
+    try std.testing.expectEqual(@as(u64, 4), pool_mod.prefilter_stats.evaluated());
+    try std.testing.expectEqual(@as(u64, 2), pool_mod.prefilter_stats.skipped());
+}
+
+test "prefilter: unbounded pattern disables prefilter" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // `.+` has no extractable literals — prefilter must be NULL.
+    var cq = try compile("select(.x | test(\".+\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter == null);
+}
+
+test "prefilter: non-select filter does not get prefilter" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // `map(...)` is not a filtering construct — no prefilter.
+    var cq = try compile("map(select(.x | test(\"foo\")))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter == null);
+
+    // `.x | test("foo")` at top level: produces a bool per record, not a
+    // filtering construct — no prefilter.
+    var cq2 = try compile(".x | test(\"foo\")");
+    defer cq2.deinit();
+    try std.testing.expect(cq2.prefilter == null);
+}
+
+test "prefilter: correctness — no false negatives on matching records" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // Record contains the literal encoded inside a larger value.
+    const input =
+        \\{"note":"the quick brown foo jumps over"}
+        \\{"note":"no match here"}
+        \\
+    ;
+    var cq = try compile("select(.note | test(\"brown foo\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    pool_mod.prefilter_stats.reset();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    try std.testing.expectEqualStrings(
+        \\{"note":"the quick brown foo jumps over"}
+        \\
+    , out.data);
+}

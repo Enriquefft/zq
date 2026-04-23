@@ -1,6 +1,8 @@
 const std = @import("std");
 const query = @import("query");
 const types = @import("types");
+const regex = @import("regex");
+const build_options = @import("build_options");
 
 const CompiledQuery = query.CompiledQuery;
 const Opts = query.Opts;
@@ -2351,4 +2353,703 @@ test "tape copy: reduce range(100) builds deeply nested array without crash" {
     // 101 nesting levels (initial [] + 100 wrappings) = 202 tape entries
     try std.testing.expectEqual(@as(u32, 202), val.array.end - val.array.start);
     try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+// ── Phase C: regex opcode + filter-compile-time pool wiring ─────────────────
+//
+// These assertions cover the compiler wiring, not VM behavior:
+//
+//   1. A string-literal pattern (`test("foo")`) interns into the filter's
+//      `regex_pool`; the emitted `call_builtin` carries a non-sentinel pool
+//      index; the pool holds exactly one `Regex`.
+//   2. An invalid literal pattern (`test("[invalid")`) surfaces as a structured
+//      compile error whose span points at the offending literal.
+//   3. A dynamic pattern (`test($p)`) compiles successfully and emits the
+//      `REGEX_POOL_DYNAMIC` sentinel in the upper slot of the operand.
+//   4. Duplicate literals (`test("foo") | test("foo")`) intern once — same
+//      pool index, pool length 1.
+
+/// Find the first `call_builtin` instruction in a compiled filter. Returns
+/// `null` if none exist (shouldn't happen for regex tests).
+fn firstCallBuiltin(q: *const query.CompiledQuery) ?types.Instruction {
+    for (q.instructions) |instr| {
+        if (instr.op == .call_builtin) return instr;
+    }
+    return null;
+}
+
+/// Return every `call_builtin` instruction whose packed BuiltinId matches `bid`.
+fn collectCallBuiltins(
+    q: *const query.CompiledQuery,
+    bid: types.BuiltinId,
+    out: *std.ArrayList(types.Instruction),
+) !void {
+    for (q.instructions) |instr| {
+        if (instr.op != .call_builtin) continue;
+        if (types.builtinIdOf(instr.operand.index) == bid) {
+            try out.append(alloc, instr);
+        }
+    }
+}
+
+test "regex pool: literal pattern interns into filter pool" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    var q = try compile("test(\"foo\")");
+    defer q.deinit();
+
+    // Pool owns exactly one compiled Regex.
+    try std.testing.expectEqual(@as(usize, 1), q.regex_pool.len());
+
+    // Emitted opcode encodes BuiltinId=test_ and the interned pool index (0).
+    const instr = firstCallBuiltin(&q) orelse return error.NoCallBuiltin;
+    try std.testing.expectEqual(types.BuiltinId.test_, types.builtinIdOf(instr.operand.index));
+    try std.testing.expectEqual(@as(u32, 0), types.regexPoolIndexOf(instr.operand.index));
+}
+
+test "regex pool: invalid literal surfaces as compile error with literal span" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    const src = "test(\"[invalid\")";
+    const result = try query.CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => |ce| {
+            try std.testing.expectEqual(@import("error").ErrorKind.regex_compile_error, ce.kind);
+            // Span must cover the string literal including its surrounding
+            // quotes — that is the token the compiler records.
+            try std.testing.expectEqual(@as(u32, 5), ce.offset); // position of the opening quote
+            try std.testing.expectEqual(@as(u32, 10), ce.len); // "[invalid" + two quotes
+        },
+    }
+}
+
+test "regex pool: dynamic pattern emits REGEX_POOL_DYNAMIC sentinel" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // `$p` forces the slow path: pattern is not a bare string literal, so no
+    // compile-time interning. Pool is empty; operand carries the sentinel.
+    const src = "(\"foo\") as $p | test($p)";
+    var q = try compile(src);
+    defer q.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), q.regex_pool.len());
+
+    var calls = std.ArrayList(types.Instruction){};
+    defer calls.deinit(alloc);
+    try collectCallBuiltins(&q, .test_, &calls);
+    try std.testing.expect(calls.items.len >= 1);
+    for (calls.items) |instr| {
+        try std.testing.expectEqual(
+            types.REGEX_POOL_DYNAMIC,
+            types.regexPoolIndexOf(instr.operand.index),
+        );
+    }
+}
+
+test "regex pool: duplicate literals intern once" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    var q = try compile("test(\"foo\") | test(\"foo\")");
+    defer q.deinit();
+
+    // One entry in the pool; two call_builtin ops with the same index.
+    try std.testing.expectEqual(@as(usize, 1), q.regex_pool.len());
+
+    var calls = std.ArrayList(types.Instruction){};
+    defer calls.deinit(alloc);
+    try collectCallBuiltins(&q, .test_, &calls);
+    try std.testing.expectEqual(@as(usize, 2), calls.items.len);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        types.regexPoolIndexOf(calls.items[0].operand.index),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        types.regexPoolIndexOf(calls.items[1].operand.index),
+    );
+}
+
+test "regex pool: capture and scan literals intern too" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // Each literal is distinct → pool holds two entries.
+    var q = try compile("capture(\"(?<y>\\\\d+)\") | scan(\"[a-z]+\")");
+    defer q.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), q.regex_pool.len());
+
+    var captures = std.ArrayList(types.Instruction){};
+    defer captures.deinit(alloc);
+    try collectCallBuiltins(&q, .capture_, &captures);
+    try std.testing.expectEqual(@as(usize, 1), captures.items.len);
+    try std.testing.expect(
+        types.regexPoolIndexOf(captures.items[0].operand.index) != types.REGEX_POOL_DYNAMIC,
+    );
+
+    var scans = std.ArrayList(types.Instruction){};
+    defer scans.deinit(alloc);
+    try collectCallBuiltins(&q, .scan_, &scans);
+    try std.testing.expectEqual(@as(usize, 1), scans.items.len);
+    try std.testing.expect(
+        types.regexPoolIndexOf(scans.items[0].operand.index) != types.REGEX_POOL_DYNAMIC,
+    );
+}
+
+test "regex pool: sub literal pattern interns and packs index" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    var q = try compile("sub(\"foo\"; \"bar\")");
+    defer q.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), q.regex_pool.len());
+
+    var calls = std.ArrayList(types.Instruction){};
+    defer calls.deinit(alloc);
+    try collectCallBuiltins(&q, .sub_, &calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        types.regexPoolIndexOf(calls.items[0].operand.index),
+    );
+}
+
+test "regex disabled build: literal test() surfaces regex_not_compiled" {
+    if (regex.enabled) return error.SkipZigTest;
+
+    const src = "test(\"foo\")";
+    const result = try query.CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => |ce| {
+            try std.testing.expectEqual(
+                @import("error").ErrorKind.regex_not_compiled,
+                ce.kind,
+            );
+        },
+    }
+}
+
+test "unused build_options import placeholder" {
+    // Silence unused-import warnings if build_options is not referenced
+    // elsewhere in this test file.
+    _ = build_options;
+}
+
+// ── Runtime regex tests (Phase D) ──────────────────────────────────────────
+
+/// Build a tape holding one string value. Ownership: caller keeps `buf`
+/// alive for the tape's lifetime. No allocator needed.
+fn stringTape(entries: *[1]Entry, buf: []const u8) Tape {
+    entries[0] = .{ .tag = .string, .payload = .{ .string = .{ .offset = 0, .len = @intCast(buf.len) } } };
+    return Tape{ .entries = entries, .string_buf = buf };
+}
+
+fn runFilterStr(src: []const u8, input: []const u8) ![]Value {
+    var q = try compile(src);
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, input);
+    return try collectAll(&q, t);
+}
+
+test "regex runtime: test() literal matches" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("test(\"bar\")", "foo bar baz");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "regex runtime: test() literal no match" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("test(\"qux\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(false, vals[0].bool_val);
+}
+
+test "regex runtime: test() dynamic pattern" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("(\"ba\" + \"r\") as $p | test($p)", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "regex runtime: test() unicode class" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("test(\"\\\\p{L}+\")", "café");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "regex runtime: test() non-string input errors" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var q = try compile("test(\"x\")");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 42 } }};
+    const t = Tape{ .entries = &entries, .string_buf = "" };
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+test "regex runtime: match() no match is an error" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var q = try compile("match(\"xyz\")");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, "foo");
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+test "regex runtime: match() has jq shape" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var q = try compile("match(\"(\\\\w+)\") | .offset");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, "foo bar");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+}
+
+test "regex runtime: match() char offset for multibyte" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var q = try compile("match(\"bar\") | .offset");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, "café bar");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    // "café" is 4 chars, space=5, then "bar" starts at char 5.
+    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+}
+
+test "regex runtime: scan() yields strings on pattern without captures" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("[scan(\"\\\\w+\")]", "foo bar baz");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    // Result is an array of 3 strings. Verify by compiling a sub-query that
+    // extracts each element. Lazy way: just assert array has 3 entries.
+    const arr = vals[0].array;
+    const len = arr.end - arr.start - 2; // exclude array_start/end markers
+    // rough sanity
+    try std.testing.expect(len >= 3);
+}
+
+test "regex runtime: scan() yields arrays on captured pattern" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("[scan(\"(\\\\w+)\")]", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals[0]));
+}
+
+test "regex runtime: capture() named groups" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("capture(\"(?<a>\\\\d+)-(?<b>\\\\d+)\") | .a + \"|\" + .b", "12-34");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("12|34", vals[0].string);
+}
+
+test "regex runtime: sub() with backref" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("sub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("<foo> bar", vals[0].string);
+}
+
+test "regex runtime: gsub() with backref" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("gsub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("<foo> <bar>", vals[0].string);
+}
+
+test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("gsub(\"\"; \"X\")", "abc");
+    defer alloc.free(vals);
+    // regex-automata matches empty at every position → Xs interleaved.
+    // Just assert it terminates and produces a string.
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals[0]));
+}
+
+test "regex runtime: optional unmatched group sentinel in match" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // match result.captures[0].offset == -1 when group didn't match.
+    const vals = try runFilterStr("match(\"foo(bar)?baz\") | .captures[0].offset", "foobaz");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+}
+
+// ── Phase E: flags overload ─────────────────────────────────────────────────
+
+test "regex flags: test() case-insensitive literal flag" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("test(\"FOO\"; \"i\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "regex flags: test() no-op 'g' flag still compiles" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("test(\"foo\"; \"g\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(true, vals[0].bool_val);
+}
+
+test "regex flags: capture() case-insensitive" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("capture(\"(?<a>[A-Z]+)\"; \"i\") | .a", "hello");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("hello", vals[0].string);
+}
+
+test "regex flags: scan() case-insensitive" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("[scan(\"[A-Z]+\"; \"i\")]", "abCDef");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals[0]));
+}
+
+test "regex flags: sub() 3-arg with case-insensitive" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("sub(\"FOO\"; \"X\"; \"i\")", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("X bar", vals[0].string);
+}
+
+test "regex flags: gsub() 3-arg with case-insensitive" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("gsub(\"A\"; \"X\"; \"i\")", "aAbBcA");
+    defer alloc.free(vals);
+    try std.testing.expectEqualStrings("XXbBcX", vals[0].string);
+}
+
+test "regex flags: unknown flag letter is a compile error" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const result = try query.CompiledQuery.compile("test(\"foo\"; \"Z\")", .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => |ce| {
+            try std.testing.expectEqual(@import("error").ErrorKind.regex_compile_error, ce.kind);
+        },
+    }
+}
+
+// ── Phase E: pool-rollback on invalid pattern ────────────────────────────────
+
+test "regex pool: compile error leaves previously-interned entries intact" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // First: verify a clean compile interns one pattern.
+    var q1 = try compile("test(\"foo\")");
+    try std.testing.expectEqual(@as(usize, 1), q1.regex_pool.len());
+    q1.deinit();
+
+    // Now: a filter that interns one pattern, then fails on the second.
+    // The compile should fail cleanly — no use-after-free, no double-deinit.
+    const src = "test(\"ok\") | test(\"[unclosed\")";
+    const result = try query.CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => |ce| {
+            try std.testing.expectEqual(@import("error").ErrorKind.regex_compile_error, ce.kind);
+        },
+    }
+    // Surviving the deinit path is the real assertion. Run one more valid
+    // compile to confirm the pool allocator isn't poisoned.
+    var q2 = try compile("test(\"bar\")");
+    defer q2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), q2.regex_pool.len());
+}
+
+// ── match-g and splits ─────────────────────────────────────────────────────
+
+test "regex runtime: match(re; \"g\") yields three match strings" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // Non-collecting generator path: each yielded match object becomes a
+    // separate output value via runFilterStr.
+    const vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .string", "foo bar baz");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 3), vals.len);
+    try std.testing.expectEqualStrings("foo", vals[0].string);
+    try std.testing.expectEqualStrings("bar", vals[1].string);
+    try std.testing.expectEqualStrings("baz", vals[2].string);
+}
+
+test "regex runtime: match(re; \"g\") offsets and lengths match each occurrence" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .offset", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 2), vals.len);
+    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 4), vals[1].int);
+}
+
+test "regex runtime: match(re; \"ig\") combines case-insensitive and global" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("match(\"FOO\"; \"ig\") | .string", "foo Foo FOO bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 3), vals.len);
+}
+
+test "regex runtime: match(re; \"g\") no matches yields no values" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("match(\"xyz\"; \"g\") | .string", "foo bar");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
+test "regex runtime: splits(re) yields four segments around three matches" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // "a1b22c333" split on /[0-9]+/ → "a", "b", "c", "" (jq semantics).
+    const vals = try runFilterStr("splits(\"[0-9]+\")", "a1b22c333");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 4), vals.len);
+    try std.testing.expectEqualStrings("a", vals[0].string);
+    try std.testing.expectEqualStrings("b", vals[1].string);
+    try std.testing.expectEqualStrings("c", vals[2].string);
+    try std.testing.expectEqualStrings("", vals[3].string);
+}
+
+test "regex runtime: splits() with no match yields whole input" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("splits(\"[0-9]+\")", "nodigits");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("nodigits", vals[0].string);
+}
+
+test "regex runtime: splits() with flags case-insensitive" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("splits(\"X\"; \"i\")", "aXbxcXd");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 4), vals.len);
+    try std.testing.expectEqualStrings("a", vals[0].string);
+    try std.testing.expectEqualStrings("b", vals[1].string);
+    try std.testing.expectEqualStrings("c", vals[2].string);
+    try std.testing.expectEqualStrings("d", vals[3].string);
+}
+
+test "regex runtime: splits() dynamic pattern works through LRU" {
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr("(\"[0-9]+\") as $p | splits($p)", "a1b22");
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 3), vals.len);
+    try std.testing.expectEqualStrings("a", vals[0].string);
+    try std.testing.expectEqualStrings("b", vals[1].string);
+    try std.testing.expectEqualStrings("", vals[2].string);
+}
+
+test "regex runtime: dynamic scan() survives LRU eviction mid-fork" {
+    // BLOCKER 1 regression test — dynamic-pattern generator forks
+    // (`scan($p)` / `match($p; "g")` / `splits($p)`) must own their own
+    // `Regex`+`RegexClone` pair so that subsequent dynamic-pattern compiles
+    // inside the generator body cannot evict the LRU entry backing the
+    // suspended fork and cause a UAF on resume.
+    //
+    // Shape of the hostile filter:
+    //   * outer `scan($p)` yields every "a" in the input (10 matches)
+    //   * for each yield we compile 100 distinct dynamic patterns via
+    //     `range(100) | tostring as $k | test($k)` — this sends 100 unique
+    //     byte-strings through the runtime LRU (capacity 64), forcing
+    //     eviction of whichever entry once held $p. If the scan frame
+    //     borrowed the LRU's clone pointer this backtracks onto freed
+    //     memory.
+    //
+    // Under Zig safety checks / allocator poisoning a regression would
+    // manifest as a crash or wrong-length result. With the fork-owned
+    // clones the answer is deterministic: 10 matches × (`test` result is
+    // unused; we collect the yielded match strings). We only verify the
+    // overall shape / length here — behaviour across the LRU churn is
+    // what matters.
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr(
+        "(\"a\") as $p | [scan($p) as $s | (range(100) | tostring | test(.)) as $_ignore | $s] | length",
+        "aaaaaaaaaa",
+    );
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    // 10 scan matches × 100 inner range iterations = 1000 yields.
+    try std.testing.expectEqual(@as(i64, 1000), vals[0].int);
+}
+
+// NOTE: The match-g generator path always requires a compile-time literal
+// "g" flag — the dynamic pattern form (`match($p; "g")`) is a compile-time
+// syntax error today (no runtime 2-arg dispatch is wired for test/match/
+// scan/splits). So there is no dynamic `match_g` fork path to stress.
+// The static-pool match_g path never aliases LRU state, so it is not
+// vulnerable to this class of UAF. Tracked here explicitly so a future
+// change that enables `match($p; $f)` dynamic flags also revisits this
+// fork-ownership contract.
+
+test "regex runtime: dynamic splits() survives LRU eviction mid-fork" {
+    // Same pattern for `splits($p)`. A dynamic pattern here puts a borrowed
+    // clone pointer in SplitsState; the fork persists across many
+    // inter-match yields, giving the LRU plenty of chances to evict it.
+    if (!regex.enabled) return error.SkipZigTest;
+    const vals = try runFilterStr(
+        "(\"a\") as $p | [splits($p) as $s | (range(80) | tostring | test(.)) as $_ignore | $s] | length",
+        "aXaXaXaXa",
+    );
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    // Input has 5 'a's, so splits produces 6 segments (leading empty,
+    // 4 "X" segments, trailing empty). 6 × 80 = 480.
+    try std.testing.expectEqual(@as(i64, 480), vals[0].int);
+}
+
+// ── Full-matrix disabled-build tests ────────────────────────────────────────
+// Pin the `-Dregex=false` user-facing behavior for every regex builtin. The
+// diagnostic must be `regex_not_compiled` (feature not built in) — NOT
+// `regex_internal_error` — across both the compile and runtime paths.
+
+fn expectCompileRegexNotCompiled(src: []const u8) !void {
+    const result = try query.CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => |ce| {
+            try std.testing.expectEqual(
+                @import("error").ErrorKind.regex_not_compiled,
+                ce.kind,
+            );
+        },
+    }
+}
+
+fn expectRuntimeRegexNotCompiled(src: []const u8, input: []const u8) !void {
+    const result = try query.CompiledQuery.compile(src, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var cqm = cq;
+            defer cqm.deinit();
+            var entries: [1]Entry = undefined;
+            const t = stringTape(&entries, input);
+            var it = try cqm.execute(t, &.{}, alloc);
+            defer it.deinit();
+            try std.testing.expectError(error.RegexNotCompiled, it.next());
+        },
+        .err => return error.UnexpectedCompileError,
+    }
+}
+
+test "regex disabled: test() literal compile-errors as regex_not_compiled" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("test(\"foo\")");
+}
+
+test "regex disabled: test() dynamic runtime-errors as RegexNotCompiled" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"foo\") as $p | test($p)", "foo bar");
+}
+
+test "regex disabled: match() literal compile-errors as regex_not_compiled" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("match(\"foo\")");
+}
+
+test "regex disabled: match() dynamic runtime-errors as RegexNotCompiled" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"foo\") as $p | match($p)", "foo");
+}
+
+test "regex disabled: match(re; \"g\") literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("match(\"foo\"; \"g\")");
+}
+
+test "regex disabled: capture() literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("capture(\"(?<x>.)\")");
+}
+
+test "regex disabled: capture() dynamic runtime-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"(?<x>.)\") as $p | capture($p)", "foo");
+}
+
+test "regex disabled: scan() literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("scan(\"foo\")");
+}
+
+test "regex disabled: scan() dynamic runtime-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"foo\") as $p | scan($p)", "foo bar foo");
+}
+
+test "regex disabled: splits() literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("splits(\"[0-9]+\")");
+}
+
+test "regex disabled: splits() dynamic runtime-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"[0-9]+\") as $p | splits($p)", "a1b22c");
+}
+
+test "regex disabled: sub() literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("sub(\"foo\"; \"X\")");
+}
+
+test "regex disabled: sub() dynamic runtime-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"foo\") as $p | sub($p; \"X\")", "foo");
+}
+
+test "regex disabled: gsub() literal compile-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("gsub(\"foo\"; \"X\")");
+}
+
+test "regex disabled: gsub() dynamic runtime-errors" {
+    if (regex.enabled) return error.SkipZigTest;
+    try expectRuntimeRegexNotCompiled("(\"foo\") as $p | gsub($p; \"X\")", "foo foo");
+}
+
+test "regex disabled: sub() 3-arg with literal g flag compile-errors" {
+    // Compile-time `g`-flag → gsub dispatch happens inside the fast path that
+    // also attempts pattern-pool interning. In disabled builds that intern
+    // step hits the stub and surfaces `regex_not_compiled`. Pin that the
+    // compile-surface behaviour is identical to the literal sub/gsub cases
+    // — no silent acceptance just because the bid got rewritten to gsub.
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("sub(\"foo\"; \"X\"; \"g\")");
+}
+
+test "regex disabled: match(re; \"g\") paired with dynamic fallback fails consistently" {
+    // `match(pat; "g")` with a non-literal pattern is a compile-time syntax
+    // error today (no runtime flag dispatch wired). We still want the
+    // disabled matrix to pin the builtin's compile-path behaviour when the
+    // pattern *is* a literal — the complementary fast-path to the dynamic
+    // runtime tests elsewhere in this file. With `-Dregex=false` it must
+    // surface `regex_not_compiled`, never the generic `query_syntax_error`.
+    if (regex.enabled) return error.SkipZigTest;
+    try expectCompileRegexNotCompiled("match(\"foo\"; \"g\")");
 }

@@ -23,4 +23,5 @@ comptime {
     _ = @import("unary_negation.zig");
     _ = @import("object_merge.zig");
     _ = @import("regression.zig");
+    _ = @import("regex.zig");
 }

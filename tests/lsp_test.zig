@@ -58,3 +58,38 @@ test "utf16 offset for ascii" {
     const offset = lsp.protocol.utf8ToUtf16Offset(text, 5);
     try testing.expectEqual(@as(u32, 5), offset);
 }
+
+// ── Regex compile-error diagnostics ─────────────────────────────────────
+//
+// `fromCompileErrors` runs the real compiler and maps the structured
+// `CompileError` (or `regex_not_compiled` when the feature is off) into
+// an LSP diagnostic anchored at the offending string literal.
+
+test "fromCompileErrors: invalid regex literal surfaces a diagnostic" {
+    const source = "test(\"[invalid\")";
+    const diags = lsp.features.diagnostics.fromCompileErrors(source, testing.allocator);
+    defer {
+        for (diags) |d| testing.allocator.free(d.message);
+        testing.allocator.free(diags);
+    }
+
+    try testing.expect(diags.len >= 1);
+    const d = diags[0];
+    try testing.expectEqual(lsp.protocol.DiagnosticSeverity.@"error", d.severity);
+
+    // Range must point at the offending string literal (cols 5..15 on line 0).
+    try testing.expectEqual(@as(u32, 0), d.range.start.line);
+    try testing.expectEqual(@as(u32, 5), d.range.start.character);
+    try testing.expectEqual(@as(u32, 0), d.range.end.line);
+    try testing.expectEqual(@as(u32, 15), d.range.end.character);
+}
+
+test "fromCompileErrors: valid filter produces no diagnostics" {
+    const source = ".foo | length";
+    const diags = lsp.features.diagnostics.fromCompileErrors(source, testing.allocator);
+    defer {
+        for (diags) |d| testing.allocator.free(d.message);
+        testing.allocator.free(diags);
+    }
+    try testing.expectEqual(@as(usize, 0), diags.len);
+}
