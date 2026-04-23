@@ -19,6 +19,15 @@ pub const ZqError = error{
     IoError,
     /// Malformed filter expression detected at compile time.
     QuerySyntaxError,
+    /// Regex pattern failed to compile (bad syntax, unsupported construct,
+    /// or shim internal error). Surfaced at filter-compile time for literal
+    /// patterns, at runtime for dynamic ones.
+    RegexCompileError,
+    /// Regex engine not linked into this build (`-Dregex=false`).
+    RegexNotCompiled,
+    /// Regex engine raised an internal error at runtime (shim panic,
+    /// unrecoverable state, or malformed replacement directive).
+    RegexInternalError,
     /// Operation applied to wrong JSON type at runtime.
     TypeError,
     /// Array index beyond array length at runtime.
@@ -42,6 +51,12 @@ pub const ErrorKind = enum {
     io_error,
     /// Malformed filter expression detected at compile time.
     query_syntax_error,
+    /// Regex pattern failed to compile (literal pattern rejected by engine).
+    regex_compile_error,
+    /// Regex engine not linked into this build.
+    regex_not_compiled,
+    /// Regex engine raised an internal/runtime error.
+    regex_internal_error,
     /// Operation applied to wrong JSON type at runtime.
     type_error,
     /// Array index beyond array length at runtime.
@@ -81,6 +96,9 @@ pub fn kindFromZqError(e: ZqError) ErrorKind {
         error.DepthLimitExceeded => .depth_limit_exceeded,
         error.IoError => .io_error,
         error.QuerySyntaxError => .query_syntax_error,
+        error.RegexCompileError => .regex_compile_error,
+        error.RegexNotCompiled => .regex_not_compiled,
+        error.RegexInternalError => .regex_internal_error,
         error.TypeError => .type_error,
         error.IndexOutOfBounds => .index_out_of_bounds,
         error.OutOfMemory => .out_of_memory,
@@ -125,6 +143,9 @@ pub fn kindToString(kind: ErrorKind) []const u8 {
         .depth_limit_exceeded => "depth limit exceeded",
         .io_error => "I/O error",
         .query_syntax_error => "query syntax error",
+        .regex_compile_error => "regex compile error",
+        .regex_not_compiled => "regex not compiled",
+        .regex_internal_error => "regex internal error",
         .type_error => "type error",
         .index_out_of_bounds => "index out of bounds",
         .out_of_memory => "out of memory",

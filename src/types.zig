@@ -353,10 +353,14 @@ pub const BuiltinId = enum(u16) {
     ltrimstr_, // ltrimstr(str) — remove prefix
     rtrimstr_, // rtrimstr(str) — remove suffix
     trimstr_, // trimstr(str) — remove prefix and suffix
-    test_, // test(regex) — simplified substring match
-    match_, // match(regex) — simplified match details
+    test_, // test(regex) — boolean match
+    match_, // match(regex) — full match details object
+    match_g_, // match(regex; "g") — generator: yields a match object per occurrence
     sub_, // sub(regex; replacement) — replace first
     gsub_, // gsub(regex; replacement) — replace all
+    capture_, // capture(regex) — object of named captures
+    scan_, // scan(regex) — generator of matches (string or array of captures)
+    splits_, // splits(regex) — generator yielding segments between matches
 
     // Array utility builtins
     transpose_, // transpose — transpose array of arrays (zero-arg)
@@ -403,9 +407,11 @@ pub const BuiltinId = enum(u16) {
     /// Return the jq-visible "name/arity" entry for this builtin, or null for
     /// internal variants that should not appear in `builtins` output.
     pub fn jqEntry(comptime self: BuiltinId) ?JqEntry {
-        // Internal generator variants — not user-facing.
+        // Internal generator variants — not user-facing. `match_g_` dispatches
+        // through the ordinary `match(re; flags)` surface when flags contain
+        // `g`; it does not get its own builtins-list entry.
         switch (self) {
-            .range1_gen, .range2_gen, .range3_gen, .limit_gen => return null,
+            .range1_gen, .range2_gen, .range3_gen, .limit_gen, .match_g_ => return null,
             else => {},
         }
         return .{ .name = self.jqBaseName(), .arity = self.jqArity() };
@@ -571,6 +577,9 @@ pub const BuiltinId = enum(u16) {
             .trimstr_,
             .test_,
             .match_,
+            .capture_,
+            .scan_,
+            .splits_,
             .bsearch_,
             .map_values_,
             .isempty_,
@@ -602,7 +611,7 @@ pub const BuiltinId = enum(u16) {
             .fma_, .range3 => 3,
 
             // Internal generator variants — handled by jqEntry returning null
-            .range1_gen, .range2_gen, .range3_gen, .limit_gen => unreachable,
+            .range1_gen, .range2_gen, .range3_gen, .limit_gen, .match_g_ => unreachable,
         };
     }
 
@@ -615,6 +624,55 @@ pub const BuiltinId = enum(u16) {
         return count;
     }
 };
+
+// ─── Regex opcode payload packing ────────────────────────────────────────────
+//
+// Regex-taking builtins (`test_`, `match_`, `sub_`, `gsub_`, `capture_`,
+// `scan_`) piggy-back on `call_builtin`'s i64 operand. The low 16 bits carry
+// the `BuiltinId` (unchanged for every non-regex builtin); the next 32 bits
+// carry the filter-compile-time `RegexPool` index. Non-regex builtins and
+// dynamic-pattern regex calls leave the upper slot at the sentinel below.
+//
+// Single source of truth: compiler packs via `packRegexBuiltinOperand`, the
+// VM unpacks via `regexPoolIndexOf` / `builtinIdOf`. No other code inspects
+// the bit layout.
+
+/// Sentinel in the pool-index slot meaning "compile at runtime" — the pattern
+/// argument was not a string literal so no entry was interned at compile time.
+/// Phase D's VM wires this to the per-worker `LruCache`.
+pub const REGEX_POOL_DYNAMIC: u32 = std.math.maxInt(u32);
+
+/// Pack a `(BuiltinId, regex_pool_index)` pair into a `call_builtin` operand.
+/// Non-regex builtins should pass `REGEX_POOL_DYNAMIC` — it is harmless because
+/// they never inspect the upper bits.
+pub fn packRegexBuiltinOperand(bid: BuiltinId, regex_pool_index: u32) i64 {
+    const low: u64 = @intFromEnum(bid);
+    const high: u64 = @as(u64, regex_pool_index) << 16;
+    return @bitCast(low | high);
+}
+
+/// Extract the `BuiltinId` from any `call_builtin` operand. Safe for every
+/// builtin regardless of whether regex metadata is packed.
+pub fn builtinIdOf(operand_index: i64) BuiltinId {
+    const bits: u64 = @bitCast(operand_index);
+    return @enumFromInt(@as(u16, @truncate(bits)));
+}
+
+/// Extract the regex-pool index from a `call_builtin` operand. Only meaningful
+/// for regex-taking builtins; others return `REGEX_POOL_DYNAMIC` (harmless).
+pub fn regexPoolIndexOf(operand_index: i64) u32 {
+    const bits: u64 = @bitCast(operand_index);
+    return @truncate(bits >> 16);
+}
+
+/// True iff this builtin takes a regex pattern as its first explicit argument
+/// and therefore participates in filter-compile-time pool interning.
+pub fn isRegexBuiltin(bid: BuiltinId) bool {
+    return switch (bid) {
+        .test_, .match_, .match_g_, .sub_, .gsub_, .capture_, .scan_, .splits_ => true,
+        else => false,
+    };
+}
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────
 /// Operands for the `slice` instruction (.[from:to]).

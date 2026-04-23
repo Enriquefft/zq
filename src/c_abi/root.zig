@@ -234,6 +234,9 @@ fn errorToCode(e: ZqError) c_int {
         error.DepthLimitExceeded,
         error.IoError,
         error.QuerySyntaxError,
+        error.RegexCompileError,
+        error.RegexNotCompiled,
+        error.RegexInternalError,
         => ERR_PARSE,
     };
 }
