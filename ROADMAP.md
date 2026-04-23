@@ -669,19 +669,39 @@ and treated as pattern-level no-ops. Unknown flag letters are a compile error.
 
 | Pattern | Target | Measured median |
 |---|---|---|
-| Literal `"foo"` | 30–80 ns | 33 ns |
-| Alternation `"foo\|bar\|baz\|qux"` | 80–200 ns | 46 ns |
-| Anchored prefix `"^GET "` | 30–80 ns | 49 ns |
-| Simple class `"[a-z]+"` | 80–200 ns | 44 ns |
-| Named capture `"(?<year>\d{4})"` | 300 ns – 1 µs | 57 ns (isMatch path) |
+| Literal `"foo"` | 30–80 ns | 22 ns |
+| Alternation `"foo\|bar\|baz\|qux"` | 80–200 ns | 35 ns |
+| Anchored prefix `"^GET "` | 30–80 ns | 37 ns |
+| Simple class `"[a-z]+"` | 80–200 ns | 32 ns |
+| Named capture `"(?<year>\d{4})"` | 300 ns – 1 µs | 42 ns (isMatch path) |
 
 All pattern classes meet or exceed plan targets. Run `zig build bench-regex
 -Doptimize=ReleaseFast` to reproduce.
 
+**Prefilter speedup on miss path** (`select(.endpoint | test("/v1/login"))` against
+a 90-byte log record that does not contain the literal, 50k iterations,
+iterator reused across records exactly as in `src/pool/root.zig: process_line`):
+
+| Path | Median | p99 |
+|---|---|---|
+| full parse + query bytecode + no-match output | 461 ns | 884 ns |
+| prefilter literal scan (record rejected before parse) | 59 ns | 62 ns |
+| **speedup** | **7.8×** | 14× |
+
+Honest measurement caveat: earlier drafts of this bench rebuilt the
+`ResultIterator` per iteration (via `cq.execute` + `it.deinit`), which
+inflated the "full path" median by two orders of magnitude and produced a
+bogus ~2600× ratio. Production reuses the iterator — the bench now does too.
+The 7.8× figure is the real parse-avoidance benefit per record; the whole-pipeline
+end-to-end win depends on how often the prefilter fires (workload selectivity).
+
 **Differential fuzz:** `zig build fuzz-regex` runs a small-grammar harness that
 compares zq vs jq on randomly generated pattern/haystack pairs. 1000 iterations
-produce 0 divergences (patterns jq rejects are skipped as documented compat
-delta). Override iteration count with `ZQ_FUZZ_ITERS=N`.
+produce 0 divergences. A second fuzz test diffs zq-with-prefilter vs
+zq-without-prefilter vs jq across random `select(.k | test("LIT"))` queries and
+records containing raw, `\uXXXX`-escaped, and short-escape-containing string
+values — 1000 iterations, 0 divergences (catches any regression that would
+re-introduce a false-negative path in the prefilter).
 
 ---
 

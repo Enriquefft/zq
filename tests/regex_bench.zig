@@ -97,14 +97,34 @@ test "regex bench: prefilter skips parse for non-matching records" {
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    // (A) Full path — same work done in process_line for a non-prefiltered
-    // record: parse the JSON, execute the compiled query pipeline.
+    // (A) Full path. We time the work `process_line` actually does on a miss:
+    //   parser.feed → execute/reset → it.next() → parser.reset
+    //
+    // Production reuses the ResultIterator across records (see
+    // `src/pool/root.zig: process_line` — the iterator is allocated on the
+    // first record and `.reset(tape, bindings)`-rebound thereafter). Earlier
+    // versions of this bench built a fresh iterator per iteration, which
+    // over-counted the full-path cost by several-fold. The fix: init once,
+    // reset in the loop — matches the real hot path.
     var parser = try parser_mod.Parser.init(alloc);
     defer parser.deinit();
 
     const iters: u32 = 50_000;
 
-    // Warmup.
+    // Build the iterator against the first tape; immediately reset() rebinds
+    // it per iteration. Do NOT call parser.reset() between `execute` and the
+    // first `reset(tape, ...)` below — the tape buffer must stay live.
+    const first_fr = parser.feed(record, true) catch unreachable;
+    const first_tape = switch (first_fr) {
+        .done => |d| d.tape,
+        .need_more => unreachable,
+    };
+    var it = try cq.execute(first_tape, &.{}, alloc);
+    defer it.deinit();
+    _ = try it.next();
+    parser.reset();
+
+    // Warmup: exercise the hot path without the allocator ever expanding.
     var w: u32 = 0;
     while (w < warmup) : (w += 1) {
         const fr = parser.feed(record, true) catch unreachable;
@@ -112,9 +132,8 @@ test "regex bench: prefilter skips parse for non-matching records" {
             .done => |d| d.tape,
             .need_more => unreachable,
         };
-        var it = try cq.execute(tape, &.{}, alloc);
+        it.reset(tape, &.{});
         _ = try it.next();
-        it.deinit();
         parser.reset();
     }
 
@@ -129,9 +148,8 @@ test "regex bench: prefilter skips parse for non-matching records" {
             .done => |d| d.tape,
             .need_more => unreachable,
         };
-        var it = try cq.execute(tape, &.{}, alloc);
+        it.reset(tape, &.{});
         _ = try it.next();
-        it.deinit();
         parser.reset();
         times_full[i] = timer.read();
     }
@@ -153,8 +171,8 @@ test "regex bench: prefilter skips parse for non-matching records" {
     const med_pre = times_pre[iters / 2];
     const speedup: f64 = @as(f64, @floatFromInt(med_full)) / @as(f64, @floatFromInt(@max(med_pre, 1)));
 
-    std.debug.print("\nSparser prefilter impact (miss path, {} iters)\n", .{iters});
-    std.debug.print("  full parse+regex: median={d} ns  p99={d} ns\n", .{ med_full, times_full[(iters * 99) / 100] });
+    std.debug.print("\nSparser prefilter impact on miss path ({} iters, iterator reused)\n", .{iters});
+    std.debug.print("  full parse+query: median={d} ns  p99={d} ns\n", .{ med_full, times_full[(iters * 99) / 100] });
     std.debug.print("  prefilter skip:   median={d} ns  p99={d} ns\n", .{ med_pre, times_pre[(iters * 99) / 100] });
     std.debug.print("  skip is {d:.1}x faster per record\n", .{speedup});
 
