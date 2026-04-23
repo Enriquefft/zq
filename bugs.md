@@ -84,3 +84,26 @@ literal with `len >= 2` is now prefilter-safe (including `"`, `\`, control chars
 non-ASCII UTF-8). Regression tests in `tests/pool_test.zig` cover the `\uXXXX`, `\t`,
 and raw paths end-to-end; `zig build fuzz-regex` runs a differential harness that
 diffs zq-with-prefilter vs zq-without vs jq (0 divergences over 1000 iterations).
+
+---
+
+## BUG-004: `capture()` with named groups aborts with StringRef OOB
+
+**Symptom**: `capture("(?<a>\\d+)-(?<b>\\d+)") | .a + "|" + .b` on input `"12-34"`
+terminates with signal 6 and `index out of bounds: index 6, len 2` at
+`src/types.zig:56 getString`. Reproduces on both Linux and macOS.
+
+**Root cause**: Not yet root-caused. The capture object written by the `capture`
+builtin contains `StringRef { offset, len }` entries into a string buffer whose
+addressable length is 2, but one of the capture slots records an offset of 6 —
+a stale pointer into a reallocated or already-freed buffer. Likely the match slot
+survives across a `RuntimeTape.internString` call that reallocates the underlying
+`string_buf`, invalidating the earlier offset. Confirm by instrumenting the capture
+emission path and the tape-grow paths around `+` concatenation.
+
+**Lives in**: `tests/query_test.zig:2659-2664`. Currently counted inside the
+"107 pre-existing failures" number but is NOT a compat-gap test — it's a regex
+test shipped by this codebase. Separating it out surfaces the real defect count.
+
+**Fixed in**: _pending_. See also `TODO.md` for triage priority once AST-walk
+pipeline (Phase 2) lands, since the capture-emission path may move.

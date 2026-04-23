@@ -29,3 +29,14 @@ it turns into a named defect) as it matures. Delete entries as they resolve.
    roadmap rebuilds a full per-stage microbench covering parse / lookup /
    predicate / serialize / coord — see `research/phase-0-design.md` §4.
    Noted in auto-memory on 2026-04-07.
+
+4. **`tests/fuzz_regex.zig` portability + test-race hygiene.**
+   Two pre-existing issues, only reachable via `zig build fuzz-regex` (not
+   `test_step`), so CI never hits them today. Both surface if the fuzz step
+   ever enters CI or runs on non-Linux:
+   - Line 346 calls `std.posix.memfd_create` unconditionally; stdlib emits a
+     `@compileError` on non-Linux. Apply the same comptime-gate pattern that
+     `tests/pool_test.zig:30-42` now uses.
+   - The input path `/tmp/zq_fuzz_regex_input.json` is fixed, so two
+     concurrent fuzz invocations race on the same file. Suffix with the PID
+     (the harness already has a `currentPid()` helper since commit `f62c8e0`).
