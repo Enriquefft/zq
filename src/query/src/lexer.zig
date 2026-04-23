@@ -406,6 +406,11 @@ pub const Lexer = struct {
         while (l.pos < l.src.len) {
             switch (l.src[l.pos]) {
                 ' ', '\t', '\r', '\n' => l.pos += 1,
+                // jq line comments: `#` to end of line. No block comments.
+                '#' => {
+                    l.pos += 1;
+                    while (l.pos < l.src.len and l.src[l.pos] != '\n') : (l.pos += 1) {}
+                },
                 else => break,
             }
         }

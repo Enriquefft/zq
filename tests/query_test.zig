@@ -3053,3 +3053,52 @@ test "regex disabled: match(re; \"g\") paired with dynamic fallback fails consis
     if (regex.enabled) return error.SkipZigTest;
     try expectCompileRegexNotCompiled("match(\"foo\"; \"g\")");
 }
+
+// ── `#` line comments ─────────────────────────────────────────────────────────
+//
+// jq supports `#` to end-of-line as a filter comment. zq's lexer mirrors that.
+// No block comments (matches jq).
+
+test "comment: leading # then identity" {
+    var q = try compile("# leading comment\n.");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "comment: trailing # after expression (no final newline)" {
+    var q = try compile(". # trailing no newline");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "comment: multiple comments between tokens" {
+    var q = try compile("# one\n# two\n. # three\n");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
+    const t = tape(&entries, "");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+}
+
+test "comment: # inside string literal is NOT a comment" {
+    var q = try compile("\"#x\"");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+    const vals = try collectAll(&q, t);
+    defer alloc.free(vals);
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqualStrings("#x", vals[0].string);
+}

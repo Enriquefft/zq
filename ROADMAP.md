@@ -300,7 +300,7 @@ Pool module fully implemented; CLI surface pending.
 | | Item | Detail |
 |---|------|--------|
 | [ ] | **REPL mode** | `zq --repl` — interactive filter development with instant feedback. |
-| [ ] | **Filter comments** | Allow `#` comments in filter files. |
+| [x] | **Filter comments** | `#` to end-of-line. jq-compatible. |
 
 ---
 
@@ -530,7 +530,6 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | `input` with no remaining input | Error | Empty output (no values) | Composability with generators. Matches jaq. |
 | Duplicate object keys | Last value wins silently | Last value wins, but `--warn-duplicate-keys` emits stderr warning | Data integrity. |
 | Streaming incomplete JSON | Error | Auto-close truncated containers (opt-in via `--stream-recover`) | LLM streaming use case. |
-| Filter comments | Not supported | `#` comments in filter files | Developer experience. |
 | Error output | Human-readable text only | `--json-errors` for structured JSON errors | Agent integration. |
 | Null propagation | Silent null on missing fields | `--strict` errors on null field access | Agent reliability. |
 | Regex engine | Oniguruma (archived 2025; ReDoS-vulnerable) | `regex-automata` (linear-time, unicode-aware, panic-safe) | Security, maintenance trajectory. |
