@@ -309,6 +309,11 @@ pub const ResultIterator = struct {
     object_construct: std.ArrayList(ObjectField),
     /// Stack of saved field counts for nested object construction.
     object_construct_depth: std.ArrayList(u32),
+    /// Stack of saved input values for nested object construction. Each entry
+    /// is the `current` value at object_construct_start time, restored before
+    /// every field's value expression so all fields evaluate against the same
+    /// `.` even when prior fields leave intermediate values in `current`.
+    object_construct_input: std.ArrayList(Value),
     /// Stack of saved `current` values for if/elif branch restoration.
     /// save_input pushes; restore_input pops.
     if_stack: std.ArrayList(Value),
@@ -393,6 +398,10 @@ pub const ResultIterator = struct {
         errdefer object_construct_depth.deinit(allocator);
         try object_construct_depth.ensureTotalCapacity(allocator, 16);
 
+        var object_construct_input = std.ArrayList(Value){};
+        errdefer object_construct_input.deinit(allocator);
+        try object_construct_input.ensureTotalCapacity(allocator, 16);
+
         // Initialize if-branch input stack
         var if_stack = std.ArrayList(Value){};
         errdefer if_stack.deinit(allocator);
@@ -444,6 +453,7 @@ pub const ResultIterator = struct {
             .runtime_tape = runtime_tape,
             .object_construct = object_construct,
             .object_construct_depth = object_construct_depth,
+            .object_construct_input = object_construct_input,
             .if_stack = if_stack,
             .collect_stack = collect_stack,
             .call_stack = call_stack,
@@ -504,6 +514,7 @@ pub const ResultIterator = struct {
         it.variable_store.deinit(it.alloc);
         it.object_construct.deinit(it.alloc);
         it.object_construct_depth.deinit(it.alloc);
+        it.object_construct_input.deinit(it.alloc);
         it.if_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
@@ -550,6 +561,8 @@ pub const ResultIterator = struct {
             }
         }
         it.object_construct.clearRetainingCapacity();
+        it.object_construct_depth.clearRetainingCapacity();
+        it.object_construct_input.clearRetainingCapacity();
         it.if_stack.clearRetainingCapacity();
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
@@ -1188,8 +1201,9 @@ pub const ResultIterator = struct {
                 // Save the current field count so nested object constructions
                 // don't clobber the outer object's fields.
                 it.object_construct_depth.appendAssumeCapacity(@intCast(it.object_construct.items.len));
-                // Snapshot input so each field's value expression starts from it.
-                it.current = it.input_value;
+                // Snapshot the input `.` for this object literal so every field's
+                // value expression evaluates against the same context.
+                it.object_construct_input.appendAssumeCapacity(it.current);
                 it.ip += 1;
                 return null;
             },
@@ -1217,9 +1231,11 @@ pub const ResultIterator = struct {
                     .value = value,
                 });
 
-                // Restore current to the filter input so the next field's
-                // value expression is evaluated against the same context.
-                it.current = it.input_value;
+                // Restore current to the snapshot taken at object_construct_start
+                // so the next field's value expression sees the same `.` as the
+                // first one (rather than whatever this field's expression left).
+                const depth = it.object_construct_input.items.len;
+                it.current = it.object_construct_input.items[depth - 1];
                 it.ip += 1;
                 return null;
             },
@@ -1230,6 +1246,9 @@ pub const ResultIterator = struct {
                     it.object_construct_depth.pop().?
                 else
                     0;
+                if (it.object_construct_input.items.len > 0) {
+                    _ = it.object_construct_input.pop();
+                }
                 const obj = try it.constructObjectFromFieldsRange(saved_depth);
                 // Truncate back to the saved depth, removing this level's fields.
                 it.object_construct.items.len = saved_depth;
