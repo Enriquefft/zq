@@ -30,9 +30,27 @@ pub const ZqError = error{
     /// An underlying OS call failed (fstat, mmap, read, etc.).
     /// Distinct from UnexpectedEof — the stream is not at a clean end.
     IoError,
+    /// Malformed filter expression detected at compile time.
+    QuerySyntaxError,
+    /// Regex pattern failed to compile (bad syntax, unsupported construct,
+    /// or shim internal error). Surfaced at filter-compile time for literal
+    /// patterns, at runtime for dynamic ones.
+    RegexCompileError,
+    /// Regex engine not linked into this build (`-Dregex=false`).
+    RegexNotCompiled,
+    /// Regex engine raised an internal error at runtime.
+    RegexInternalError,
+    /// Operation applied to wrong JSON type at runtime.
+    TypeError,
+    /// Array index beyond array length at runtime.
+    IndexOutOfBounds,
+    /// Memory allocation failed during operation.
+    OutOfMemory,
+    /// User-raised error via the `error` builtin.
+    UserError,
 };
 
-/// All error conditions zq can produce (mirrors ZqError).
+/// All error conditions zq can produce (mirrors ZqError 1:1).
 /// Used only at the display layer — never in function signatures.
 pub const ErrorKind = enum {
     unexpected_token,
@@ -41,8 +59,15 @@ pub const ErrorKind = enum {
     invalid_number,
     unterminated_string,
     depth_limit_exceeded,
-    /// An underlying OS call failed (fstat, mmap, read, etc.).
     io_error,
+    query_syntax_error,
+    regex_compile_error,
+    regex_not_compiled,
+    regex_internal_error,
+    type_error,
+    index_out_of_bounds,
+    out_of_memory,
+    user_error,
 };
 
 /// Rich diagnostic context attached to every user-facing error.
@@ -70,16 +95,30 @@ pub const LineTable = struct {
     newlines: []const u64,  // sorted ascending; offsets of each '\n' in source
     source:   []const u8,
 };
+
+/// Structured compile-time error with source location.
+/// Returned inside `query.CompileResult.err`.
+pub const CompileError = struct {
+    kind:   ErrorKind,
+    offset: u32,
+    len:    u32,
+};
+
+/// Output format selector for `formatDiagnostic`.
+pub const DiagnosticFormat = enum { text, json };
 ```
 
 ### Functions
 
-| Function         | Input → Output                                        | Description                                                              |
-|------------------|-------------------------------------------------------|--------------------------------------------------------------------------|
-| `buildLineTable` | `source: []const u8, alloc: Allocator → !LineTable`  | Scan source once, record all `\n` offsets. Call only on error path.      |
-| `resolve`        | `table: LineTable, offset: u64 → struct{line, col}`  | Binary-search `newlines` to compute 1-based line and col from byte offset.|
-| `raise`          | `kind: ErrorKind, ctx: Context → Error`               | Assemble and return a display Error. Allocation-free and infallible.     |
-| `deinit`         | `table: LineTable, alloc: Allocator → void`           | Free the `newlines` slice.                                               |
+| Function            | Input → Output                                                                                                                        | Description                                                                               |
+|---------------------|---------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------|
+| `buildLineTable`    | `source: []const u8, alloc: Allocator → !LineTable`                                                                                   | Scan source once, record all `\n` offsets. Call only on error path.                      |
+| `resolve`           | `table: LineTable, offset: u64 → struct{line, col}`                                                                                   | Binary-search `newlines` to compute 1-based line and col from byte offset.                |
+| `raise`             | `kind: ErrorKind, ctx: Context → Error`                                                                                               | Assemble and return a display Error. Allocation-free and infallible.                      |
+| `deinit`            | `table: LineTable, alloc: Allocator → void`                                                                                           | Free the `newlines` slice.                                                                |
+| `kindFromZqError`   | `ZqError → ErrorKind`                                                                                                                 | Convert a propagated `ZqError` back to its matching `ErrorKind` (1:1 mapping).            |
+| `kindToString`      | `ErrorKind → []const u8`                                                                                                              | Human-readable description ("type error", "regex compile error", …).                      |
+| `formatDiagnostic`  | `writer, filter_src, kind, offset, len, input_preview?, user_message?, alloc, DiagnosticFormat → void`                                | Render a `text` or `json` diagnostic with caret underline. Infallible (write errors swallowed). |
 
 ### Error Propagation Pattern
 
@@ -109,9 +148,13 @@ const result = tokenize(source, off) catch |e| {
 
 ### Errors
 
-| Error                       | When                               | Return              |
-|-----------------------------|------------------------------------|---------------------|
-| `Allocator.Error.OutOfMemory` | `buildLineTable` fails to allocate | propagate `!LineTable` |
+| Error                         | When                                           | Return                  |
+|-------------------------------|------------------------------------------------|-------------------------|
+| `Allocator.Error.OutOfMemory` | `buildLineTable` fails to allocate             | propagate `!LineTable`  |
+
+`formatDiagnostic` is infallible: if the `LineTable` allocation fails it emits
+a bare error message (text) or a minimal `{"error":"..."}` object (json)
+instead of returning an error.
 
 ## Dependencies
 - `std.mem.Allocator` (stdlib only — no external dependencies)
