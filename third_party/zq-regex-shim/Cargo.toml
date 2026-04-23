@@ -1,0 +1,40 @@
+[package]
+name = "zq-regex-shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Static C ABI shim over regex-automata for the zq query engine."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zq_regex_shim"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[dependencies.regex-automata]
+version = "0.4"
+default-features = false
+features = [
+    "std",
+    "syntax",
+    "meta",
+    "nfa-pikevm",
+    "hybrid",
+    "perf-literal",
+    "unicode-perl",
+    "unicode-case",
+    "unicode-gencat",
+    "unicode-script",
+    "unicode-bool",
+]
+
+[dependencies.regex-syntax]
+version = "0.8"
+default-features = false
+features = ["std", "unicode"]

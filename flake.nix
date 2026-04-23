@@ -29,6 +29,9 @@
             just
             vhs
             nodejs
+            rustc
+            cargo
+            cargo-zigbuild
           ];
         };
 

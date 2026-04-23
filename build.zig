@@ -7,8 +7,49 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const ver = b.option([]const u8, "version", "Version string") orelse version;
+    const regex_enabled = b.option(bool, "regex", "Enable regex builtins (requires rustc+cargo)") orelse true;
     const options = b.addOptions();
     options.addOption([]const u8, "version", ver);
+    options.addOption(bool, "regex_enabled", regex_enabled);
+    // One concrete options module, imported everywhere via addImport. Using
+    // `addOptions(...)` on each consumer module would create *separate*
+    // modules backed by the same generated source file — that collides when
+    // two such modules reach the same executable compilation.
+    const build_options_module = options.createModule();
+
+    // ── Regex shim (Rust staticlib) ───────────────────────────────────────────
+    // When -Dregex=true (default), invoke cargo on the vendored shim crate and
+    // link the produced static archive into every Zig artifact that needs regex.
+    // When -Dregex=false, skip cargo entirely — regex builtins compile to stubs
+    // that return error.RegexNotCompiled at runtime.
+    const shim_manifest = "third_party/zq-regex-shim/Cargo.toml";
+    const shim_archive_path = "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
+    const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled) blk: {
+        const cmd = b.addSystemCommand(&.{
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+            shim_manifest,
+        });
+        break :blk cmd;
+    } else null;
+
+    const regex_module = b.createModule(.{
+        .root_source_file = b.path("src/regex/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    regex_module.addImport("build_options", build_options_module);
+    if (regex_enabled) {
+        regex_module.addObjectFile(b.path(shim_archive_path));
+        regex_module.link_libc = true;
+        // Rust panic=unwind requires libunwind symbols; Zig ships one in its
+        // sysroot so `-lunwind` resolves without extra system dependencies.
+        regex_module.linkSystemLibrary("unwind", .{});
+    }
 
     // ── Modules ───────────────────────────────────────────────────────────────
     const types_module = b.createModule(.{
@@ -62,6 +103,12 @@ pub fn build(b: *std.Build) void {
     query_module.addImport("error", error_module);
     query_module.addImport("types", types_module);
     query_module.addImport("lexer", lexer_module);
+    query_module.addImport("regex", regex_module);
+    // The regex module already carries the shim as an object file and links
+    // libc/libunwind. The query module picks those up transitively via
+    // `addImport`, so no extra link options are needed here. Avoid adding
+    // a second `build_options` module here — regex already exposes it, and
+    // duplicating the options here triggers "file exists in two modules".
 
     const output_module = b.createModule(.{
         .root_source_file = b.path("src/output/root.zig"),
@@ -109,6 +156,10 @@ pub fn build(b: *std.Build) void {
     lsp_module.addImport("error", error_module);
     lsp_module.addImport("types", types_module);
     lsp_module.addImport("lexer", lexer_module);
+    // The LSP surfaces compile errors (including regex compile errors) by
+    // invoking the real compiler. Import the query module so diagnostics
+    // reflect production behaviour — single source of truth.
+    lsp_module.addImport("query", query_module);
 
     // ── Executable ─────────────────────────────────────────────────────────────
     const is_release = optimize != .Debug;
@@ -128,12 +179,14 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("pool", pool_module);
     exe_mod.addImport("describe", describe_module);
     exe_mod.addImport("lsp", lsp_module);
-    exe_mod.addOptions("build_options", options);
+    exe_mod.addImport("regex", regex_module);
+    exe_mod.addImport("build_options", build_options_module);
 
     const exe = b.addExecutable(.{
         .name = "zq",
         .root_module = exe_mod,
     });
+    if (shim_build_step) |step| exe.step.dependOn(&step.step);
     b.installArtifact(exe);
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -187,8 +240,12 @@ pub fn build(b: *std.Build) void {
     });
     query_test_mod.addImport("query", query_module);
     query_test_mod.addImport("types", types_module);
+    query_test_mod.addImport("regex", regex_module);
+    query_test_mod.addImport("error", error_module);
+    query_test_mod.addImport("build_options", build_options_module);
 
     const query_tests = b.addTest(.{ .root_module = query_test_mod });
+    if (shim_build_step) |step| query_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(query_tests).step);
 
     const output_test_mod = b.createModule(.{
@@ -211,8 +268,10 @@ pub fn build(b: *std.Build) void {
     pool_test_mod.addImport("query", query_module);
     pool_test_mod.addImport("types", types_module);
     pool_test_mod.addImport("io", io_module);
+    pool_test_mod.addImport("regex", regex_module);
 
     const pool_tests = b.addTest(.{ .root_module = pool_test_mod });
+    if (shim_build_step) |step| pool_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(pool_tests).step);
 
     const c_abi_test_mod = b.createModule(.{
@@ -255,6 +314,7 @@ pub fn build(b: *std.Build) void {
     lsp_test_mod.addImport("ast", ast_module);
 
     const lsp_tests = b.addTest(.{ .root_module = lsp_test_mod });
+    if (shim_build_step) |step| lsp_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(lsp_tests).step);
 
     // ── JSONTestSuite ──────────────────────────────────────────────────────
@@ -296,7 +356,40 @@ pub fn build(b: *std.Build) void {
     fuzz_query_mod.addImport("query", query_module);
 
     const fuzz_query_tests = b.addTest(.{ .root_module = fuzz_query_mod });
+    if (shim_build_step) |step| fuzz_query_tests.step.dependOn(&step.step);
     fuzz_query_step.dependOn(&b.addRunArtifact(fuzz_query_tests).step);
+
+    // ── Regex fuzz (NOT in test_step) ─────────────────────────────────────
+    // Differential harness against jq. Not in default test step because it
+    // shells out to an external binary on every iteration; run with
+    //   `zig build fuzz-regex` (optionally `ZQ_FUZZ_ITERS=5000`).
+    const fuzz_regex_step = b.step("fuzz-regex", "Fuzz the regex engine against jq");
+    const fuzz_regex_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_regex.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_regex_mod.addImport("regex", regex_module);
+    const fuzz_regex_tests = b.addTest(.{ .root_module = fuzz_regex_mod });
+    if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
+    fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);
+
+    // ── Regex bench (NOT in test_step) ────────────────────────────────────
+    // Latency probe. Prints median/p99 per pattern class to stderr. Not part
+    // of the default test step to keep CI runs fast. Invoke with
+    //   `zig build bench-regex` — in release mode for meaningful numbers.
+    const bench_regex_step = b.step("bench-regex", "Regex latency probe");
+    const bench_regex_mod = b.createModule(.{
+        .root_source_file = b.path("tests/regex_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_regex_mod.addImport("regex", regex_module);
+    bench_regex_mod.addImport("parser", parser_module);
+    bench_regex_mod.addImport("query", query_module);
+    const bench_regex_tests = b.addTest(.{ .root_module = bench_regex_mod });
+    if (shim_build_step) |step| bench_regex_tests.step.dependOn(&step.step);
+    bench_regex_step.dependOn(&b.addRunArtifact(bench_regex_tests).step);
 
     const compat_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/compat/root.zig"),
@@ -307,7 +400,27 @@ pub fn build(b: *std.Build) void {
     compat_test_mod.addImport("types", types_module);
     compat_test_mod.addImport("parser", parser_module);
     compat_test_mod.addImport("query", query_module);
+    compat_test_mod.addImport("regex", regex_module);
 
     const compat_tests = b.addTest(.{ .root_module = compat_test_mod });
+    if (shim_build_step) |step| compat_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(compat_tests).step);
+
+    // ── Regex tests ───────────────────────────────────────────────────────────
+    // root.zig's test block reffs cache.zig so all regex tests run from here.
+    const regex_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/regex/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    regex_test_mod.addImport("build_options", build_options_module);
+    if (regex_enabled) {
+        regex_test_mod.addObjectFile(b.path(shim_archive_path));
+        regex_test_mod.link_libc = true;
+        regex_test_mod.linkSystemLibrary("unwind", .{});
+    }
+
+    const regex_tests = b.addTest(.{ .root_module = regex_test_mod });
+    if (shim_build_step) |step| regex_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(regex_tests).step);
 }
