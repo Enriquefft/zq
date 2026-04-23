@@ -373,6 +373,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     fuzz_regex_mod.addImport("regex", regex_module);
+    fuzz_regex_mod.addImport("query", query_module);
+    fuzz_regex_mod.addImport("pool", pool_module);
+    fuzz_regex_mod.addImport("types", types_module);
+    fuzz_regex_mod.addImport("io", io_module);
     const fuzz_regex_tests = b.addTest(.{ .root_module = fuzz_regex_mod });
     if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
     fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);

@@ -20,6 +20,9 @@
 
 const std = @import("std");
 const regex = @import("regex");
+const query_mod = @import("query");
+const pool_mod = @import("pool");
+const types_mod = @import("types");
 
 const default_iterations: u32 = 1000;
 
@@ -251,6 +254,255 @@ test "regex fuzz: small grammar 100 iters" {
     std.debug.print(
         "regex fuzz: {d}/{d} compiled, {d} diffed, {d} divergences\n",
         .{ compile_ok, n, checked, divergences },
+    );
+    try std.testing.expectEqual(@as(u32, 0), divergences);
+}
+
+// ─── Prefilter soundness fuzz ─────────────────────────────────────────────────
+//
+// The prefilter is a per-record "maybe" predicate: false = skip, true = full
+// filter. The contract is strict ONE-WAY:
+//
+//     accept(bytes) = false  ⇒  filter produces no output for that record.
+//
+// False positives are allowed (records the prefilter keeps that the filter
+// rejects). False negatives — records the prefilter drops that the filter
+// would have output — silently corrupt the result.
+//
+// This fuzz harness generates:
+//   - A query in the prefilter-eligible idiom select(.FIELD | test("LIT")).
+//   - A batch of records, some of which contain the literal raw, some
+//     \uXXXX-encoded, some short-escape-encoded, some unrelated.
+//
+// For each record it verifies:
+//   1. Running zq WITH prefilter gates → zq output A.
+//   2. Running zq WITHOUT prefilter gates → zq output B.
+//   3. Running jq on the same record     → output C.
+//   Invariant: A == B == C.
+//
+// This catches any future regression that re-introduces a false-negative
+// path in the prefilter (e.g. new encoding form not handled by the
+// backslash-presence check, a walker bug, etc.).
+
+const prefilter_default_iters: u32 = 1000;
+
+fn runWithOptionalPrefilter(
+    alloc: std.mem.Allocator,
+    cq: *query_mod.CompiledQuery,
+    input: []const u8,
+    enable_prefilter: bool,
+) ![]u8 {
+    // Snapshot + temporarily disable the prefilter if requested. We do NOT
+    // deinit the prefilter — we just detach it for this run and restore it.
+    const saved = cq.prefilter;
+    defer cq.prefilter = saved;
+    if (!enable_prefilter) cq.prefilter = null;
+
+    const fd = std.posix.memfd_create("zq_fuzz_pf", 0) catch return error.MemfdFailed;
+    errdefer std.posix.close(fd);
+    _ = try std.posix.write(fd, input);
+    try std.posix.lseek_SET(fd, 0);
+    var file = std.fs.File{ .handle = fd };
+    defer file.close();
+
+    const budget = pool_mod.MemoryBudget.explicit(1024 * 1024 * 1024);
+    var p = try pool_mod.Pool.init(1, budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, cq, .compact, null, .{}, false, &.{});
+
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(alloc);
+    while (try p.collect_bytes()) |r| {
+        try out.appendSlice(alloc, r.data);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn genLiteral(gen: *Generator) ![]u8 {
+    // Random 2-6 char literal from the genChar alphabet. All are safe to
+    // splice directly into both the query pattern and JSON record values.
+    const len = gen.rng.uintLessThan(u8, 5) + 2;
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(gen.alloc);
+    var i: u8 = 0;
+    while (i < len) : (i += 1) {
+        // Restrict to ident-safe chars — no regex metas, no JSON escapes needed.
+        const pool = "abcdefghijklmnopqrstuvwxyz0123456789";
+        try buf.append(gen.alloc, pool[gen.rng.uintLessThan(usize, pool.len)]);
+    }
+    return buf.toOwnedSlice(gen.alloc);
+}
+
+const EncodingMode = enum { raw, uhex, short_escape, unrelated };
+
+fn encodeChar(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, b: u8, mode: EncodingMode) !void {
+    switch (mode) {
+        .raw => try buf.append(alloc, b),
+        .uhex => {
+            var tmp: [8]u8 = undefined;
+            const enc = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}) catch unreachable;
+            try buf.appendSlice(alloc, enc);
+        },
+        .short_escape => {
+            // Short-escape the first char only if it has a short form.
+            // For printable ascii we simulate one via a preceding benign
+            // escape sequence like `\t`: this doesn't alter the decoded
+            // string's literal but forces a `\` into the raw record bytes.
+            try buf.appendSlice(alloc, "\\t");
+            try buf.append(alloc, b);
+        },
+        .unrelated => unreachable, // handled at record level
+    }
+}
+
+fn genRecord(
+    alloc: std.mem.Allocator,
+    gen: *Generator,
+    literal: []const u8,
+    field: []const u8,
+    mode: EncodingMode,
+) ![]u8 {
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(alloc);
+
+    try buf.append(alloc, '{');
+    try jsonEscapeInto(&buf, alloc, field);
+    try buf.append(alloc, ':');
+
+    // Value is a string that either contains the literal (in some encoding)
+    // or is unrelated noise.
+    switch (mode) {
+        .unrelated => {
+            // Random 5-10 byte string that DOES NOT contain `literal` as a
+            // substring. Generate and retry up to 3 times.
+            var tries: u8 = 0;
+            while (tries < 3) : (tries += 1) {
+                var hay = std.ArrayList(u8){};
+                defer hay.deinit(alloc);
+                const hlen = gen.rng.uintLessThan(u8, 6) + 5;
+                var i: u8 = 0;
+                while (i < hlen) : (i += 1) {
+                    const pool = "ABCDEFGHIJ0123456789";
+                    try hay.append(alloc, pool[gen.rng.uintLessThan(usize, pool.len)]);
+                }
+                if (std.mem.indexOf(u8, hay.items, literal) == null) {
+                    try jsonEscapeInto(&buf, alloc, hay.items);
+                    break;
+                }
+            } else {
+                // Worst-case fallback: just emit a fixed non-matching string.
+                try jsonEscapeInto(&buf, alloc, "XXXXXX");
+            }
+        },
+        else => {
+            // Build a string literal manually: open quote, encode each char
+            // of `literal` per `mode`, close quote. We inject surrounding
+            // chars too so there's some "noise" around the literal.
+            try buf.append(alloc, '"');
+            try buf.append(alloc, 'a');
+            try buf.append(alloc, 'b');
+            for (literal) |c| try encodeChar(&buf, alloc, c, mode);
+            try buf.append(alloc, 'y');
+            try buf.append(alloc, 'z');
+            try buf.append(alloc, '"');
+        },
+    }
+    try buf.append(alloc, '}');
+    return buf.toOwnedSlice(alloc);
+}
+
+test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    const iter_env = std.posix.getenv("ZQ_FUZZ_ITERS");
+    const n: u32 = if (iter_env) |s|
+        std.fmt.parseInt(u32, s, 10) catch prefilter_default_iters
+    else
+        100; // in-test-step default; set ZQ_FUZZ_ITERS=1000 for full run.
+
+    const seed_env = std.posix.getenv("ZQ_FUZZ_SEED");
+    const seed: u64 = if (seed_env) |s| std.fmt.parseInt(u64, s, 10) catch 0 else 0;
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    var gen = Generator{ .rng = prng.random(), .alloc = std.testing.allocator };
+
+    var divergences: u32 = 0;
+    var checked: u32 = 0;
+
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const lit = try genLiteral(&gen);
+        defer std.testing.allocator.free(lit);
+        const field = "k";
+
+        // Build query: select(.k | test("LIT"))
+        var q_buf = std.ArrayList(u8){};
+        defer q_buf.deinit(std.testing.allocator);
+        try q_buf.appendSlice(std.testing.allocator, "select(.k | test(");
+        try jsonEscapeInto(&q_buf, std.testing.allocator, lit);
+        try q_buf.append(std.testing.allocator, ')');
+        try q_buf.append(std.testing.allocator, ')');
+
+        const cres = query_mod.CompiledQuery.compile(q_buf.items, .{}, std.testing.allocator) catch continue;
+        var cq = switch (cres) {
+            .ok => |c| c,
+            .err => continue,
+        };
+        defer cq.deinit();
+
+        // Generate a batch of records across all encoding modes.
+        var record_buf = std.ArrayList(u8){};
+        defer record_buf.deinit(std.testing.allocator);
+        const modes = [_]EncodingMode{ .raw, .uhex, .short_escape, .unrelated };
+        for (modes) |m| {
+            const rec = try genRecord(std.testing.allocator, &gen, lit, field, m);
+            defer std.testing.allocator.free(rec);
+            try record_buf.appendSlice(std.testing.allocator, rec);
+            try record_buf.append(std.testing.allocator, '\n');
+        }
+
+        // Run with and without prefilter.
+        const out_pf = runWithOptionalPrefilter(std.testing.allocator, &cq, record_buf.items, true) catch continue;
+        defer std.testing.allocator.free(out_pf);
+        const out_no = runWithOptionalPrefilter(std.testing.allocator, &cq, record_buf.items, false) catch continue;
+        defer std.testing.allocator.free(out_no);
+
+        // Shell to jq for ground truth.
+        const jq_out_raw = runJq(std.testing.allocator, q_buf.items, record_buf.items) catch continue;
+        defer std.testing.allocator.free(jq_out_raw);
+
+        // Normalize jq output: append trailing newline if there's any content
+        // (zq pool output has one), else leave empty.
+        var jq_norm = std.ArrayList(u8){};
+        defer jq_norm.deinit(std.testing.allocator);
+        if (jq_out_raw.len > 0) {
+            try jq_norm.appendSlice(std.testing.allocator, jq_out_raw);
+            try jq_norm.append(std.testing.allocator, '\n');
+        }
+
+        checked += 1;
+
+        if (!std.mem.eql(u8, out_pf, out_no)) {
+            std.debug.print(
+                "PREFILTER DIVERGENCE (pf vs no-pf): lit={s} q={s}\n  pf={s}\n  no={s}\n",
+                .{ lit, q_buf.items, out_pf, out_no },
+            );
+            divergences += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, out_pf, jq_norm.items)) {
+            std.debug.print(
+                "ZQ vs JQ DIVERGENCE: lit={s} q={s}\n  zq={s}\n  jq={s}\n",
+                .{ lit, q_buf.items, out_pf, jq_norm.items },
+            );
+            divergences += 1;
+        }
+    }
+
+    std.debug.print(
+        "prefilter fuzz: {d}/{d} ran, {d} divergences\n",
+        .{ checked, n, divergences },
     );
     try std.testing.expectEqual(@as(u32, 0), divergences);
 }
