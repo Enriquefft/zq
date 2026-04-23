@@ -456,11 +456,38 @@ pub const Server = struct {
             doc.model = analysis.SemanticModel.analyze(pr.root, self.alloc);
         }
 
-        // Publish diagnostics
+        // Publish diagnostics. Two-stage:
+        //   1. AST parser diagnostics (cheap, covers most syntax errors).
+        //   2. Full compile diagnostics (catches regex-compile errors that
+        //      only surface when the real compiler reaches the `RegexPool`).
+        // We merge both into a single `publishDiagnostics` so the client
+        // sees a stable diagnostic set per edit.
         if (doc.parse_result) |*pr| {
-            const diags = diagnostics_feat.fromParseErrors(pr.errors, doc.source, self.alloc);
-            defer if (diags.len > 0) self.alloc.free(diags);
-            self.publishDiagnostics(doc.uri, diags);
+            const parse_diags = diagnostics_feat.fromParseErrors(pr.errors, doc.source, self.alloc);
+            defer if (parse_diags.len > 0) self.alloc.free(parse_diags);
+
+            // Skip the compile pass when the AST already disagreed — a
+            // syntactically broken filter won't reach the regex pool anyway
+            // and the compiler error would be redundant.
+            if (pr.errors.len == 0) {
+                const compile_diags = diagnostics_feat.fromCompileErrors(doc.source, self.alloc);
+                defer {
+                    for (compile_diags) |d| self.alloc.free(d.message);
+                    if (compile_diags.len > 0) self.alloc.free(compile_diags);
+                }
+                if (compile_diags.len == 0) {
+                    self.publishDiagnostics(doc.uri, parse_diags);
+                } else {
+                    // Concatenate and publish the union.
+                    var all = std.ArrayList(protocol.Diagnostic){};
+                    defer all.deinit(self.alloc);
+                    all.appendSlice(self.alloc, parse_diags) catch {};
+                    all.appendSlice(self.alloc, compile_diags) catch {};
+                    self.publishDiagnostics(doc.uri, all.items);
+                }
+            } else {
+                self.publishDiagnostics(doc.uri, parse_diags);
+            }
         }
     }
 
