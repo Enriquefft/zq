@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
     const ver = b.option([]const u8, "version", "Version string") orelse version;
     const regex_enabled = b.option(bool, "regex", "Enable regex builtins (requires rustc+cargo)") orelse true;
     const lsp_enabled = b.option(bool, "lsp", "Enable LSP server (--lsp flag). Disable to shrink CLI binary.") orelse true;
+    // Absolute path to a pre-built libzq_regex_shim.a. When set, skip the
+    // in-tree cargo invocation and link this archive directly. Used by Nix
+    // packaging so `nix build` stays hermetic (no cargo/rustc at build time).
+    const shim_archive_opt = b.option([]const u8, "shim-archive", "Path to prebuilt libzq_regex_shim.a (skips cargo)");
     const strip_opt = b.option(bool, "strip", "Strip symbols from release binary (default: true in release, false in debug)");
     const options = b.addOptions();
     options.addOption([]const u8, "version", ver);
@@ -35,12 +39,21 @@ pub fn build(b: *std.Build) void {
     // plain `cargo build` to avoid the zigbuild wrapper's startup overhead.
     const rust_triple_opt = rustTripleFromTarget(target.result);
     const is_host = target.query.isNative();
-    const shim_archive_path: []const u8 = if (!is_host and rust_triple_opt != null)
+    const shim_archive_path: []const u8 = if (shim_archive_opt) |p|
+        p
+    else if (!is_host and rust_triple_opt != null)
         b.fmt("third_party/zq-regex-shim/target/{s}/release/libzq_regex_shim.a", .{rust_triple_opt.?})
     else
         "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
+    // Absolute paths (from -Dshim-archive) bypass the source-root lookup
+    // that `b.path` performs. Use `.cwd_relative` in that case; fall back
+    // to `b.path` for the in-tree cargo-produced location.
+    const shim_lazy: std.Build.LazyPath = if (shim_archive_opt != null)
+        .{ .cwd_relative = shim_archive_path }
+    else
+        b.path(shim_archive_path);
 
-    const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled) blk: {
+    const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled and shim_archive_opt == null) blk: {
         const cmd = if (!is_host) cross: {
             const triple = rust_triple_opt orelse {
                 std.debug.panic(
@@ -81,7 +94,7 @@ pub fn build(b: *std.Build) void {
     });
     regex_module.addImport("build_options", build_options_module);
     if (regex_enabled) {
-        regex_module.addObjectFile(b.path(shim_archive_path));
+        regex_module.addObjectFile(shim_lazy);
         regex_module.link_libc = true;
         // Rust panic=unwind requires libunwind symbols; Zig ships one in its
         // sysroot so `-lunwind` resolves without extra system dependencies.
@@ -466,7 +479,7 @@ pub fn build(b: *std.Build) void {
     });
     regex_test_mod.addImport("build_options", build_options_module);
     if (regex_enabled) {
-        regex_test_mod.addObjectFile(b.path(shim_archive_path));
+        regex_test_mod.addObjectFile(shim_lazy);
         regex_test_mod.link_libc = true;
         regex_test_mod.linkSystemLibrary("unwind", .{});
     }
