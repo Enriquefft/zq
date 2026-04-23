@@ -40,10 +40,14 @@ pub const Color = struct {
 /// magenta booleans, bold dark gray nulls. Structural chars uncolored.
 pub const default_colors: Color;
 
-/// Serialization options controlling key ordering and indentation.
+/// Serialization options controlling key ordering, indentation, and any
+/// scratch allocator required by individual formats (e.g. `sort_keys`).
 pub const SerializeOpts = struct {
     sort_keys: bool = false,
     indent: Indent = .{ .spaces = 2 },
+    /// Optional scratch allocator. Required by key-sorting paths; `null` is
+    /// fine when `sort_keys = false` and no other allocating serializer is used.
+    allocator: ?std.mem.Allocator = null,
 
     pub const Indent = union(enum) {
         spaces: u8,
@@ -51,21 +55,23 @@ pub const SerializeOpts = struct {
     };
 };
 
-/// Adapts an std.ArrayList(u8) to the writeByte/writeSlice interface
-/// used by the generic serialization functions.  Used by pool workers to
-/// serialize values directly into arena-backed byte buffers.
+/// Adapts an `std.ArrayList(u8)` to the `writeByte`/`writeSlice` interface used
+/// by the generic serialization functions. Used by pool workers to serialize
+/// values directly into arena-backed byte buffers. Both methods propagate
+/// `error{OutOfMemory}` from the underlying list grow.
 pub const BufferSink = struct {
     list: *std.ArrayList(u8),
-    aa: std.mem.Allocator,
+    aa:   std.mem.Allocator,
 
     pub fn writeByte(self: *BufferSink, byte: u8) error{OutOfMemory}!void;
     pub fn writeSlice(self: *BufferSink, data: []const u8) error{OutOfMemory}!void;
 };
 
 pub const Writer = struct {
-    /// Create a Writer targeting `fd`.
+    /// Create a Writer targeting `file`. TTY detection (`file.isTty()`) is
+    /// performed once at init time; the result is cached for `is_tty()`.
     /// `allocator` is stored internally and used by `deinit`.
-    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator) error{OutOfMemory}!Writer;
+    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) error{OutOfMemory}!Writer;
 
     /// Flush any buffered bytes and release the internal buffer.
     /// Safe to call in `defer` immediately after `init`.
@@ -84,7 +90,7 @@ pub const Writer = struct {
     /// Returns `error.IoError` if the `write()` syscall fails.
     pub fn flush(w: *Writer) ZqError!void;
 
-    /// True if `fd` refers to a terminal device (isatty).
+    /// True if `file` refers to a terminal device (result cached at init).
     /// Callers may use this to pick a default Format.
     pub fn is_tty(w: *const Writer) bool;
 };
@@ -95,7 +101,7 @@ pub const Writer = struct {
 | Function          | Signature                                              | Description                                                                       |
 |-------------------|--------------------------------------------------------|-----------------------------------------------------------------------------------|
 | `serialize`       | `anytype, Value, Format, ?*const Color, SerializeOpts → !void` | Serialize `val` into any sink with `writeByte`/`writeSlice` methods.      |
-| `Writer.init`     | `fd, Allocator → error{OutOfMemory}!Writer`           | Allocate 64 KB internal buffer; detect TTY via `isatty`.                          |
+| `Writer.init`     | `std.fs.File, Allocator → error{OutOfMemory}!Writer`  | Allocate 64 KB internal buffer; cache `file.isTty()`.                             |
 | `Writer.deinit`   | `*Writer → void`                                       | Flush buffered output and free the internal buffer.                               |
 | `Writer.write_value` | `*Writer, Value, Format, ?*const Color, SerializeOpts → ZqError!void` | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB. |
 | `Writer.writeSlice`  | `*Writer, []const u8 → ZqError!void`              | Append pre-serialized bytes to the buffer; auto-flush as needed.                  |
@@ -104,21 +110,23 @@ pub const Writer = struct {
 
 ### Format Semantics
 
-| Format    | Output                                             |
-|-----------|----------------------------------------------------|
-| `pretty`  | Indented JSON (default 2-space; configurable via `SerializeOpts.indent`). |
-| `compact` | Single-line JSON with no extra whitespace.         |
-| `raw`     | Strings without quotes; all other types as compact JSON. |
-| `jsonl`   | Compact JSON followed by a single newline (`\n`). |
+| Format    | Output                                                                         |
+|-----------|--------------------------------------------------------------------------------|
+| `pretty`  | Indented JSON (default 2-space; configurable via `SerializeOpts.indent`).      |
+| `compact` | Single-line JSON with no extra whitespace.                                     |
+| `raw`     | Strings without quotes; all other types as compact JSON.                       |
+| `jsonl`   | Compact JSON followed by a single newline (`\n`).                              |
+| `join`    | Same serializer as `raw`; used by the `@join` path to avoid adding a newline.  |
 
 ### Errors
 
-| ZqError   | When                                                               |
-|-----------|--------------------------------------------------------------------|
-| `IoError` | `write()` syscall fails (non-EINTR) during `flush` or auto-flush. |
+| Error              | When                                                                                                         |
+|--------------------|--------------------------------------------------------------------------------------------------------------|
+| `IoError`          | `Writer` path: `writeAll()` syscall fails during `flush` or auto-flush.                                      |
+| `OutOfMemory`      | `Writer.init` buffer allocation; `BufferSink.writeByte` / `writeSlice` when the underlying list cannot grow. |
 
-`OutOfMemory` is only possible at `init` time (buffer allocation); it is not part of
-`ZqError` and propagates as a standard Zig allocation error.
+`BufferSink` is used by pool workers whose arena can run out, so both its
+methods propagate `error{OutOfMemory}` on every call — not only at init.
 
 ---
 

@@ -55,6 +55,16 @@ const types = @import("types");
 
 pub const ZqError = err.ZqError;
 
+/// Global Sparser-prefilter counters. Exposed as a namespace (not a type);
+/// bumped with relaxed atomics from every worker. Informational only — no
+/// program logic depends on the numbers. Callers that want a per-run count
+/// must invoke `reset()` explicitly.
+pub const prefilter_stats = struct {
+    pub fn reset() void;
+    pub fn skipped() u64;     // records skipped by the raw-byte prescreen
+    pub fn evaluated() u64;   // records that ran the full query
+};
+
 /// A single output value together with its submission sequence number.
 /// Values are views into internally-owned Tape memory; they are valid until
 /// the next call to collect() or deinit().
@@ -64,8 +74,10 @@ pub const Result = struct {
 
 /// Pre-serialized bytes for one record, returned by collect_bytes().
 /// Valid until the next call to collect_bytes() or deinit().
+/// `last_was_false_or_null` flags records whose final emitted value was `false`
+/// or `null`; the CLI uses it to compute the process exit code (jq parity).
 pub const BytesResult = struct {
-    data: []const u8,
+    data:                   []const u8,
     last_was_false_or_null: bool,
 };
 
@@ -98,21 +110,36 @@ pub const Pool = struct {
     pub fn deinit(p: *Pool) void;
 
     /// Submit a regular file for parallel processing.
-    /// `format`: null → structured path (use collect()), non-null → serialized path (use collect_bytes()).
+    ///
+    /// `format`: null → structured path (use `collect()`), non-null → serialized
+    /// path (use `collect_bytes()`). `color`, `opts`, `raw_input`, and
+    /// `external_bindings` are forwarded to each worker so the serialized path
+    /// can render final bytes directly.
     pub fn submit_file(
-        p:      *Pool,
-        file:   std.fs.File,
-        cq:     *const query.CompiledQuery,
-        format: ?types.Format,
+        p:                 *Pool,
+        file:              std.fs.File,
+        cq:                *const query.CompiledQuery,
+        format:            ?types.Format,
+        color:             ?*const output.Color,
+        opts:              output.SerializeOpts,
+        raw_input:         bool,
+        external_bindings: []const query.ExternalVarBinding,
     ) ZqError!void;
 
     /// Submit a streaming source for pipeline processing.
-    /// `format`: null → structured path (use collect()), non-null → serialized path (use collect_bytes()).
+    ///
+    /// Parameters match `submit_file` with the exception that the source is an
+    /// `io.Source` (stdin, pipe, …) instead of a regular file. The dedicated
+    /// IO thread reads complete lines and dispatches them to workers.
     pub fn submit_stream(
-        p:      *Pool,
-        src:    *io.Source,
-        cq:     *const query.CompiledQuery,
-        format: ?types.Format,
+        p:                 *Pool,
+        src:               *io.Source,
+        cq:                *const query.CompiledQuery,
+        format:            ?types.Format,
+        color:             ?*const output.Color,
+        opts:              output.SerializeOpts,
+        raw_input:         bool,
+        external_bindings: []const query.ExternalVarBinding,
     ) void;
 
     /// Return the next result in submission order (structured path).
@@ -133,8 +160,8 @@ pub const Pool = struct {
 | `MemoryBudget.computeParams` | `MemoryBudget, u64, usize, ?Format → ChunkParams`                         | Compute adaptive chunk_factor, in_flight_factor, stream_batch_size.                    |
 | `Pool.init`           | `usize, MemoryBudget, Allocator → error{OutOfMemory}!Pool`                      | Allocate all internal state and spawn N worker threads.                                 |
 | `Pool.deinit`         | `*Pool → void`                                                                   | Stop all workers, join threads, free memory.                                            |
-| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format → ZqError!void`                     | Read file, split into adaptive chunks, enqueue for parallel processing.                |
-| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format → void`                           | Attach stream; IO thread reads lines and feeds workers in pipeline mode.                |
+| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → ZqError!void` | Read file, split into adaptive chunks, enqueue for parallel processing. |
+| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → void`      | Attach stream; IO thread reads lines and feeds workers in pipeline mode. |
 | `Pool.collect`        | `*Pool → ZqError!?Result`                                                        | Return next in-order result; null when exhausted; error on per-record failure.          |
 | `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                                   | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
 
@@ -152,6 +179,10 @@ pub const Pool = struct {
 | `TypeError`        | Worker query: operation applied to wrong JSON type.                                     |
 | `IndexOutOfBounds` | Worker query: array index beyond bounds.                                                |
 | `QuerySyntaxError` | Not raised at runtime; only from CompiledQuery.compile before submit.                   |
+| `RegexCompileError`| Worker query: dynamic regex pattern rejected by the engine at runtime.                  |
+| `RegexNotCompiled` | Worker query: regex builtin invoked but build was compiled with `-Dregex=false`.       |
+| `RegexInternalError`| Worker query: regex engine raised a runtime/shim error.                                |
+| `UserError`        | Worker query: filter invoked the `error` builtin.                                       |
 | `OutOfMemory`      | `init` only; internal structure allocation.                                             |
 
 ---
@@ -160,10 +191,12 @@ pub const Pool = struct {
 
 - `src/error/root.zig`  — `ZqError` for propagation
 - `src/types.zig`       — `Value`, `Tape`, `Format`
-- `src/io/root.zig`     — `Source`, `SliceView`, `MappedFile`
+- `src/io/root.zig`     — `Source`, `SliceView`, `MappedFile` (mmap-backed file chunks)
 - `src/parser/root.zig` — `Parser`, `FeedResult`
-- `src/query/root.zig`  — `CompiledQuery`, `ResultIterator`
-- `src/output/root.zig` — `BufferSink`, `serialize()` (serialized path only)
+- `src/query/root.zig`  — `CompiledQuery`, `ResultIterator`, `ExternalVarBinding`
+- `src/output/root.zig` — `Color`, `SerializeOpts`, `BufferSink`, `serialize()` (serialized path)
+- `src/regex/root.zig`  — indirect via `query`; every Regex error variant can surface here
+- `src/ast/root.zig`    — indirect via `query` prefilter harvester at compile time
 
 ---
 

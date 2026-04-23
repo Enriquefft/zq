@@ -26,12 +26,18 @@ pub const Tape    = types.Tape;
 /// The outcome of a single `feed()` call.
 pub const FeedResult = union(enum) {
     /// A complete, top-level JSON value was parsed.
-    /// `tape` is a non-owning view into parser-internal memory;
-    /// valid until the next `reset()` or `deinit()` call.
-    done: Tape,
+    /// `tape` is a non-owning view into parser-internal memory; valid until
+    /// the next `reset()` or `deinit()` call.
+    /// `consumed` is the number of input bytes the parser used to produce
+    /// this value (0 ≤ consumed ≤ input.len). Callers must re-submit the
+    /// unconsumed tail on the next `feed()` call.
+    done: struct {
+        tape:     Tape,
+        consumed: usize,
+    },
 
-    /// The bytes consumed so far are valid JSON, but the value is not yet complete.
-    /// Call `feed()` again with the next chunk from `Source`.
+    /// The bytes consumed so far are valid JSON, but the value is not yet
+    /// complete. Call `feed()` again with the next chunk from `Source`.
     need_more,
 };
 
@@ -50,15 +56,21 @@ pub const Parser = struct {
     /// produces `UnexpectedEof` on the next call.
     ///
     /// Returns:
-    ///   `.done(tape)` — a complete JSON value was parsed. `tape` is valid until `reset()`.
-    ///   `.need_more`  — valid so far but incomplete; call again with the next chunk.
-    ///   error.*       — malformed JSON; call `reset()` before reusing the Parser.
+    ///   `.done{tape, consumed}` — a complete JSON value was parsed. `tape` is
+    ///                             valid until `reset()`. `consumed` tells the
+    ///                             caller how much of `input` was used.
+    ///   `.need_more`            — valid so far but incomplete; call again with
+    ///                             the next chunk.
+    ///   error.*                 — malformed JSON; call `reset()` before reusing.
     ///
     /// Auto-Close: when `is_eof = true` and the structural stack is non-empty
-    /// (truncated JSON such as `{"a":1`), the parser synthetically closes all
-    /// open containers and returns `.done` rather than an error. The only
-    /// exception is an unterminated string literal, which cannot be closed
-    /// safely — that always returns `error.UnterminatedString`.
+    /// (truncated JSON such as `{"a":1`), `processEof` synthetically closes
+    /// every open container and returns `.done`. Unrecoverable tail states
+    /// still error:
+    ///   - Unterminated string/escape/unicode → `UnterminatedString`.
+    ///   - Dangling `:` (`want_colon`)        → `UnexpectedEof`.
+    ///   - Comma with no following value      → `UnexpectedEof`.
+    ///   - Number truncated mid-sign / exponent → `InvalidNumber`.
     pub fn feed(
         p:      *Parser,
         input:  []const u8,
@@ -110,9 +122,15 @@ pub const Parser = struct {
 - **`Tape` is non-owning.** The slice fields (`entries`, `string_buf`) point into
   parser-internal memory. The caller must not retain them across `reset()` or `deinit()`.
   This matches the non-ownership convention of `SliceView` (io) and `snippet` (error).
-- **Auto-Close scope.** Only structural containers (`{` / `[`) are auto-closed. An
-  unterminated string always returns `error.UnterminatedString`; a dangling `:` or `,`
-  always returns `error.UnexpectedEof`.
+- **Auto-Close scope.** Only structural containers (`{` / `[`) are auto-closed.
+  Unterminated strings return `error.UnterminatedString`; dangling `:` or `,`
+  return `error.UnexpectedEof`; truncated numbers in `neg` / `frac_start` /
+  `exp_sign` / `exp_start` substates return `error.InvalidNumber`.
+- **`FeedResult.done.consumed` must be honoured.** The parser guarantees
+  `consumed ≤ input.len` and that the unconsumed tail is still raw, unparsed
+  bytes — callers slicing off `[consumed..]` and feeding that to the next
+  `feed()` call is the supported way to parse concatenated JSON records from a
+  single chunk (this is exactly what the C ABI and pool do).
 - **Depth limit is 512.** The structural stack is fixed at 512 slots. `DepthLimitExceeded`
   is returned on the 513th `{` or `[`.
 - **SIMD is a hidden implementation detail.** The parser uses AVX2 (x86-64) or NEON

@@ -18,7 +18,10 @@ pub const SliceView = struct {
 };
 
 pub const Source = struct {
-    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator) ZqError!Source;
+    /// Detects backend via `file.stat()`: regular non-empty files use mmap,
+    /// everything else (pipes, sockets, empty files, devices) uses the ring
+    /// buffer backend.
+    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) ZqError!Source;
     pub fn deinit(s: *Source) void;
 
     /// Zero-copy view of available bytes. No syscalls.
@@ -31,12 +34,17 @@ pub const Source = struct {
     /// std.posix.read handles EINTR internally; all other read failures return error.IoError.
     pub fn refill(s: *Source) ZqError!bool;
 };
+
+/// mmap-backed view over a regular file. Re-exported from `src/io/root.zig`
+/// and used directly by the parallel pool (`submit_file`) when an entire file
+/// must stay addressable across worker chunks.
+pub const MappedFile = @import("src/mmap.zig").MappedFile;
 ```
 
 ### Functions
 | Function | Input → Output | Description |
 |----------|----------------|-------------|
-| `Source.init` | `fd, allocator → ZqError!Source` | Detects backend (mmap vs ring), allocates buffer |
+| `Source.init` | `std.fs.File, allocator → ZqError!Source` | Detects backend (mmap vs ring), allocates buffer |
 | `Source.deinit` | `*Source → void` | Releases mmap region or ring buffer memory |
 | `Source.peek` | `*Source → ZqError!SliceView` | Zero-copy view; no syscalls |
 | `Source.consume` | `*Source, usize → void` | Advances cursor; pointer arithmetic only |
