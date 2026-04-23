@@ -93,7 +93,7 @@ Ranked by observed agent usage.
 
 | | Feature | Tests blocked | Impact | Detail |
 |---|---------|---------------|--------|--------|
-| [ ] | **`del()` with complex args** | ~6 | High | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Current `compileDel` handles single static keys/indices only. Desugar to canonical `delpaths([path(arg)])` to reuse the path-tracking infrastructure. |
+| [x] | **`del()` with complex args** | ~6 | High | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Desugared to `. as $orig \| [path(f)] as $paths \| $orig \| delpaths($paths)`. |
 | [ ] | **`contains` deep comparison** | ~2 | High | Nested object containment check fails. `{foo:{baz:12}} \| contains({foo:{baz:12}})` should return `true`. |
 | [~] | **Variable destructuring — complex patterns** | ~5 | Medium | Simple patterns work; complex patterns (`. as {$a, $b:[$c, $d]}`, computed key destructuring) fail. |
 | [ ] | **`any`/`all` short-circuit** | ~2 | Medium | `any(true, error; .)` should not evaluate the error expression. Eager evaluation today. |
