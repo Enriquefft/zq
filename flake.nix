@@ -31,7 +31,6 @@
             nodejs
             rustc
             cargo
-            cargo-zigbuild
           ];
         };
 

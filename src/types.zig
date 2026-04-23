@@ -665,15 +665,6 @@ pub fn regexPoolIndexOf(operand_index: i64) u32 {
     return @truncate(bits >> 16);
 }
 
-/// True iff this builtin takes a regex pattern as its first explicit argument
-/// and therefore participates in filter-compile-time pool interning.
-pub fn isRegexBuiltin(bid: BuiltinId) bool {
-    return switch (bid) {
-        .test_, .match_, .match_g_, .sub_, .gsub_, .capture_, .scan_, .splits_ => true,
-        else => false,
-    };
-}
-
 // ─── Slice Args ──────────────────────────────────────────────────────────────
 /// Operands for the `slice` instruction (.[from:to]).
 /// Uses i32 to keep @sizeOf(SliceArgs) = 12, within the 16-byte Operand union slot.

@@ -3181,10 +3181,10 @@ fn compileValueArgBuiltin1Collecting(
 /// with `ctx.last_regex_pattern_offset/len` set to the string literal's span
 /// so the top-level compile loop can build a diagnostic with a useful caret.
 fn compileRegexBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
-    // Fast-path detection: lookahead requires a saved lexer position — peek
-    // at the token after '(' and the one after it without committing.
+    // Fast-path detection: peek the token after '(' and the one after it
+    // via a cloned lexer (`lex_probe`) — no rewind needed because the real
+    // consumption below drives `ctx.lex` from its current position.
     // Handles BOTH 1-arg `test("pat")` and 2-arg `test("pat"; "flags")` forms.
-    const saved_pos = ctx.lex.pos;
     var lex_probe = ctx.lex;
     const probe_lparen = lex_probe.next() catch {
         // Syntax is handled by the slow path; fall through.
@@ -3201,7 +3201,6 @@ fn compileRegexBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
 
     // Fast path: `builtin("literal")` with exactly one string literal arg.
     if (probe_arg.tag == .string_lit and probe_close.tag == .rparen) {
-        _ = saved_pos; // lex not consumed yet — real consume happens below.
         return compileRegexBuiltin1FastLiteral(ctx, bid, null);
     }
 
