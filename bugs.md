@@ -107,3 +107,54 @@ test shipped by this codebase. Separating it out surfaces the real defect count.
 
 **Fixed in**: _pending_. See also `TODO.md` for triage priority once AST-walk
 pipeline (Phase 2) lands, since the capture-emission path may move.
+
+---
+
+## BUG-005: Query syntax error on nix-manual mdbook filter (+ leak on error path)
+
+**Symptom**: `sudo nixos-rebuild switch` against a NixOS flake that overlays `jq`
+with `zq` fails while rebuilding `nix-manual-2.34.6.drv`. mdbook invokes the
+`anchors` preprocessor, which shells out to `jq` (now `zq`). zq rejects the
+filter:
+
+```
+zq: query syntax error at line 18, col 31
+              content: .Chapter.content | transformer,
+                              ^
+error(gpa): memory address 0x7ffff7e60000 leaked:
+Unable to print stack trace: Unable to open debug info: MissingDebugInfo
+ WARN Error writing the RenderContext to the backend, Broken pipe (os error 32)
+ERROR The "anchors" preprocessor exited unsuccessfully with exit status: 3 status
+ninja: build stopped: subcommand failed.
+```
+
+**Two defects**:
+1. **Compat gap** — the filter (a jq program mdbook's anchors preprocessor
+   feeds over stdin) uses a construct zq rejects. The shown context
+   `content: .Chapter.content | transformer,` suggests an object-constructor
+   value calling a user-defined function `transformer` (likely declared via
+   `def transformer: ...;` earlier in the filter). Unconfirmed whether zq's
+   parser rejects `def`-call inside an object value, or chokes on something
+   else at col 31.
+2. **Leak on error path** — zq's syntax-error exit leaks an allocation
+   (`0x7ffff7e60000`). Error paths must free before exit; the GPA leak check
+   fires because the allocator is not short-circuited on `QuerySyntaxError`.
+
+**Repro strategy**: capture the exact filter by running nix-manual's build
+under a strace/ptrace that records argv+stdin to jq, or grep the nixpkgs
+source tree for the mdbook `anchors` preprocessor invocation. Minimize to a
+single `.jq` file; then `zq -f min.jq < sample.json`.
+
+**Blast radius**: any NixOS configuration that substitutes `jq` → `zq` via
+overlay cannot rebuild `nix` itself (because nix ships the mdbook-built
+manual). Breaks `nixos-rebuild switch`.
+
+**Fixed in**: _pending_. Triage: (1) first isolate the minimal filter;
+(2) classify — parser limitation vs. interpreter limitation; (3) fix the
+leak on `QuerySyntaxError` regardless of (1)/(2) progress, since any
+syntax error path will leak today.
+
+**Context**: Surfaced during the hermetic-Nix-build rollout
+(commit `1f57ce1`). The hermetic flake itself works — `nix build .#default`
+is green, the overlay is live, and zq is actually being invoked by nix's
+build graph. This is a separate zq compat gap, not a Nix packaging issue.
