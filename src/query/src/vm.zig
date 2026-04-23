@@ -829,11 +829,6 @@ pub const ResultIterator = struct {
 
             .load_index => {
                 const idx = instr.operand.index;
-                // In path-tracking mode, negative indices are errors (jq semantics).
-                if (it.path_stack.items.len > 0 and idx < 0) {
-                    it.type_error_detail = .{ .string = "Out of bounds negative array index" };
-                    return error.TypeError;
-                }
                 const idx_result = try it.doLoadIndex(idx);
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
@@ -5327,10 +5322,17 @@ pub const ResultIterator = struct {
                 const target_idx: usize = if (idx < 0) blk: {
                     const len: i64 = switch (base) {
                         .array => |span| @intCast(arrayLength(span.tape, span)),
+                        .null_val => {
+                            it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                            return error.TypeError;
+                        },
                         else => 0,
                     };
                     const resolved = len + idx;
-                    if (resolved < 0) break :blk 0;
+                    if (resolved < 0) {
+                        it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                        return error.TypeError;
+                    }
                     break :blk @intCast(resolved);
                 } else @intCast(idx);
 
@@ -5404,7 +5406,10 @@ pub const ResultIterator = struct {
         const paths_elems = try it.extractArrayElements(paths_val);
         defer it.alloc.free(paths_elems);
 
-        // Extract each path as an array of elements.
+        // Extract each path as an array of elements, normalizing the first
+        // component against the base value so that negative indices and slices
+        // are resolved against the original array length (matching jq's
+        // delpaths which resolves all paths before applying deletions).
         var path_list = std.ArrayList([]Value){};
         defer {
             for (path_list.items) |p| it.alloc.free(p);
@@ -5412,7 +5417,7 @@ pub const ResultIterator = struct {
         }
         for (paths_elems) |p| {
             const elems = try it.extractArrayElements(p);
-            try path_list.append(it.alloc, elems);
+            try it.normalizeAndAppendPath(&path_list, elems);
         }
 
         // Sort paths: longer paths first, then by last component descending.
@@ -5447,14 +5452,81 @@ pub const ResultIterator = struct {
         return try valueToStackValue(current);
     }
 
+    /// Normalize a path against the base value (it.current) and append the
+    /// result to `out`. Negative integer components at array depth are
+    /// resolved to positive indices, and slice objects are expanded into one
+    /// path per index in the slice range. Ownership of `elems` transfers in
+    /// (we free or reuse it). Null components are kept verbatim (they become
+    /// a no-op at deletion time).
+    fn normalizeAndAppendPath(
+        it: *ResultIterator,
+        out: *std.ArrayList([]Value),
+        elems: []Value,
+    ) ZqError!void {
+        // If the first component is a slice on an array base, expand into
+        // one path per index in the slice range.
+        if (elems.len > 0) {
+            switch (elems[0]) {
+                .object => |slice_span| switch (it.current) {
+                    .array => |span| {
+                        const arr_len: i64 = @intCast(arrayLength(span.tape, span));
+                        const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse Value.null_val;
+                        const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse Value.null_val;
+                        const from_raw: i64 = switch (from_val) {
+                            .int => |v| v,
+                            .null_val => 0,
+                            else => return error.TypeError,
+                        };
+                        const to_raw: i64 = switch (to_val) {
+                            .int => |v| v,
+                            .null_val => arr_len,
+                            else => return error.TypeError,
+                        };
+                        const from_resolved: i64 = if (from_raw < 0) @max(0, arr_len + from_raw) else @min(from_raw, arr_len);
+                        const to_resolved: i64 = if (to_raw < 0) @max(0, arr_len + to_raw) else @min(to_raw, arr_len);
+                        const slice_end: i64 = if (to_resolved < from_resolved) from_resolved else to_resolved;
+
+                        // Free the incoming elems — we're replacing with new paths.
+                        it.alloc.free(elems);
+                        var i: i64 = from_resolved;
+                        while (i < slice_end) : (i += 1) {
+                            const new_path = try it.alloc.alloc(Value, 1);
+                            new_path[0] = .{ .int = i };
+                            try out.append(it.alloc, new_path);
+                        }
+                        return;
+                    },
+                    else => {},
+                },
+                .int => |idx| switch (it.current) {
+                    .array => |span| {
+                        if (idx < 0) {
+                            const arr_len: i64 = @intCast(arrayLength(span.tape, span));
+                            const resolved = arr_len + idx;
+                            if (resolved >= 0) {
+                                elems[0] = .{ .int = resolved };
+                            }
+                            // else: leave as-is; delpathSingle will skip out-of-range.
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        try out.append(it.alloc, elems);
+    }
+
     /// Delete a single path from a value.
     fn delpathSingle(it: *ResultIterator, base: Value, path: []const Value, depth: usize) ZqError!Value {
-        if (depth >= path.len) return error.TypeError; // can't delete empty path
+        // Empty path deletes the value itself — jq returns null.
+        if (depth >= path.len) return .null_val;
 
         const component = path[depth];
         const is_leaf = (depth + 1 == path.len);
 
         switch (component) {
+            .null_val => return base,
             .string => |key| {
                 switch (base) {
                     .object => |span| {
@@ -5543,6 +5615,67 @@ pub const ResultIterator = struct {
                                 }
                                 // else: skip this element (delete it).
                             } else {
+                                try writeValueToTape(&tmp_tape, it.alloc, existing_val);
+                            }
+                            pos = skipEntry(span.tape.*, pos);
+                        }
+
+                        const arr_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .array_end,
+                            .payload = .{ .none = {} },
+                        });
+                        tmp_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+
+                        const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        try it.runtime_tape.copySpan(tmp_tape.asTape(), arr_start, arr_end_idx + 1, it.alloc);
+                        const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                        return .{ .array = .{
+                            .tape = &it.runtime_tape.view,
+                            .start = result_start,
+                            .end = result_end,
+                        } };
+                    },
+                    else => return base,
+                }
+            },
+            .object => |slice_span| {
+                // Slice path component `{"start": int|null, "end": int|null}`.
+                // Delete the [start, end) range from an array.
+                switch (base) {
+                    .array => |span| {
+                        const arr_len: i64 = @intCast(arrayLength(span.tape, span));
+                        const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse Value.null_val;
+                        const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse Value.null_val;
+                        const from_raw: i64 = switch (from_val) {
+                            .int => |v| v,
+                            .null_val => 0,
+                            else => return error.TypeError,
+                        };
+                        const to_raw: i64 = switch (to_val) {
+                            .int => |v| v,
+                            .null_val => arr_len,
+                            else => return error.TypeError,
+                        };
+                        const from_resolved: i64 = if (from_raw < 0) @max(0, arr_len + from_raw) else @min(from_raw, arr_len);
+                        const to_resolved: i64 = if (to_raw < 0) @max(0, arr_len + to_raw) else @min(to_raw, arr_len);
+                        const slice_end: i64 = if (to_resolved < from_resolved) from_resolved else to_resolved;
+
+                        if (!is_leaf) return error.TypeError;
+
+                        var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                        defer tmp_tape.deinit(it.alloc);
+
+                        const arr_start = try tmp_tape.appendEntry(it.alloc, .{
+                            .tag = .array_start,
+                            .payload = .{ .skip = 0 },
+                        });
+
+                        var pos = span.start + 1;
+                        const end_pos = span.end - 1;
+                        var i: i64 = 0;
+                        while (pos < end_pos) : (i += 1) {
+                            const existing_val = tapeEntryToValue(span.tape, pos);
+                            if (i < from_resolved or i >= slice_end) {
                                 try writeValueToTape(&tmp_tape, it.alloc, existing_val);
                             }
                             pos = skipEntry(span.tape.*, pos);
@@ -5894,7 +6027,8 @@ pub const ResultIterator = struct {
     }
 
     /// Build a path array (e.g. ["a", 0, "b", {"start":2,"end":4}]) on the
-    /// runtime tape. Components may be strings, ints, or slice objects.
+    /// runtime tape. Components may be strings, ints, slice objects, or null
+    /// (for `path(.[nan])` and similar — jq records these as null components).
     fn buildPathArray(it: *ResultIterator, components: []const Value) ZqError!Value {
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .array_start,
@@ -5919,6 +6053,12 @@ pub const ResultIterator = struct {
                     // Slice path component: copy the {"start":..,"end":..}
                     // object span into the path array.
                     try it.runtime_tape.copySpan(span.tape.*, span.start, span.end, it.alloc);
+                },
+                .null_val => {
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .null_val,
+                        .payload = .{ .none = {} },
+                    });
                 },
                 else => return error.TypeError,
             }

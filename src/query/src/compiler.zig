@@ -5639,61 +5639,48 @@ fn compileJOIN(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     popScope(ctx, ctx.alloc);
 }
 
-/// Compile `del(.key)` or `del(.[n])`: static single-level path deletion.
+/// Compile `del(f)`: desugars to `. as $orig | [path(f)] as $paths | $orig | delpaths($paths)`.
 fn compileDel(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.nextToken(); // consume '('
 
-    // Parse the path expression inside del()
-    const path_tok = try ctx.nextToken();
-    if (path_tok.tag != .dot) return ctx.syntaxErr(path_tok.offset, path_tok.len);
+    try pushScope(ctx, ctx.alloc);
 
-    const next_tok = try ctx.lex.peek();
-    switch (next_tok.tag) {
-        .ident => {
-            // del(.key) — push key string, call_builtin(del)
-            const ident = try ctx.nextToken();
-            const ref = try internStr(&ctx.intern, ctx.alloc, ident.slice(ctx.src));
-            try ctx.emit(.push_string, .{ .str_ref = ref });
-        },
-        .lbracket => {
-            // del(.[n]) or del(.["key"])
-            _ = try ctx.nextToken(); // consume '['
-            const inner = try ctx.lex.peek();
-            switch (inner.tag) {
-                .int_lit => {
-                    const tok = try ctx.nextToken();
-                    const n = std.fmt.parseInt(i64, tok.slice(ctx.src), 10) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                    try ctx.emit(.push_int, .{ .int = n });
-                },
-                .string_lit => {
-                    const tok = try ctx.nextToken();
-                    const raw_str = tok.slice(ctx.src);
-                    const content = raw_str[1 .. raw_str.len - 1];
-                    const ref = try internDecodedStr(&ctx.intern, ctx.alloc, content);
-                    try ctx.emit(.push_string, .{ .str_ref = ref });
-                },
-                .minus => {
-                    _ = try ctx.nextToken(); // consume '-'
-                    const num_tok = try ctx.nextToken();
-                    if (num_tok.tag != .int_lit) return ctx.syntaxErr(num_tok.offset, num_tok.len);
-                    const n = std.fmt.parseInt(i64, num_tok.slice(ctx.src), 10) catch return ctx.syntaxErr(ctx.last_tok_offset, 0);
-                    try ctx.emit(.push_int, .{ .int = -n });
-                },
-                else => return ctx.syntaxErr(ctx.last_tok_offset, 0),
-            }
-            const close = try ctx.nextToken();
-            if (close.tag != .rbracket) return ctx.syntaxErr(close.offset, close.len);
-        },
-        else => return ctx.syntaxErr(ctx.last_tok_offset, 0),
-    }
+    const orig_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const paths_var = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    try ctx.emit(.push_current, .{ .none = {} });
+    try ctx.emit(.capture_variable, .{ .index = orig_var });
+
+    const ace_start = ctx.raw.items.len;
+    try ctx.emit(.array_collect_start, .{ .index = 0 });
+
+    const path_begin_ip = ctx.raw.items.len;
+    try ctx.emit(.path_begin, .{ .index = 0 });
+
+    try parsePipe(ctx);
+
+    try ctx.emit(.path_end, .{ .none = {} });
+    ctx.raw.items[path_begin_ip].operand = .{ .index = @intCast(ctx.raw.items.len - 1) };
+
+    try ctx.emit(.yield_output, .{ .none = {} });
+
+    const ace_end: u32 = @intCast(ctx.raw.items.len);
+    try ctx.emit(.array_collect_end, .{ .none = {} });
+    ctx.raw.items[ace_start].operand = .{ .index = ace_end };
+
+    try ctx.emit(.capture_variable, .{ .index = paths_var });
+
+    try ctx.emit(.load_variable, .{ .index = orig_var });
+    try ctx.emit(.pipe, .{ .none = {} });
+    try ctx.emit(.load_variable, .{ .index = paths_var });
+    try ctx.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.delpaths) });
 
     const rparen = try ctx.nextToken();
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
-    try ctx.emit(
-        .call_builtin,
-        .{ .index = @intFromEnum(types.BuiltinId.del) },
-    );
+    popScope(ctx, ctx.alloc);
 }
 
 /// Map a format name (after @) to its BuiltinId.
