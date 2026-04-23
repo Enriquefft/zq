@@ -5,6 +5,9 @@ const Instruction = types.Instruction;
 const lx = @import("lexer");
 const Lexer = lx.Lexer;
 const Token = lx.Token;
+const regex_mod = @import("regex");
+const RegexPool = regex_mod.RegexPool;
+const prefilter_mod = @import("prefilter.zig");
 
 // ── Public output type ────────────────────────────────────────────────────────
 
@@ -20,12 +23,27 @@ pub const Compiled = struct {
     string_buf: []u8,
     external_var_ids: []u32,
     source_map: []u32,
+    /// Filter-compile-time regex interner. Every string-literal pattern
+    /// encountered during compilation is compiled exactly once and stored
+    /// here; opcodes reference entries by `u32` index packed into the
+    /// `call_builtin` operand. Lifetime: equal to the compiled filter.
+    /// Dynamic patterns (e.g. `test($var)`) are NOT interned here — their
+    /// runtime LRU lives on the `ResultIterator` (Phase D).
+    regex_pool: RegexPool,
+
+    /// Sparser raw-byte prefilter literals for the top-level
+    /// `select(... | regex_builtin("lit"))` idiom. `null` when the filter
+    /// doesn't match the pattern (or regex disabled). Owned here; freed by
+    /// `deinit`.
+    prefilter: ?prefilter_mod.PrefilterSet,
 
     pub fn deinit(c: *Compiled, alloc: std.mem.Allocator) void {
         alloc.free(c.instructions);
         alloc.free(c.string_buf);
         alloc.free(c.source_map);
         if (c.external_var_ids.len > 0) alloc.free(c.external_var_ids);
+        c.regex_pool.deinit();
+        if (c.prefilter) |*p| p.deinit();
         // function_table is part of string_buf, no need to free separately
     }
 };
@@ -100,6 +118,26 @@ const Ctx = struct {
     last_tok_offset: u32 = 0,
     error_offset: u32 = 0,
     error_len: u32 = 0,
+
+    // Filter-compile-time regex pool. Populated on literal-pattern regex
+    // calls (`test("…")`, `match("…")`, …). Moved into `Compiled` on success;
+    // deinit'd on error. Single source of truth for Regex lifetimes bound
+    // to the compiled filter.
+    regex_pool: RegexPool,
+    /// Source offset of the last regex pattern interned — used by the
+    /// top-level error path to produce a diagnostic pointing at the exact
+    /// string literal when `RegexPool.intern` fails to compile the pattern.
+    last_regex_pattern_offset: u32 = 0,
+    last_regex_pattern_len: u32 = 0,
+
+    /// Sparser-prefilter literal groups. Populated by a source-byte scan run
+    /// ONCE at the start of `compile()`: we only harvest from syntactically
+    /// pristine `select(... | regex_builtin("literal"))` idioms, because only
+    /// those guarantee the "no literal → no output" invariant the raw-byte
+    /// prescreen relies on. The scan is entirely independent of the recursive
+    /// descent, so there is no need to thread state through every compile step.
+    /// Transferred to `Compiled.prefilter` on success; freed on any error path.
+    prefilter_groups: std.ArrayList(prefilter_mod.LiteralGroup) = std.ArrayList(prefilter_mod.LiteralGroup){},
 
     /// Emit a raw instruction with the current source offset.
     fn emit(ctx: *Ctx, op: Instruction.Op, operand: RawOp) error{OutOfMemory}!void {
@@ -1279,6 +1317,7 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         .function_table = std.ArrayList(FunctionEntry){},
         .next_var_id = 0,
         .next_func_id = 0,
+        .regex_pool = RegexPool.init(alloc),
     };
     defer ctx.raw.deinit(alloc); // always freed; fuse() copies what it needs
     defer {
@@ -1303,6 +1342,33 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     // errors (OOM) and early `.err` CompileResult returns.
     var intern_consumed = false;
     defer if (!intern_consumed) ctx.intern.deinit(alloc);
+    // Regex pool ownership mirrors intern: moved into Compiled on success,
+    // freed here on any error path.
+    var regex_pool_consumed = false;
+    defer if (!regex_pool_consumed) ctx.regex_pool.deinit();
+    // Prefilter harvest list ownership: same contract as the regex pool. On
+    // success, the groups are moved into a `PrefilterSet` on the Compiled
+    // struct and `prefilter_groups_consumed` is flipped. On any error path,
+    // we free the harvested byte copies here.
+    var prefilter_groups_consumed = false;
+    defer if (!prefilter_groups_consumed) {
+        for (ctx.prefilter_groups.items) |g| {
+            for (g.literals) |l| alloc.free(l);
+            alloc.free(g.literals);
+        }
+        ctx.prefilter_groups.deinit(alloc);
+    };
+
+    // Sparser-prefilter harvest: scan source bytes for the exact idiom
+    // `select(... | regex_builtin("lit"))`. Only that syntactic shape
+    // guarantees a record producing no regex match also produces no select
+    // output — which is the necessary condition for skipping a record's
+    // full parse. Arithmetic, boolean combinators, nested `map`, function
+    // calls, etc. all invalidate the assumption and are rejected by the
+    // scanner (safe-by-default: unrecognised shape → no prefilter).
+    harvestPrefilterFromSource(&ctx, alloc) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer {
         // Cleanup scope chain (both success and error paths)
         var s: ?*VariableScope = ctx.current_scope;
@@ -1345,6 +1411,14 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
                 .offset = ctx.error_offset,
                 .len = ctx.error_len,
             } },
+            // A literal-pattern regex call surfaces the shim's compile error
+            // here; the ctx stashes the source span of the string literal so
+            // the diagnostic underlines the exact bytes the user typed.
+            error.RegexCompileError, error.RegexNotCompiled => return .{ .err = .{
+                .kind = err_mod.kindFromZqError(@as(err_mod.ZqError, @errorCast(e))),
+                .offset = ctx.last_regex_pattern_offset,
+                .len = ctx.last_regex_pattern_len,
+            } },
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .err = .{
                 .kind = err_mod.kindFromZqError(@as(err_mod.ZqError, @errorCast(e))),
@@ -1381,7 +1455,344 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     intern_consumed = true; // fuse() took ownership via toOwnedSlice
     compiled.external_var_ids = ext_var_ids;
     ext_var_ids_consumed = true;
+    // Transfer regex-pool ownership. `fuse` seeded `compiled.regex_pool`
+    // with an empty placeholder; free its internal map before swapping in
+    // the populated pool that Ctx owns.
+    compiled.regex_pool.deinit();
+    compiled.regex_pool = ctx.regex_pool;
+    regex_pool_consumed = true;
+
+    // Transfer prefilter literal groups into a PrefilterSet that owns them.
+    // `ownFrom` copies bytes, so we still free the originals through the
+    // defer above — flip `prefilter_groups_consumed` only when we skip copy
+    // and transfer ownership directly below.
+    if (ctx.prefilter_groups.items.len > 0) {
+        // Move semantics: hand the already-owned byte slices straight to the
+        // PrefilterSet by allocating a new groups array and copying pointers
+        // (NOT the underlying bytes). Then flip the consumed flag so the
+        // defer doesn't double-free.
+        const moved_groups = alloc.alloc(prefilter_mod.LiteralGroup, ctx.prefilter_groups.items.len) catch {
+            // OOM: fall back to no prefilter rather than fail the whole compile
+            compiled.prefilter = null;
+            return .{ .ok = compiled };
+        };
+        @memcpy(moved_groups, ctx.prefilter_groups.items);
+        compiled.prefilter = prefilter_mod.PrefilterSet{
+            .allocator = alloc,
+            .groups = moved_groups,
+        };
+        // The items in ctx.prefilter_groups are now owned by compiled.prefilter.
+        ctx.prefilter_groups.clearAndFree(alloc);
+        prefilter_groups_consumed = true;
+    } else {
+        compiled.prefilter = null;
+    }
     return .{ .ok = compiled };
+}
+
+/// Scan `ctx.src` for the exact idiom `select(<accessor> | <regex_builtin>("<literal>"[, "<flags>"]))`
+/// at the top-level position — no preceding operators, no trailing content
+/// past the matching `)`. On a match, compile the pattern and append its
+/// literals to `ctx.prefilter_groups`.
+///
+/// This is intentionally conservative. The scanner rejects any source with:
+///   - Boolean combinators (`and`, `or`, `not`, `//`) in the select body.
+///   - Other function calls, `if`, `try`, `map`, `..`, etc.
+///   - A trailing pipe/expression past the select (`select(...) | other_expr`).
+///     Because if anything else consumes the value, the record can still
+///     produce output and the prefilter would be unsound.
+///
+/// A rejected source is simply not prefiltered — which is the safe fallback.
+/// The prefilter optimisation is opt-in at the idiom level.
+fn harvestPrefilterFromSource(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMemory}!void {
+    var i: usize = 0;
+    // Skip leading whitespace / comments.
+    i = skipWsAndComments(ctx.src, i);
+    // Require `select(` at position i.
+    const kw = "select";
+    if (i + kw.len > ctx.src.len) return;
+    if (!std.mem.eql(u8, ctx.src[i .. i + kw.len], kw)) return;
+    i += kw.len;
+    if (i < ctx.src.len and isIdentTail(ctx.src[i])) return;
+    i = skipWsAndComments(ctx.src, i);
+    if (i >= ctx.src.len or ctx.src[i] != '(') return;
+    i += 1; // consume '('
+
+    // Locate the matching `)` for the select call, at balance zero.
+    const body_start = i;
+    var depth: u32 = 1;
+    var in_string: bool = false;
+    while (i < ctx.src.len) : (i += 1) {
+        const b = ctx.src[i];
+        if (in_string) {
+            if (b == '\\') {
+                i += 1; // skip escaped byte
+            } else if (b == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (b) {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return; // unbalanced — let the real parser produce the diagnostic
+    const body_end = i; // points at the matching `)`
+    const after_select = body_end + 1;
+
+    // Tail check: must be end-of-source (ignoring trailing whitespace). If
+    // anything follows the select call — even a pipe — the prefilter can't
+    // be sound because we don't know what the trailing expression does.
+    const tail_pos = skipWsAndComments(ctx.src, after_select);
+    if (tail_pos != ctx.src.len) return;
+
+    // Now inspect the select body: `BODY == <accessor> | <builtin>("literal" [; "flags"])`.
+    // The accessor part is everything up to and including the final `|` at
+    // balance zero within the body.
+    const body = ctx.src[body_start..body_end];
+    const pipe_pos = findTopLevelPipe(body) orelse return;
+    // Skip whitespace after the pipe to find the builtin identifier.
+    const call_start_rel = skipWsAndComments(body, pipe_pos + 1);
+    if (call_start_rel >= body.len) return;
+
+    // Parse the builtin identifier.
+    var id_end = call_start_rel;
+    while (id_end < body.len and isIdentTail(body[id_end])) : (id_end += 1) {}
+    const builtin_name = body[call_start_rel..id_end];
+    // Only `test` and `scan` are prefilter-safe. The other regex builtins
+    // violate the "no-literal-bytes → no-output" invariant that the
+    // prefilter relies on:
+    //   - match / capture raise a TypeError on no-match (we'd silently
+    //     swallow the error if we skipped the record entirely).
+    //   - splits on no-match yields the original string (non-empty, so
+    //     `select(.x | splits("foo"))` outputs even without "foo").
+    //   - sub / gsub are mutators — `select(.x | sub(...))` doesn't filter
+    //     records at all.
+    const is_prefilter_safe_builtin = std.mem.eql(u8, builtin_name, "test") or
+        std.mem.eql(u8, builtin_name, "scan");
+    if (!is_prefilter_safe_builtin) return;
+
+    // Must be followed by `(` (optional whitespace), then `"LITERAL"` (optional
+    // `; "FLAGS"`), then `)`, then end-of-body.
+    var p = skipWsAndComments(body, id_end);
+    if (p >= body.len or body[p] != '(') return;
+    p += 1;
+    p = skipWsAndComments(body, p);
+    if (p >= body.len or body[p] != '"') return;
+    const lit_start = p + 1;
+    var lit_end = lit_start;
+    while (lit_end < body.len and body[lit_end] != '"') {
+        if (body[lit_end] == '\\') lit_end += 2 else lit_end += 1;
+    }
+    if (lit_end >= body.len) return; // unterminated — real parser will error
+    const literal_raw = body[lit_start..lit_end];
+    p = lit_end + 1;
+    p = skipWsAndComments(body, p);
+
+    // Optional flags arg: `; "flags"`.
+    var flags_literal: ?[]const u8 = null;
+    if (p < body.len and body[p] == ';') {
+        p += 1;
+        p = skipWsAndComments(body, p);
+        if (p >= body.len or body[p] != '"') return;
+        const fs = p + 1;
+        var fe = fs;
+        while (fe < body.len and body[fe] != '"') {
+            if (body[fe] == '\\') fe += 2 else fe += 1;
+        }
+        if (fe >= body.len) return;
+        flags_literal = body[fs..fe];
+        p = fe + 1;
+        p = skipWsAndComments(body, p);
+    }
+
+    // Closing `)` and end-of-body.
+    if (p >= body.len or body[p] != ')') return;
+    p += 1;
+    p = skipWsAndComments(body, p);
+    if (p != body.len) return; // trailing junk inside select body — not our shape
+
+    // Accessor before the pipe: must be purely a path expression (`.foo`,
+    // `.foo.bar`, `.[]`, etc.) with no `and`/`or`/function calls. Bracketed
+    // access and dot-chains are fine because they still produce a STREAM
+    // whose truthiness drives select. Keyword rejection is cheap and
+    // sufficient for the safe subset.
+    const accessor = body[0..pipe_pos];
+    if (!isSafeAccessor(accessor)) return;
+
+    // Build the real pattern that the regex engine will see: optional
+    // `(?<flags>)` prefix from the flags argument, then the decoded literal.
+    var pattern_buf = std.ArrayList(u8){};
+    defer pattern_buf.deinit(alloc);
+    if (flags_literal) |fl| {
+        // Decode + emit inline flags. Bail if unknown flag letter — the real
+        // compiler will emit the diagnostic.
+        var inline_buf: [8]u8 = undefined;
+        var inline_len: usize = 0;
+        for (fl) |ch| {
+            switch (ch) {
+                'i', 'x', 'm', 's' => {
+                    inline_buf[inline_len] = ch;
+                    inline_len += 1;
+                },
+                'g', 'n' => {}, // no pattern effect
+                else => return, // unknown → let the full compile path error
+            }
+        }
+        if (inline_len > 0) {
+            try pattern_buf.appendSlice(alloc, "(?");
+            try pattern_buf.appendSlice(alloc, inline_buf[0..inline_len]);
+            try pattern_buf.append(alloc, ')');
+        }
+    }
+    // Decode the literal-string escape sequences into the actual pattern.
+    decodeStringLiteralInto(&pattern_buf, alloc, literal_raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return, // malformed escape → let the parser diagnose
+    };
+
+    // Ask the shim for required literals. A null result means the pattern is
+    // unbounded (e.g. `.+`) — nothing to prefilter on.
+    if (!regex_mod.enabled) return;
+    var probe = regex_mod.Regex.compile(pattern_buf.items) catch return;
+    defer probe.deinit();
+    const maybe_group = prefilter_mod.groupFromRegex(alloc, &probe) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const group = maybe_group orelse return;
+    try ctx.prefilter_groups.append(alloc, group);
+}
+
+fn isIdentTail(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_';
+}
+
+fn skipWsAndComments(src: []const u8, start: usize) usize {
+    var i = start;
+    while (i < src.len) {
+        const b = src[i];
+        if (b == ' ' or b == '\t' or b == '\n' or b == '\r') {
+            i += 1;
+        } else if (b == '#') {
+            while (i < src.len and src[i] != '\n') : (i += 1) {}
+        } else break;
+    }
+    return i;
+}
+
+/// Find the byte index of the top-level `|` inside `body` (depth 0, not inside
+/// a string). Returns null if no such pipe exists. We use the RIGHTMOST
+/// top-level pipe so `PATH_CHAIN | regex_builtin(...)` with any length
+/// path prefix still locates the correct split.
+fn findTopLevelPipe(body: []const u8) ?usize {
+    var i: usize = 0;
+    var depth: u32 = 0;
+    var in_string: bool = false;
+    var last: ?usize = null;
+    while (i < body.len) : (i += 1) {
+        const b = body[i];
+        if (in_string) {
+            if (b == '\\') i += 1 else if (b == '"') in_string = false;
+            continue;
+        }
+        switch (b) {
+            '"' => in_string = true,
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            '|' => {
+                // Skip `||` and `|=` (not a pipe).
+                if (depth == 0) {
+                    const nxt = if (i + 1 < body.len) body[i + 1] else 0;
+                    const prv = if (i > 0) body[i - 1] else 0;
+                    if (nxt != '|' and nxt != '=' and prv != '|') last = i;
+                }
+            },
+            else => {},
+        }
+    }
+    return last;
+}
+
+/// True iff `accessor` is a pure path-expression with no function calls,
+/// boolean combinators, or variable references. Permitted forms:
+///   - `.`, `.field`, `.field.other`, `.field?`
+///   - `.[]`, `.[n]`, `.[a:b]`, `.[]?`
+///   - `.[ "key" ]`  (bracket + string literal)
+///   - chains of the above
+///
+/// Rejected: bare identifiers (function/variable references), reserved
+/// keywords (`and`, `or`, `not`, `if`, `try`, `as`, etc.), `$var`,
+/// arithmetic / comparison operators, `//` alternative, and anything else
+/// that could produce a truthy stream independent of the regex.
+///
+/// Identifier-shaped bytes are accepted ONLY when directly preceded by
+/// `.` or `[` (making them field names, not references). Any other
+/// position → reject.
+fn isSafeAccessor(accessor: []const u8) bool {
+    // Strip leading + trailing whitespace.
+    var i: usize = 0;
+    var j: usize = accessor.len;
+    while (i < j and (accessor[i] == ' ' or accessor[i] == '\t' or accessor[i] == '\n' or accessor[i] == '\r')) i += 1;
+    while (j > i and (accessor[j - 1] == ' ' or accessor[j - 1] == '\t' or accessor[j - 1] == '\n' or accessor[j - 1] == '\r')) j -= 1;
+    if (i == j) return false; // empty accessor means body was just `| regex(...)` — reject
+
+    var in_string: bool = false;
+    var has_dot: bool = false;
+    var k = i;
+    // "Last non-whitespace structural byte" — used to decide whether an
+    // identifier byte is a field name (after `.` / `[`) or a reference.
+    var last_structural: u8 = 0;
+
+    while (k < j) : (k += 1) {
+        const b = accessor[k];
+        if (in_string) {
+            if (b == '\\') {
+                k += 1;
+            } else if (b == '"') {
+                in_string = false;
+                last_structural = '"';
+            }
+            continue;
+        }
+        switch (b) {
+            '.' => {
+                has_dot = true;
+                last_structural = '.';
+            },
+            '[' => last_structural = '[',
+            ']', '?' => last_structural = b,
+            ',', ':' => last_structural = b,
+            ' ', '\t', '\n', '\r' => {}, // whitespace preserves last_structural
+            '0'...'9', '-' => last_structural = b,
+            '"' => {
+                in_string = true;
+            },
+            'a'...'z', 'A'...'Z', '_' => {
+                // Identifier-shaped byte. Safe iff immediately following a
+                // `.` or `[` (with only whitespace between). Otherwise
+                // could be a bare identifier or a keyword.
+                if (last_structural != '.' and last_structural != '[') return false;
+                // Consume the whole ident — treat as field name.
+                while (k < j and (isIdentTail(accessor[k]))) : (k += 1) {}
+                k -= 1; // compensate the outer loop's `k += 1`
+                last_structural = 'a'; // "just finished an ident" — any
+                // subsequent non-`.` non-`[` operator outside the whitelist
+                // will be caught by the else branch.
+            },
+            '$' => return false,
+            else => return false,
+        }
+    }
+    return has_dot;
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -2771,6 +3182,9 @@ fn isArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "match") or
         std.mem.eql(u8, name, "sub") or
         std.mem.eql(u8, name, "gsub") or
+        std.mem.eql(u8, name, "capture") or
+        std.mem.eql(u8, name, "scan") or
+        std.mem.eql(u8, name, "splits") or
         std.mem.eql(u8, name, "bsearch") or
         std.mem.eql(u8, name, "strftime") or
         std.mem.eql(u8, name, "strptime") or
@@ -2798,6 +3212,22 @@ fn isArgBuiltin(name: []const u8) bool {
 /// but not `,`). The `call_builtin` is emitted per-alternative so that each value
 /// independently drives the builtin (e.g. `range(3,5)` → range(3) then range(5)).
 fn compileValueArgBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    return compileValueArgBuiltin1Collecting(ctx, bid, null);
+}
+
+/// Like `compileValueArgBuiltin1`, but when `call_sink` is non-null every
+/// `call_builtin` instruction this function emits for `bid` is recorded as
+/// a raw-index into `ctx.raw`. Callers that need to retrofit the operand
+/// after lowering (e.g. the regex slow path, which packs the dynamic-pool
+/// sentinel into the upper bits of the call_builtin operand) use this to
+/// avoid scanning the instruction stream heuristically — the sink is the
+/// explicit emit-and-mark protocol. `bid` is preserved as the parameter
+/// so the internal emit sites stay a single source of truth.
+fn compileValueArgBuiltin1Collecting(
+    ctx: *Ctx,
+    bid: types.BuiltinId,
+    call_sink: ?*std.ArrayList(u32),
+) (ZqError || error{OutOfMemory})!void {
     _ = try ctx.nextToken(); // consume '('
 
     // Use fork/backtrack model for generator args: each comma alternative
@@ -2814,11 +3244,22 @@ fn compileValueArgBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{Ou
         if (t.tag != .comma) break;
         _ = try ctx.nextToken(); // consume ','
 
-        // Emit call_builtin for the left side before inserting FORK
+        // Emit call_builtin for the left side before inserting FORK.
+        const call_idx: u32 = @intCast(ctx.raw.items.len);
         try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+        if (call_sink) |sink| try sink.append(ctx.alloc, call_idx);
 
-        // Insert FORK before the left branch
+        // Insert FORK before the left branch. Note the FORK insertion shifts
+        // the raw-instruction indices of everything after `left_start` by
+        // one, including the call_builtin we just emitted. Fix up the sink
+        // entry below.
         try insertRawInstr(ctx, left_start, RawInstr{ .op = .fork, .operand = .{ .index = 0 } });
+        if (call_sink) |sink| {
+            // The just-pushed sink entry pointed at the pre-shift call_idx;
+            // after the insertRawInstr above the real index is one higher.
+            const last = &sink.items[sink.items.len - 1];
+            last.* += 1;
+        }
         if (prev_fork_pos) |pfp| {
             ctx.raw.items[pfp].operand.index = @intCast(left_start);
         }
@@ -2843,12 +3284,278 @@ fn compileValueArgBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{Ou
     if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
 
     // Emit call_builtin for the last (or only) alternative
+    const tail_call_idx: u32 = @intCast(ctx.raw.items.len);
     try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+    if (call_sink) |sink| try sink.append(ctx.alloc, tail_call_idx);
 
     // Backpatch all JUMPs to end
     const end_pos: i64 = @intCast(ctx.raw.items.len);
     for (jump_fixups.items) |fixup| {
         ctx.raw.items[fixup].operand.index = end_pos;
+    }
+}
+
+/// Compile a 1-arg regex builtin: `test(p)`, `match(p)`, `capture(p)`, `scan(p)`.
+///
+/// Fast path — when the argument is a bare string literal (`test("^GET ")`):
+///   1. Intern the decoded pattern into the filter's `regex_pool`. Duplicate
+///      patterns across the filter resolve to the same index.
+///   2. Emit `push_string` so the VM's value stack contains the pattern
+///      (required by the Phase C VM path, which still reads the pattern off
+///      the stack for `test_`/`match_`/`sub_`/`gsub_`).
+///   3. Emit `call_builtin` with the operand packed as
+///      `(regex_pool_index << 16) | BuiltinId`. Phase D's VM reads the pool
+///      index off the opcode and bypasses the stack string.
+///
+/// Slow path — any other expression (`test($p)`, `test(.field)`, …):
+///   delegate to `compileValueArgBuiltin1`, then rewrite the emitted
+///   `call_builtin` operand(s) to set the upper slot to `REGEX_POOL_DYNAMIC`,
+///   which tells Phase D's VM "compile this pattern at runtime via the LRU".
+///
+/// Compile errors surfacing from `RegexPool.intern` (bad pattern, unsupported
+/// construct, or shim internal error) bubble up as `error.RegexCompileError`
+/// with `ctx.last_regex_pattern_offset/len` set to the string literal's span
+/// so the top-level compile loop can build a diagnostic with a useful caret.
+fn compileRegexBuiltin1(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    // Fast-path detection: lookahead requires a saved lexer position — peek
+    // at the token after '(' and the one after it without committing.
+    // Handles BOTH 1-arg `test("pat")` and 2-arg `test("pat"; "flags")` forms.
+    const saved_pos = ctx.lex.pos;
+    var lex_probe = ctx.lex;
+    const probe_lparen = lex_probe.next() catch {
+        // Syntax is handled by the slow path; fall through.
+        return compileRegexBuiltinSlow(ctx, bid);
+    };
+    if (probe_lparen.tag != .lparen) return compileRegexBuiltinSlow(ctx, bid);
+
+    const probe_arg = lex_probe.next() catch {
+        return compileRegexBuiltinSlow(ctx, bid);
+    };
+    const probe_close = lex_probe.next() catch {
+        return compileRegexBuiltinSlow(ctx, bid);
+    };
+
+    // Fast path: `builtin("literal")` with exactly one string literal arg.
+    if (probe_arg.tag == .string_lit and probe_close.tag == .rparen) {
+        _ = saved_pos; // lex not consumed yet — real consume happens below.
+        return compileRegexBuiltin1FastLiteral(ctx, bid, null);
+    }
+
+    // Fast path: `builtin("literal"; "flags")` with both string literal args.
+    if (probe_arg.tag == .string_lit and probe_close.tag == .semicolon) {
+        const probe_flags = lex_probe.next() catch {
+            return compileRegexBuiltinSlow(ctx, bid);
+        };
+        const probe_end = lex_probe.next() catch {
+            return compileRegexBuiltinSlow(ctx, bid);
+        };
+        if (probe_flags.tag == .string_lit and probe_end.tag == .rparen) {
+            return compileRegexBuiltin1FastLiteral(ctx, bid, probe_flags);
+        }
+    }
+
+    return compileRegexBuiltinSlow(ctx, bid);
+}
+
+/// Literal-pattern fast path for regex builtins, with optional literal flags.
+/// When `flags_tok` is non-null the flag string is translated into an inline
+/// `(?imsx-…)` prefix prepended to the pattern before interning — this keeps
+/// the regex pool the single source of truth and avoids any runtime pattern
+/// munging. Unknown flag letters surface as `error.RegexCompileError`.
+fn compileRegexBuiltin1FastLiteral(
+    ctx: *Ctx,
+    bid: types.BuiltinId,
+    flags_tok: ?Token,
+) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // '('
+    const str_tok = try ctx.nextToken(); // the pattern literal
+    const raw = str_tok.slice(ctx.src);
+    const body = raw[1 .. raw.len - 1];
+
+    var pattern_buf = std.ArrayList(u8){};
+    defer pattern_buf.deinit(ctx.alloc);
+
+    var has_g_flag: bool = false;
+    if (flags_tok) |ft| {
+        const raw_flags = ft.slice(ctx.src);
+        const flag_body = raw_flags[1 .. raw_flags.len - 1];
+        has_g_flag = try emitFlagPrefix(ctx, &pattern_buf, flag_body, str_tok.offset, str_tok.len);
+    }
+    try decodeStringLiteralInto(&pattern_buf, ctx.alloc, body);
+
+    ctx.last_regex_pattern_offset = str_tok.offset;
+    ctx.last_regex_pattern_len = str_tok.len;
+
+    const pool_idx = ctx.regex_pool.intern(pattern_buf.items) catch |e| switch (e) {
+        regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
+        regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
+        regex_mod.Error.RegexInternalError => return error.RegexCompileError,
+        regex_mod.Error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    if (flags_tok != null) {
+        _ = try ctx.nextToken(); // ';'
+        _ = try ctx.nextToken(); // flags literal
+    }
+    const rparen = try ctx.nextToken();
+    if (rparen.tag != .rparen) return ctx.syntaxErr(rparen.offset, rparen.len);
+
+    // `match(re; "g")` rewrites to the generator-mode match_g_ opcode. The
+    // jq-level surface stays `match(re; flags)`; the `g` flag is parsed here
+    // at compile time and dispatches to a distinct VM opcode so there is one
+    // opcode per distinct runtime behavior.
+    const effective_bid = if (bid == .match_ and has_g_flag) types.BuiltinId.match_g_ else bid;
+    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(effective_bid, pool_idx) });
+}
+
+/// Translate a jq flag string like "gi" into a `regex-automata` inline flag
+/// group `(?i)` that we prepend to the pattern. Flag semantics:
+///   - `i`  case-insensitive          → `i`
+///   - `x`  extended / ignore-whitespace → `x`
+///   - `m`  multi-line                → `m`
+///   - `s`  dotall / dot-matches-newline → `s`
+///   - `g`  global — NO-OP at the pattern level. Signaled via the return
+///           value so `match(re;"g")` dispatches to the generator-mode
+///           opcode at compile time. For scan/sub/gsub/capture/test it is
+///           ignored (they already match globally or the flag is meaningless).
+///   - `n`  ignore empty matches — VM-level, silently accepted but not yet
+///           enforced at the VM (tracked).
+///   - `p`  perl-mode — unsupported; compile error.
+///   - `l`  find-longest — unsupported; compile error.
+/// Unknown letters → compile error.
+///
+/// Returns `true` iff the flag string contained `g`.
+fn emitFlagPrefix(
+    ctx: *Ctx,
+    out: *std.ArrayList(u8),
+    flag_body: []const u8,
+    pat_offset: u32,
+    pat_len: u32,
+) (ZqError || error{OutOfMemory})!bool {
+    var has_inline: bool = false;
+    var inline_buf: [8]u8 = undefined;
+    var inline_len: usize = 0;
+    var has_g: bool = false;
+
+    for (flag_body) |ch| {
+        switch (ch) {
+            'i', 'x', 'm', 's' => {
+                inline_buf[inline_len] = ch;
+                inline_len += 1;
+                has_inline = true;
+            },
+            'g' => {
+                has_g = true;
+            },
+            'n' => {
+                // Accepted but not enforced — tracked.
+            },
+            else => {
+                ctx.last_regex_pattern_offset = pat_offset;
+                ctx.last_regex_pattern_len = pat_len;
+                return error.RegexCompileError;
+            },
+        }
+    }
+
+    if (has_inline) {
+        try out.appendSlice(ctx.alloc, "(?");
+        try out.appendSlice(ctx.alloc, inline_buf[0..inline_len]);
+        try out.append(ctx.alloc, ')');
+    }
+    return has_g;
+}
+
+/// Slow/dynamic path for regex builtins. Delegates to the general
+/// value-arg-builtin lowering, then overwrites every `call_builtin` operand
+/// it emitted with the dynamic-pool sentinel in the upper slot.
+fn compileRegexBuiltinSlow(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    // Explicit emit-and-mark protocol: ask the lowering helper to record the
+    // exact indices of every `call_builtin` it emits for `bid` into `sink`,
+    // then retrofit only those instructions. No heuristic scan of the raw
+    // stream, no dependence on `bid_tag` matching — refactors of the
+    // lowering helper cannot silently break this path.
+    var sink = std.ArrayList(u32){};
+    defer sink.deinit(ctx.alloc);
+
+    try compileValueArgBuiltin1Collecting(ctx, bid, &sink);
+
+    const packed_operand = types.packRegexBuiltinOperand(bid, types.REGEX_POOL_DYNAMIC);
+    for (sink.items) |idx| {
+        ctx.raw.items[idx].operand.index = packed_operand;
+    }
+}
+
+/// `internDecodedStr` but into an arbitrary ArrayList (used by the regex
+/// fast path to build a pattern string without touching the compiler's
+/// intern buffer, because the pool makes its own copy of the key).
+fn decodeStringLiteralInto(
+    buf: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+) (ZqError || error{OutOfMemory})!void {
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '\\') {
+            try buf.append(alloc, raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= raw.len) return error.QuerySyntaxError;
+        switch (raw[i]) {
+            '\\' => {
+                try buf.append(alloc, '\\');
+                i += 1;
+            },
+            '"' => {
+                try buf.append(alloc, '"');
+                i += 1;
+            },
+            '/' => {
+                try buf.append(alloc, '/');
+                i += 1;
+            },
+            'n' => {
+                try buf.append(alloc, '\n');
+                i += 1;
+            },
+            'r' => {
+                try buf.append(alloc, '\r');
+                i += 1;
+            },
+            't' => {
+                try buf.append(alloc, '\t');
+                i += 1;
+            },
+            'b' => {
+                try buf.append(alloc, '\x08');
+                i += 1;
+            },
+            'f' => {
+                try buf.append(alloc, '\x0C');
+                i += 1;
+            },
+            'u' => {
+                i += 1;
+                if (i + 4 > raw.len) return error.QuerySyntaxError;
+                const hi = std.fmt.parseInt(u21, raw[i..][0..4], 16) catch return error.QuerySyntaxError;
+                i += 4;
+                var codepoint: u21 = hi;
+                if (hi >= 0xD800 and hi <= 0xDBFF) {
+                    if (i + 6 > raw.len or raw[i] != '\\' or raw[i + 1] != 'u')
+                        return error.QuerySyntaxError;
+                    const lo = std.fmt.parseInt(u21, raw[i + 2 ..][0..4], 16) catch return error.QuerySyntaxError;
+                    if (lo < 0xDC00 or lo > 0xDFFF) return error.QuerySyntaxError;
+                    codepoint = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 6;
+                }
+                var utf8_buf: [4]u8 = undefined;
+                const utf8_len = std.unicode.utf8Encode(@intCast(codepoint), &utf8_buf) catch return error.QuerySyntaxError;
+                try buf.appendSlice(alloc, utf8_buf[0..utf8_len]);
+            },
+            else => return error.QuerySyntaxError,
+        }
     }
 }
 
@@ -3270,6 +3977,131 @@ fn compileTwoArgMath(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMem
 
     // call_builtin — pops two args from stack
     try ctx.emit(.call_builtin, .{ .index = @intFromEnum(bid) });
+}
+
+/// Compile a 2-arg regex builtin: `sub(pattern; replacement)`,
+/// `gsub(pattern; replacement)`. Mirrors `compileTwoArgMath` for instruction
+/// order (stack push order: pattern then replacement), but if `pattern` is
+/// a bare string literal we intern it into the `regex_pool` and pack the
+/// pool index into the final `call_builtin` operand. Otherwise the sentinel
+/// `REGEX_POOL_DYNAMIC` goes into the upper slot.
+fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOfMemory})!void {
+    _ = try ctx.nextToken(); // consume '('
+
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    // Fast-path detection: the first argument is a bare string literal
+    // followed immediately by ';'. Any other shape falls through to the
+    // dynamic path (which still evaluates `parsePipe` on the pattern).
+    // Additional fast path: `builtin("pat"; repl; "flags")` — 3-arg sub/gsub
+    // with literal flags. When the closing token after the replacement is a
+    // ';' we expect a 3rd literal-string flags argument.
+    var regex_pool_idx: u32 = types.REGEX_POOL_DYNAMIC;
+    var fast_path_handled = false;
+    var pattern_tok_for_flags: ?Token = null;
+    {
+        var probe = ctx.lex;
+        const probe_arg = probe.next() catch null;
+        const probe_sep = probe.next() catch null;
+        if (probe_arg != null and probe_sep != null and
+            probe_arg.?.tag == .string_lit and probe_sep.?.tag == .semicolon)
+        {
+            pattern_tok_for_flags = probe_arg.?;
+            // Consume the literal for real.
+            const str_tok = try ctx.nextToken();
+            const raw = str_tok.slice(ctx.src);
+            const body = raw[1 .. raw.len - 1];
+
+            var pattern_buf = std.ArrayList(u8){};
+            defer pattern_buf.deinit(ctx.alloc);
+
+            // Tentatively compile here — if a literal flags arg appears later,
+            // re-intern with the inline flag prefix. The two-pass wrinkle is
+            // unavoidable without extra probe lookahead; Rev1 keeps it simple
+            // and accepts the small duplicate work for the fast path.
+            try decodeStringLiteralInto(&pattern_buf, ctx.alloc, body);
+
+            ctx.last_regex_pattern_offset = str_tok.offset;
+            ctx.last_regex_pattern_len = str_tok.len;
+
+            regex_pool_idx = ctx.regex_pool.intern(pattern_buf.items) catch |e| switch (e) {
+                regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
+                regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
+                regex_mod.Error.RegexInternalError => return error.RegexCompileError,
+                regex_mod.Error.OutOfMemory => return error.OutOfMemory,
+            };
+            fast_path_handled = true;
+        }
+    }
+
+    if (!fast_path_handled) {
+        try parsePipe(ctx);
+    }
+
+    const semi = try ctx.nextToken();
+    if (semi.tag != .semicolon) return ctx.syntaxErr(semi.offset, semi.len);
+
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.save_input, .{ .none = {} });
+
+    try parsePipe(ctx);
+
+    const after_repl = try ctx.nextToken();
+    if (after_repl.tag == .rparen) {
+        // 2-arg form: sub(pat; repl).
+        try ctx.emit(.restore_input, .{ .none = {} });
+        try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(bid, regex_pool_idx) });
+        return;
+    }
+    if (after_repl.tag != .semicolon) return ctx.syntaxErr(after_repl.offset, after_repl.len);
+
+    // 3-arg form: sub(pat; repl; flags). Only literal flags + literal pattern
+    // are supported — see emitFlagPrefix notes on why the runtime path is
+    // intentionally out of scope for this revision.
+    const flags_tok = try ctx.nextToken();
+    const rparen = try ctx.nextToken();
+    if (flags_tok.tag != .string_lit or rparen.tag != .rparen or !fast_path_handled) {
+        // Runtime-built flags or runtime-built patterns trip here. Surface a
+        // compile error with the flags span pointed at — users get a clear
+        // "3-arg regex must have literal flags + literal pattern" hint by
+        // looking at the message in `last_regex_pattern_*`.
+        ctx.last_regex_pattern_offset = flags_tok.offset;
+        ctx.last_regex_pattern_len = flags_tok.len;
+        return error.RegexCompileError;
+    }
+
+    // Re-intern the pattern with the flag prefix. This changes the pool key,
+    // so duplicates across different flag sets get distinct entries — correct
+    // behavior (they are semantically distinct patterns).
+    const pat_tok = pattern_tok_for_flags.?;
+    const pat_raw = pat_tok.slice(ctx.src);
+    const pat_body = pat_raw[1 .. pat_raw.len - 1];
+    const flags_raw = flags_tok.slice(ctx.src);
+    const flags_body = flags_raw[1 .. flags_raw.len - 1];
+
+    var new_buf = std.ArrayList(u8){};
+    defer new_buf.deinit(ctx.alloc);
+    const has_g_flag = try emitFlagPrefix(ctx, &new_buf, flags_body, pat_tok.offset, pat_tok.len);
+    try decodeStringLiteralInto(&new_buf, ctx.alloc, pat_body);
+
+    ctx.last_regex_pattern_offset = pat_tok.offset;
+    ctx.last_regex_pattern_len = pat_tok.len;
+
+    regex_pool_idx = ctx.regex_pool.intern(new_buf.items) catch |e| switch (e) {
+        regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
+        regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
+        regex_mod.Error.RegexInternalError => return error.RegexCompileError,
+        regex_mod.Error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    // `sub(pat; repl; "g")` is jq-equivalent to `gsub(pat; repl)` — dispatch
+    // to the global-mode opcode at compile time. `gsub` with `g` is a no-op
+    // (already global). Single source of truth: one opcode per distinct
+    // runtime behavior; no runtime flag peek on the stack.
+    const effective_bid = if (bid == .sub_ and has_g_flag) types.BuiltinId.gsub_ else bid;
+
+    try ctx.emit(.restore_input, .{ .none = {} });
+    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(effective_bid, regex_pool_idx) });
 }
 
 /// Compile a three-arg math builtin: `fma(x;y;z)`.
@@ -5305,13 +6137,19 @@ fn parsePrimaryInner(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                 } else if (std.mem.eql(u8, ident_name, "trimstr")) {
                     try compileValueArgBuiltin1(ctx, .trimstr_);
                 } else if (std.mem.eql(u8, ident_name, "test")) {
-                    try compileValueArgBuiltin1(ctx, .test_);
+                    try compileRegexBuiltin1(ctx, .test_);
                 } else if (std.mem.eql(u8, ident_name, "match")) {
-                    try compileValueArgBuiltin1(ctx, .match_);
+                    try compileRegexBuiltin1(ctx, .match_);
+                } else if (std.mem.eql(u8, ident_name, "capture")) {
+                    try compileRegexBuiltin1(ctx, .capture_);
+                } else if (std.mem.eql(u8, ident_name, "scan")) {
+                    try compileRegexBuiltin1(ctx, .scan_);
+                } else if (std.mem.eql(u8, ident_name, "splits")) {
+                    try compileRegexBuiltin1(ctx, .splits_);
                 } else if (std.mem.eql(u8, ident_name, "sub")) {
-                    try compileTwoArgMath(ctx, .sub_);
+                    try compileRegexBuiltin2(ctx, .sub_);
                 } else if (std.mem.eql(u8, ident_name, "gsub")) {
-                    try compileTwoArgMath(ctx, .gsub_);
+                    try compileRegexBuiltin2(ctx, .gsub_);
                 } else if (std.mem.eql(u8, ident_name, "bsearch")) {
                     try compileValueArgBuiltin1(ctx, .bsearch_);
                 } else if (std.mem.eql(u8, ident_name, "error")) {
@@ -6762,5 +7600,14 @@ fn fuse(
     const source_map = try fused_src_offsets.toOwnedSlice(alloc);
     errdefer alloc.free(source_map);
 
-    return Compiled{ .instructions = instructions, .function_table = function_defs, .string_buf = string_buf, .external_var_ids = &.{}, .source_map = source_map };
+    return Compiled{
+        .instructions = instructions,
+        .function_table = function_defs,
+        .string_buf = string_buf,
+        .external_var_ids = &.{},
+        .source_map = source_map,
+        // Placeholder; caller overwrites with the real pool before returning.
+        .regex_pool = RegexPool.init(alloc),
+        .prefilter = null,
+    };
 }

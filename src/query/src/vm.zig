@@ -1,6 +1,7 @@
 const std = @import("std");
 const ZqError = @import("error").ZqError;
 const types = @import("types");
+const regex_mod = @import("regex");
 const Tape = types.Tape;
 const Value = types.Value;
 const Instruction = types.Instruction;
@@ -30,7 +31,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, path_scope };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, path_scope, scan, match_g, splits };
 
 const EachState = struct {
     pos: u32,
@@ -94,6 +95,73 @@ const SkipState = struct {
     saved_collect_len: u32,
 };
 
+/// State for one active `scan(pattern)` generator iteration. The fork frame
+/// owns the `slots` slice (allocated at push, freed at pop).
+///
+/// Two ownership modes for the regex handles:
+///   - Static-pool path: `clone` points into the iterator's `regex_clones`
+///     array (which owns the RegexClone for the compiled-filter lifetime).
+///     `owned_regex`/`owned_clone` are null. Pool entries never evict, so the
+///     borrowed pointer is stable for the life of the fork frame.
+///   - Dynamic path (`scan($var)`): the frame owns a private compiled `Regex`
+///     AND its `RegexClone`, both populated at fork-push time. This isolates
+///     the frame from the runtime LRU — subsequent dynamic-pattern compiles
+///     that evict the LRU entry backing the pattern cannot dangle this frame's
+///     handles. `clone` aliases `&owned_clone.?` for uniform iterNext access.
+///
+/// `hay` is a slice into tape / runtime_tape memory — arena-owned, lifetime
+/// covers the full next() call, so borrowing it across backtracks is safe.
+const ScanState = struct {
+    clone: *regex_mod.RegexClone,
+    owned_regex: ?regex_mod.Regex = null,
+    owned_clone: ?regex_mod.RegexClone = null,
+    hay: []const u8,
+    cursor: usize,
+    /// capture_count slots. slots[0] is the full-match span; slots[1..] are
+    /// capture groups. Allocated with iterator's allocator; freed on frame pop.
+    slots: []regex_mod.MatchSlot,
+    /// Whether the pattern has any capture groups beyond the implicit full-
+    /// match. When true, `scan` yields arrays of capture strings; when false
+    /// (pattern has no user-written groups), `scan` yields the matched string.
+    has_user_captures: bool,
+};
+
+/// Fork state for `match(re; "g")` — yields one jq-match-object per
+/// non-overlapping occurrence. Distinct opcode from scan because the yield
+/// value shape differs (full match object vs scan's string/array).
+///
+/// Same two-mode ownership as ScanState. `regex` is used for metadata
+/// (capture count + group names) when building match objects.
+const MatchGState = struct {
+    clone: *regex_mod.RegexClone,
+    regex: *const regex_mod.Regex,
+    owned_regex: ?regex_mod.Regex = null,
+    owned_clone: ?regex_mod.RegexClone = null,
+    hay: []const u8,
+    cursor: usize,
+    slots: []regex_mod.MatchSlot,
+};
+
+/// Fork state for `splits(re; flags)` — yields the segment between the
+/// previous match end and the current match start, then a final tail segment
+/// when matches are exhausted.
+///
+/// Same two-mode ownership as ScanState.
+const SplitsState = struct {
+    clone: *regex_mod.RegexClone,
+    owned_regex: ?regex_mod.Regex = null,
+    owned_clone: ?regex_mod.RegexClone = null,
+    hay: []const u8,
+    cursor: usize,
+    /// Byte offset where the previous match ended (= start of next segment).
+    prev_end: usize,
+    slots: []regex_mod.MatchSlot,
+    /// True after matches are exhausted and the trailing tail segment has
+    /// been yielded. Used to terminate the generator on the following
+    /// backtrack without producing an extra empty segment.
+    tail_yielded: bool,
+};
+
 const ForkAux = union(ForkType) {
     normal: void,
     each: EachState,
@@ -107,6 +175,16 @@ const ForkAux = union(ForkType) {
     /// sole purpose is to pop the matching path frame when execution
     /// backtracks past the path() expression scope.
     path_scope: void,
+    /// State for `scan(pattern)` generator iterations. On backtrack,
+    /// `doBacktrack` / `backtrackToDepth` calls `iterNext` via the frame's
+    /// `clone`; when no more matches are available the frame is popped.
+    scan: ScanState,
+    /// State for `match(pattern; "g")` generator iterations. Yields one
+    /// full jq-match-object per occurrence.
+    match_g: MatchGState,
+    /// State for `splits(pattern; flags)` generator iterations. Yields each
+    /// segment between matches plus the trailing tail.
+    splits: SplitsState,
 };
 
 /// Snapshot of the path-tracking state at the time a fork was created.
@@ -246,6 +324,26 @@ pub const ResultIterator = struct {
     initialized: bool,
     source_map: []const u32,
     last_error_ip: u32,
+    /// Borrowed reference to the compiled filter's regex pool. Non-null for
+    /// every iterator constructed via `CompiledQuery.execute`; may be null in
+    /// unit tests that short-circuit the pool. When null, every regex builtin
+    /// that reaches a pool-index path errors cleanly.
+    regex_pool: ?*const regex_mod.RegexPool,
+    /// Per-worker clones of every pool entry. Lazily populated on first use:
+    /// `regex_clones[i] == null` until the i-th pool regex is accessed.
+    /// Aligned 1:1 with `regex_pool.entries`. Owned by this iterator; every
+    /// non-null clone is deinit'd in `deinit`.
+    regex_clones: []?regex_mod.RegexClone,
+    /// Bounded LRU for dynamic (`test($var)` etc.) patterns. Each entry bundles
+    /// the compiled `Regex` AND its per-iterator `RegexClone` — the cache is
+    /// the single source of truth for keyed-by-pattern regex state. Owned by
+    /// this iterator; evicted entries free both halves in lockstep.
+    dynamic_regex_cache: regex_mod.cache.LruCache(64),
+    /// Entry of the last resolved dynamic pattern in THIS builtin call. Used
+    /// by metadata helpers so capture/match builders don't need the pattern
+    /// string a second time. Only valid for the duration of a single builtin
+    /// invocation. A single borrowed-pointer pair — no ownership.
+    last_dynamic_entry: ?regex_mod.cache.DynamicEntry,
 
     pub fn init(
         instructions: []const Instruction,
@@ -255,6 +353,7 @@ pub const ResultIterator = struct {
         tape: Tape,
         external_bindings: []const ExternalVarBinding,
         source_map: []const u32,
+        regex_pool: ?*const regex_mod.RegexPool,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
         var value_stack = std.ArrayList(StackValue){};
@@ -313,6 +412,15 @@ pub const ResultIterator = struct {
         var runtime_tape = try types.RuntimeTape.init(allocator);
         errdefer runtime_tape.deinit(allocator);
 
+        // Allocate the clone slots array sized to the pool. On regex-disabled
+        // builds `len()` is 0 (no patterns can be interned), so this is a
+        // zero-length allocation. Slots start at null; lazy population
+        // amortizes per-pattern clone cost across scans.
+        const clone_count: usize = if (regex_pool) |p| p.len() else 0;
+        const regex_clones = try allocator.alloc(?regex_mod.RegexClone, clone_count);
+        errdefer allocator.free(regex_clones);
+        for (regex_clones) |*slot| slot.* = null;
+
         return ResultIterator{
             .tape = tape,
             .instructions = instructions,
@@ -340,7 +448,45 @@ pub const ResultIterator = struct {
             .initialized = false,
             .source_map = source_map,
             .last_error_ip = 0,
+            .regex_pool = regex_pool,
+            .regex_clones = regex_clones,
+            .dynamic_regex_cache = regex_mod.cache.LruCache(64).init(allocator),
+            .last_dynamic_entry = null,
         };
+    }
+
+    /// Free arena-allocated state attached to a regex-generator forkpoint
+    /// (`scan`, `match_g`, `splits`): the `slots` slice plus any
+    /// dynamic-path-owned `Regex`/`RegexClone`. No-op for any other aux kind.
+    ///
+    /// The owned-regex / owned-clone pair exists only for dynamic-pattern
+    /// forks (see state-struct docs) — freeing them here is what makes the
+    /// fork robust against LRU eviction of the pattern backing the frame.
+    fn freeRegexForkSlots(it: *ResultIterator, fp: *Forkpoint) void {
+        switch (fp.aux) {
+            .scan => |*s| {
+                it.alloc.free(s.slots);
+                if (s.owned_clone) |*c| c.deinit();
+                if (s.owned_regex) |*r| r.deinit();
+                s.owned_clone = null;
+                s.owned_regex = null;
+            },
+            .match_g => |*s| {
+                it.alloc.free(s.slots);
+                if (s.owned_clone) |*c| c.deinit();
+                if (s.owned_regex) |*r| r.deinit();
+                s.owned_clone = null;
+                s.owned_regex = null;
+            },
+            .splits => |*s| {
+                it.alloc.free(s.slots);
+                if (s.owned_clone) |*c| c.deinit();
+                if (s.owned_regex) |*r| r.deinit();
+                s.owned_clone = null;
+                s.owned_regex = null;
+            },
+            else => {},
+        }
     }
 
     /// Free the internal eval stack. Idempotent.
@@ -355,11 +501,20 @@ pub const ResultIterator = struct {
         it.call_stack.deinit(it.alloc);
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
+            it.freeRegexForkSlots(fp);
         }
         it.fork_stack.deinit(it.alloc);
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
         it.path_stack.deinit(it.alloc);
         it.runtime_tape.deinit(it.alloc);
+
+        // Free per-pool clones and the runtime dynamic cache (which owns both
+        // Regex + RegexClone for every resident entry).
+        for (it.regex_clones) |*maybe_clone| {
+            if (maybe_clone.*) |*c| c.deinit();
+        }
+        it.alloc.free(it.regex_clones);
+        it.dynamic_regex_cache.deinit();
     }
 
     /// Rebind this iterator to a new tape from the same query.
@@ -392,6 +547,7 @@ pub const ResultIterator = struct {
         it.call_stack.clearRetainingCapacity();
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
+            it.freeRegexForkSlots(fp);
         }
         it.fork_stack.clearRetainingCapacity();
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
@@ -402,6 +558,10 @@ pub const ResultIterator = struct {
         it.runtime_tape.entries.clearRetainingCapacity();
         it.runtime_tape.string_buf.clearRetainingCapacity();
         it.runtime_tape.refreshView();
+        // Retain per-pool clones and the dynamic LRU across resets — the
+        // compiled filter (and therefore its regex pool) is unchanged between
+        // iterator runs, so recompiling would be pure waste.
+        it.last_dynamic_entry = null;
     }
 
     /// True when null propagation is active (globally via Opts).
@@ -453,14 +613,21 @@ pub const ResultIterator = struct {
     }
 
     /// Truncate the fork stack to `new_len`, freeing any `saved_stack`
-    /// snapshots on the forkpoints being discarded.
+    /// snapshots and scan-slot arrays on the forkpoints being discarded.
     fn truncateForkStack(it: *ResultIterator, new_len: usize) void {
         var i = it.fork_stack.items.len;
         while (i > new_len) {
             i -= 1;
-            if (it.fork_stack.items[i].saved_stack) |snap| {
+            const fp = &it.fork_stack.items[i];
+            if (fp.saved_stack) |snap| {
                 it.alloc.free(snap);
-                it.fork_stack.items[i].saved_stack = null;
+                fp.saved_stack = null;
+            }
+            it.freeRegexForkSlots(fp);
+            // Clear to avoid double-free on any subsequent pass.
+            switch (fp.aux) {
+                .scan, .match_g, .splits => fp.aux = .{ .normal = {} },
+                else => {},
             }
         }
         it.fork_stack.items.len = new_len;
@@ -517,7 +684,7 @@ pub const ResultIterator = struct {
         while (true) {
             if (it.ip >= it.instructions.len) {
                 // Try fork-stack backtracking (handles comma, each, range, try, alt, label, limit).
-                if (it.doBacktrack()) continue;
+                if (try it.doBacktrack()) continue;
 
                 // No forkpoints — check for collect frame finalization.
                 if (it.collect_stack.items.len > 0) {
@@ -540,7 +707,7 @@ pub const ResultIterator = struct {
                 if (maybe_val) |v| return v;
                 // null → no output produced; continue main loop
             } else |err| {
-                if (it.handleError(err)) {
+                if (try it.handleError(err)) {
                     if (it.done) return null;
                     // Continue executing at catch handler (or done path handled above).
                 } else {
@@ -554,7 +721,9 @@ pub const ResultIterator = struct {
     /// Scan fork_stack for the nearest try_handler or alt_handler, unwind to it,
     /// and route execution to the catch handler (or suppress).
     /// Returns true if an error handler was found, false if error should propagate.
-    fn handleError(it: *ResultIterator, err: ZqError) bool {
+    /// Returns ZqError only if the suppressed-error backtrack itself fails
+    /// (e.g. a scan generator hits OOM while advancing).
+    fn handleError(it: *ResultIterator, err: ZqError) ZqError!bool {
         var idx = it.fork_stack.items.len;
         while (idx > 0) {
             idx -= 1;
@@ -597,7 +766,7 @@ pub const ResultIterator = struct {
                     it.value_stack.items.len = fp.saved_value_stack_len;
                 }
 
-                if (!it.doBacktrack()) {
+                if (!(try it.doBacktrack())) {
                     it.ip = @intCast(it.instructions.len);
                 }
             }
@@ -1223,17 +1392,22 @@ pub const ResultIterator = struct {
             },
 
             .call_builtin => {
-                const bid: BuiltinId = @enumFromInt(@as(u16, @intCast(instr.operand.index)));
-                const result = try it.doBuiltin(bid);
+                // Low 16 bits of operand.index carry the BuiltinId; upper bits
+                // may carry a RegexPool index for regex builtins (see
+                // types.packRegexBuiltinOperand). Truncate here so non-regex
+                // builtins ignore the upper slot cleanly.
+                const bid: BuiltinId = types.builtinIdOf(instr.operand.index);
+                const result = try it.doBuiltin(bid, instr.operand.index);
                 if (result) |val| {
                     it.pushValue(val);
                 }
-                // doBuiltin advances ip when it sets up generators (range, paths, leaf_paths);
+                // doBuiltin advances ip when it sets up generators (range, paths, leaf_paths, scan);
                 // otherwise advance here.
                 // For empty, ip is set past end of instructions — do not advance again.
                 // We only advance if doBuiltin didn't already change ip.
                 if (bid != .empty and bid != .range and bid != .range2 and bid != .range3 and
-                    bid != .paths and bid != .leaf_paths and bid != .recurse)
+                    bid != .paths and bid != .leaf_paths and bid != .recurse and
+                    bid != .scan_ and bid != .match_g_ and bid != .splits_)
                 {
                     it.ip += 1;
                 }
@@ -1514,7 +1688,7 @@ pub const ResultIterator = struct {
             },
 
             .backtrack => {
-                if (!it.doBacktrack()) {
+                if (!(try it.doBacktrack())) {
                     // No forkpoints — let step() handle collect finalization or done.
                     it.ip = @intCast(it.instructions.len);
                 }
@@ -1528,7 +1702,7 @@ pub const ResultIterator = struct {
                         const end = span.end - 1;
                         if (first >= end) {
                             // Empty array — backtrack to next generator.
-                            if (!it.doBacktrack()) {
+                            if (!(try it.doBacktrack())) {
                                 it.ip = @intCast(it.instructions.len);
                             }
                             return null;
@@ -1558,7 +1732,7 @@ pub const ResultIterator = struct {
                         const first_key = span.start + 1;
                         const end = span.end - 1;
                         if (first_key >= end) {
-                            if (!it.doBacktrack()) {
+                            if (!(try it.doBacktrack())) {
                                 it.ip = @intCast(it.instructions.len);
                             }
                             return null;
@@ -1588,7 +1762,7 @@ pub const ResultIterator = struct {
                     },
                     .null_val => {
                         // null | .[] produces nothing.
-                        if (!it.doBacktrack()) {
+                        if (!(try it.doBacktrack())) {
                             it.ip = @intCast(it.instructions.len);
                         }
                         return null;
@@ -2770,7 +2944,7 @@ pub const ResultIterator = struct {
 
     /// Dispatch to individual builtin implementations.
     /// Returns a StackValue to push (or null for empty/generators that set ip).
-    noinline fn doBuiltin(it: *ResultIterator, bid: BuiltinId) ZqError!?StackValue {
+    noinline fn doBuiltin(it: *ResultIterator, bid: BuiltinId, operand: i64) ZqError!?StackValue {
         switch (bid) {
             .length => return try it.builtinLength(),
             .keys => return try it.builtinKeys(true),
@@ -2781,7 +2955,7 @@ pub const ResultIterator = struct {
             .type_ => return it.builtinType(),
             .empty => {
                 // `empty` produces no output — backtrack to next generator path.
-                if (!it.doBacktrack()) {
+                if (!(try it.doBacktrack())) {
                     it.ip = @intCast(it.instructions.len);
                 }
                 return null;
@@ -2914,10 +3088,14 @@ pub const ResultIterator = struct {
             .ltrimstr_ => return try it.builtinLtrimstr(),
             .rtrimstr_ => return try it.builtinRtrimstr(),
             .trimstr_ => return try it.builtinTrimstr(),
-            .test_ => return try it.builtinTest(),
-            .match_ => return try it.builtinMatch(),
-            .sub_ => return try it.builtinSub(),
-            .gsub_ => return try it.builtinGsub(),
+            .test_ => return try it.builtinTest(operand),
+            .match_ => return try it.builtinMatch(operand),
+            .match_g_ => return try it.builtinMatchG(operand),
+            .sub_ => return try it.builtinSub(operand),
+            .gsub_ => return try it.builtinGsub(operand),
+            .capture_ => return try it.builtinCapture(operand),
+            .scan_ => return try it.builtinScan(operand),
+            .splits_ => return try it.builtinSplits(operand),
 
             // Array utility builtins
             .transpose_ => return try it.builtinTranspose(),
@@ -4565,7 +4743,7 @@ pub const ResultIterator = struct {
         switch (end_sv) {
             .int => |end_n| {
                 if (end_n <= 0) {
-                    if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                    if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                     return null;
                 }
                 it.fork_stack.appendAssumeCapacity(.{
@@ -4588,7 +4766,7 @@ pub const ResultIterator = struct {
             },
             .float => |end_f| {
                 if (end_f <= 0) {
-                    if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                    if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                     return null;
                 }
                 it.fork_stack.appendAssumeCapacity(.{
@@ -4633,7 +4811,7 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (from_f >= to_f) {
-                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             it.fork_stack.appendAssumeCapacity(.{
@@ -4662,7 +4840,7 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (from_i >= to_i) {
-                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             it.fork_stack.appendAssumeCapacity(.{
@@ -4711,7 +4889,7 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (by_f == 0 or (by_f > 0 and from_f >= to_f) or (by_f < 0 and from_f <= to_f)) {
-                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             it.fork_stack.appendAssumeCapacity(.{
@@ -4744,7 +4922,7 @@ pub const ResultIterator = struct {
                 else => return error.TypeError,
             };
             if (by_i == 0 or (by_i > 0 and from_i >= to_i) or (by_i < 0 and from_i <= to_i)) {
-                if (!it.doBacktrack()) it.ip = @intCast(it.instructions.len);
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             it.fork_stack.appendAssumeCapacity(.{
@@ -5415,7 +5593,7 @@ pub const ResultIterator = struct {
         try it.collectPaths(it.current, &path_buf, &all_paths, leaf_only);
 
         if (all_paths.items.len == 0) {
-            if (!it.doBacktrack()) {
+            if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
             return null;
@@ -5427,7 +5605,7 @@ pub const ResultIterator = struct {
 
         // Set up fork-based iteration over the container.
         if (!it.setupEachFromCurrent()) {
-            if (!it.doBacktrack()) {
+            if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
         }
@@ -5496,7 +5674,7 @@ pub const ResultIterator = struct {
         try it.collectRecurse(it.current, &all_values);
 
         if (all_values.items.len == 0) {
-            if (!it.doBacktrack()) {
+            if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
             return null;
@@ -5508,7 +5686,7 @@ pub const ResultIterator = struct {
 
         // Set up fork-based iteration over the container.
         if (!it.setupEachFromCurrent()) {
-            if (!it.doBacktrack()) {
+            if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
         }
@@ -5652,7 +5830,7 @@ pub const ResultIterator = struct {
                     break;
                 }
             } else |err| {
-                if (!it.handleError(err)) {
+                if (!(try it.handleError(err))) {
                     it.ip = saved_ip;
                     it.current = saved_current;
                     it.input_value = saved_input;
@@ -5674,7 +5852,7 @@ pub const ResultIterator = struct {
 
             if (it.ip >= it.instructions.len) {
                 if (it.fork_stack.items.len > saved_fork_len) {
-                    if (it.backtrackToDepth(saved_fork_len)) {
+                    if (try it.backtrackToDepth(saved_fork_len)) {
                         continue;
                     }
                 }
@@ -6074,7 +6252,7 @@ pub const ResultIterator = struct {
     /// Each/range forkpoints try to advance; if exhausted, pop and continue.
     /// Stops when it finds a forkpoint that can produce the next path.
     /// Returns true if a path was found, false if all forkpoints exhausted.
-    fn backtrackToDepth(it: *ResultIterator, min_depth: u32) bool {
+    fn backtrackToDepth(it: *ResultIterator, min_depth: u32) ZqError!bool {
         while (it.fork_stack.items.len > min_depth) {
             const fp = &it.fork_stack.items[it.fork_stack.items.len - 1];
             switch (fp.aux) {
@@ -6162,13 +6340,53 @@ pub const ResultIterator = struct {
                     }
                     _ = it.fork_stack.pop();
                 },
+                .scan => {
+                    // Mirror range: advance via iterNext; if exhausted, pop.
+                    it.restorePathState(fp.saved_path);
+                    if (try it.advanceScanForkpoint(fp)) {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        it.ip = fp.backtrack_ip;
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    it.freeRegexForkSlots(fp);
+                    fp.aux = .{ .normal = {} };
+                    _ = it.fork_stack.pop();
+                },
+                .match_g => {
+                    it.restorePathState(fp.saved_path);
+                    if (try it.advanceMatchGForkpoint(fp)) {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        it.ip = fp.backtrack_ip;
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    it.freeRegexForkSlots(fp);
+                    fp.aux = .{ .normal = {} };
+                    _ = it.fork_stack.pop();
+                },
+                .splits => {
+                    it.restorePathState(fp.saved_path);
+                    if (try it.advanceSplitsForkpoint(fp)) {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        it.ip = fp.backtrack_ip;
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    it.freeRegexForkSlots(fp);
+                    fp.aux = .{ .normal = {} };
+                    _ = it.fork_stack.pop();
+                },
             }
         }
         return false;
     }
 
     /// Backtrack within the innermost scope (collect frame boundary or depth 0).
-    fn doBacktrack(it: *ResultIterator) bool {
+    fn doBacktrack(it: *ResultIterator) ZqError!bool {
         const min_depth: u32 = if (it.collect_stack.items.len > 0)
             it.collect_stack.items[it.collect_stack.items.len - 1].outer_fork_depth
         else
@@ -7034,143 +7252,721 @@ pub const ResultIterator = struct {
         return .{ .tape_value = .{ .string = after_prefix } };
     }
 
-    /// `test(regex)`: simplified — test if string contains substring.
-    fn builtinTest(it: *ResultIterator) ZqError!?StackValue {
-        const arg_sv = try it.popValue();
-        const arg = try stackValueToValue(arg_sv);
-        const pattern = switch (arg) {
+    // ── Regex fork-frame handle ownership ──────────────────────────────────
+    //
+    // Generator regex builtins (`scan`, `match(re;"g")`, `splits`) live as
+    // fork frames that can remain suspended while the VM does arbitrary
+    // work, including further dynamic-pattern compiles that evict the LRU
+    // entry backing this frame. Borrowing the LRU's clone pointer is a UAF
+    // waiting to happen.
+    //
+    // `ForkRegexHandles` is the staging struct: for dynamic patterns we
+    // eagerly compile + clone a private pair; for pool-backed patterns we
+    // keep the stable borrowed pointers. Callers move the `owned_*` fields
+    // into the fork aux on frame push and null their local copy so the
+    // `defer deinit` does not double-free.
+
+    const ForkRegexHandles = struct {
+        /// Borrowed pointer when pool-backed; aliases `&owned_clone.?` when
+        /// dynamic. Always safe to call `clone.iterNext(...)` on.
+        clone_ref: *regex_mod.RegexClone,
+        /// Borrowed pointer when pool-backed; aliases `&owned_regex.?` when
+        /// dynamic. Used for metadata (captureCount / groupName).
+        regex_ref: *const regex_mod.Regex,
+        owned_regex: ?regex_mod.Regex = null,
+        owned_clone: ?regex_mod.RegexClone = null,
+
+        fn clonePtr(self: *ForkRegexHandles) *regex_mod.RegexClone {
+            if (self.owned_clone) |*oc| return oc;
+            return self.clone_ref;
+        }
+        fn regexPtr(self: *const ForkRegexHandles) *const regex_mod.Regex {
+            if (self.owned_regex) |*or_| return or_;
+            return self.regex_ref;
+        }
+        fn deinit(self: *ForkRegexHandles) void {
+            if (self.owned_clone) |*c| c.deinit();
+            if (self.owned_regex) |*r| r.deinit();
+            self.owned_clone = null;
+            self.owned_regex = null;
+        }
+    };
+
+    /// Resolve a fork-safe (regex, clone) pair for a generator regex builtin.
+    /// Static-pool operands: borrow the iterator-owned clone + pool regex.
+    /// Dynamic operands: consume the pattern from the stack, compile a fresh
+    /// private `Regex`, clone it, and return both as owned handles on the
+    /// returned struct — independent of the LRU entry.
+    ///
+    /// The caller MUST either move `owned_regex`/`owned_clone` into a fork
+    /// aux (and set them to null on the returned struct) or call
+    /// `handles.deinit()` to release them. The helper never leaks on its
+    /// own error paths.
+    fn buildRegexForkHandles(it: *ResultIterator, operand: i64) ZqError!ForkRegexHandles {
+        if (!regex_mod.enabled) return it.regexError();
+        it.last_dynamic_entry = null;
+        const pool_index = types.regexPoolIndexOf(operand);
+        if (pool_index != types.REGEX_POOL_DYNAMIC) {
+            const clone = try it.resolveRegexClone(pool_index);
+            const regex = try it.resolveRegexMetaForOperand(pool_index);
+            return .{ .clone_ref = clone, .regex_ref = regex };
+        }
+        // Dynamic path: consume pattern from stack, compile a frame-private
+        // Regex + RegexClone. The LRU's cached clone is intentionally NOT
+        // used here — the frame must not alias cache-owned state.
+        const pat_sv = try it.popValue();
+        const pat_val = try stackValueToValue(pat_sv);
+        const pat = switch (pat_val) {
             .string => |s| s,
             else => return error.TypeError,
         };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return error.TypeError,
+
+        var compiled = regex_mod.Regex.compile(pat) catch |e| return it.mapRegexError(e);
+        errdefer compiled.deinit();
+        var cloned = compiled.clone() catch |e| return it.mapRegexError(e);
+        errdefer cloned.deinit();
+
+        // Warm the LRU with the same pattern so subsequent non-fork
+        // dynamic-path callers still amortize compile cost.
+        _ = it.dynamic_regex_cache.getOrCompile(pat) catch |e| {
+            // If the LRU warm-up fails (OOM), we still return the owned
+            // handles — the fork itself is unaffected. Surface the error
+            // so the caller can decide; but practically only OOM fires.
+            return it.mapRegexError(e);
         };
-        return .{ .bool_val = std.mem.indexOf(u8, input, pattern) != null };
+
+        // Transfer into the returned handles struct. `owned_*` pointers
+        // remain stable as long as the struct itself is not moved after
+        // the caller embeds the owned fields into the fork aux.
+        return .{
+            .clone_ref = undefined, // unused when owned_* is set
+            .regex_ref = undefined,
+            .owned_regex = compiled,
+            .owned_clone = cloned,
+        };
     }
 
-    /// `match(regex)`: simplified — return match object for first substring occurrence.
-    fn builtinMatch(it: *ResultIterator) ZqError!?StackValue {
-        const arg_sv = try it.popValue();
-        const arg = try stackValueToValue(arg_sv);
-        const pattern = switch (arg) {
+    // ── Regex builtins (real engine, Phase D) ──────────────────────────────
+    //
+    // Dispatch:
+    //   - Fast path (literal pattern): operand's upper slot holds a pool index.
+    //     `resolveRegexClone` lazy-initializes the per-worker clone on first
+    //     use and returns a pointer into `regex_clones`.
+    //   - Dynamic path (`test($var)` etc.): operand's upper slot is
+    //     `REGEX_POOL_DYNAMIC`. The pattern was pushed by the slow compile
+    //     path; pop it, look up in the LRU, compile on miss.
+    //
+    // When regex is disabled at build time the shim's types collapse to stubs
+    // that return `error.RegexNotCompiled`; we pass that through as a clean
+    // VM-level error with the shim's last message attached.
+
+    /// Fetch a per-worker RegexClone for a filter-compile-time pool entry.
+    /// Lazily clones on first use. Returned pointer is stable for this
+    /// iterator's lifetime (owned by `regex_clones`).
+    fn resolveRegexClone(it: *ResultIterator, pool_index: u32) ZqError!*regex_mod.RegexClone {
+        if (!regex_mod.enabled) return it.regexError();
+        const pool = it.regex_pool orelse return it.regexError();
+        if (pool_index >= it.regex_clones.len) return it.regexError();
+        if (it.regex_clones[pool_index]) |*existing| return existing;
+        const base = pool.get(pool_index);
+        const cloned = base.clone() catch |e| return it.mapRegexError(e);
+        it.regex_clones[pool_index] = cloned;
+        return &it.regex_clones[pool_index].?;
+    }
+
+    /// Resolve a regex clone from a packed operand. For dynamic operands the
+    /// pattern is popped from the value stack and fed through the LRU cache.
+    /// For pool operands the stack is NOT touched — Phase D compiler emits
+    /// no push_string on the literal fast path.
+    fn resolveRegexForOperand(it: *ResultIterator, operand: i64) ZqError!*regex_mod.RegexClone {
+        it.last_dynamic_entry = null;
+        const idx = types.regexPoolIndexOf(operand);
+        if (idx != types.REGEX_POOL_DYNAMIC) return it.resolveRegexClone(idx);
+        // Dynamic path: pattern is on the value stack.
+        const pat_sv = try it.popValue();
+        const pat_val = try stackValueToValue(pat_sv);
+        const pat = switch (pat_val) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        const entry = try it.resolveDynamicRegex(pat);
+        return entry.clone;
+    }
+
+    fn resolveDynamicRegex(it: *ResultIterator, pattern: []const u8) ZqError!regex_mod.cache.DynamicEntry {
+        if (!regex_mod.enabled) return it.regexError();
+        const entry = it.dynamic_regex_cache.getOrCompile(pattern) catch |e| return it.mapRegexError(e);
+        it.last_dynamic_entry = entry;
+        return entry;
+    }
+
+    /// Produce the appropriate ZqError for a regex failure in a given build:
+    /// disabled builds raise `RegexNotCompiled` (feature not linked), enabled
+    /// builds raise `RegexInternalError`. Detail for `RegexInternalError`
+    /// lives on the shim's last-error TLS channel — the VM never synthesises
+    /// a message of its own, so there is no parameter to surface.
+    ///
+    /// This function takes no arguments on purpose: a descriptive Zig-side
+    /// message string would be dead weight (no surfacing path exists for it
+    /// without crossing the shim boundary) and having one invites drift.
+    /// If the call site has structural context that genuinely belongs in
+    /// the user-facing error, route it via `type_error_detail` / a new
+    /// detail channel instead of through this shim-error helper.
+    fn regexError(it: *ResultIterator) ZqError {
+        _ = it;
+        if (comptime !regex_mod.enabled) return error.RegexNotCompiled;
+        return error.RegexInternalError;
+    }
+
+    fn mapRegexError(it: *ResultIterator, e: regex_mod.Error) ZqError {
+        _ = it;
+        return switch (e) {
+            regex_mod.Error.OutOfMemory => error.OutOfMemory,
+            regex_mod.Error.RegexNotCompiled => error.RegexNotCompiled,
+            regex_mod.Error.RegexCompileFailed => error.RegexCompileError,
+            regex_mod.Error.RegexInternalError => error.RegexInternalError,
+        };
+    }
+
+    /// `test(regex)`: bool — does the input match?
+    fn builtinTest(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        const matched = clone.isMatch(input) catch |e| return it.mapRegexError(e);
+        return .{ .bool_val = matched };
+    }
 
-        if (std.mem.indexOf(u8, input, pattern)) |pos| {
-            // Build match object: {"offset": N, "length": N, "string": "...", "captures": []}
-            const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                .tag = .object_start,
-                .payload = .{ .skip = 0 },
+    /// `match(regex)`: full match-object (or raise TypeError if no match).
+    fn builtinMatch(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const clone = try it.resolveRegexForOperand(operand);
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const pool_index = types.regexPoolIndexOf(operand);
+        const regex = try it.resolveRegexMetaForOperand(pool_index);
+        const n_slots = regex.captureCount();
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        defer it.alloc.free(slots_buf);
+        const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
+        if (!matched) return error.TypeError;
+        return try it.buildMatchObject(regex, input, slots_buf);
+    }
+
+    /// Resolve the shared compiled `Regex` (for metadata like captureCount and
+    /// groupName) corresponding to an operand's pool index. The dynamic-path
+    /// case piggy-backs on the LRU entry stashed by `resolveRegexForOperand`.
+    fn resolveRegexMetaForOperand(it: *ResultIterator, pool_index: u32) ZqError!*const regex_mod.Regex {
+        if (pool_index != types.REGEX_POOL_DYNAMIC) {
+            const pool = it.regex_pool orelse return it.regexError();
+            if (pool_index >= pool.len()) return it.regexError();
+            return pool.get(pool_index);
+        }
+        const entry = it.last_dynamic_entry orelse return it.regexError();
+        return entry.regex;
+    }
+
+    /// `capture(regex)`: jq — object of NAMED groups only. Raises on no match.
+    fn builtinCapture(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const clone = try it.resolveRegexForOperand(operand);
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const pool_index = types.regexPoolIndexOf(operand);
+        const regex = try it.resolveRegexMetaForOperand(pool_index);
+        const n_slots = regex.captureCount();
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        defer it.alloc.free(slots_buf);
+        const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
+        if (!matched) return error.TypeError;
+        return try it.buildCaptureObject(regex, input, slots_buf);
+    }
+
+    /// `sub(pattern; replacement)`: first-match replacement. Replacement
+    /// supports `\1..\9` numeric backrefs and `\g<name>` named backrefs.
+    fn builtinSub(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        return try it.builtinSubImpl(operand, false);
+    }
+
+    /// `gsub(pattern; replacement)`: all-match replacement. Same backref
+    /// syntax as `sub`.
+    fn builtinGsub(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        return try it.builtinSubImpl(operand, true);
+    }
+
+    fn builtinSubImpl(it: *ResultIterator, operand: i64, global: bool) ZqError!?StackValue {
+        // Stack layout (see compiler.zig compileRegexBuiltin2): [pattern?, replacement].
+        // Dynamic path pushes pattern; literal path does NOT push pattern.
+        // Replacement is ALWAYS pushed (general parsePipe path).
+        const repl_sv = try it.popValue();
+        const repl = switch (try stackValueToValue(repl_sv)) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const clone = try it.resolveRegexForOperand(operand);
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        const pool_index = types.regexPoolIndexOf(operand);
+        const regex = try it.resolveRegexMetaForOperand(pool_index);
+        const n_slots = regex.captureCount();
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        defer it.alloc.free(slots_buf);
+
+        var out = std.ArrayList(u8){};
+        defer out.deinit(it.alloc);
+        try out.ensureTotalCapacity(it.alloc, input.len);
+
+        var cursor: usize = 0;
+        var prev_end: usize = 0;
+        while (true) {
+            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            if (!got) break;
+            const m_start = slots_buf[0].start;
+            const m_end = slots_buf[0].end;
+            if (m_start > prev_end) try out.appendSlice(it.alloc, input[prev_end..m_start]);
+            try expandReplacement(it.alloc, &out, regex, input, slots_buf, repl);
+            prev_end = m_end;
+            if (!global) break;
+        }
+        if (prev_end < input.len) try out.appendSlice(it.alloc, input[prev_end..]);
+
+        const str_ref = try it.runtime_tape.internString(it.alloc, out.items);
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    }
+
+    /// `scan(pattern)`: generator. See header comment above for integration.
+    ///
+    /// Dynamic-pattern forks: build a fresh private `Regex` + `RegexClone`
+    /// for the frame. Without this the frame would borrow the clone pointer
+    /// from an LRU entry that can evict while the fork is suspended; the
+    /// LRU is strictly an amortization layer for pattern compile and does
+    /// not participate in fork-frame lifetime.
+    fn builtinScan(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        var handles = try it.buildRegexForkHandles(operand);
+        var handles_transferred = false;
+        defer if (!handles_transferred) handles.deinit();
+
+        const n_slots = handles.regexPtr().captureCount();
+        const has_user_captures = n_slots > 1;
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        errdefer it.alloc.free(slots_buf);
+        var cursor: usize = 0;
+        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+            it.alloc.free(slots_buf);
+            return it.mapRegexError(e);
+        };
+        if (!got) {
+            it.alloc.free(slots_buf);
+            if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+        // First match succeeded. Push fork frame; build the yield value; set current.
+        const resume_ip = it.ip + 1;
+        it.fork_stack.appendAssumeCapacity(.{
+            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+            .saved_current = it.current,
+            .backtrack_ip = resume_ip,
+            .aux = .{ .scan = .{
+                .clone = handles.clonePtr(),
+                .owned_regex = handles.owned_regex,
+                .owned_clone = handles.owned_clone,
+                .hay = input,
+                .cursor = cursor,
+                .slots = slots_buf,
+                .has_user_captures = has_user_captures,
+            } },
+            .saved_path = it.snapshotPathState(),
+        });
+        handles_transferred = true;
+
+        // Re-point `clone` into the aux-owned copy so later backtracks (and
+        // the very first advance) use the stable storage on the frame, not
+        // the address of the now-expired local.
+        const st = &it.fork_stack.items[it.fork_stack.items.len - 1].aux.scan;
+        if (st.owned_clone) |*oc| st.clone = oc;
+
+        const yield_sv = try it.buildScanYield(st.slots, input, has_user_captures);
+        it.current = try stackValueToValue(yield_sv);
+        it.ip = resume_ip;
+        return null;
+    }
+
+    /// Called from backtrackToDepth on a `.scan` frame. Advances the cursor
+    /// to the next match; returns true if found (it.current set), false if
+    /// exhausted (caller will pop the frame).
+    fn advanceScanForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
+        var st = &fp.aux.scan;
+        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+        if (!got) return false;
+        const yield_sv = try it.buildScanYield(st.slots, st.hay, st.has_user_captures);
+        it.current = try stackValueToValue(yield_sv);
+        return true;
+    }
+
+    /// `match(pattern; "g")`: generator — one match object per non-overlapping
+    /// occurrence. Shape mirrors `match(pattern)`: `{offset, length, string,
+    /// captures: [...]}` with character-count offsets.
+    ///
+    /// Dynamic-pattern ownership mirrors `builtinScan`: frame owns its own
+    /// (Regex, Clone) pair so the LRU cannot dangle it via eviction.
+    fn builtinMatchG(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        var handles = try it.buildRegexForkHandles(operand);
+        var handles_transferred = false;
+        defer if (!handles_transferred) handles.deinit();
+
+        const n_slots = handles.regexPtr().captureCount();
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        errdefer it.alloc.free(slots_buf);
+        var cursor: usize = 0;
+        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+            it.alloc.free(slots_buf);
+            return it.mapRegexError(e);
+        };
+        if (!got) {
+            it.alloc.free(slots_buf);
+            if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
+            return null;
+        }
+        const resume_ip = it.ip + 1;
+        it.fork_stack.appendAssumeCapacity(.{
+            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+            .saved_current = it.current,
+            .backtrack_ip = resume_ip,
+            .aux = .{ .match_g = .{
+                .clone = handles.clonePtr(),
+                .regex = handles.regexPtr(),
+                .owned_regex = handles.owned_regex,
+                .owned_clone = handles.owned_clone,
+                .hay = input,
+                .cursor = cursor,
+                .slots = slots_buf,
+            } },
+            .saved_path = it.snapshotPathState(),
+        });
+        handles_transferred = true;
+
+        const st = &it.fork_stack.items[it.fork_stack.items.len - 1].aux.match_g;
+        if (st.owned_clone) |*oc| st.clone = oc;
+        if (st.owned_regex) |*or_| st.regex = or_;
+
+        const yield_sv = try it.buildMatchObject(st.regex, input, st.slots);
+        it.current = try stackValueToValue(yield_sv);
+        it.ip = resume_ip;
+        return null;
+    }
+
+    fn advanceMatchGForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
+        var st = &fp.aux.match_g;
+        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+        if (!got) return false;
+        const yield_sv = try it.buildMatchObject(st.regex, st.hay, st.slots);
+        it.current = try stackValueToValue(yield_sv);
+        return true;
+    }
+
+    /// `splits(pattern; flags)`: generator — yields the input split into
+    /// segments by the regex, mirroring jq's builtin. Like `scan` but yields
+    /// the "between" pieces: the prefix before the first match, each
+    /// inter-match gap, and the tail after the last match (including empty
+    /// tails). Equivalent to `split` when the pattern is a literal.
+    fn builtinSplits(it: *ResultIterator, operand: i64) ZqError!?StackValue {
+        const input = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+        var handles = try it.buildRegexForkHandles(operand);
+        var handles_transferred = false;
+        defer if (!handles_transferred) handles.deinit();
+
+        const n_slots = handles.regexPtr().captureCount();
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        errdefer it.alloc.free(slots_buf);
+        var cursor: usize = 0;
+        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+            it.alloc.free(slots_buf);
+            return it.mapRegexError(e);
+        };
+
+        const resume_ip = it.ip + 1;
+
+        if (!got) {
+            // No matches: yield the input whole, then terminate on next backtrack.
+            it.alloc.free(slots_buf);
+            // handles defer frees owned pair automatically.
+            const ref = try it.runtime_tape.internString(it.alloc, input);
+            const whole_sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            // Push a `normal` forkpoint so the single emitted value ends the
+            // generator cleanly on backtrack — this matches scan's empty-case
+            // shape without bypassing the fork stack.
+            it.fork_stack.appendAssumeCapacity(.{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                // Point past the instructions so backtracking pops the frame
+                // and the loop sees no more work.
+                .backtrack_ip = @intCast(it.instructions.len),
+                .aux = .{ .normal = {} },
+                .saved_path = it.snapshotPathState(),
             });
-
-            // offset
-            const k_offset = try it.runtime_tape.internString(it.alloc, "offset");
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_offset } });
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .int, .payload = .{ .int = @intCast(pos) } });
-
-            // length
-            const k_length = try it.runtime_tape.internString(it.alloc, "length");
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_length } });
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .int, .payload = .{ .int = @intCast(pattern.len) } });
-
-            // string
-            const k_string = try it.runtime_tape.internString(it.alloc, "string");
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_string } });
-            const match_str = try it.runtime_tape.internString(it.alloc, pattern);
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .string, .payload = .{ .string = match_str } });
-
-            // captures (empty array)
-            const k_captures = try it.runtime_tape.internString(it.alloc, "captures");
-            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_captures } });
-            const cap_start = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_start, .payload = .{ .skip = 0 } });
-            const cap_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_end, .payload = .{ .none = {} } });
-            it.runtime_tape.entries.items[cap_start].payload.skip = cap_end_idx + 1;
-
-            const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
-            it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-            return .{ .tape_value = .{ .object = .{
-                .tape = &it.runtime_tape.view,
-                .start = obj_start,
-                .end = obj_end_idx + 1,
-            } } };
+            it.current = try stackValueToValue(whole_sv);
+            it.ip = resume_ip;
+            return null;
         }
 
-        // No match — raise error (jq behavior for test/match without match)
-        return error.TypeError;
+        // First match found. Yield the prefix segment [0, slots[0].start).
+        const seg_start: usize = 0;
+        const seg_end: usize = slots_buf[0].start;
+        const prev_end: usize = slots_buf[0].end;
+        const seg_bytes = input[seg_start..seg_end];
+        const ref = try it.runtime_tape.internString(it.alloc, seg_bytes);
+        const seg_sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+
+        it.fork_stack.appendAssumeCapacity(.{
+            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+            .saved_current = it.current,
+            .backtrack_ip = resume_ip,
+            .aux = .{ .splits = .{
+                .clone = handles.clonePtr(),
+                .owned_regex = handles.owned_regex,
+                .owned_clone = handles.owned_clone,
+                .hay = input,
+                .cursor = cursor,
+                .prev_end = prev_end,
+                .slots = slots_buf,
+                .tail_yielded = false,
+            } },
+            .saved_path = it.snapshotPathState(),
+        });
+        handles_transferred = true;
+
+        const st = &it.fork_stack.items[it.fork_stack.items.len - 1].aux.splits;
+        if (st.owned_clone) |*oc| st.clone = oc;
+
+        it.current = try stackValueToValue(seg_sv);
+        it.ip = resume_ip;
+        return null;
     }
 
-    /// `sub(pattern; replacement)`: replace first occurrence.
-    fn builtinSub(it: *ResultIterator) ZqError!?StackValue {
-        const replacement_sv = try it.popValue();
-        const pattern_sv = try it.popValue();
-        const replacement = switch (try stackValueToValue(replacement_sv)) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-        const pattern = switch (try stackValueToValue(pattern_sv)) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-
-        if (std.mem.indexOf(u8, input, pattern)) |pos| {
-            var buf = std.ArrayList(u8){};
-            defer buf.deinit(it.alloc);
-            try buf.appendSlice(it.alloc, input[0..pos]);
-            try buf.appendSlice(it.alloc, replacement);
-            try buf.appendSlice(it.alloc, input[pos + pattern.len ..]);
-            const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+    fn advanceSplitsForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
+        var st = &fp.aux.splits;
+        if (st.tail_yielded) return false;
+        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+        if (!got) {
+            // Yield final tail segment [prev_end, input.len), then terminate.
+            const bytes = st.hay[st.prev_end..st.hay.len];
+            const ref = try it.runtime_tape.internString(it.alloc, bytes);
+            const sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            it.current = try stackValueToValue(sv);
+            st.tail_yielded = true;
+            return true;
         }
-        return .{ .tape_value = .{ .string = input } };
+        // Inter-match segment [prev_end, slots[0].start).
+        const seg_bytes = st.hay[st.prev_end..st.slots[0].start];
+        const ref = try it.runtime_tape.internString(it.alloc, seg_bytes);
+        const sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+        st.prev_end = st.slots[0].end;
+        it.current = try stackValueToValue(sv);
+        return true;
     }
 
-    /// `gsub(pattern; replacement)`: replace all occurrences.
-    fn builtinGsub(it: *ResultIterator) ZqError!?StackValue {
-        const replacement_sv = try it.popValue();
-        const pattern_sv = try it.popValue();
-        const replacement = switch (try stackValueToValue(replacement_sv)) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-        const pattern = switch (try stackValueToValue(pattern_sv)) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
-
-        if (pattern.len == 0) {
-            // Empty pattern: return input unchanged (avoid infinite loop)
-            return .{ .tape_value = .{ .string = input } };
+    /// Build the value yielded by one scan iteration: a matched string when
+    /// the pattern has no user-written capture groups, or an array of capture
+    /// strings when it does. Mirrors jq's behavior exactly.
+    fn buildScanYield(
+        it: *ResultIterator,
+        slots: []const regex_mod.MatchSlot,
+        hay: []const u8,
+        has_user_captures: bool,
+    ) ZqError!StackValue {
+        if (!has_user_captures) {
+            const s = slots[0];
+            const bytes = hay[s.start..s.end];
+            const ref = try it.runtime_tape.internString(it.alloc, bytes);
+            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
         }
-
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(it.alloc);
-        var i: usize = 0;
-        while (i < input.len) {
-            if (i + pattern.len <= input.len and std.mem.eql(u8, input[i..][0..pattern.len], pattern)) {
-                try buf.appendSlice(it.alloc, replacement);
-                i += pattern.len;
+        // Array of capture strings (indices 1..captureCount).
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        var i: usize = 1;
+        while (i < slots.len) : (i += 1) {
+            const s = slots[i];
+            if (s.start == regex_mod.SLOT_UNMATCHED) {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .null_val, .payload = .{ .none = {} } });
             } else {
-                try buf.append(it.alloc, input[i]);
-                i += 1;
+                const bytes = hay[s.start..s.end];
+                const ref = try it.runtime_tape.internString(it.alloc, bytes);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .string, .payload = .{ .string = ref } });
+            }
+        }
+        const arr_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end + 1;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape.view,
+            .start = arr_start,
+            .end = arr_end + 1,
+        } } };
+    }
+
+    /// Build the jq `match` object: {offset, length, string, captures}.
+    /// offset/length are **character counts**, not bytes.
+    fn buildMatchObject(
+        it: *ResultIterator,
+        regex: *const regex_mod.Regex,
+        hay: []const u8,
+        slots: []const regex_mod.MatchSlot,
+    ) ZqError!StackValue {
+        var oc = regex_mod.offset.OffsetCursor.init(hay);
+        const m_start_char = oc.charAt(slots[0].start);
+        const m_end_char = oc.charAt(slots[0].end);
+
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        try it.appendRuntimeKV(
+            "offset",
+            .{ .tag = .int, .payload = .{ .int = @intCast(m_start_char) } },
+        );
+        try it.appendRuntimeKV(
+            "length",
+            .{ .tag = .int, .payload = .{ .int = @intCast(m_end_char - m_start_char) } },
+        );
+        const match_bytes = hay[slots[0].start..slots[0].end];
+        const match_ref = try it.runtime_tape.internString(it.alloc, match_bytes);
+        try it.appendRuntimeKV(
+            "string",
+            .{ .tag = .string, .payload = .{ .string = match_ref } },
+        );
+
+        // captures
+        const k_captures = try it.runtime_tape.internString(it.alloc, "captures");
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_captures } });
+        const caps_start = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_start, .payload = .{ .skip = 0 } });
+
+        var i: usize = 1;
+        while (i < slots.len) : (i += 1) {
+            try it.appendCaptureEntry(regex, hay, slots[i], i, &oc);
+        }
+
+        const caps_end = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_end, .payload = .{ .none = {} } });
+        it.runtime_tape.entries.items[caps_start].payload.skip = caps_end + 1;
+
+        const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape.view,
+            .start = obj_start,
+            .end = obj_end + 1,
+        } } };
+    }
+
+    /// Build a capture() object: {<named groups...>}. Unnamed groups skipped.
+    /// Unmatched optional named groups emit null.
+    fn buildCaptureObject(
+        it: *ResultIterator,
+        regex: *const regex_mod.Regex,
+        hay: []const u8,
+        slots: []const regex_mod.MatchSlot,
+    ) ZqError!StackValue {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        var i: usize = 1;
+        while (i < slots.len) : (i += 1) {
+            const name = regex.groupName(i) orelse continue;
+            const k_ref = try it.runtime_tape.internString(it.alloc, name);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_ref } });
+            if (slots[i].start == regex_mod.SLOT_UNMATCHED) {
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .null_val, .payload = .{ .none = {} } });
+            } else {
+                const bytes = hay[slots[i].start..slots[i].end];
+                const s_ref = try it.runtime_tape.internString(it.alloc, bytes);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .string, .payload = .{ .string = s_ref } });
             }
         }
 
-        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape.view,
+            .start = obj_start,
+            .end = obj_end + 1,
+        } } };
+    }
+
+    /// Append one capture entry (a nested object) to the runtime tape.
+    /// Shape: `{offset, length, string, name}` with `name = null` when the
+    /// group is unnamed. Unmatched optional groups get `offset: -1, length: 0,
+    /// string: null`.
+    fn appendCaptureEntry(
+        it: *ResultIterator,
+        regex: *const regex_mod.Regex,
+        hay: []const u8,
+        slot: regex_mod.MatchSlot,
+        idx: usize,
+        oc: *regex_mod.offset.OffsetCursor,
+    ) ZqError!void {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        if (slot.start == regex_mod.SLOT_UNMATCHED) {
+            try it.appendRuntimeKV("offset", .{ .tag = .int, .payload = .{ .int = -1 } });
+            try it.appendRuntimeKV("length", .{ .tag = .int, .payload = .{ .int = 0 } });
+            try it.appendRuntimeKV("string", .{ .tag = .null_val, .payload = .{ .none = {} } });
+        } else {
+            const s_char = oc.charAt(slot.start);
+            const e_char = oc.charAt(slot.end);
+            try it.appendRuntimeKV("offset", .{ .tag = .int, .payload = .{ .int = @intCast(s_char) } });
+            try it.appendRuntimeKV("length", .{ .tag = .int, .payload = .{ .int = @intCast(e_char - s_char) } });
+            const bytes = hay[slot.start..slot.end];
+            const ref = try it.runtime_tape.internString(it.alloc, bytes);
+            try it.appendRuntimeKV("string", .{ .tag = .string, .payload = .{ .string = ref } });
+        }
+
+        if (regex.groupName(idx)) |name| {
+            const name_ref = try it.runtime_tape.internString(it.alloc, name);
+            try it.appendRuntimeKV("name", .{ .tag = .string, .payload = .{ .string = name_ref } });
+        } else {
+            try it.appendRuntimeKV("name", .{ .tag = .null_val, .payload = .{ .none = {} } });
+        }
+
+        const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .object_end, .payload = .{ .none = {} } });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+    }
+
+    /// Helper: append a key entry + value entry. `entry` must be a value
+    /// entry (not a container). For containers the caller must manage starts
+    /// and ends manually.
+    fn appendRuntimeKV(it: *ResultIterator, key: []const u8, entry: Tape.Entry) ZqError!void {
+        const k_ref = try it.runtime_tape.internString(it.alloc, key);
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .key, .payload = .{ .string = k_ref } });
+        // Strings embedded by callers must have had their bytes interned
+        // before we're called — we just append the entry as-is.
+        _ = try it.runtime_tape.appendEntry(it.alloc, entry);
     }
 
     // ── Array utility builtins ───────────────────────────────────────────────
@@ -7495,6 +8291,84 @@ pub const ResultIterator = struct {
         }
     }
 };
+
+// ── Replacement-string expansion for sub / gsub ────────────────────────────
+//
+// Syntax supported (jq / onig compat):
+//   `\0`–`\9`   numeric backref. `\0` is the entire match; `\1..\9` are
+//               capture groups by index. Unmatched optional groups expand to
+//               the empty string.
+//   `\g<name>`  named backref. Unknown names error with RegexInternalError.
+//   `\\`        literal backslash.
+//   anything else after `\`: literal, in line with onig's lenient behavior.
+//
+// Invalid `\g<...>` (no closing `>`, or unknown name) surfaces as
+// `error.RegexInternalError` — no silent ignore.
+
+fn expandReplacement(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    regex: *const regex_mod.Regex,
+    hay: []const u8,
+    slots: []const regex_mod.MatchSlot,
+    repl: []const u8,
+) ZqError!void {
+    var i: usize = 0;
+    while (i < repl.len) {
+        const c = repl[i];
+        if (c != '\\') {
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        // Escape. Need lookahead.
+        i += 1;
+        if (i >= repl.len) {
+            try out.append(alloc, '\\');
+            break;
+        }
+        const nx = repl[i];
+        if (nx == '\\') {
+            try out.append(alloc, '\\');
+            i += 1;
+            continue;
+        }
+        if (nx >= '0' and nx <= '9') {
+            const group_idx: usize = @intCast(nx - '0');
+            i += 1;
+            if (group_idx >= slots.len) continue; // unknown numeric ref → empty
+            const s = slots[group_idx];
+            if (s.start == regex_mod.SLOT_UNMATCHED) continue;
+            try out.appendSlice(alloc, hay[s.start..s.end]);
+            continue;
+        }
+        if (nx == 'g') {
+            // \g<name> or \g<N>
+            i += 1;
+            if (i >= repl.len or repl[i] != '<') return error.RegexInternalError;
+            i += 1;
+            const name_start = i;
+            while (i < repl.len and repl[i] != '>') : (i += 1) {}
+            if (i >= repl.len) return error.RegexInternalError;
+            const name = repl[name_start..i];
+            i += 1; // skip '>'
+            // Try numeric first
+            const group_idx: ?usize = if (name.len > 0)
+                std.fmt.parseInt(usize, name, 10) catch null
+            else
+                null;
+            const gi = group_idx orelse (regex.groupIndexByName(name) orelse return error.RegexInternalError);
+            if (gi >= slots.len) return error.RegexInternalError;
+            const s = slots[gi];
+            if (s.start == regex_mod.SLOT_UNMATCHED) continue;
+            try out.appendSlice(alloc, hay[s.start..s.end]);
+            continue;
+        }
+        // Unknown escape: preserve as literal (drop the backslash, keep nx).
+        try out.append(alloc, nx);
+        i += 1;
+    }
+}
 
 /// Simple JSON parser for fromjson builtin.
 /// Parses a JSON string and builds entries in the ResultIterator's runtime tape.

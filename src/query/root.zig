@@ -3,6 +3,10 @@ const err_mod = @import("error");
 const types = @import("types");
 const compiler = @import("src/compiler.zig");
 const vm = @import("src/vm.zig");
+const regex_mod = @import("regex");
+const prefilter_mod = @import("src/prefilter.zig");
+
+pub const PrefilterSet = prefilter_mod.PrefilterSet;
 
 pub const ZqError = err_mod.ZqError;
 pub const Tape = types.Tape;
@@ -49,6 +53,15 @@ pub const CompiledQuery = struct {
     external_var_ids: []u32,
     source_map: []u32,
     opts: Opts,
+    /// Filter-compile-time regex pool. Owns every `Regex` compiled for a
+    /// string-literal pattern in this query. Freed on `deinit`. Opcodes
+    /// reference entries by `u32` index in the packed `call_builtin` operand.
+    regex_pool: regex_mod.RegexPool,
+    /// Sparser raw-byte prefilter — populated at compile time when the
+    /// source matches the exact shape `select(PATH | regex_builtin("lit"))`.
+    /// `null` otherwise. The parallel chunk worker consults this before
+    /// parsing each record; see `src/query/src/prefilter.zig`.
+    prefilter: ?prefilter_mod.PrefilterSet,
 
     /// Compile `src` into bytecode. Returns a CompileResult union:
     /// `.ok` on success, `.err` with source location on compile error.
@@ -68,6 +81,8 @@ pub const CompiledQuery = struct {
                 .external_var_ids = compiled.external_var_ids,
                 .source_map = compiled.source_map,
                 .opts = opts,
+                .regex_pool = compiled.regex_pool,
+                .prefilter = compiled.prefilter,
             } },
             .err => |ce| return .{ .err = ce },
         }
@@ -79,6 +94,8 @@ pub const CompiledQuery = struct {
         q.allocator.free(q.string_buf);
         q.allocator.free(q.source_map);
         if (q.external_var_ids.len > 0) q.allocator.free(q.external_var_ids);
+        q.regex_pool.deinit();
+        if (q.prefilter) |*p| p.deinit();
     }
 
     /// Bind `tape` to this query and allocate an iterator eval stack.
@@ -98,6 +115,7 @@ pub const CompiledQuery = struct {
             tape,
             external_bindings,
             q.source_map,
+            &q.regex_pool,
             allocator,
         );
     }
