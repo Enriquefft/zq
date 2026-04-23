@@ -28,7 +28,7 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-04-16)
+## Quick Status (Updated 2026-04-23)
 
 **Last updated:** Number-formatting + jq parity fixes. Rewrote `formatJqFloat` to match jq's `jvp_dtoa_fmt` (removed spurious i64 fast-path, ±inf→±DBL_MAX clamp, IGNORE_ZERO_SIGN). Rewrote `doMod` per jq's `binop_mod` with saturating `dtoiClamp` (inf%n, nan, INT64_MIN%-1). `doMul` nan/inf×string→null. Added `have_decnum`/`have_literal_numbers` builtins (return false). Added `Forkpoint.saved_stack` snapshots so binop left-operand survives generator backtrack inside array-collect (`[. * (a,b)]`). Fixed `insertRawInstr` off-by-one in jump-target shifting (`>=`→`>`) which silently skipped half the inner iterations in `(a,b)⊕(c,d,e)`.
 
@@ -76,9 +76,9 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
 - [x] 60%+ of migrated jq compat tests pass
 - [x] 100% of internal regression tests pass
 - [x] 75%+ compat **with parity** for assignment, paths, error semantics — remaining gaps are decnum-dependent (require jq's arbitrary-precision build)
-- [ ] All P0/P1 query features below are implemented
+- [~] All P0/P1 query features below are implemented — P0 complete; P1 remains `[~]` on **Core builtins (tier 2)** (`del` with complex args, deep `contains`, short-circuit `any`/`all`, `first`/`last` with generator args)
 - [x] `zq` binary under 3 MB static
-- [ ] Zero known crashes on valid JSON input
+- [~] Zero known crashes on valid JSON input — no crash reproducers open in `bugs.md`; 107 jq compat tests still fail as correctness deltas (literals / iteration / object-merge paths), none of which are crashes. Promote to `[x]` once fuzz coverage (v1.0) runs clean.
 - [x] Memory: RSS < 2x input size for per-record queries on file mode
 - [x] Startup time < 3ms
 - [x] `--json-errors` produces structured error output
@@ -188,6 +188,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 | [x] | Static binary builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) | P1 |
 | [x] | Expanded `--help` with filter syntax, format strings, examples, exit codes, and builtins discovery | P1 |
 | [x] | Error messages include filter position and input context | P2 |
+| [x] | LSP (Language Server) — `zq --lsp`. Autocomplete, hover docs, diagnostics, references, rename, semantic tokens, formatting. Source: `src/lsp/`. Originally scoped for v1.0, shipped ahead of schedule during v0.1 work. | P2 |
 
 ---
 
@@ -338,7 +339,7 @@ complete above, tracked here for visibility. Goal is **75%+ compat tests** and
 |---|---------|-------------|---------------|
 | [ ] | **Agent framework integrations** | Pre-built tool definitions for LangChain, CrewAI, AutoGen, Claude Agent SDK. | Agents in any framework can use zq with zero configuration. |
 | [ ] | **`--schema FILE`** | Validate input against JSON Schema before processing. Exit with structured error on mismatch. | Agents can enforce data contracts in pipelines. |
-| [x] | **LSP (Language Server)** | Language server for jq filter syntax. Autocomplete, hover docs, error diagnostics, references, rename, semantic tokens, formatting. `zq --lsp` | Coding agents (Cursor, Copilot, Claude Code) get IDE-level support when writing zq filters. |
+| [x] | **LSP (Language Server)** | Shipped in v0.1 — see `src/lsp/` and the v0.1 Infrastructure list. Row kept here for the v1.0 agent-ecosystem narrative. | Coding agents (Cursor, Copilot, Claude Code) get IDE-level support when writing zq filters. |
 | [ ] | **VS Code extension** | Syntax highlighting + LSP integration for `.jq` filter files. | Coding agents working in VS Code/Cursor get first-class zq support. |
 | [ ] | **Plugin system** | Custom builtins via shared library. Load with `--plugin path.so`. Uses the C ABI. | Agents can extend zq for domain-specific workflows without forking. |
 | [ ] | **`zq serve`** | Long-running HTTP/gRPC server mode. POST JSON + filter, get results. Connection pooling, compiled query caching. | Agents in networked environments (k8s, microservices) can call zq without process spawn overhead. |
@@ -663,7 +664,7 @@ and treated as pattern-level no-ops. Unknown flag letters are a compile error.
 | `match(re; "g")` global-generator mode | yields all matches | yields all matches (implemented) | — |
 | `match([re, flags])` array overload | works | compile error | `match(re; flags)` |
 | `splits(re; flags)` regex split | works | works (implemented) | — |
-| `n` flag (ignore empty matches) | filters zero-width matches | currently a no-op | accepted silently |
+| `n` flag (ignore empty matches) | filters zero-width matches | rejected at compile time — `RegexCompileError`. See commit e69b413 for rationale. | use a non-empty pattern, or post-filter with `select(. != "")` |
 
 **Performance targets vs measured** (release build, isMatch, per-worker clone, x86_64 ReleaseFast):
 
