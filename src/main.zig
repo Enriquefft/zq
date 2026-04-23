@@ -81,10 +81,26 @@ const QueryDiag = struct {
 };
 
 /// Map an ErrorKind to the appropriate exit code.
+///
+/// Bucket rationale (single source of truth for the zq exit-code contract):
+///   - `EXIT_COMPILE`  — the user's filter or build environment cannot run
+///     the query as written. `regex_compile_error` (bad pattern) is obvious.
+///     `regex_not_compiled` also lands here even when it fires at runtime
+///     (dynamic pattern in a `-Dregex=false` build): the failure root-cause
+///     is build-configuration, not runtime data. The user cannot recover by
+///     changing input — they recover by rebuilding with regex enabled. That
+///     makes it a compile-surface class of failure, not a data-runtime one.
+///   - `EXIT_RUNTIME` — the filter compiled and the build supports the
+///     operation, but the runtime data tripped a jq-level semantic error
+///     (type mismatch, index OOB, user-raised `error`, regex-engine
+///     internal failure). These can be caught with `try`/`?`.
+///   - `EXIT_SYSTEM`  — the process itself failed at a lower layer
+///     (tokenization, number parsing, I/O, OOM, depth-limit). Not
+///     recoverable from the filter; operational issue.
 fn exitCodeForKind(kind: err_mod.ErrorKind) u8 {
     return switch (kind) {
-        .query_syntax_error => EXIT_COMPILE,
-        .type_error, .index_out_of_bounds, .user_error => EXIT_RUNTIME,
+        .query_syntax_error, .regex_compile_error, .regex_not_compiled => EXIT_COMPILE,
+        .type_error, .index_out_of_bounds, .user_error, .regex_internal_error => EXIT_RUNTIME,
         .unexpected_token, .unexpected_eof, .invalid_utf8, .invalid_number, .unterminated_string, .depth_limit_exceeded, .io_error, .out_of_memory => EXIT_SYSTEM,
     };
 }
