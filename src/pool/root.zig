@@ -65,6 +65,34 @@ const types = @import("types");
 
 pub const ZqError = err_mod.ZqError;
 
+/// Global Sparser-prefilter statistics. Incremented (relaxed atomic) from
+/// every worker when a record is skipped because its raw bytes failed the
+/// literal prescreen. Exposed as a simple counter for tests and benchmarks —
+/// the number is informational; no program logic depends on it.
+///
+/// Reset explicitly by callers that want a per-run count
+/// (`prefilter_stats.reset()`). Never reset implicitly.
+pub const prefilter_stats = struct {
+    pub const Counters = struct {
+        skipped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        evaluated: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    };
+    pub var counters: Counters = .{};
+
+    pub fn reset() void {
+        counters.skipped.store(0, .monotonic);
+        counters.evaluated.store(0, .monotonic);
+    }
+
+    pub fn skipped() u64 {
+        return counters.skipped.load(.monotonic);
+    }
+
+    pub fn evaluated() u64 {
+        return counters.evaluated.load(.monotonic);
+    }
+};
+
 // ── Public result types ───────────────────────────────────────────────────────
 
 /// One output value returned by collect() (structured path).
@@ -610,6 +638,21 @@ fn process_line(
     raw_input: bool,
     external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordOutcome {
+    // ── Sparser prefilter ───────────────────────────────────────────────────────
+    // Raw-byte literal scan. When present AND the record's bytes fail the
+    // scan, skip straight to an empty outcome — the select(...|regex(lit))
+    // idiom would have produced no output for this record anyway. The cost
+    // we save is a full JSON parse + regex engine run. See src/query/src/prefilter.zig.
+    if (!raw_input) {
+        if (query.prefilter) |pf| {
+            _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);
+            if (!pf.accept(line)) {
+                _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
+                return .{ .values = &[_]OwnedValue{} };
+            }
+        }
+    }
+
     // ── Parse ──────────────────────────────────────────────────────────────────
     var raw_entry_buf: [1]types.Tape.Entry = undefined;
     const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
@@ -671,6 +714,22 @@ fn process_line_serialized(
     external_bindings: []const query_mod.ExternalVarBinding,
 ) RecordMeta {
     const start: u32 = @intCast(chunk_buf.items.len);
+
+    // ── Sparser prefilter ───────────────────────────────────────────────────────
+    if (!raw_input) {
+        if (query.prefilter) |pf| {
+            _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);
+            if (!pf.accept(line)) {
+                _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
+                return .{
+                    .end_offset = start,
+                    .last_was_false_or_null = false,
+                    .is_error = false,
+                    .error_code = 0,
+                };
+            }
+        }
+    }
 
     // ── Parse ──────────────────────────────────────────────────────────────────
     var raw_entry_buf: [1]types.Tape.Entry = undefined;
