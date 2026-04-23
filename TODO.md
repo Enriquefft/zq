@@ -40,3 +40,26 @@ it turns into a named defect) as it matures. Delete entries as they resolve.
    - The input path `/tmp/zq_fuzz_regex_input.json` is fixed, so two
      concurrent fuzz invocations race on the same file. Suffix with the PID
      (the harness already has a `currentPid()` helper since commit `f62c8e0`).
+
+5. **`path()` validation — close the three accepted gaps.**
+   `f43d8b3` shipped validation via `breaksPath`/`clearsPathBroken` tables on
+   `Op`. Three gaps remain vs jq:
+   - **Nested `path(path(.a))`** returns `["a"]`; jq errors. Fix: treat
+     `path_end`'s pushed array as path-breaking for the outer frame (e.g.,
+     post-op clear exception, or set `path_broken` on the outer frame inside
+     `path_end` when `path_stack.len >= 2`).
+   - **`path(recurse)`** errors; jq emits all paths. Fix: whitelist
+     `recurse`, `paths`, `leaf_paths`, `..` in `breaksPath` (or mark those
+     `call_builtin` variants as preserving via a per-builtin table).
+   - **`$x | path($x.a)`** silently succeeds. `load_variable` is PRESERVING
+     because zq's compiler emits synthetic variable loads inside path
+     constructs. Proper fix: distinguish synthetic from user-bound vars
+     (name convention or a `load_synthetic` opcode).
+
+6. **CLI surfacing of `user_error_msg` in pool/stdin mode.**
+   `src/main.zig:554` passes `null` for `user_message` in the pool path, so
+   `"Invalid path expression with result X"` (and historically `error("msg")`)
+   never reach the user on stdin/file-arg inputs — only `-n`/null-input mode
+   surfaces the detail. Wire the thread-local or per-chunk diagnostic out of
+   `pool` and into the formatter. Pre-existing infra limitation amplified by
+   the `path()` validation work.
