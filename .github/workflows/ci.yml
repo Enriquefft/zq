@@ -71,6 +71,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Partition per rust-target so an x86_64 cache doesn't poison an
+          # aarch64 build (different target/ artifacts, different host-tool
+          # binaries cached in ~/.cargo/bin such as cargo-zigbuild).
+          key: ${{ matrix.rust-target }}
+          workspaces: third_party/zq-regex-shim -> target
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
