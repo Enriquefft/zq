@@ -1,6 +1,6 @@
 # zq
 
-> zq is a high-performance JSON processor compatible with jq filter syntax. It is a drop-in jq replacement that runs 31x faster on large files via automatic parallelization. It produces structured JSON errors, machine-readable data shape descriptions, and uses documented exit codes — designed for reliable use by AI agents and automated workflows.
+> zq is a high-performance JSON processor compatible with jq filter syntax. It is a drop-in jq replacement that runs up to ~48x faster on large files via automatic parallelization, a literal prefilter, and linear-time regex. It produces structured JSON errors, machine-readable data shape descriptions, a `--lsp` JSON-RPC server, and uses documented exit codes — designed for reliable use by AI agents and automated workflows.
 
 ## Installation
 
@@ -146,7 +146,7 @@ Backed by Rust's `regex-automata` (linear-time, no ReDoS). Unicode-aware by defa
 - `gsub(re; repl)` / `gsub(re; repl; flags)` — all-match replace.
 - `splits(re)` / `splits(re; flags)` — generator. Yields each segment between matches; like `split(sep)` but the separator is a regex.
 
-Flags: `i` (case-insensitive), `m` (multi-line), `s` (dotall), `x` (ignore whitespace). `g` is significant for `match` (generator mode); `n` is accepted but a no-op. Other flags are pattern-level no-ops.
+Flags: `i` (case-insensitive), `m` (multi-line), `s` (dotall), `x` (ignore whitespace), `p` (pattern-level no-op). `g` is significant for `match` (generator mode). `n` is **rejected at compile time** with `regex_compile_error` — jq's `n` semantics (treat zero-width matches as non-matches) differ per builtin and silently accepting it produced jq-incompatible output. Other flags are pattern-level no-ops.
 
 Compat delta vs jq/onig: no pattern backrefs (`(\w+) \1`), no lookaround (`(?=...)`, `(?<=...)`), no `\g<name>` subroutine calls in the pattern, no replacement-as-filter evaluation (jq evaluates `sub`/`gsub` replacement as a filter with `.` bound to the match object; e.g. `sub("(?<x>.)"; "\(.captures[0].string | ascii_upcase)")` — zq supports `\1..\9` / `\g<name>` backrefs only; accepted as permanent delta). Compile errors point at the offending literal. Users can opt out of regex entirely with `zig build -Dregex=false` — builtins return `regex_not_compiled`, no Rust dependency.
 
@@ -174,7 +174,7 @@ When `--json-errors` is passed, errors are written to stderr as JSON:
 
 Fields: `error` (error type), `line`, `col`, `offset`, `len` (position in filter), `filter` (the filter string), `description` (human-readable message).
 
-Error types: `query_syntax_error`, `type_error`, `index_out_of_bounds`, `user_error`, `unexpected_token`, `unexpected_eof`, `invalid_utf8`, `invalid_number`, `unterminated_string`, `depth_limit_exceeded`, `io_error`, `out_of_memory`.
+Error types: `query_syntax_error`, `type_error`, `index_out_of_bounds`, `user_error`, `unexpected_token`, `unexpected_eof`, `invalid_utf8`, `invalid_number`, `unterminated_string`, `depth_limit_exceeded`, `io_error`, `out_of_memory`, `regex_compile_error`, `regex_not_compiled`, `regex_internal_error` (15 variants total, mirroring `ZqError` in `src/error/root.zig`).
 
 ### Filter validation (--validate)
 
@@ -211,6 +211,50 @@ cat large.jsonl | zq '.id'    # streaming (batched, all cores)
 ```
 
 No flags needed. File arguments trigger parallel mode automatically.
+
+### Language Server Protocol (--lsp)
+
+`zq --lsp` starts a JSON-RPC 2.0 server on stdin/stdout. Same compiler and analyzer used by the CLI — no separate toolchain.
+
+Entry point: `zq --lsp`.
+
+Capabilities (advertised on `initialize`):
+
+- `textDocument/publishDiagnostics` — compile errors inline; memoized on source hash (identical edits skip recompilation).
+- `textDocument/completion` — trigger characters `.`, `$`, `@`, `|`.
+- `textDocument/hover`
+- `textDocument/definition`
+- `textDocument/references`
+- `textDocument/rename` (with `prepareProvider`)
+- `textDocument/signatureHelp` — trigger characters `(`, `;`.
+- `textDocument/semanticTokens/full` — legend: keyword, function, variable, string, number, operator, property, type; modifiers: declaration, builtin.
+- `textDocument/formatting`
+
+Source: `src/lsp/`. Backed by the error-tolerant AST (`src/ast/`), so diagnostics and completion work on partial/mid-keystroke input.
+
+### AST
+
+`src/ast/` — error-tolerant recursive-descent parser. One AST, two consumers:
+
+1. **LSP** — drives all editor features.
+2. **Query compiler** — the literal-prefilter harvester walks the AST to find `select(... | test("literal"))` idioms and hand literals to the pool for raw-byte pre-parse scanning.
+
+Single source of truth: one parser, two surfaces.
+
+### C ABI
+
+Embed zq in any language via the 6 exported symbols in `src/c_abi/root.zig`:
+
+- `zq_compile(query_str)` → `?*QueryHandle`
+- `zq_compile_ext(query_str, error_out)` → `?*QueryHandle` (writes error message through `error_out`)
+- `zq_execute(handle, json_input, len)` → `c_int` (0 or negative error code)
+- `zq_get_result(handle)` → `[*:0]const u8` (null-terminated result buffer)
+- `zq_get_error(handle)` → `[*:0]const u8` (JSON error object for most recent failure)
+- `zq_free(handle)`
+
+Error codes: `0` ok, `-1` parse, `-2` type, `-3` OOM, `-4` index out of bounds, `-5` user error.
+
+Not thread-safe per handle — each concurrent caller needs its own.
 
 ## Common patterns
 
