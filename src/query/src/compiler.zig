@@ -42,7 +42,7 @@ pub const Compiled = struct {
         alloc.free(c.instructions);
         alloc.free(c.string_buf);
         alloc.free(c.source_map);
-        if (c.external_var_ids.len > 0) alloc.free(c.external_var_ids);
+        alloc.free(c.external_var_ids);
         c.regex_pool.deinit();
         if (c.prefilter) |*p| p.deinit();
         // function_table is part of string_buf, no need to free separately
@@ -7477,7 +7477,7 @@ fn fuse(
         .instructions = instructions,
         .function_table = function_defs,
         .string_buf = string_buf,
-        .external_var_ids = &.{},
+        .external_var_ids = try alloc.alloc(u32, 0),
         .source_map = source_map,
         // Placeholder; caller overwrites with the real pool before returning.
         .regex_pool = RegexPool.init(alloc),

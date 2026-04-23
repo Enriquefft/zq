@@ -93,7 +93,7 @@ pub const CompiledQuery = struct {
         q.allocator.free(q.instructions);
         q.allocator.free(q.string_buf);
         q.allocator.free(q.source_map);
-        if (q.external_var_ids.len > 0) q.allocator.free(q.external_var_ids);
+        q.allocator.free(q.external_var_ids);
         q.regex_pool.deinit();
         if (q.prefilter) |*p| p.deinit();
     }
