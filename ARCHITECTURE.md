@@ -4,7 +4,7 @@
 
 zq parses JSON into a flat tape, compiles jq filters into bytecode, and executes them via a stack-based VM. For JSONL workloads, a fixed-size worker pool splits the input into newline-aligned chunks and processes them in parallel, reordering results before output.
 
-Zero external dependencies. Zig 0.15.2 only.
+Zig 0.15.2 core. The vendored Rust `regex-automata` shim (`third_party/zq-regex-shim/`) is linked in when `-Dregex=true` (default); `-Dregex=false` builds are dependency-free and regex builtins return `regex_not_compiled`.
 
 ## Data Flow
 
@@ -57,16 +57,22 @@ Parallel — stream mode:
 ## Modules
 
 ```
-error   (no deps)          Zig error set, lazy line/col resolution
-types   (no deps)          Tape, Value, Format, Instruction, Op, RuntimeTape
-io      → error            mmap (files) / ring buffer (pipes)
-parser  → error, types     Streaming state machine → flat Tape
-query   → error, types     Compiler + bytecode VM + ResultIterator
-output  → error, types     Buffered serialization, generic over sink type
-pool    → all above        Worker pool, Sequencer, InFlightLimiter
-c_abi   → error, types,    C ABI bridge: zq_compile/zq_execute/zq_free
-          parser, query
-main    → all              CLI arg parsing, routing
+error    (no deps)          Zig error set, lazy line/col resolution
+types    (no deps)          Tape, Value, Format, Instruction, Op, RuntimeTape, BuiltinId
+io       → error            mmap (files) / ring buffer (pipes)
+parser   → error, types     Streaming state machine → flat Tape
+regex    → error            Vendored Rust regex-automata shim (gated on -Dregex)
+ast      → error            Error-tolerant recursive-descent AST (LSP + prefilter harvester)
+query    → error, types,    Compiler + fuse pass + literal prefilter + bytecode VM
+           ast, regex
+output   → error, types     Buffered serialization, generic over sink type
+describe → parser, types    Schema inference for --describe
+pool     → io, parser,      Worker pool, Sequencer, InFlightLimiter, madvise(MADV_DONTNEED)
+           query, output
+lsp      → ast, query       JSON-RPC server: diagnostics/completion/hover/...
+c_abi    → error, types,    C ABI bridge: zq_compile/zq_compile_ext/zq_execute/...
+           parser, query
+main     → all              CLI arg parsing, routing, --lsp entry
 ```
 
 Each module's public API, constraints, and invariants: `src/[module]/INTERFACE.md`
@@ -115,7 +121,7 @@ Three phases:
 
 1. **Lexer** — tokenizes filter string. Handles string literals, operators, keywords, field names, numbers.
 2. **Compiler** — recursive descent → bytecode. Includes a **fuse pass**: `.a | .b | .c` collapsed into a single `load_path` instruction.
-3. **VM** — stack-based execution. Filters are generators (0..N outputs per input). Eval stack, value stack, generator stack, try stack, collect stack, if stack.
+3. **VM** — stack-based execution. Filters are generators (0..N outputs per input). Eval stack, value stack, unified fork stack (subsumes the former try/collect/if stacks — one `Forkpoint` type handles backtracking for try/catch, alternative, generators, and collect).
 
 `CompiledQuery` is immutable after compile — thread-safe for concurrent `execute()` calls. Each `execute()` produces an independent `ResultIterator`.
 
@@ -125,7 +131,7 @@ Three phases:
 
 Implemented operators: field access, pipes, iteration, arithmetic, comparisons, boolean logic, conditionals, variables, user-defined functions, string interpolation, recursive descent, alternative (`//`), try/catch, optional (`?`), slicing, update assignment (`|=`, `+=`, etc.), comma (generators), array/object construction, bracket expressions.
 
-Builtins: length, keys, values, has, in, type, empty, select, map, add, not, error, tostring, tonumber, range, sort, sort_by, group_by, unique, unique_by, reverse, flatten, min, max, min_by, max_by, to_entries, from_entries, with_entries, del, contains, inside, any, all, limit, first, last, indices, index, rindex.
+Builtins: see `src/types.zig:BuiltinId` — the canonical enum (~160 variants). Classes: core (length/keys/values/type/has/in/empty/select/map/add/not/error), path algebra (getpath/setpath/delpaths/paths/leaf_paths/del), math (floor/ceil/sqrt/pow/log/…, ~40 entries), type-check (arrays/objects/strings/numbers/…), string/ASCII (ascii_downcase/upcase/explode/implode/split/join/…), JSON (tojson/fromjson/tonumber/tostring), regex (test/match/match_g/capture/scan/sub/gsub/splits), date/time (now/gmtime/mktime/strftime/strptime/strflocaltime/todate/fromdate/todateiso8601/fromdateiso8601), I/O (input/inputs/debug/stderr/halt/halt_error/env/builtins), and `@format` encoders (base64/uri/html/csv/tsv/json/sh/text).
 
 `runtime_tape` handles object/array construction — grows monotonically within a `next()` call, cleared only at `reset()`. Self-copy safety: pre-reserves exact capacity and refreshes view before copy loop.
 
@@ -138,6 +144,43 @@ Serialization is generic via Zig's `anytype` — parameterized on `writeByte`/`w
 `SerializeOpts` controls formatting: `sort_keys` (sort object keys before output, dual-path — stack buffer for ≤256 keys, heap fallback for larger), `indent` (spaces with configurable width 0–8, or tab character). Threaded through all serialization paths including pool workers.
 
 ANSI color output when stdout is a TTY. `-C` forces color, `-M` disables, `NO_COLOR` env var respected. Color state shared via `*const Color` pointer across main thread and workers.
+
+### regex
+
+Thin Zig wrapper around the vendored Rust `regex-automata` crate at `third_party/zq-regex-shim/`. Linked as a static archive (`libzq_regex_shim.a`) into every artifact that needs regex when `-Dregex=true` (default). `-Dregex=false` swaps in stubs — regex builtins then return `RegexNotCompiled` and no Rust is invoked.
+
+Capabilities: compile, match, named captures, replace with `\1..\9` and `\g<name>` backrefs, required-literal extraction (used by the query prefilter). Linear time in input × pattern size; no catastrophic backtracking.
+
+Flag surface matches jq/Onig where feasible: `i` (case-insensitive), `x` (extended), `s` (dotall), `m` (multi-line), `g` (generator mode for `match`), `p` (pattern-level no-op). The `n` flag is **rejected at compile time** with `RegexCompileError` — jq's `n` semantics require per-builtin zero-width handling that would diverge silently from correct jq behavior.
+
+Compat delta vs jq/Onig: no backreferences in patterns, no lookaround, no `\g<name>` subroutine calls in the pattern, no replacement-as-filter evaluation. Documented as a permanent delta.
+
+### ast
+
+Error-tolerant recursive-descent parser (`src/ast/`). One AST, two consumers:
+
+1. **LSP** — drives diagnostics, hover, completion, definition, references, rename, signature help, semantic tokens, formatting. The AST survives partial input so the editor gets useful suggestions mid-keystroke.
+2. **Query compiler's literal-prefilter harvester** — walks the AST to find `select(X | test("literal"))` idioms, decodes `\uXXXX` escapes in the literal, and hands the byte sequence(s) to the pool for pre-parse raw-byte scanning.
+
+Single source of truth: both surfaces consume the same parser. A fix to AST handling improves LSP diagnostics and prefilter accuracy simultaneously.
+
+### describe
+
+Schema inference for `--describe`. Walks parsed values, unifies types across records, emits a JSON schema object: `{"type": ..., "fields": ..., "elements": ..., "count": N}`. `--depth N` bounds recursion (default 12, 0 = unlimited). Fields seen in some records but not others are marked `"optional": true`.
+
+### lsp
+
+JSON-RPC server over stdin/stdout, launched by `--lsp`. Capabilities advertised on `initialize`:
+
+- `textDocument/publishDiagnostics` — compile errors surfaced inline; memoized on source hash so identical edits don't recompile.
+- `textDocument/completion` — triggered on `.`, `$`, `@`, `|`.
+- `textDocument/hover` — builtin docs and inferred types.
+- `textDocument/definition` / `references` / `rename` — works on user-defined functions and bound variables.
+- `textDocument/signatureHelp` — triggered on `(` and `;`.
+- `textDocument/semanticTokens/full` — keyword/function/variable/string/number/operator/property/type classes with `declaration`/`builtin` modifiers.
+- `textDocument/formatting` — `zq fmt` over the LSP surface.
+
+Document store keeps source per URI. Features receive `(source, offset, ast_root, semantic_model, alloc)`. No network I/O, no threads — a single request loop over `File.reader()`.
 
 ### pool
 
@@ -159,15 +202,20 @@ Fixed-size worker pool. Orchestrates io → parser → query → output in paral
 
 **External bindings**: `submit_file()` and `submit_stream()` accept `external_bindings` and `SerializeOpts`, threaded to all workers. Workers pass bindings to `ResultIterator.reset()` on each record.
 
-**Memory model**: arena-per-chunk, freed atomically when chunk is fully consumed. Workers own persistent `Parser` + `ResultIterator` — init once, `reset()` per record. 2 MiB thread stacks (reduced from 16 MiB default).
+**Memory model**: arena-per-chunk, freed atomically when chunk is fully consumed. Workers own persistent `Parser` + `ResultIterator` — init once, `reset()` per record. 2 MiB thread stacks (reduced from 16 MiB default). After a file-mode chunk's output is serialized into the arena buffer, the worker calls `madvise(MADV_DONTNEED)` on the mmap pages it consumed; the kernel drops them from RSS immediately. Linux-only; gated on `builtin.os.tag == .linux`. This alone dropped `.id` RSS from 1.29x to 0.31x input size on a 1.3 GB file.
 
 `n_threads = 0` is valid — calling thread executes all work inline.
 
 ### c_abi
 
-Four exported C functions: `zq_compile`, `zq_execute`, `zq_get_result`, `zq_free`.
+Six exported C functions: `zq_compile`, `zq_compile_ext`, `zq_execute`, `zq_get_result`, `zq_get_error`, `zq_free`.
 
-Opaque `QueryHandle` owns everything: `CompiledQuery`, `Parser`, null-terminated result buffer. Error codes: 0=ok, -1=parse, -2=query, -3=OOM.
+- `zq_compile_ext` adds a `[*:0]const u8` out-param that receives a descriptive error message on compile failure.
+- `zq_get_error` returns a null-terminated JSON error object (`{"error_code": ..., "kind": "...", ...}`) for the most recent failure on the handle.
+
+Opaque `QueryHandle` owns everything: `CompiledQuery`, `Parser`, null-terminated result buffer, last-error buffer. Error codes: `0` ok, `-1` ERR_PARSE, `-2` ERR_TYPE, `-3` ERR_OOM, `-4` ERR_INDEX, `-5` ERR_USER.
+
+Handles allocate via `std.heap.page_allocator` (not `c_allocator`) — avoids pulling in libc malloc when the host binary doesn't already link it.
 
 Not thread-safe per handle. Each concurrent caller needs its own handle.
 
@@ -182,7 +230,7 @@ CLI entry point. Parses jq-compatible flags into `Config` struct. Routes to:
 
 **External variable binding**: after compilation, main constructs bindings for `--arg`/`--argjson` values. Scalars (null, bool, int, float) bind directly. Compound types (string, array, object) are copied into a persistent `RuntimeTape` that outlives all query executions. The `$ARGS` variable is assembled as `{"positional": [...], "named": {...}}` in the same `RuntimeTape`.
 
-Flags: `-r` (raw), `-c` (compact), `-e` (exit status), `-n` (null input), `-s` (slurp), `-R` (raw input), `-S` (sort keys), `-j` (join output), `-f` (filter from file), `-C`/`-M` (color), `--tab`, `--indent N`, `--arg NAME VALUE`, `--argjson NAME VALUE`, `--args`, `--jsonargs`.
+Flags: `-r` (raw), `-c` (compact), `-e` (exit status), `-n` (null input), `-s` (slurp), `-R` (raw input), `-S` (sort keys), `-j` (join output), `-f` (filter from file), `-C`/`-M` (color), `--tab`, `--indent N`, `--arg NAME VALUE`, `--argjson NAME VALUE`, `--args`, `--jsonargs`, `--json-errors`, `--lsp`, `--validate`, `--describe`, `--depth N`.
 
 ## Design Decisions
 
@@ -202,6 +250,19 @@ Record-level parallelism on a 15M-line file means 15M sequencer operations, 15M 
 
 Initial implementation enqueued one job per line (2.16M jobs, 38s). Rewrite to chunk-level: 2.24s. Further optimization with InFlightLimiter: 1.41s.
 
+### Literal prefilter (Sparser-style)
+
+When a filter matches the shape `select(<pure-accessor> | <regex-builtin>("literal"))`, the compiler extracts the must-contain literal(s) via `regex-syntax`'s required-literal API and attaches them to the compiled query. Pool workers then scan the raw chunk bytes for each literal before parsing JSON. Records that cannot contain any match are discarded without ever being handed to the parser.
+
+The prefilter MUST NEVER produce false negatives. Two guarantees make this safe:
+
+1. `regex-syntax`'s literal set is either exhaustive (every listed literal must appear for a match) or a covering set of alternatives (at least one must appear). Both are sound rejection bases.
+2. JSON string escapes can hide a literal's bytes (`"A"` contains `A`, not `\x41`). Fallback: if a record contains any `\` byte, we do not prefilter it — we let the full parse + regex run decide.
+
+The net effect on low-selectivity queries like `select(.message | test("CRITICAL"))` is that the slow paths (JSON parse, regex engine) only run on candidate records. End-to-end `test()` speedups reach ~47x vs jq on workloads where most records lack the literal.
+
+Implementation: `src/query/src/prefilter.zig` (literal set, harvesting, acceptance check). Pool integration: `src/pool/root.zig` (`prefilter_stats` counters and the per-chunk acceptance loop).
+
 ### Arena-per-chunk with atomic deallocation
 
 Each chunk gets its own arena allocator, freed atomically when `collect()` / `collect_bytes()` advances past it.
@@ -214,7 +275,7 @@ When the output format is known at submit time, workers serialize values directl
 
 For scalar queries (`.id`, `select()`), `OwnedValue` copies ~150 bytes/record (tape entries + string data). Serialized output is ~3 bytes/record (`"42\n"`). On 15M records: ~700 MB vs ~50 MB of arena memory.
 
-Result: RSS for `.id` query dropped from ~2.6x to ~1.1x input size. Contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B per `RecordOutcome`) further reduced allocation count.
+Result: RSS for `.id` query dropped from ~2.6x to ~1.1x input size (serialized path alone). Contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B per `RecordOutcome`) further reduced allocation count. A subsequent `madvise(MADV_DONTNEED)` pass on consumed mmap pages (see **pool**) took RSS to **0.31x input size** — now less than the file itself.
 
 Implementation detail: `meta_list` is pre-allocated before `chunk_buf` so the chunk buffer (always the arena's last allocation) can resize in-place when output exceeds input size (e.g. pretty format). Uses `.items` directly instead of `toOwnedSlice` — arena owns the memory.
 
@@ -321,22 +382,25 @@ Version defined in `build.zig` with `-Dversion` override for release CI. Install
 | Large integers | f64, loses precision above 2^53 | i64, exact to 2^63 | Data integrity |
 | Division by zero | Inconsistent | IEEE 754 (nan/infinite) | Consistency |
 | Truncated JSON | Crashes | Auto-close containers | LLM streaming |
-| Duplicate keys | Silent last-wins | Last-wins + optional `--warn-duplicate-keys` | Data integrity |
+| Regex `n` flag | Silently accepted (no-op) | Rejected at compile time with `RegexCompileError` | Refuse to silently produce jq-incompatible output |
+| Regex engine | Oniguruma (PCRE-style) | `regex-automata` (linear time, no backrefs/lookaround) | No ReDoS; safe on untrusted input |
 
 ## Performance Snapshot
 
-1.3 GB / 15M-record JSONL:
+1.3 GB / 15M-record JSONL, ReleaseFast, x86_64, regex enabled, vs jq 1.8.1:
 
 ```
-File mode (.id):      1.05s,  403 MB RSS  (31x faster than jq, 0.31x input size)
-File mode (select):   1.90s,  831 MB RSS  (37x faster than jq, 0.64x input size)
-File mode (complex):  2.22s               (43x faster than jq)
-Stream mode (.id):    3.47s,    7 MB RSS  (9x faster than jq)
-Startup:              ~2.4 ms             (1.5x faster than jq)
-Binary:               2.7 MB             (static, stripped, zero deps)
+File mode (.id):         0.83s ± 0.04,  440 MB RSS   (24.6x vs jq, 0.31x input)
+File mode (select>500k): 1.52s,         845 MB RSS   (0.64x input)
+File mode (complex):     1.96s
+Stream mode (.id):       1.76s,           7 MB RSS   (11.6x vs jq)
+Regex end-to-end:                                    up to 47x vs jq test()
+Startup:                 1.5 ms
+Binary (regex on):       2.78 MB stripped (libc + Rust shim, dynamically linked)
+Binary (-Dregex=false):  1.29 MB stripped (dependency-free)
 ```
 
-Memory optimization progression (historical — measured on 648 MB file, pre-SIMD):
+Memory optimization progression (historical — earlier rows measured on 648 MB file, pre-SIMD; the madvise row is on the current 1277 MB / 15M workload):
 ```
 Initial (all chunks live):        2998 MB
 + InFlightLimiter:                1764 MB  (-41%)
@@ -344,5 +408,6 @@ Initial (all chunks live):        2998 MB
 + Serialized path:                1124 MB  (-34%)
 + 2 MiB stacks + contiguous:      792 MB  (-29%)
 + Arena interleaving fix:          715 MB  (-10%)
-                          Total:          -76%
++ madvise(MADV_DONTNEED):          396 MB  (-45%, 1277 MB file, .id → 0.31x input)
+                          Total:          -87%
 ```
