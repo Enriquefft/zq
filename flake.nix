@@ -49,11 +49,11 @@
           version = "0.1.0";
           src = ./third_party/zq-regex-shim;
 
-          # Vendor strictly from the checked-in lockfile. Nix fetches each crate
-          # via fixed-output derivations; the in-repo vendor/ dir is ignored here.
-          cargoLock = {
-            lockFile = ./third_party/zq-regex-shim/Cargo.lock;
-          };
+          # Reuse the checked-in vendor tree. Dev (`cargo build --offline`) and
+          # Nix both consume third_party/zq-regex-shim/vendor/, so there is one
+          # SSOT: Cargo.lock generates vendor/ via `cargo vendor`; both paths
+          # read the same tree. No FOD network fetch on the Nix side.
+          cargoVendorDir = "vendor";
 
           doCheck = false;
           # staticlib consumed downstream by zig's linker — leave archive untouched.

@@ -6,19 +6,28 @@
 
 Two derivations in `flake.nix`:
 
-- `zqRegexShim` — `rustPlatform.buildRustPackage`. Vendors crates from
-  `third_party/zq-regex-shim/Cargo.lock` via fixed-output derivations and
-  produces `libzq_regex_shim.a`.
+- `zqRegexShim` — `rustPlatform.buildRustPackage` pointing at the checked-in
+  vendor tree via `cargoVendorDir = "vendor"`. Dev (`cargo build --offline`
+  driven by `build.zig`) and Nix both consume the same
+  `third_party/zq-regex-shim/vendor/`. Single source of truth: `Cargo.lock`
+  generates that tree via `cargo vendor`.
 - `packages.default` — `stdenv.mkDerivation` running `zig build` with
   `-Dshim-archive=${zqRegexShim}/lib/libzq_regex_shim.a`. The flag skips the
   in-tree cargo invocation in `build.zig` and links the pre-built archive.
 
 ## Refreshing `Cargo.lock`
 
-`cargoLock.lockFile` reads the committed file at eval — just
-`cd third_party/zq-regex-shim && cargo update && git commit`. If a new crate's
-hash is unknown, Nix prints the expected SRI hash; add it to
-`cargoLock.outputHashes` and re-run.
+```
+cd third_party/zq-regex-shim
+cargo update
+cargo vendor            # regenerates vendor/ from the new lockfile
+git add Cargo.lock vendor/
+git commit
+```
+
+Nix reads `vendor/` directly — no SRI hashes to update, no FOD fetch. If
+`vendor/` drifts from `Cargo.lock`, BOTH dev and Nix break in the same way
+(no silent divergence).
 
 ## Refreshing `build.zig.zon`
 
