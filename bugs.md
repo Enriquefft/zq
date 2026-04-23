@@ -158,3 +158,67 @@ syntax error path will leak today.
 (commit `1f57ce1`). The hermetic flake itself works — `nix build .#default`
 is green, the overlay is live, and zq is actually being invoked by nix's
 build graph. This is a separate zq compat gap, not a Nix packaging issue.
+
+---
+
+## BUG-006: Generator in object-value position errors with "type error"
+
+**Symptom**: Any generator yielding more than one value in object-construction
+value position raises a runtime `type error` at the position where the
+generator emits its second value. jq produces N separate objects, one per
+generator yield.
+
+```
+$ echo 5 | zq '{a:(1,2,3)}'
+zq: type error at line 1, col 10
+  {a:(1,2,3)}
+           ^
+  type error
+
+$ echo 5 | jq '{a:(1,2,3)}'
+{"a":1}
+{"a":2}
+{"a":3}
+```
+
+Same failure mode for `.[]` in value position (`[1,2,3] | {a:.[]}`),
+multi-yield user functions, and bare commas (`{a:1,2}` — note jq parses
+this as `{a:1, 2:???}` and errors differently, but `{"a":(1,2)}` is the
+clean form).
+
+**Single-yield works** (`{a:(1)}` ✓, `{a:(empty)}` ✓ — produces nothing).
+**Generator outside the object literal works** (`(1,2,3) | {a:.}` ✓).
+
+**Root cause hypothesis**: `object_key` opcode consumes one value off the
+stack, emits one ObjectField, advances `ip`. When the value expression is a
+generator, the generator's first yield is consumed cleanly but the
+forkpoint backtracks to the generator's "next value" rather than to
+`object_construct_start` — so on backtrack, the second yield arrives at
+`object_key` with the field-stack already populated from the first
+iteration, the `it.current` pointing at a non-input intermediate, or
+similar invariant violation that surfaces as `type error`.
+
+The compiler does NOT wrap the entire `object_construct_start … object_construct_end`
+range in a save/restore frame keyed for the generator forkpoint. This is
+why the parallel pattern `[(1,2,3) | {a:.}]` — where the comma operator
+sits OUTSIDE the object literal — works correctly.
+
+**Surfaced during**: contains() fix work (commit `dbd53e2`). Reviewer ran
+`5 | {a:(1,2,3)}` as an edge-case probe; pre-existing pre-fix failure, NOT
+a regression of the contains fix. Filed as separate bug rather than rolled
+into that scope.
+
+**Fix sketch**: emit the object construction sequence inside a forkpoint
+frame so generator backtrack restores `object_construct.items.len`,
+`object_construct_depth`, `object_construct_input`, and `it.current` to
+their `object_construct_start`-time snapshots. Likely lives in
+`src/query/src/compiler.zig` around object-literal compilation; the VM
+opcodes themselves should not need to know about generators.
+
+**Blast radius**: blocks any jq pattern that builds multiple objects per
+input record via in-value generators. Common in transformations that
+expand one record into many (logs → events, batch → items). Likely a
+contributor to compat-test failures involving `with_entries` /
+`from_entries` / object reshaping pipelines.
+
+**Fixed in**: _pending_.
