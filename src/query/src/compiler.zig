@@ -3857,11 +3857,20 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
     // followed immediately by ';'. Any other shape falls through to the
     // dynamic path (which still evaluates `parsePipe` on the pattern).
     // Additional fast path: `builtin("pat"; repl; "flags")` — 3-arg sub/gsub
-    // with literal flags. When the closing token after the replacement is a
-    // ';' we expect a 3rd literal-string flags argument.
+    // with literal flags.
+    //
+    // SSOT on interning: we commit exactly one entry to the pool. The pattern
+    // bytes are decoded into `pending_pattern` but NOT interned until we know
+    // whether literal flags will prepend an inline-flag group. Only after
+    // parsing past the closing `)` (or past the literal flags in the 3-arg
+    // form) do we build the final key and call `regex_pool.intern` once.
+    // This fixes F8 (previously a tentative intern without flags committed a
+    // dead pool slot that was then superseded by the flag-prefixed key).
     var regex_pool_idx: u32 = types.REGEX_POOL_DYNAMIC;
     var fast_path_handled = false;
     var pattern_tok_for_flags: ?Token = null;
+    var pending_pattern = std.ArrayList(u8){};
+    defer pending_pattern.deinit(ctx.alloc);
     {
         var probe = ctx.lex;
         const probe_arg = probe.next() catch null;
@@ -3875,24 +3884,13 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
             const raw = str_tok.slice(ctx.src);
             const body = raw[1 .. raw.len - 1];
 
-            var pattern_buf = std.ArrayList(u8){};
-            defer pattern_buf.deinit(ctx.alloc);
-
-            // Tentatively compile here — if a literal flags arg appears later,
-            // re-intern with the inline flag prefix. The two-pass wrinkle is
-            // unavoidable without extra probe lookahead; Rev1 keeps it simple
-            // and accepts the small duplicate work for the fast path.
-            try decodeStringLiteralInto(&pattern_buf, ctx.alloc, body);
+            // Decode now but defer interning until the full key (pattern
+            // ± flag prefix) is known. This is the single-intern point.
+            try decodeStringLiteralInto(&pending_pattern, ctx.alloc, body);
 
             ctx.last_regex_pattern_offset = str_tok.offset;
             ctx.last_regex_pattern_len = str_tok.len;
 
-            regex_pool_idx = ctx.regex_pool.intern(pattern_buf.items) catch |e| switch (e) {
-                regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
-                regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
-                regex_mod.Error.RegexInternalError => return error.RegexCompileError,
-                regex_mod.Error.OutOfMemory => return error.OutOfMemory,
-            };
             fast_path_handled = true;
         }
     }
@@ -3911,7 +3909,16 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
 
     const after_repl = try ctx.nextToken();
     if (after_repl.tag == .rparen) {
-        // 2-arg form: sub(pat; repl).
+        // 2-arg form: sub(pat; repl). No flags, so the pattern bytes ARE
+        // the final key — intern once here.
+        if (fast_path_handled) {
+            regex_pool_idx = ctx.regex_pool.intern(pending_pattern.items) catch |e| switch (e) {
+                regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
+                regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
+                regex_mod.Error.RegexInternalError => return error.RegexCompileError,
+                regex_mod.Error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
         try ctx.emit(.restore_input, .{ .none = {} });
         try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(bid, regex_pool_idx) });
         return;
@@ -3933,24 +3940,22 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
         return error.RegexCompileError;
     }
 
-    // Re-intern the pattern with the flag prefix. This changes the pool key,
-    // so duplicates across different flag sets get distinct entries — correct
-    // behavior (they are semantically distinct patterns).
+    // Build the final key: flag prefix (if any) + decoded pattern bytes.
+    // This is the FIRST and ONLY intern for this call site — no dead pool
+    // entries linger from an earlier tentative intern.
     const pat_tok = pattern_tok_for_flags.?;
-    const pat_raw = pat_tok.slice(ctx.src);
-    const pat_body = pat_raw[1 .. pat_raw.len - 1];
     const flags_raw = flags_tok.slice(ctx.src);
     const flags_body = flags_raw[1 .. flags_raw.len - 1];
 
-    var new_buf = std.ArrayList(u8){};
-    defer new_buf.deinit(ctx.alloc);
-    const has_g_flag = try emitFlagPrefix(ctx, &new_buf, flags_body, pat_tok.offset, pat_tok.len);
-    try decodeStringLiteralInto(&new_buf, ctx.alloc, pat_body);
+    var final_key = std.ArrayList(u8){};
+    defer final_key.deinit(ctx.alloc);
+    const has_g_flag = try emitFlagPrefix(ctx, &final_key, flags_body, pat_tok.offset, pat_tok.len);
+    try final_key.appendSlice(ctx.alloc, pending_pattern.items);
 
     ctx.last_regex_pattern_offset = pat_tok.offset;
     ctx.last_regex_pattern_len = pat_tok.len;
 
-    regex_pool_idx = ctx.regex_pool.intern(new_buf.items) catch |e| switch (e) {
+    regex_pool_idx = ctx.regex_pool.intern(final_key.items) catch |e| switch (e) {
         regex_mod.Error.RegexCompileFailed => return error.RegexCompileError,
         regex_mod.Error.RegexNotCompiled => return error.RegexNotCompiled,
         regex_mod.Error.RegexInternalError => return error.RegexCompileError,
