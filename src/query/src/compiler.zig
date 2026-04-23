@@ -8,6 +8,7 @@ const Token = lx.Token;
 const regex_mod = @import("regex");
 const RegexPool = regex_mod.RegexPool;
 const prefilter_mod = @import("prefilter.zig");
+const ast = @import("ast");
 
 // ── Public output type ────────────────────────────────────────────────────────
 
@@ -1359,14 +1360,14 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
         ctx.prefilter_groups.deinit(alloc);
     };
 
-    // Sparser-prefilter harvest: scan source bytes for the exact idiom
+    // Sparser-prefilter harvest: walk the AST looking for the exact idiom
     // `select(... | regex_builtin("lit"))`. Only that syntactic shape
     // guarantees a record producing no regex match also produces no select
-    // output — which is the necessary condition for skipping a record's
-    // full parse. Arithmetic, boolean combinators, nested `map`, function
-    // calls, etc. all invalidate the assumption and are rejected by the
-    // scanner (safe-by-default: unrecognised shape → no prefilter).
-    harvestPrefilterFromSource(&ctx, alloc) catch |e| switch (e) {
+    // output — the necessary condition for skipping a record's full parse.
+    // Arithmetic, boolean combinators, nested `map`, function calls, etc.
+    // all invalidate the assumption and cause the AST walker to bail (safe
+    // by default: unrecognised shape → no prefilter).
+    harvestPrefilterFromAst(&ctx, alloc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer {
@@ -1490,149 +1491,89 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     return .{ .ok = compiled };
 }
 
-/// Scan `ctx.src` for the exact idiom `select(<accessor> | <regex_builtin>("<literal>"[, "<flags>"]))`
-/// at the top-level position — no preceding operators, no trailing content
-/// past the matching `)`. On a match, compile the pattern and append its
-/// literals to `ctx.prefilter_groups`.
+/// Harvest prefilter literal groups by walking the AST produced by
+/// `src/ast/`. We match the exact idiom:
 ///
-/// This is intentionally conservative. The scanner rejects any source with:
-///   - Boolean combinators (`and`, `or`, `not`, `//`) in the select body.
-///   - Other function calls, `if`, `try`, `map`, `..`, etc.
-///   - A trailing pipe/expression past the select (`select(...) | other_expr`).
-///     Because if anything else consumes the value, the record can still
-///     produce output and the prefilter would be unsound.
+///     select( <pure-accessor> | <regex-builtin>("<literal>" [; "<flags>"]) )
 ///
-/// A rejected source is simply not prefiltered — which is the safe fallback.
-/// The prefilter optimisation is opt-in at the idiom level.
-fn harvestPrefilterFromSource(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMemory}!void {
-    var i: usize = 0;
-    // Skip leading whitespace / comments.
-    i = skipWsAndComments(ctx.src, i);
-    // Require `select(` at position i.
-    const kw = "select";
-    if (i + kw.len > ctx.src.len) return;
-    if (!std.mem.eql(u8, ctx.src[i .. i + kw.len], kw)) return;
-    i += kw.len;
-    if (i < ctx.src.len and isIdentTail(ctx.src[i])) return;
-    i = skipWsAndComments(ctx.src, i);
-    if (i >= ctx.src.len or ctx.src[i] != '(') return;
-    i += 1; // consume '('
+/// at the top-level position — i.e., the AST root is a `builtin_call` with
+/// name == "select" and exactly one argument whose shape is:
+///
+///     pipe( left = pure_accessor, right = builtin_call(test|scan, args) )
+///
+/// Anything else (boolean combinators, `//`, trailing pipes, map(), if/try,
+/// arithmetic, function calls, variable refs) invalidates the invariant
+/// "no regex match ⇒ no select output" that makes the record skip sound.
+///
+/// Single source of truth: the same AST parser the LSP uses. No shadow
+/// tokenizer, no duplicated escape-decode, no balanced-paren book-keeping —
+/// the parser has already done all of that.
+///
+/// Cost: one extra AST parse per compile (tens of microseconds on typical
+/// filters, dwarfed by regex compilation). AST parser is error-tolerant so
+/// malformed source still returns cleanly (we just don't prefilter).
+///
+/// NOTE: This does NOT replace the bytecode compile path. Production still
+/// goes through the recursive-descent lexer/compiler in this file — the AST
+/// is consulted *only* for prefilter harvesting. Wiring the full compile
+/// pipeline through the AST is Phase 2 of the roadmap.
+fn harvestPrefilterFromAst(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMemory}!void {
+    if (!regex_mod.enabled) return;
 
-    // Locate the matching `)` for the select call, at balance zero.
-    const body_start = i;
-    var depth: u32 = 1;
-    var in_string: bool = false;
-    while (i < ctx.src.len) : (i += 1) {
-        const b = ctx.src[i];
-        if (in_string) {
-            if (b == '\\') {
-                i += 1; // skip escaped byte
-            } else if (b == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        switch (b) {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if (depth == 0) break;
-            },
-            else => {},
-        }
-    }
-    if (depth != 0) return; // unbalanced — let the real parser produce the diagnostic
-    const body_end = i; // points at the matching `)`
-    const after_select = body_end + 1;
+    // Parse once. The AST parser never errors out — partial trees are fine;
+    // an idiom match on a partial tree is still sound because we independently
+    // re-compile the literal through the real regex engine below.
+    var parsed = ast.parse(ctx.src, alloc);
+    defer parsed.deinit();
 
-    // Tail check: must be end-of-source (ignoring trailing whitespace). If
-    // anything follows the select call — even a pipe — the prefilter can't
-    // be sound because we don't know what the trailing expression does.
-    const tail_pos = skipWsAndComments(ctx.src, after_select);
-    if (tail_pos != ctx.src.len) return;
+    // Top-level must be exactly `select(BODY)`. Any other shape → bail.
+    const root = parsed.root;
+    const sel = switch (root.kind) {
+        .builtin_call => |bc| bc,
+        else => return,
+    };
+    if (!std.mem.eql(u8, sel.name, "select")) return;
+    if (sel.args.len != 1) return;
 
-    // Now inspect the select body: `BODY == <accessor> | <builtin>("literal" [; "flags"])`.
-    // The accessor part is everything up to and including the final `|` at
-    // balance zero within the body.
-    const body = ctx.src[body_start..body_end];
-    const pipe_pos = findTopLevelPipe(body) orelse return;
-    // Skip whitespace after the pipe to find the builtin identifier.
-    const call_start_rel = skipWsAndComments(body, pipe_pos + 1);
-    if (call_start_rel >= body.len) return;
-
-    // Parse the builtin identifier.
-    var id_end = call_start_rel;
-    while (id_end < body.len and isIdentTail(body[id_end])) : (id_end += 1) {}
-    const builtin_name = body[call_start_rel..id_end];
-    // Only `test` and `scan` are prefilter-safe. The other regex builtins
-    // violate the "no-literal-bytes → no-output" invariant that the
-    // prefilter relies on:
-    //   - match / capture raise a TypeError on no-match (we'd silently
-    //     swallow the error if we skipped the record entirely).
-    //   - splits on no-match yields the original string (non-empty, so
-    //     `select(.x | splits("foo"))` outputs even without "foo").
+    // BODY must be a pipe whose left is a pure accessor and whose right is a
+    // builtin call to `test` or `scan` with 1-2 string literal args.
+    const body = sel.args[0];
+    const pipe = switch (body.kind) {
+        .pipe => |p| p,
+        else => return,
+    };
+    if (!isPureAccessorNode(pipe.left)) return;
+    const call = switch (pipe.right.kind) {
+        .builtin_call => |bc| bc,
+        else => return,
+    };
+    // Only `test` / `scan` are prefilter-safe. See the source-scan prose
+    // (now moved here) for the reasoning:
+    //   - match / capture raise a TypeError on no-match — skipping the
+    //     record would silently swallow the error.
+    //   - splits on no-match yields the original string (non-empty), so
+    //     `select(.x | splits("foo"))` outputs even without "foo".
     //   - sub / gsub are mutators — `select(.x | sub(...))` doesn't filter
     //     records at all.
-    const is_prefilter_safe_builtin = std.mem.eql(u8, builtin_name, "test") or
-        std.mem.eql(u8, builtin_name, "scan");
-    if (!is_prefilter_safe_builtin) return;
+    if (!std.mem.eql(u8, call.name, "test") and !std.mem.eql(u8, call.name, "scan")) return;
+    if (call.args.len < 1 or call.args.len > 2) return;
 
-    // Must be followed by `(` (optional whitespace), then `"LITERAL"` (optional
-    // `; "FLAGS"`), then `)`, then end-of-body.
-    var p = skipWsAndComments(body, id_end);
-    if (p >= body.len or body[p] != '(') return;
-    p += 1;
-    p = skipWsAndComments(body, p);
-    if (p >= body.len or body[p] != '"') return;
-    const lit_start = p + 1;
-    var lit_end = lit_start;
-    while (lit_end < body.len and body[lit_end] != '"') {
-        if (body[lit_end] == '\\') lit_end += 2 else lit_end += 1;
+    // Pattern arg must be a direct string literal. Interpolation or pipe
+    // expressions as the pattern don't yield a statically-known literal.
+    const pattern_decoded = stringLiteralValue(call.args[0]) orelse return;
+
+    // Optional flags arg (same shape: plain string literal).
+    var flags_decoded: ?[]const u8 = null;
+    if (call.args.len == 2) {
+        flags_decoded = stringLiteralValue(call.args[1]) orelse return;
     }
-    if (lit_end >= body.len) return; // unterminated — real parser will error
-    const literal_raw = body[lit_start..lit_end];
-    p = lit_end + 1;
-    p = skipWsAndComments(body, p);
-
-    // Optional flags arg: `; "flags"`.
-    var flags_literal: ?[]const u8 = null;
-    if (p < body.len and body[p] == ';') {
-        p += 1;
-        p = skipWsAndComments(body, p);
-        if (p >= body.len or body[p] != '"') return;
-        const fs = p + 1;
-        var fe = fs;
-        while (fe < body.len and body[fe] != '"') {
-            if (body[fe] == '\\') fe += 2 else fe += 1;
-        }
-        if (fe >= body.len) return;
-        flags_literal = body[fs..fe];
-        p = fe + 1;
-        p = skipWsAndComments(body, p);
-    }
-
-    // Closing `)` and end-of-body.
-    if (p >= body.len or body[p] != ')') return;
-    p += 1;
-    p = skipWsAndComments(body, p);
-    if (p != body.len) return; // trailing junk inside select body — not our shape
-
-    // Accessor before the pipe: must be purely a path expression (`.foo`,
-    // `.foo.bar`, `.[]`, etc.) with no `and`/`or`/function calls. Bracketed
-    // access and dot-chains are fine because they still produce a STREAM
-    // whose truthiness drives select. Keyword rejection is cheap and
-    // sufficient for the safe subset.
-    const accessor = body[0..pipe_pos];
-    if (!isSafeAccessor(accessor)) return;
 
     // Build the real pattern that the regex engine will see: optional
-    // `(?<flags>)` prefix from the flags argument, then the decoded literal.
+    // `(?<flags>)` prefix, then the decoded literal. Pattern is ALREADY
+    // decoded because the AST stores decoded string literals.
     var pattern_buf = std.ArrayList(u8){};
     defer pattern_buf.deinit(alloc);
-    if (flags_literal) |fl| {
-        // Decode + emit inline flags. Bail if unknown flag letter — the real
-        // compiler will emit the diagnostic.
+    if (flags_decoded) |fl| {
         var inline_buf: [8]u8 = undefined;
         var inline_len: usize = 0;
         for (fl) |ch| {
@@ -1651,15 +1592,8 @@ fn harvestPrefilterFromSource(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMe
             try pattern_buf.append(alloc, ')');
         }
     }
-    // Decode the literal-string escape sequences into the actual pattern.
-    decodeStringLiteralInto(&pattern_buf, alloc, literal_raw) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return, // malformed escape → let the parser diagnose
-    };
+    try pattern_buf.appendSlice(alloc, pattern_decoded);
 
-    // Ask the shim for required literals. A null result means the pattern is
-    // unbounded (e.g. `.+`) — nothing to prefilter on.
-    if (!regex_mod.enabled) return;
     var probe = regex_mod.Regex.compile(pattern_buf.items) catch return;
     defer probe.deinit();
     const maybe_group = prefilter_mod.groupFromRegex(alloc, &probe) catch |e| switch (e) {
@@ -1669,130 +1603,60 @@ fn harvestPrefilterFromSource(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMe
     try ctx.prefilter_groups.append(alloc, group);
 }
 
-fn isIdentTail(ch: u8) bool {
-    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_';
-}
-
-fn skipWsAndComments(src: []const u8, start: usize) usize {
-    var i = start;
-    while (i < src.len) {
-        const b = src[i];
-        if (b == ' ' or b == '\t' or b == '\n' or b == '\r') {
-            i += 1;
-        } else if (b == '#') {
-            while (i < src.len and src[i] != '\n') : (i += 1) {}
-        } else break;
-    }
-    return i;
-}
-
-/// Find the byte index of the top-level `|` inside `body` (depth 0, not inside
-/// a string). Returns null if no such pipe exists. We use the RIGHTMOST
-/// top-level pipe so `PATH_CHAIN | regex_builtin(...)` with any length
-/// path prefix still locates the correct split.
-fn findTopLevelPipe(body: []const u8) ?usize {
-    var i: usize = 0;
-    var depth: u32 = 0;
-    var in_string: bool = false;
-    var last: ?usize = null;
-    while (i < body.len) : (i += 1) {
-        const b = body[i];
-        if (in_string) {
-            if (b == '\\') i += 1 else if (b == '"') in_string = false;
-            continue;
-        }
-        switch (b) {
-            '"' => in_string = true,
-            '(', '[', '{' => depth += 1,
-            ')', ']', '}' => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            '|' => {
-                // Skip `||` and `|=` (not a pipe).
-                if (depth == 0) {
-                    const nxt = if (i + 1 < body.len) body[i + 1] else 0;
-                    const prv = if (i > 0) body[i - 1] else 0;
-                    if (nxt != '|' and nxt != '=' and prv != '|') last = i;
+/// True iff `n` is a pure path expression — a chain of field accesses,
+/// index accesses, iteration, slices, and optionals starting from identity
+/// or a field access, with no function calls, boolean combinators, variable
+/// refs, arithmetic, or alternatives.
+///
+/// Matches the same safe subset the old byte-scan `isSafeAccessor` accepted,
+/// now expressed as a direct AST-kind whitelist.
+fn isPureAccessorNode(n: *const ast.nodes.Node) bool {
+    return switch (n.kind) {
+        .identity => true,
+        .field_access => true,
+        .iterate => true,
+        .index_access => true,
+        .slice => true,
+        .recurse => true,
+        .optional => |u| isPureAccessorNode(u.operand),
+        .paren => |u| isPureAccessorNode(u.operand),
+        .pipe => |p| isPureAccessorNode(p.left) and isPureAccessorNode(p.right),
+        .suffix => |s| blk: {
+            // Base must itself be a pure accessor, and every suffix op must
+            // stay inside the accessor grammar.
+            if (!isPureAccessorNode(s.base)) break :blk false;
+            for (s.ops) |op| {
+                switch (op) {
+                    .field, .index, .iterate, .slice, .optional, .bracket_str => {},
+                    .bracket_expr => |inner| {
+                        // .[EXPR] is safe only if EXPR is itself a pure
+                        // accessor OR a literal (e.g. `.[2]` equivalents).
+                        // Bare literals — int/string — are trivially safe.
+                        switch (inner.kind) {
+                            .literal => {},
+                            else => if (!isPureAccessorNode(inner)) break :blk false,
+                        }
+                    },
                 }
-            },
-            else => {},
-        }
-    }
-    return last;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
-/// True iff `accessor` is a pure path-expression with no function calls,
-/// boolean combinators, or variable references. Permitted forms:
-///   - `.`, `.field`, `.field.other`, `.field?`
-///   - `.[]`, `.[n]`, `.[a:b]`, `.[]?`
-///   - `.[ "key" ]`  (bracket + string literal)
-///   - chains of the above
-///
-/// Rejected: bare identifiers (function/variable references), reserved
-/// keywords (`and`, `or`, `not`, `if`, `try`, `as`, etc.), `$var`,
-/// arithmetic / comparison operators, `//` alternative, and anything else
-/// that could produce a truthy stream independent of the regex.
-///
-/// Identifier-shaped bytes are accepted ONLY when directly preceded by
-/// `.` or `[` (making them field names, not references). Any other
-/// position → reject.
-fn isSafeAccessor(accessor: []const u8) bool {
-    // Strip leading + trailing whitespace.
-    var i: usize = 0;
-    var j: usize = accessor.len;
-    while (i < j and (accessor[i] == ' ' or accessor[i] == '\t' or accessor[i] == '\n' or accessor[i] == '\r')) i += 1;
-    while (j > i and (accessor[j - 1] == ' ' or accessor[j - 1] == '\t' or accessor[j - 1] == '\n' or accessor[j - 1] == '\r')) j -= 1;
-    if (i == j) return false; // empty accessor means body was just `| regex(...)` — reject
-
-    var in_string: bool = false;
-    var has_dot: bool = false;
-    var k = i;
-    // "Last non-whitespace structural byte" — used to decide whether an
-    // identifier byte is a field name (after `.` / `[`) or a reference.
-    var last_structural: u8 = 0;
-
-    while (k < j) : (k += 1) {
-        const b = accessor[k];
-        if (in_string) {
-            if (b == '\\') {
-                k += 1;
-            } else if (b == '"') {
-                in_string = false;
-                last_structural = '"';
-            }
-            continue;
-        }
-        switch (b) {
-            '.' => {
-                has_dot = true;
-                last_structural = '.';
-            },
-            '[' => last_structural = '[',
-            ']', '?' => last_structural = b,
-            ',', ':' => last_structural = b,
-            ' ', '\t', '\n', '\r' => {}, // whitespace preserves last_structural
-            '0'...'9', '-' => last_structural = b,
-            '"' => {
-                in_string = true;
-            },
-            'a'...'z', 'A'...'Z', '_' => {
-                // Identifier-shaped byte. Safe iff immediately following a
-                // `.` or `[` (with only whitespace between). Otherwise
-                // could be a bare identifier or a keyword.
-                if (last_structural != '.' and last_structural != '[') return false;
-                // Consume the whole ident — treat as field name.
-                while (k < j and (isIdentTail(accessor[k]))) : (k += 1) {}
-                k -= 1; // compensate the outer loop's `k += 1`
-                last_structural = 'a'; // "just finished an ident" — any
-                // subsequent non-`.` non-`[` operator outside the whitelist
-                // will be caught by the else branch.
-            },
-            '$' => return false,
-            else => return false,
-        }
+/// If `n` is a plain string literal node, return its decoded bytes. All
+/// other shapes (interpolation, pipe, etc.) return null — a statically-known
+/// literal is required for a sound prefilter.
+fn stringLiteralValue(n: *const ast.nodes.Node) ?[]const u8 {
+    switch (n.kind) {
+        .literal => |l| switch (l) {
+            .string => |s| return s,
+            else => return null,
+        },
+        .paren => |u| return stringLiteralValue(u.operand),
+        else => return null,
     }
-    return has_dot;
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────

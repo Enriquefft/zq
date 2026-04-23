@@ -104,6 +104,9 @@ pub fn build(b: *std.Build) void {
     query_module.addImport("types", types_module);
     query_module.addImport("lexer", lexer_module);
     query_module.addImport("regex", regex_module);
+    // Prefilter harvest walks the AST from src/ast/. Single source of truth:
+    // the same parser the LSP uses — no second source-byte scanner.
+    query_module.addImport("ast", ast_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding

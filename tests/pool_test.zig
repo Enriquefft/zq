@@ -942,6 +942,96 @@ test "prefilter: non-select filter does not get prefilter" {
     try std.testing.expect(cq2.prefilter == null);
 }
 
+test "prefilter: trailing pipe after select rejects prefilter (soundness)" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // select(...) | .y — the trailing pipe means the pipeline continues
+    // to produce output per input record; skipping is unsound.
+    var cq = try compile("select(.x | test(\"foo\")) | .y");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter == null);
+}
+
+test "prefilter: boolean combinator in select body rejects prefilter" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // `and` / `or` / `//` make the body truthy even when regex misses.
+    var cq1 = try compile("select(.x | test(\"foo\") or .y == 1)");
+    defer cq1.deinit();
+    try std.testing.expect(cq1.prefilter == null);
+
+    var cq2 = try compile("select(.x | test(\"foo\") and .y)");
+    defer cq2.deinit();
+    try std.testing.expect(cq2.prefilter == null);
+
+    var cq3 = try compile("select((.x | test(\"foo\")) // true)");
+    defer cq3.deinit();
+    try std.testing.expect(cq3.prefilter == null);
+}
+
+test "prefilter: idiom-shaped bytes inside string literal do not trigger false positive" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // The byte-scanner version had to be careful not to match `select(` and
+    // `test(` that appeared inside a string literal. The AST walker can't
+    // get fooled: string literals are nodes, not bytes.
+    var cq = try compile("select(.x | test(\"select(.y | test(\\\"foo\\\"))\"))");
+    defer cq.deinit();
+    // Prefilter must be populated using the literal "select(.y | test("foo"))"
+    // as the pattern — not misinterpreted as nested calls.
+    try std.testing.expect(cq.prefilter != null);
+}
+
+test "prefilter: interpolated pattern (not a static literal) disables prefilter" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // Dynamic pattern — AST surfaces this as string_interp, not a string
+    // literal. The walker must reject it; skipping a non-matching record
+    // would be unsound because the pattern is record-dependent. The real
+    // bytecode compiler may legitimately reject or accept the form; either
+    // way, the prefilter must not be populated.
+    const result = try CompiledQuery.compile("select(.x | test(\"\\(.pat)\"))", .{}, alloc);
+    switch (result) {
+        .ok => |c| {
+            var cq = c;
+            defer cq.deinit();
+            try std.testing.expect(cq.prefilter == null);
+        },
+        .err => |_| {}, // either outcome proves the walker didn't mis-harvest
+    }
+}
+
+test "prefilter: extra whitespace still harvests" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // AST parser handles whitespace uniformly — the walker doesn't need
+    // to care. The old byte-scan had hand-rolled skipWsAndComments logic.
+    var cq = try compile("  select( .name | test(\"alpha\") )  \n");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+}
+
+test "prefilter: AST walker handles non-literal pattern argument without crashing" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // `foo` as an unquoted arg is a function ref in jq, not a string. The
+    // real compile path rejects it, but the AST walker must first handle
+    // the non-literal shape without crashing — no prefilter, and the
+    // compile error surfaces naturally.
+    const result = try CompiledQuery.compile("select(.x | test(.y))", .{}, alloc);
+    switch (result) {
+        .ok => |c| {
+            var cq = c;
+            defer cq.deinit();
+            // `.y` is a field access, not a string literal — walker bails.
+            try std.testing.expect(cq.prefilter == null);
+        },
+        .err => |_| {
+            // Real compile rejects it — CompileError is POD, nothing to free.
+        },
+    }
+}
+
 test "prefilter: correctness — no false negatives on matching records" {
     if (!regex_mod.enabled) return error.SkipZigTest;
 
