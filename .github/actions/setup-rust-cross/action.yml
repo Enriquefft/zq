@@ -1,0 +1,39 @@
+# Composite action: install the Rust toolchain + cargo-zigbuild for cross-
+# compiling the Rust regex shim under `third_party/zq-regex-shim`.
+#
+# The `rust-target` input must match one of the triples returned by
+# `rustTripleFromTarget` in build.zig. Keep the matrix entries in
+# .github/workflows/ci.yml, .github/workflows/release.yml, and the fenix
+# targets pulled by flake.nix in sync with that mapping.
+#
+# Zig itself is installed separately in each workflow (mlugg/setup-zig@v2)
+# so that the Zig version stays aligned across Rust and non-Rust jobs.
+name: Setup Rust cross-compile toolchain
+description: Install stable Rust + cargo-zigbuild with per-target caching.
+
+inputs:
+  rust-target:
+    description: Rust target triple (e.g. x86_64-unknown-linux-musl).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.rust-target }}
+
+    - name: Cache cargo registry + ~/.cargo/bin + target
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Partition the cache per rust-target so an x86_64 cache never
+        # poisons an aarch64 build (different target/ contents, different
+        # pre-built host-tool binaries in ~/.cargo/bin).
+        key: ${{ inputs.rust-target }}
+        # The only Cargo workspace in the repo is the regex shim.
+        workspaces: third_party/zq-regex-shim -> target
+
+    - name: Install cargo-zigbuild
+      shell: bash
+      run: cargo install --locked cargo-zigbuild

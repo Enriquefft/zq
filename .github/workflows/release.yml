@@ -32,18 +32,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-cross
         with:
-          targets: ${{ matrix.rust-target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Partition per rust-target so an x86_64 cache doesn't poison an
-          # aarch64 build (different target/ artifacts, different host-tool
-          # binaries cached in ~/.cargo/bin such as cargo-zigbuild).
-          key: ${{ matrix.rust-target }}
-          workspaces: third_party/zq-regex-shim -> target
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
+          rust-target: ${{ matrix.rust-target }}
 
       - name: Build
         run: |

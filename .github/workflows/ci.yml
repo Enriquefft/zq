@@ -68,16 +68,7 @@ jobs:
       # `zig cc` as the linker. Keep the rust-target entries above in sync with
       # the mapping in build.zig (rustTripleFromTarget) and the fenix targets
       # pulled by flake.nix.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-cross
         with:
-          targets: ${{ matrix.rust-target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Partition per rust-target so an x86_64 cache doesn't poison an
-          # aarch64 build (different target/ artifacts, different host-tool
-          # binaries cached in ~/.cargo/bin such as cargo-zigbuild).
-          key: ${{ matrix.rust-target }}
-          workspaces: third_party/zq-regex-shim -> target
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
+          rust-target: ${{ matrix.rust-target }}
       - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
