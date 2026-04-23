@@ -103,12 +103,11 @@
           version = "0.2.3";
           src = ./.;
 
+          # zig's compiler_rt bundles libunwind sources and compiles them
+          # on-demand when a Zig target links `-lunwind`; no external libunwind
+          # is needed. Verified via empty `nm -D unwind` + a closure containing
+          # only glibc/libgcc/libunistring/libidn2/zq.
           nativeBuildInputs = [ pkgs.zig ];
-          # Insurance: Rust panic=unwind requires libunwind symbols at final link.
-          # zig 0.15 bundles the sysroot but `-lunwind` resolution goes through the
-          # linker's -L search, which inside the sandbox sees only buildInputs. If
-          # zig resolves its bundled copy first, pkgs.libunwind is unused.
-          buildInputs = [ pkgs.libunwind ];
 
           buildPhase = ''
             runHook preBuild
