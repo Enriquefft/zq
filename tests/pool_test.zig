@@ -27,17 +27,20 @@ const test_budget = MemoryBudget.explicit(1024 * 1024 * 1024);
 /// Write `data` to a tmp file and return a readable File.
 /// Caller must close the file.
 fn tmp_file_fd(data: []const u8) !std.fs.File {
-    const fd = std.posix.memfd_create("pool_test", 0) catch {
-        // Fallback: write to a named temp file.
-        const path = "/tmp/_zq_pool_test_tmp";
-        const f = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = true });
-        try f.writeAll(data);
-        try f.seekTo(0);
-        return f;
-    };
-    _ = try std.posix.write(fd, data);
-    try std.posix.lseek_SET(fd, 0);
-    return std.fs.File{ .handle = fd };
+    // memfd_create is Linux-only and has a @compileError on other targets, so
+    // gate the call comptime. Non-Linux falls through to the named-temp path.
+    if (comptime @import("builtin").os.tag == .linux) {
+        if (std.posix.memfd_create("pool_test", 0)) |fd| {
+            _ = try std.posix.write(fd, data);
+            try std.posix.lseek_SET(fd, 0);
+            return std.fs.File{ .handle = fd };
+        } else |_| {}
+    }
+    const path = "/tmp/_zq_pool_test_tmp";
+    const f = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = true });
+    try f.writeAll(data);
+    try f.seekTo(0);
+    return f;
 }
 
 /// Drain all results from the pool into an ArrayList of Values (structured path).

@@ -289,6 +289,9 @@ pub fn build(b: *std.Build) void {
     c_abi_test_mod.addImport("c_abi", c_abi_module);
 
     const c_abi_tests = b.addTest(.{ .root_module = c_abi_test_mod });
+    // c_abi imports query which imports regex; the test binary links the shim
+    // archive transitively, so the test compile must wait for cargo.
+    if (shim_build_step) |step| c_abi_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(c_abi_tests).step);
 
     const describe_test_mod = b.createModule(.{
