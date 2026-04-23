@@ -46,21 +46,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-linux
-          - aarch64-linux
-          - x86_64-macos
-          - aarch64-macos
-          - x86_64-windows
-          - x86_64-freebsd
+        include:
+          - target: x86_64-linux
+            rust-target: x86_64-unknown-linux-musl
+          - target: aarch64-linux
+            rust-target: aarch64-unknown-linux-musl
+          - target: x86_64-macos
+            rust-target: x86_64-apple-darwin
+          - target: aarch64-macos
+            rust-target: aarch64-apple-darwin
+          - target: x86_64-windows
+            rust-target: x86_64-pc-windows-gnu
+          - target: x86_64-freebsd
+            rust-target: x86_64-unknown-freebsd
     steps:
       - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-      # -Dregex=false: the Rust shim is built by cargo on the runner (Linux
-      # x86_64) and can't natively cross-compile to macOS/Windows/FreeBSD/ARM
-      # without a platform SDK. The cross-compile smoke test verifies Zig-code
-      # portability across targets; regex-enabled builds get real coverage
-      # from `Test (linux)` and `Test (macos)` on native runners.
-      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -Dregex=false
+      # The Rust regex shim is cross-compiled via cargo-zigbuild, which drives
+      # `zig cc` as the linker. Keep the rust-target entries above in sync with
+      # the mapping in build.zig (rustTripleFromTarget) and the fenix targets
+      # pulled by flake.nix.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe

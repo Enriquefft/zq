@@ -16,18 +16,27 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # `rust-target` must agree with rustTripleFromTarget in build.zig and
+        # with the fenix targets pulled by flake.nix. The Rust regex shim is
+        # cross-compiled with cargo-zigbuild so release binaries ship with
+        # regex enabled on every platform.
         include:
-          - { target: x86_64-linux,   os: linux,   arch: amd64, ext: tar.gz }
-          - { target: aarch64-linux,  os: linux,   arch: arm64, ext: tar.gz }
-          - { target: x86_64-macos,   os: macos,   arch: amd64, ext: tar.gz }
-          - { target: aarch64-macos,  os: macos,   arch: arm64, ext: tar.gz }
-          - { target: x86_64-windows, os: windows, arch: amd64, ext: zip    }
-          - { target: x86_64-freebsd, os: freebsd, arch: amd64, ext: tar.gz }
+          - { target: x86_64-linux,   os: linux,   arch: amd64, ext: tar.gz, rust-target: x86_64-unknown-linux-musl }
+          - { target: aarch64-linux,  os: linux,   arch: arm64, ext: tar.gz, rust-target: aarch64-unknown-linux-musl }
+          - { target: x86_64-macos,   os: macos,   arch: amd64, ext: tar.gz, rust-target: x86_64-apple-darwin }
+          - { target: aarch64-macos,  os: macos,   arch: arm64, ext: tar.gz, rust-target: aarch64-apple-darwin }
+          - { target: x86_64-windows, os: windows, arch: amd64, ext: zip,    rust-target: x86_64-pc-windows-gnu }
+          - { target: x86_64-freebsd, os: freebsd, arch: amd64, ext: tar.gz, rust-target: x86_64-unknown-freebsd }
     steps:
       - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
 
       - name: Build
         run: |
