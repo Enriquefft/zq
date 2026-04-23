@@ -22,9 +22,39 @@ pub fn build(b: *std.Build) void {
     // link the produced static archive into every Zig artifact that needs regex.
     // When -Dregex=false, skip cargo entirely — regex builtins compile to stubs
     // that return error.RegexNotCompiled at runtime.
-    const shim_archive_path = "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
+    //
+    // Cross-compile story: plain `cargo build` produces host-only archives, so
+    // cross-compiling zq from Linux to macOS/Windows/FreeBSD/ARM would link a
+    // Linux x86_64 archive into a foreign Mach-O/PE/ELF and fail. When the
+    // requested zig target is not the host, we invoke `cargo zigbuild` — a
+    // drop-in wrapper that uses `zig cc` as the cross-linker, so the Rust
+    // archive matches the zig target exactly. Native-host builds still use
+    // plain `cargo build` to avoid the zigbuild wrapper's startup overhead.
+    const rust_triple_opt = rustTripleFromTarget(target.result);
+    const is_host = target.query.isNative();
+    const shim_archive_path: []const u8 = if (!is_host and rust_triple_opt != null)
+        b.fmt("third_party/zq-regex-shim/target/{s}/release/libzq_regex_shim.a", .{rust_triple_opt.?})
+    else
+        "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
+
     const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled) blk: {
-        const cmd = b.addSystemCommand(&.{
+        const cmd = if (!is_host) cross: {
+            const triple = rust_triple_opt orelse {
+                std.debug.panic(
+                    "regex shim cross-compile requires a known rust triple; zig target {s}-{s}-{s} is unmapped. Either add a mapping in build.zig or pass -Dregex=false.",
+                    .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag), @tagName(target.result.abi) },
+                );
+            };
+            const c = b.addSystemCommand(&.{
+                "cargo",
+                "zigbuild",
+                "--release",
+                "--locked",
+                "--offline",
+                b.fmt("--target={s}", .{triple}),
+            });
+            break :cross c;
+        } else b.addSystemCommand(&.{
             "cargo",
             "build",
             "--release",
@@ -437,4 +467,55 @@ pub fn build(b: *std.Build) void {
     const regex_tests = b.addTest(.{ .root_module = regex_test_mod });
     if (shim_build_step) |step| regex_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(regex_tests).step);
+}
+
+/// Map a zig target to the rust target triple the Cargo crate is built against.
+///
+/// Only the triples in our CI/release matrix are mapped — anything else returns
+/// null and the shim build panics with a clear message rather than silently
+/// linking the wrong archive. Keep this table in sync with:
+///   - `.github/workflows/ci.yml` cross-compile matrix
+///   - `.github/workflows/release.yml` build matrix
+///   - `flake.nix` fenix `targets.*` entries
+///
+/// Windows uses the `-gnu` ABI because cargo-zigbuild drives `zig cc` which
+/// targets mingw-w64, not MSVC. Linux picks musl vs gnu based on zig's ABI
+/// resolution: bare `-Dtarget=x86_64-linux` resolves to musl (static, no
+/// glibc floor — preferred for release tarballs) while explicit `-linux-gnu`
+/// uses the glibc triple.
+fn rustTripleFromTarget(t: std.Target) ?[]const u8 {
+    const arch = t.cpu.arch;
+    return switch (t.os.tag) {
+        // Linux: follow zig's ABI choice. When `-Dtarget=x86_64-linux` is
+        // passed without an explicit ABI, zig 0.15 resolves it to musl, which
+        // gives statically-linkable artifacts with no glibc version
+        // dependency — ideal for release tarballs. Respect an explicit `.gnu`
+        // if the caller asked for glibc.
+        .linux => switch (t.abi) {
+            .gnu, .gnueabi, .gnueabihf, .gnuabin32, .gnuabi64, .gnux32 => switch (arch) {
+                .x86_64 => "x86_64-unknown-linux-gnu",
+                .aarch64 => "aarch64-unknown-linux-gnu",
+                else => null,
+            },
+            else => switch (arch) {
+                .x86_64 => "x86_64-unknown-linux-musl",
+                .aarch64 => "aarch64-unknown-linux-musl",
+                else => null,
+            },
+        },
+        .macos => switch (arch) {
+            .x86_64 => "x86_64-apple-darwin",
+            .aarch64 => "aarch64-apple-darwin",
+            else => null,
+        },
+        .windows => switch (arch) {
+            .x86_64 => "x86_64-pc-windows-gnu",
+            else => null,
+        },
+        .freebsd => switch (arch) {
+            .x86_64 => "x86_64-unknown-freebsd",
+            else => null,
+        },
+        else => null,
+    };
 }

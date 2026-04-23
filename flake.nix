@@ -30,6 +30,12 @@
           stable.cargo
           stable.clippy
           stable.rustfmt
+          # zig 0.15 resolves `-Dtarget=<arch>-linux` (no ABI) to musl, which
+          # yields statically-linkable release artifacts with no glibc version
+          # floor. The gnu triples are listed alongside so `-Dtarget=...-linux-gnu`
+          # also works when a glibc build is explicitly requested.
+          targets.x86_64-unknown-linux-musl.stable.rust-std
+          targets.aarch64-unknown-linux-musl.stable.rust-std
           targets.x86_64-unknown-linux-gnu.stable.rust-std
           targets.aarch64-unknown-linux-gnu.stable.rust-std
           targets.x86_64-apple-darwin.stable.rust-std
