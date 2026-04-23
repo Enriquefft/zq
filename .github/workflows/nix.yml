@@ -1,0 +1,21 @@
+name: nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            sandbox = true
+      - run: nix flake check --no-build
+      - run: nix build .#default --option sandbox true --print-build-logs
+      - run: ./result/bin/zq --version
+      - run: echo '{"a":[1,2,3]}' | ./result/bin/zq '.a | map(. * 2)'
