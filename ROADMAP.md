@@ -229,7 +229,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 | | Category | Functions |
 |---|----------|-----------|
 | [x] | **String** | `split`, `join`, `test`, `match`, `sub`, `gsub`, `startswith`, `endswith`, `ltrimstr`, `rtrimstr`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tojson`, `fromjson` |
-| [ ] | **String (remaining)** | `capture`, `scan` |
+| [x] | **String (regex)** | `capture`, `scan`, `splits`, `match(re; "g")` generator mode (Phases A–F) |
 | [x] | **String (new)** | `trim`, `ltrim`, `rtrim`, `trimstr`, `toboolean` |
 | [x] | **Math** | `floor`, `ceil`, `round`, `sqrt`, `pow`, `log`, `log2`, `exp`, `exp2`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `abs`, `significand`, `logb`, `cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `hypot`, `remainder`, `tgamma`, `lgamma`, `j0`, `j1`, `nearbyint`, `rint`, `trunc`, `scalb`, `scalbln`, `ldexp`, `fma`, `drem`, `exp10`, `log10` |
 | [x] | **Array** | `transpose`, `bsearch`, `recurse` |
@@ -247,7 +247,7 @@ Progress: 2998 MB -> 1702 MB -> 701 MB -> 403 MB (-87% total).
 | [x] | **Type selectors** | `arrays`, `objects`, `iterables`, `booleans`, `numbers`, `strings`, `nulls`, `normals`, `scalars`, `values` |
 | [ ] | **Type selectors (remaining)** | `finites` |
 | [x] | **Misc** | `isempty`, `ascii`, `first`, `last` |
-| [ ] | **Misc (remaining)** | `splits`, `repeat`, `limit/2` |
+| [ ] | **Misc (remaining)** | `repeat`, `limit/2` |
 | [x] | **Misc (new)** | `utf8bytelength`, `add(expr)` |
 
 ### Query language — compat gaps
@@ -629,6 +629,59 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Filter comments | Not supported | `#` comments in filter files | Developer experience. |
 | Error output | Human-readable text only | `--json-errors` for structured JSON errors | Agent integration. |
 | Null propagation | Silent null on missing fields | `--strict` errors on null field access | Agent reliability. |
+| Regex engine | Oniguruma (archived 2025; ReDoS-vulnerable) | `regex-automata` (linear-time, unicode-aware, panic-safe) | Security, maintenance trajectory. |
+
+## Regex
+
+zq's regex builtins run on Rust's `regex-automata` via a vendored shim
+(`third_party/zq-regex-shim/`). Linear-time guarantees eliminate ReDoS. Build
+with `-Dregex=true` (default) for full support, or `-Dregex=false` to ship a
+Rust-free binary where every regex builtin surfaces `regex_not_compiled`.
+
+**Supported builtins:**
+`test(re)`, `test(re; flags)`, `match(re)`, `capture(re)`, `capture(re; flags)`,
+`scan(re)`, `scan(re; flags)`, `sub(re; repl)`, `sub(re; repl; flags)`,
+`gsub(re; repl)`, `gsub(re; repl; flags)`.
+
+**Supported pattern features:** POSIX classes (`[:alpha:]`), Unicode properties
+(`\p{L}`, `\p{Greek}`), unicode-aware `\w`/`\d`/`\s`/`\b`, named captures
+(`(?<name>...)`), non-capturing groups, alternation, anchors, greedy/lazy
+quantifiers, inline flag groups (`(?i:foo)`).
+
+**Supported flags (as 2nd/3rd arg):** `i` (case-insensitive), `m` (multi-line),
+`s` (dotall / `.` matches `\n`), `x` (ignore whitespace). `g`/`n` are accepted
+and treated as pattern-level no-ops. Unknown flag letters are a compile error.
+
+**Compat delta vs jq (deliberate, documented):**
+
+| Feature | jq/onig | zq | User workaround |
+|---|---|---|---|
+| Pattern backrefs (`(\w+) \1`) | works | compile error | rewrite without backref |
+| Positive/negative lookaround | works | compile error | alternation + anchors |
+| `\g<name>` subroutine calls in pattern | works | compile error | repeat the subpattern inline |
+| Replacement-as-filter (`\(.field)` in repl) | jq evaluates the replacement as a full filter with `.` bound to the match object — e.g. `sub("(?<x>.)"; "\(.captures[0].string \| ascii_upcase)")` | `\1..\9` and `\g<name>` backref substitution only | compose with `match` + manual concat. **Accepted as permanent delta** — pulling the full jq evaluator into the sub/gsub path violates the VM boundary for a rarely-used feature. |
+| `match(re; "g")` global-generator mode | yields all matches | yields all matches (implemented) | — |
+| `match([re, flags])` array overload | works | compile error | `match(re; flags)` |
+| `splits(re; flags)` regex split | works | works (implemented) | — |
+| `n` flag (ignore empty matches) | filters zero-width matches | currently a no-op | accepted silently |
+
+**Performance targets vs measured** (release build, isMatch, per-worker clone, x86_64 ReleaseFast):
+
+| Pattern | Target | Measured median |
+|---|---|---|
+| Literal `"foo"` | 30–80 ns | 33 ns |
+| Alternation `"foo\|bar\|baz\|qux"` | 80–200 ns | 46 ns |
+| Anchored prefix `"^GET "` | 30–80 ns | 49 ns |
+| Simple class `"[a-z]+"` | 80–200 ns | 44 ns |
+| Named capture `"(?<year>\d{4})"` | 300 ns – 1 µs | 57 ns (isMatch path) |
+
+All pattern classes meet or exceed plan targets. Run `zig build bench-regex
+-Doptimize=ReleaseFast` to reproduce.
+
+**Differential fuzz:** `zig build fuzz-regex` runs a small-grammar harness that
+compares zq vs jq on randomly generated pattern/haystack pairs. 1000 iterations
+produce 0 divergences (patterns jq rejects are skipped as documented compat
+delta). Override iteration count with `ZQ_FUZZ_ITERS=N`.
 
 ---
 

@@ -132,7 +132,23 @@ zq -c '{name: .title, id: .num}' items.json
 `to_entries`, `from_entries`, `with_entries(expr)`, `contains(val)`, `inside(val)`, `transpose`, `bsearch(val)`, `recurse`
 
 ### String operations
-`ascii_downcase`, `ascii_upcase`, `ascii`, `explode`, `implode`, `split(sep)`, `join(sep)`, `startswith(str)`, `endswith(str)`, `ltrimstr(str)`, `rtrimstr(str)`, `test(regex)`, `match(regex)`, `sub(regex; repl)`, `gsub(regex; repl)`, `tostring`, `tojson`, `fromjson`
+`ascii_downcase`, `ascii_upcase`, `ascii`, `explode`, `implode`, `split(sep)`, `splits(re)`, `splits(re; flags)`, `join(sep)`, `startswith(str)`, `endswith(str)`, `ltrimstr(str)`, `rtrimstr(str)`, `test(regex)`, `test(regex; flags)`, `match(regex)`, `match(regex; flags)`, `capture(regex)`, `scan(regex)`, `sub(regex; repl)`, `sub(regex; repl; flags)`, `gsub(regex; repl)`, `gsub(regex; repl; flags)`, `tostring`, `tojson`, `fromjson`
+
+### Regex
+
+Backed by Rust's `regex-automata` (linear-time, no ReDoS). Unicode-aware by default. Builtins:
+
+- `test(re)` / `test(re; flags)` — boolean.
+- `match(re)` / `match(re; flags)` — returns `{offset, length, string, captures}`. Offsets are character counts, not bytes. `match(re; "g")` is a generator that yields one match object per non-overlapping occurrence.
+- `capture(re)` / `capture(re; flags)` — returns object of named groups.
+- `scan(re)` / `scan(re; flags)` — generator. Yields each match as a string (no capture groups) or array of capture strings.
+- `sub(re; repl)` / `sub(re; repl; flags)` — first-match replace. Replacement supports `\1..\9` and `\g<name>` backref substitution.
+- `gsub(re; repl)` / `gsub(re; repl; flags)` — all-match replace.
+- `splits(re)` / `splits(re; flags)` — generator. Yields each segment between matches; like `split(sep)` but the separator is a regex.
+
+Flags: `i` (case-insensitive), `m` (multi-line), `s` (dotall), `x` (ignore whitespace). `g` is significant for `match` (generator mode); `n` is accepted but a no-op. Other flags are pattern-level no-ops.
+
+Compat delta vs jq/onig: no pattern backrefs (`(\w+) \1`), no lookaround (`(?=...)`, `(?<=...)`), no `\g<name>` subroutine calls in the pattern, no replacement-as-filter evaluation (jq evaluates `sub`/`gsub` replacement as a filter with `.` bound to the match object; e.g. `sub("(?<x>.)"; "\(.captures[0].string | ascii_upcase)")` — zq supports `\1..\9` / `\g<name>` backrefs only; accepted as permanent delta). Compile errors point at the offending literal. Users can opt out of regex entirely with `zig build -Dregex=false` — builtins return `regex_not_compiled`, no Rust dependency.
 
 ### Math
 `floor`, `ceil`, `round`, `sqrt`, `pow(x; y)`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `abs`, `fabs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(x; y)`, `cbrt`, `significand`, `logb`, `remainder(x; y)`, `hypot(x; y)`, `trunc`, `rint`, `nearbyint`, `j0`, `j1`, `lgamma`, `tgamma`, `scalb(x; y)`, `scalbln(x; y)`, `ldexp(x; y)`, `fma(x; y; z)`, `drem(x; y)`
