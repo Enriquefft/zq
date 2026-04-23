@@ -14,19 +14,47 @@ const semantic_feat = @import("features/semantic_tokens.zig");
 const formatting_feat = @import("features/formatting.zig");
 
 /// A document managed by the LSP server.
+///
+/// `compile_cache` memoizes the result of `diagnostics_feat.fromCompileErrors`
+/// keyed on a 64-bit hash of the source. Full-compile is hundreds of µs per
+/// keystroke (regex pool allocation + shim round-trip per literal pattern);
+/// re-running it on a no-op edit (same text, which happens on saves and
+/// trailing-whitespace didChanges) is pure waste. We cache only the plain-data
+/// `Diagnostic` slice — never the `CompiledQuery`, which owns a `RegexPool`
+/// whose lifetime is deliberately short.
 const Document = struct {
     uri: []const u8,
     source: []const u8,
     parse_result: ?ast.ParseResult,
     model: ?analysis.SemanticModel,
+    compile_cache: ?CompileCache = null,
 
     fn deinit(self: *Document, alloc: std.mem.Allocator) void {
         alloc.free(self.uri);
         alloc.free(self.source);
         if (self.parse_result) |*pr| pr.deinit();
         if (self.model) |*m| m.deinit();
+        if (self.compile_cache) |*cc| cc.deinit(alloc);
     }
 };
+
+/// Memoized compile-diagnostic output, keyed on source hash. Owns all
+/// `Diagnostic.message` allocations and the outer slice. Size-bound: exactly
+/// one entry per URI (the current document). Invalidated (freed and rebuilt)
+/// whenever the source hash changes.
+const CompileCache = struct {
+    source_hash: u64,
+    diags: []protocol.Diagnostic,
+
+    fn deinit(self: *CompileCache, alloc: std.mem.Allocator) void {
+        for (self.diags) |d| alloc.free(d.message);
+        if (self.diags.len > 0) alloc.free(self.diags);
+    }
+};
+
+fn hashSource(source: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, source);
+}
 
 pub const Server = struct {
     alloc: std.mem.Allocator,
@@ -34,6 +62,10 @@ pub const Server = struct {
     documents: std.StringHashMap(Document),
     initialized: bool,
     shutdown_requested: bool,
+    /// Test-visible counter bumped every time `reparse` actually invokes
+    /// `fromCompileErrors`. A no-op didChange (same source) must leave this
+    /// unchanged; that property is exercised in `tests/lsp_test.zig`.
+    compile_count: u32 = 0,
 
     pub fn init(in_file: std.fs.File, out_file: std.fs.File, alloc: std.mem.Allocator) Server {
         return .{
@@ -42,6 +74,7 @@ pub const Server = struct {
             .documents = std.StringHashMap(Document).init(alloc),
             .initialized = false,
             .shutdown_requested = false,
+            .compile_count = 0,
         };
     }
 
@@ -65,6 +98,13 @@ pub const Server = struct {
 
             self.handleMessage(body);
         }
+    }
+
+    /// Test entrypoint — drive one JSON-RPC message through the dispatch as
+    /// if it had come from the transport. Used to exercise `didOpen`/`didChange`
+    /// without spinning up a real stdio pipe pair. Not part of the LSP contract.
+    pub fn dispatchForTest(self: *Server, body: []const u8) void {
+        self.handleMessage(body);
     }
 
     fn handleMessage(self: *Server, body: []const u8) void {
@@ -470,13 +510,11 @@ pub const Server = struct {
             // syntactically broken filter won't reach the regex pool anyway
             // and the compiler error would be redundant.
             if (pr.errors.len == 0) {
-                const compile_diags = diagnostics_feat.fromCompileErrors(doc.source, self.alloc);
-                defer {
-                    for (compile_diags) |d| self.alloc.free(d.message);
-                    if (compile_diags.len > 0) self.alloc.free(compile_diags);
-                }
+                const compile_diags = self.getOrComputeCompileDiags(doc);
                 if (compile_diags.len == 0) {
                     self.publishDiagnostics(doc.uri, parse_diags);
+                } else if (parse_diags.len == 0) {
+                    self.publishDiagnostics(doc.uri, compile_diags);
                 } else {
                     // Concatenate and publish the union.
                     var all = std.ArrayList(protocol.Diagnostic){};
@@ -489,6 +527,30 @@ pub const Server = struct {
                 self.publishDiagnostics(doc.uri, parse_diags);
             }
         }
+    }
+
+    /// Memoized compile-diagnostics: hash `doc.source`, return cached slice
+    /// on hit, compile + cache on miss. The returned slice is owned by
+    /// `doc.compile_cache` — do NOT free it at the call site.
+    ///
+    /// Invariant: `compile_count` is bumped iff we actually invoked
+    /// `fromCompileErrors`. A no-op didChange leaves it untouched.
+    fn getOrComputeCompileDiags(self: *Server, doc: *Document) []const protocol.Diagnostic {
+        const h = hashSource(doc.source);
+        if (doc.compile_cache) |cc| {
+            if (cc.source_hash == h) return cc.diags;
+        }
+
+        // Miss — compile and replace the cache atomically.
+        const fresh = diagnostics_feat.fromCompileErrors(doc.source, self.alloc);
+        self.compile_count += 1;
+
+        if (doc.compile_cache) |*old| old.deinit(self.alloc);
+        doc.compile_cache = .{
+            .source_hash = h,
+            .diags = fresh,
+        };
+        return fresh;
     }
 
     fn getDocFromParams(self: *Server, params: ?std.json.Value) ?*Document {
