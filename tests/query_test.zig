@@ -3102,3 +3102,254 @@ test "comment: # inside string literal is NOT a comment" {
     try std.testing.expectEqual(@as(usize, 1), vals.len);
     try std.testing.expectEqualStrings("#x", vals[0].string);
 }
+
+// ── path(f) validation (jq compat) ───────────────────────────────────────────
+//
+// jq rejects path expressions whose body produces a non-path value with the
+// message "Invalid path expression with result <tojson>". These tests cover
+// the matching behaviour in zq, including the `del(f)` desugar which depends
+// on the same validation path.
+
+const path_null_entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+fn nullInputTape() Tape {
+    return Tape{ .entries = path_null_entries[0..], .string_buf = "" };
+}
+
+/// Collect the serialized `tojson` form of `val` into `buf`. Small inline
+/// serializer — the tape primitives here mirror compat/helpers.zig but keep
+/// query_test.zig free of parser/helpers dependencies.
+fn dumpCompact(buf: *std.ArrayList(u8), val: Value) !void {
+    switch (val) {
+        .null_val => try buf.appendSlice(alloc, "null"),
+        .bool_val => |b| try buf.appendSlice(alloc, if (b) "true" else "false"),
+        .int => |n| {
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
+            try buf.appendSlice(alloc, s);
+        },
+        .float => |f| {
+            const formatted = types.formatJqFloat(f);
+            try buf.appendSlice(alloc, formatted.slice());
+        },
+        .string => |s| {
+            try buf.append(alloc, '"');
+            try buf.appendSlice(alloc, s);
+            try buf.append(alloc, '"');
+        },
+        .array => |span| {
+            try buf.append(alloc, '[');
+            var pos = span.start + 1;
+            const end_idx = span.end - 1;
+            var first = true;
+            while (pos < end_idx) {
+                if (!first) try buf.append(alloc, ',');
+                first = false;
+                const entry = span.tape.entries[pos];
+                const item: Value = switch (entry.tag) {
+                    .null_val => .null_val,
+                    .true_val => .{ .bool_val = true },
+                    .false_val => .{ .bool_val = false },
+                    .int => .{ .int = entry.payload.int },
+                    .float => .{ .float = entry.payload.float },
+                    .string => .{ .string = span.tape.getString(entry.payload.string) },
+                    .array_start => .{ .array = .{ .tape = span.tape, .start = pos, .end = entry.payload.skip } },
+                    .object_start => .{ .object = .{ .tape = span.tape, .start = pos, .end = entry.payload.skip } },
+                    else => unreachable,
+                };
+                try dumpCompact(buf, item);
+                pos = switch (entry.tag) {
+                    .array_start, .object_start => entry.payload.skip,
+                    else => pos + 1,
+                };
+            }
+            try buf.append(alloc, ']');
+        },
+        .object => unreachable,
+    }
+}
+
+test "path(f): path(1) raises UserError (non-path result)" {
+    var q = try compile("path(1)");
+    defer q.deinit();
+    const t = nullInputTape();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    const msg = it.user_error_msg.?;
+    try std.testing.expectEqualStrings("Invalid path expression with result 1", msg.string);
+}
+
+test "path(f): path(. + \"x\") on string raises UserError" {
+    var q = try compile("path(. + \"x\")");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+    };
+    const t = tape(&entries, "a");
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result \"ax\"",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): path(.foo + \"x\") on empty object raises UserError" {
+    var q = try compile("path(.foo + \"x\")");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result \"x\"",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): path(.a, 1) on {a:1} yields [\"a\"] then errors on `1`" {
+    const sb = "a";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile("path(.a, 1)");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    // First result: ["a"]
+    const first = try it.next();
+    try std.testing.expect(first != null);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, first.?);
+    try std.testing.expectEqualStrings("[\"a\"]", buf.items);
+
+    // Second: error
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result 1",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): del(.foo + \"x\") on empty object raises UserError" {
+    var q = try compile("del(.foo + \"x\")");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result \"x\"",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): del(1) raises UserError" {
+    var q = try compile("del(1)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result 1",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): del(.a, 1) on {a:1} errors (whole del aborts)" {
+    const sb = "a";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile("del(.a, 1)");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    // `del` collects `[path(.a, 1)]` and errors during collection — no output.
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result 1",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): try path(1) catch \"caught\" suppresses error" {
+    var q = try compile("try path(1) catch \"caught\"");
+    defer q.deinit();
+    const t = nullInputTape();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    const v = try it.next();
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("caught", v.?.string);
+}
+
+test "path(f): path(.[]) on [1,2,3] yields [0], [1], [2] (backtrack resets broken flag)" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile("path(.[])");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const expected = [_][]const u8{ "[0]", "[1]", "[2]" };
+    for (expected) |want| {
+        const v = try it.next();
+        try std.testing.expect(v != null);
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(alloc);
+        try dumpCompact(&buf, v.?);
+        try std.testing.expectEqualStrings(want, buf.items);
+    }
+    try std.testing.expect((try it.next()) == null);
+}
+
+test "path(f): [path(.[])] on [1,2] yields [[0],[1]] (generator + collect)" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var q = try compile("[path(.[])]");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    const v = try it.next();
+    try std.testing.expect(v != null);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[[0],[1]]", buf.items);
+}

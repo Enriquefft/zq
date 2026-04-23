@@ -922,6 +922,140 @@ pub const Instruction = extern struct {
                 else => false,
             };
         }
+
+        /// Whether this opcode invalidates an enclosing `path(f)` expression
+        /// when it fires with an active path frame.
+        ///
+        /// jq requires that `path(f)` bodies describe a path — every step
+        /// traverses into the input. An opcode that produces a value without
+        /// recording a corresponding path component (arithmetic, comparison,
+        /// literals, constructors) breaks that invariant, and jq raises
+        /// "Invalid path expression with result <tojson>". The VM uses this
+        /// predicate to mark the innermost `PathFrame` broken at fire time;
+        /// `path_end` consults the flag to raise the user-visible error.
+        ///
+        /// Note: the flag is cleared when `clearsPathBroken` fires, so
+        /// intermediate literals/arithmetic used to compute indexes or
+        /// predicates (e.g. `.[0,1]`, `select(.>3)`) do not taint the outer
+        /// path, matching jq's path-value tracking.
+        ///
+        /// Exhaustive switch so a new opcode fails to compile until classified.
+        pub fn breaksPath(self: Op) bool {
+            return switch (self) {
+                // ── Path-preserving: descend / read / control flow ─────────
+                .load_key,
+                .load_index,
+                .load_computed,
+                .load_path,
+                .slice,
+                .navigate_key,
+                .navigate_index,
+                .pipe,
+                .identity,
+                .push_current,
+                .capture_variable,
+                .pop_variable,
+                // Variable load restores the prior input (often the compiler's
+                // own scaffolding for `.[K]` generators — internal uses must
+                // not break the path). Accepted gap: user-written
+                // `$x | path($x.a)` won't raise, matching a subset of jq.
+                .load_variable,
+                .def_function,
+                .call_function,
+                .return_function,
+                .call_filter_arg,
+                .jump,
+                .jump_if_false,
+                .save_input,
+                .restore_input,
+                .label_begin,
+                .label_end,
+                .break_op,
+                .limit_start,
+                .limit_end,
+                .skip_start,
+                .nth_start,
+                .skip_end,
+                .walk_start,
+                .walk_end,
+                .fork,
+                .backtrack,
+                .each,
+                .yield_output,
+                .fork_try,
+                .fork_alt,
+                .pop_try,
+                .path_begin,
+                .path_end,
+                => false,
+
+                // ── Path-breaking: produce a value unrelated to the input ──
+                // Literals replace current with a synthesized value.
+                .push_bool,
+                .push_int,
+                .push_float,
+                .push_null,
+                .push_string,
+                // Arithmetic / comparison / logic produce derived values.
+                .add,
+                .sub,
+                .mul,
+                .div,
+                .mod,
+                .negate,
+                .eq,
+                .ne,
+                .lt,
+                .le,
+                .gt,
+                .ge,
+                .and_op,
+                .or_op,
+                .not,
+                // Constructors produce new containers.
+                .object_construct_start,
+                .object_key,
+                .object_construct_end,
+                .array_collect_start,
+                .array_collect_end,
+                // Update ops rebuild the input — not a path descent.
+                .update_key,
+                .update_index,
+                // Builtins default to breaking. Specific whitelist entries
+                // (e.g. `paths`, `leaf_paths`) could relax later.
+                .call_builtin,
+                => true,
+            };
+        }
+
+        /// Whether this opcode clears the innermost `PathFrame.path_broken`
+        /// flag after firing. Fires AFTER the op has recorded its path
+        /// component (for descent ops) or restored a saved input (for
+        /// `restore_input`), so prior scratch values are discarded.
+        ///
+        /// This lets internal literal/arithmetic (index computation in
+        /// `.[0,1]`, predicates in `select(.>3)`) taint the flag briefly
+        /// without breaking the outer `path(f)` — jq's path-value semantics
+        /// only fail when the *final* body output isn't a path descent.
+        pub fn clearsPathBroken(self: Op) bool {
+            return switch (self) {
+                // Path-recording descent ops: after consuming the (possibly
+                // broken) key/index and appending a component, the broken
+                // trail is absorbed into a legitimate path step.
+                .load_key,
+                .load_index,
+                .load_computed,
+                .load_path,
+                .navigate_key,
+                .navigate_index,
+                .slice,
+                // Restoring a saved input discards any derived value that
+                // only existed inside a predicate / if-branch scope.
+                .restore_input,
+                => true,
+                else => false,
+            };
+        }
     };
 
     pub const Operand = extern union {

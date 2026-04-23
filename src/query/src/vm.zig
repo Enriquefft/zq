@@ -82,6 +82,11 @@ const PathFrame = struct {
     /// value_stack depth at path_begin — restored at path_end to discard
     /// only the value(s) pushed by the body, not prior state.
     saved_value_stack_len: u32,
+    /// Set when a path-breaking opcode (`types.Instruction.Op.breaksPath`)
+    /// fires while this frame is innermost. `path_end` consults the flag to
+    /// raise jq's "Invalid path expression with result <tojson>" error.
+    /// Reset across generator iterations via `PathSnapshot` save/restore.
+    path_broken: bool = false,
 
     fn deinit(self: *PathFrame, alloc: std.mem.Allocator) void {
         self.components.deinit(alloc);
@@ -200,6 +205,10 @@ const PathSnapshot = struct {
     /// Components.items.len of the innermost path frame at fork time, or 0
     /// if there was no active frame.
     components_len: u32 = 0,
+    /// `path_broken` state of the innermost frame at fork time. Restored on
+    /// backtrack so generators like `path(.[])` start each iteration with a
+    /// clean flag (the prior iteration's broken side-path can't leak).
+    path_broken: bool = false,
 };
 
 const Forkpoint = struct {
@@ -589,12 +598,13 @@ pub const ResultIterator = struct {
         return .{
             .stack_len = @intCast(it.path_stack.items.len),
             .components_len = @intCast(frame.components.items.len),
+            .path_broken = frame.path_broken,
         };
     }
 
     /// Restore the path-tracking state to a previously captured snapshot.
     /// Pops frames pushed after the snapshot, then truncates the innermost
-    /// frame's components to the saved length.
+    /// frame's components to the saved length and restores its broken flag.
     ///
     /// `stack_len == 0` means "no path frame was active at fork time" — in
     /// that case, we still tear down any inner frames added in the meantime
@@ -609,6 +619,7 @@ pub const ResultIterator = struct {
             if (frame.components.items.len > snap.components_len) {
                 frame.components.shrinkRetainingCapacity(snap.components_len);
             }
+            frame.path_broken = snap.path_broken;
         }
     }
 
@@ -780,6 +791,28 @@ pub const ResultIterator = struct {
     ///   null   — no output; caller should continue the main loop.
     ///   error  — a runtime error occurred; caller checks for an active try frame.
     fn execOne(it: *ResultIterator, instr: Instruction) ZqError!?Value {
+        // path(f) validation: if a path frame is active and the about-to-fire
+        // opcode breaks the path invariant, mark the innermost frame. The
+        // error is deferred to `path_end` so jq's message can serialize the
+        // body's result value (on top of value_stack at that point).
+        //
+        // A path-descent / restore-input op that follows clears the flag
+        // (see `clearsPathBroken`) — that's applied after the op's body runs,
+        // below, so the component/restore is actually performed.
+        if (it.path_stack.items.len > 0 and instr.op.breaksPath()) {
+            it.path_stack.items[it.path_stack.items.len - 1].path_broken = true;
+        }
+
+        const result = try it.execOneInner(instr);
+        if (it.path_stack.items.len > 0 and instr.op.clearsPathBroken()) {
+            it.path_stack.items[it.path_stack.items.len - 1].path_broken = false;
+        }
+        return result;
+    }
+
+    /// Inner dispatch of a single opcode. Wrapper `execOne` adds the path(f)
+    /// validation pre- and post-hooks around the dispatch.
+    fn execOneInner(it: *ResultIterator, instr: Instruction) ZqError!?Value {
         switch (instr.op) {
             .identity => {
                 it.ip += 1;
@@ -1623,6 +1656,19 @@ pub const ResultIterator = struct {
                 // matching path_scope sentinel forkpoint when execution
                 // backtracks out of the scope.
                 const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+
+                // Validation: if any path-breaking opcode fired inside this
+                // frame, jq raises "Invalid path expression with result <x>"
+                // where <x> is the tojson of the body's produced value.
+                if (frame.path_broken) {
+                    const result_val: Value = if (it.value_stack.items.len > frame.saved_value_stack_len)
+                        try stackValueToValue(it.value_stack.items[it.value_stack.items.len - 1])
+                    else
+                        it.current;
+                    try it.raisePathExprError(result_val);
+                    return error.UserError;
+                }
+
                 // Discard only values pushed by the body — restore to saved depth.
                 it.value_stack.items.len = frame.saved_value_stack_len;
                 // path(f) returns the path array, not the value f produced.
@@ -7301,6 +7347,18 @@ pub const ResultIterator = struct {
         const str_ref = try it.runtime_tape.internString(it.alloc, msg);
         it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
         return error.UserError;
+    }
+
+    /// Set `user_error_msg` to jq's "Invalid path expression with result <v>"
+    /// where `<v>` is the compact JSON serialization of the body's result.
+    /// Caller returns `error.UserError`.
+    fn raisePathExprError(it: *ResultIterator, result: Value) ZqError!void {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        try buf.appendSlice(it.alloc, "Invalid path expression with result ");
+        try serializeValueCompact(&buf, it.alloc, result);
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
     }
 
     /// `startswith(str)`: test if string starts with prefix.
