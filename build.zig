@@ -22,7 +22,6 @@ pub fn build(b: *std.Build) void {
     // link the produced static archive into every Zig artifact that needs regex.
     // When -Dregex=false, skip cargo entirely — regex builtins compile to stubs
     // that return error.RegexNotCompiled at runtime.
-    const shim_manifest = "third_party/zq-regex-shim/Cargo.toml";
     const shim_archive_path = "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
     const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled) blk: {
         const cmd = b.addSystemCommand(&.{
@@ -31,9 +30,14 @@ pub fn build(b: *std.Build) void {
             "--release",
             "--locked",
             "--offline",
-            "--manifest-path",
-            shim_manifest,
         });
+        // Run cargo from the shim directory so it discovers the crate's
+        // `.cargo/config.toml` and its `[source.crates-io] replace-with =
+        // "vendored-sources"` entry. `--manifest-path` from the repo root
+        // does NOT trigger config discovery in ancestors of the manifest,
+        // which breaks the offline build on CI (cargo bug/design: config
+        // discovery is rooted at CWD, not at the manifest path).
+        cmd.setCwd(b.path("third_party/zq-regex-shim"));
         break :blk cmd;
     } else null;
 
