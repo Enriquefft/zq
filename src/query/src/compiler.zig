@@ -3281,8 +3281,13 @@ fn compileRegexBuiltin1FastLiteral(
 ///           value so `match(re;"g")` dispatches to the generator-mode
 ///           opcode at compile time. For scan/sub/gsub/capture/test it is
 ///           ignored (they already match globally or the flag is meaningless).
-///   - `n`  ignore empty matches — VM-level, silently accepted but not yet
-///           enforced at the VM (tracked).
+///   - `n`  ignore empty matches — NOT SUPPORTED. jq's `n` changes every
+///           regex builtin (test/match/capture/scan/sub/gsub/splits) to
+///           treat zero-width matches as non-matches. Threading that
+///           through every opcode variant correctly is a separate design
+///           task; silently accepting `n` and producing jq-incompatible
+///           output is worse than rejecting it outright (CLAUDE.md §4,
+///           zero workarounds). Rejected at compile time with a diagnostic.
 ///   - `p`  perl-mode — unsupported; compile error.
 ///   - `l`  find-longest — unsupported; compile error.
 /// Unknown letters → compile error.
@@ -3310,10 +3315,10 @@ fn emitFlagPrefix(
             'g' => {
                 has_g = true;
             },
-            'n' => {
-                // Accepted but not enforced — tracked.
-            },
             else => {
+                // `n`, `p`, `l`, and everything else: reject. `n` in
+                // particular was previously accepted-but-ignored — that
+                // footgun is now closed. See doc comment above.
                 ctx.last_regex_pattern_offset = pat_offset;
                 ctx.last_regex_pattern_len = pat_len;
                 return error.RegexCompileError;

@@ -350,10 +350,13 @@ test "jq:onig match-array-single-arg — SKIP: match([re]) not wired" {
     return error.SkipZigTest;
 }
 
-test "jq:onig test with g,n flags — PARTIAL: g/n are pattern-level no-ops" {
-    // [test("( )*"; "gn")] expects [false]. jq's "n" (no-empty-match) flag
-    // changes test to consider zero-width matches as non-matches. zq treats
-    // the "n" flag as a pattern-level no-op; test still returns true for the
-    // zero-width "( )*" match. Documented delta.
-    return error.SkipZigTest;
+test "jq:onig test with n flag is rejected at compile time" {
+    // Historical delta: jq's `n` (no-empty-match) flag changes every regex
+    // builtin to treat zero-width matches as non-matches. zq previously
+    // accepted `n` and ignored it — silently producing jq-incompatible
+    // output. Per CLAUDE.md §4 (zero workarounds), we now reject it at
+    // compile time with RegexCompileError. Implementing `n` is a separate
+    // design task (needs per-builtin zero-width detection paths).
+    try requireRegex();
+    try h.expectCompileError("test(\"( )*\"; \"gn\")");
 }
