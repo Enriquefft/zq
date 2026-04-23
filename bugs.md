@@ -29,9 +29,7 @@ const RawInstr = extern struct {
 
 **Rule**: If a struct contains an `extern union`, the struct must also be `extern struct`.
 
-**Fixed in**: `RawInstr` + `RawOp` (compiler.zig), `Instruction.Operand` (types.zig) — commit after d37a5e7.
-
-**Still present in**: `Tape.Entry` (types.zig:19), `Instruction` (types.zig:583) — low-risk until write paths are stressed.
+**Fixed in**: `RawInstr` + `RawOp` (compiler.zig), `Instruction.Operand` (types.zig) — commit after d37a5e7. `Tape.Entry` (types.zig:19) and `Instruction` (types.zig:691) are now `extern struct` as well. No remaining occurrences.
 
 **Why only release builds**: LLVM's TBAA dead-code elimination only runs at `-O2`/`-O3`. Debug skips it.
 
@@ -45,6 +43,44 @@ const RawInstr = extern struct {
 
 **Root cause**: Unimplemented filters returned `error.QuerySyntaxError`, which was caught and converted to `error.SkipZigTest`. Zig's test runner counts skipped tests alongside passes in some output modes. ~228 tests were never executing.
 
-**Rule**: Never use `error.SkipZigTest` for unimplemented features. A test must fail loudly until the feature is implemented. Silently passing unimplemented tests hides regressions.
+**Rule**:
+
+1. Never use `error.SkipZigTest` to hide unimplemented features. A test for a missing
+   feature must fail loudly — silently passing an unimplemented case hides regressions
+   and inflates the passing denominator.
+2. `error.SkipZigTest` IS acceptable for build-time feature gates. `-Dregex=false`
+   disables the Rust shim at build time; regex-dependent tests legitimately skip in
+   that configuration (see the `if (!regex.enabled) return error.SkipZigTest` pattern
+   across `src/regex/`, `src/query/src/prefilter.zig`, `tests/pool_test.zig`, etc).
+   Gate on the build option, not on "someone will implement it eventually".
 
 **Fixed in**: Domain-split test refactor (post-2e8eb29). True denominator: 533 tests, 0 silently skipped.
+
+---
+
+## BUG-003: Prefilter false negatives on escape-encoded JSON strings
+
+**Symptom**: `select(.k | test("LIT"))` silently drops records whose `k` serializes
+`LIT`'s bytes as JSON escapes (`\uXXXX`, short escapes like `\n`/`\t`, or `\"` / `\\`).
+Spec-legal JSON records are eliminated before the query ever runs.
+
+**Root cause**: The prefilter performed a raw-byte SIMD scan for required literals
+over record bytes. RFC 8259 §7 permits a string like `"foo"` to be serialized as
+`"foo"`; the raw scan misses the escape-encoded form. The earlier workaround
+(`canPrefilterLiteral` rejecting anything containing `\`, quotes, controls, or
+non-ASCII) discarded whole classes of literals instead of handling the escape forms,
+so the hole was merely narrowed, not closed.
+
+**Rule**: Any soundness property that depends on source encoding must either (a)
+handle every spec-legal encoding or (b) degrade to the general path on evidence that
+the encoding might differ. Never ship a raw-byte optimization that silently assumes
+one canonical form.
+
+**Fixed in**: commit `8a73a20` — escape-aware fallback. A record is accepted by a
+required literal if EITHER its raw bytes appear OR the record contains any `\` byte
+(0x5C). Every JSON escape form requires a backslash; if none is present, no
+escape-encoded occurrence is possible and the record can soundly be rejected. Every
+literal with `len >= 2` is now prefilter-safe (including `"`, `\`, control chars,
+non-ASCII UTF-8). Regression tests in `tests/pool_test.zig` cover the `\uXXXX`, `\t`,
+and raw paths end-to-end; `zig build fuzz-regex` runs a differential harness that
+diffs zq-with-prefilter vs zq-without vs jq (0 divergences over 1000 iterations).
