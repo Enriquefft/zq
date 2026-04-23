@@ -8,9 +8,12 @@ pub fn build(b: *std.Build) void {
 
     const ver = b.option([]const u8, "version", "Version string") orelse version;
     const regex_enabled = b.option(bool, "regex", "Enable regex builtins (requires rustc+cargo)") orelse true;
+    const lsp_enabled = b.option(bool, "lsp", "Enable LSP server (--lsp flag). Disable to shrink CLI binary.") orelse true;
+    const strip_opt = b.option(bool, "strip", "Strip symbols from release binary (default: true in release, false in debug)");
     const options = b.addOptions();
     options.addOption([]const u8, "version", ver);
     options.addOption(bool, "regex_enabled", regex_enabled);
+    options.addOption(bool, "lsp_enabled", lsp_enabled);
     // One concrete options module, imported everywhere via addImport. Using
     // `addOptions(...)` on each consumer module would create *separate*
     // modules backed by the same generated source file — that collides when
@@ -197,15 +200,17 @@ pub fn build(b: *std.Build) void {
     // invoking the real compiler. Import the query module so diagnostics
     // reflect production behaviour — single source of truth.
     lsp_module.addImport("query", query_module);
+    lsp_module.addImport("build_options", build_options_module);
 
     // ── Executable ─────────────────────────────────────────────────────────────
     const is_release = optimize != .Debug;
+    const strip = strip_opt orelse is_release;
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = if (is_release) true else null,
+        .strip = strip,
     });
     exe_mod.addImport("error", error_module);
     exe_mod.addImport("types", types_module);
@@ -345,17 +350,19 @@ pub fn build(b: *std.Build) void {
     const ast_tests = b.addTest(.{ .root_module = ast_test_mod });
     test_step.dependOn(&b.addRunArtifact(ast_tests).step);
 
-    const lsp_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/lsp_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lsp_test_mod.addImport("lsp", lsp_module);
-    lsp_test_mod.addImport("ast", ast_module);
+    if (lsp_enabled) {
+        const lsp_test_mod = b.createModule(.{
+            .root_source_file = b.path("tests/lsp_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        lsp_test_mod.addImport("lsp", lsp_module);
+        lsp_test_mod.addImport("ast", ast_module);
 
-    const lsp_tests = b.addTest(.{ .root_module = lsp_test_mod });
-    if (shim_build_step) |step| lsp_tests.step.dependOn(&step.step);
-    test_step.dependOn(&b.addRunArtifact(lsp_tests).step);
+        const lsp_tests = b.addTest(.{ .root_module = lsp_test_mod });
+        if (shim_build_step) |step| lsp_tests.step.dependOn(&step.step);
+        test_step.dependOn(&b.addRunArtifact(lsp_tests).step);
+    }
 
     // ── JSONTestSuite ──────────────────────────────────────────────────────
     const jts_options = b.addOptions();

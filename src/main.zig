@@ -120,6 +120,10 @@ pub fn main() !u8 {
 
     if (config.lsp_mode) {
         const lsp_mod = @import("lsp");
+        if (comptime !lsp_mod.enabled) {
+            printErr("zq: --lsp is not available in this build (compiled with -Dlsp=false).\n");
+            return EXIT_USAGE;
+        }
         lsp_mod.run(allocator) catch return EXIT_SYSTEM;
         return EXIT_OK;
     }
@@ -1528,7 +1532,11 @@ fn printUsage() void {
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
-        \\  --lsp                 Start Language Server Protocol server on stdin/stdout
+    ++ (if (@import("lsp").enabled)
+        "\n  --lsp                 Start Language Server Protocol server on stdin/stdout"
+    else
+        "") ++
+        \\
         \\  --validate            Check filter syntax without executing (exit 0=valid, 3=error)
         \\  --describe            Print input data shape (type, fields, count)
         \\  --depth N             Schema recursion depth (default: 12, 0=unlimited)

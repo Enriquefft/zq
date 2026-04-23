@@ -24,6 +24,21 @@ bench:
 demo:
     vhs demo/benchmark.tape
 
+# Measure release binary size: total, section breakdown, top symbols
+binsize:
+    @zig build -Doptimize=ReleaseFast
+    @printf '\n── Stripped release ──────────────────────────────\n'
+    @ls -l zig-out/bin/zq | awk '{printf "size: %s bytes (%.2f MiB)\n", $5, $5/1048576}'
+    @printf '\n── Section sizes (size -A) ───────────────────────\n'
+    @size -A zig-out/bin/zq
+    @zig build -Doptimize=ReleaseFast -Dstrip=false
+    @printf '\n── Unstripped release (for symbol attribution) ───\n'
+    @ls -l zig-out/bin/zq | awk '{printf "size: %s bytes (%.2f MiB)\n", $5, $5/1048576}'
+    @printf '\n── Top 30 symbols by size (nm -S --size-sort) ────\n'
+    @nm -S --size-sort zig-out/bin/zq 2>/dev/null | tail -30
+    @zig build -Doptimize=ReleaseFast
+    @printf '\nRestored stripped release binary at zig-out/bin/zq.\n'
+
 # Show available commands
 help:
     @just --list
