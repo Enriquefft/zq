@@ -58,4 +58,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+      # -Dregex=false: the Rust shim is built by cargo on the runner (Linux
+      # x86_64) and can't natively cross-compile to macOS/Windows/FreeBSD/ARM
+      # without a platform SDK. The cross-compile smoke test verifies Zig-code
+      # portability across targets; regex-enabled builds get real coverage
+      # from `Test (linux)` and `Test (macos)` on native runners.
+      - run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -Dregex=false
