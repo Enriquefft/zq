@@ -33,13 +33,28 @@
 //! that's a harmless false positive — the full regex run filters it out.
 //!
 //! ## JSON escape handling
-//! JSON may encode the byte sequence "foo" inside a string as `foo`, or as
-//! `foo`, or as `foo`. Escapes are rare in practice (<1% of strings
-//! in common JSON data), and only ambiguity when the literal is itself a
-//! char that JSON might escape: `"`, `\`, or a control char. The prefilter
-//! trades this edge case (mandatory fall-through on missed escape-encoded
-//! literal = missed match = false negative = WRONG) for speed, by restricting
-//! which literals are safe to scan. See `canPrefilterLiteral` below.
+//! JSON (RFC 8259 §7) permits a given character to be serialized as raw bytes
+//! OR as an escape sequence. Any escape form (short: `\n` `\t` `\\` `\"` `\/`
+//! `\b` `\f` `\r`, or `\uXXXX` incl. surrogate pairs) REQUIRES a `\` (0x5C)
+//! byte in the raw record. UTF-8 multi-byte sequences never contain `\`.
+//!
+//! The prefilter exploits this invariant:
+//!   - If the literal's raw bytes appear → keep (may be a real match).
+//!   - If the literal's raw bytes DO NOT appear AND the record contains ANY
+//!     `\` byte → keep (we cannot rule out an escape-encoded occurrence).
+//!   - Only when BOTH conditions fail can we soundly reject.
+//!
+//! This makes every literal prefilter-safe — including literals that contain
+//! `"`, `\`, control chars, or non-ASCII UTF-8 — because a false negative is
+//! impossible by construction. False positives on records that happen to
+//! contain `\` (e.g. key names with escape sequences that don't correspond to
+//! the literal) are harmless: the full regex run filters them out.
+//!
+//! Performance: both checks are a single-byte indexOf over the record; one
+//! SIMD pass each. The second check runs ONLY when the first misses, so
+//! records that match (the common case in hit-heavy workloads) pay a single
+//! multi-byte indexOf. Records that miss and contain no `\` (also common in
+//! numeric-heavy payloads) get rejected in two linear passes — fastest case.
 
 const std = @import("std");
 const regex_mod = @import("regex");
@@ -112,11 +127,25 @@ pub const PrefilterSet = struct {
 
     /// Test `bytes` against every group. Returns true iff the record passes —
     /// i.e., cannot be rejected on the basis of missing literals.
+    ///
+    /// Escape-aware scan: a literal is deemed "possibly present" if its raw
+    /// bytes appear in the record, OR if the record contains any `\` (0x5C)
+    /// byte (because any JSON escape form for any character in the literal
+    /// requires a backslash). This closes the `\uXXXX`/short-escape hole
+    /// (RFC 8259 §7) without length caps or a variant explosion. See the
+    /// module doc comment for the correctness argument.
     pub fn accept(self: PrefilterSet, bytes: []const u8) bool {
+        // Compute once per record — shared across all groups. A single SIMD
+        // pass over the record identifies whether any escaped-form occurrence
+        // is even plausible.
+        const has_backslash = std.mem.indexOfScalar(u8, bytes, '\\') != null;
+
         for (self.groups) |g| {
             if (g.all_required) {
                 for (g.literals) |lit| {
-                    if (std.mem.indexOf(u8, bytes, lit) == null) return false;
+                    if (std.mem.indexOf(u8, bytes, lit) != null) continue;
+                    if (has_backslash) continue; // cannot rule out escape
+                    return false;
                 }
             } else {
                 var any_hit = false;
@@ -126,43 +155,42 @@ pub const PrefilterSet = struct {
                         break;
                     }
                 }
-                if (!any_hit) return false;
+                if (any_hit) continue;
+                // No raw hit. If record has `\`, one of the literals might be
+                // escape-encoded — we cannot rule out an OR match.
+                if (has_backslash) continue;
+                return false;
             }
         }
         return true;
     }
 };
 
-/// A literal is safe to prefilter iff it contains no byte that JSON may
-/// silently re-encode as an escape when the value is serialized. The raw-byte
-/// scan works on source bytes, not decoded values — so a literal like `"\n"`
-/// would fail to find its target even when `{"k":"foo\nbar"}` contains the
-/// newline semantically.
-///
-/// Safe: printable ASCII except `"` and `\`, and any multi-byte UTF-8
-/// continuation. Unsafe: `"`, `\`, control bytes (< 0x20), and DEL (0x7F).
-///
-/// Bytes in `0x80..=0xFF` are UTF-8 continuation bytes — JSON either keeps
-/// them verbatim (compliant JSON must) or escapes them as `\uXXXX`. We
-/// conservatively reject these too, because jq's output encodes non-ASCII as
-/// `\uXXXX` by default on some implementations; upstream raw JSON that we're
-/// scanning may be either form. Keeping the prefilter ASCII-printable-only is
-/// the production-safe rule.
+/// Every literal is safe to prefilter under the escape-aware scan in
+/// `PrefilterSet.accept`: the fallback `\`-presence check guarantees no false
+/// negative regardless of which bytes the literal contains. The only literals
+/// we reject are those too short to matter — single-byte literals have such
+/// low selectivity that the SIMD pass beats the savings even on cache-resident
+/// records, and empty literals are a degenerate no-op.
+const MIN_LITERAL_LEN: usize = 2;
+
 pub fn canPrefilterLiteral(lit: []const u8) bool {
-    if (lit.len == 0) return false;
-    for (lit) |b| {
-        if (b < 0x20) return false;
-        if (b == '"') return false;
-        if (b == '\\') return false;
-        if (b >= 0x7F) return false;
-    }
-    return true;
+    return lit.len >= MIN_LITERAL_LEN;
 }
 
 /// Process a `regex.Regex.requiredLiterals()` result into a `LiteralGroup` of
-/// byte-owned copies. Filters out any literal that fails `canPrefilterLiteral`.
-/// Returns `null` if the group would be empty after filtering (no safe
-/// literal → no prefilter signal).
+/// byte-owned copies. Filters out any literal that fails `canPrefilterLiteral`
+/// (currently: too-short literals — see `MIN_LITERAL_LEN`).
+///
+/// Soundness under dropping (AND/OR):
+///   - Exhaustive AND set: if any literal is dropped we can no longer assert
+///     ALL appear; downgrade to OR over the survivors. OR is a strict weaker
+///     condition, so no false negatives.
+///   - Non-exhaustive OR set (alternation cover): if any literal is dropped
+///     we lose coverage — a match could go through the dropped literal and we
+///     would reject. Disable prefilter for this group (null).
+///
+/// Returns `null` if the group would be empty after filtering.
 pub fn groupFromRegex(
     allocator: std.mem.Allocator,
     regex: *const regex_mod.Regex,
@@ -255,14 +283,63 @@ test "PrefilterSet.accept: OR semantics accepts if any literal present" {
     try std.testing.expect(!set.accept("prefix baz suffix"));
 }
 
-test "canPrefilterLiteral: rejects unsafe bytes" {
+test "canPrefilterLiteral: accepts any literal >= MIN_LITERAL_LEN" {
     try std.testing.expect(canPrefilterLiteral("hello"));
     try std.testing.expect(canPrefilterLiteral("abc123"));
     try std.testing.expect(!canPrefilterLiteral(""));
-    try std.testing.expect(!canPrefilterLiteral("a\"b"));
-    try std.testing.expect(!canPrefilterLiteral("a\\b"));
-    try std.testing.expect(!canPrefilterLiteral("a\nb"));
-    try std.testing.expect(!canPrefilterLiteral("caf\xc3\xa9"));
+    try std.testing.expect(!canPrefilterLiteral("x"));
+    // Escape-aware scan handles all byte classes safely — these must all pass.
+    try std.testing.expect(canPrefilterLiteral("a\"b"));
+    try std.testing.expect(canPrefilterLiteral("a\\b"));
+    try std.testing.expect(canPrefilterLiteral("a\nb"));
+    try std.testing.expect(canPrefilterLiteral("caf\xc3\xa9"));
+}
+
+test "PrefilterSet.accept: raw-hit kept regardless of backslash state" {
+    const alloc = std.testing.allocator;
+    const l1 = try alloc.dupe(u8, "foo");
+    const lits_arr = try alloc.alloc([]const u8, 1);
+    lits_arr[0] = l1;
+    const groups_arr = try alloc.alloc(LiteralGroup, 1);
+    groups_arr[0] = .{ .literals = lits_arr, .all_required = true };
+    var set = PrefilterSet{ .allocator = alloc, .groups = groups_arr };
+    defer set.deinit();
+
+    try std.testing.expect(set.accept("{\"k\":\"foo\"}"));
+    try std.testing.expect(set.accept("{\"k\":\"foo\\nbar\"}")); // raw "foo" present
+}
+
+test "PrefilterSet.accept: no raw hit + no backslash -> reject" {
+    const alloc = std.testing.allocator;
+    const l1 = try alloc.dupe(u8, "foo");
+    const lits_arr = try alloc.alloc([]const u8, 1);
+    lits_arr[0] = l1;
+    const groups_arr = try alloc.alloc(LiteralGroup, 1);
+    groups_arr[0] = .{ .literals = lits_arr, .all_required = true };
+    var set = PrefilterSet{ .allocator = alloc, .groups = groups_arr };
+    defer set.deinit();
+
+    try std.testing.expect(!set.accept("{\"k\":\"bar\"}"));
+    try std.testing.expect(!set.accept("plain text with no hit"));
+}
+
+test "PrefilterSet.accept: no raw hit BUT backslash present -> keep (escape possible)" {
+    // Closes the \uXXXX hole: literal `foo` serialized as `foo`
+    // won't match raw bytes but record contains backslashes -> cannot rule out.
+    const alloc = std.testing.allocator;
+    const l1 = try alloc.dupe(u8, "foo");
+    const lits_arr = try alloc.alloc([]const u8, 1);
+    lits_arr[0] = l1;
+    const groups_arr = try alloc.alloc(LiteralGroup, 1);
+    groups_arr[0] = .{ .literals = lits_arr, .all_required = true };
+    var set = PrefilterSet{ .allocator = alloc, .groups = groups_arr };
+    defer set.deinit();
+
+    // foo is `foo` under \uXXXX escape. Raw bytes do not contain
+    // "foo", but backslashes do -> must keep.
+    try std.testing.expect(set.accept("{\"k\":\"\\u0066\\u006f\\u006f\"}"));
+    // Short escapes similarly introduce backslashes -> cannot reject.
+    try std.testing.expect(set.accept("{\"k\":\"a\\tb\"}"));
 }
 
 test "groupFromRegex: extracts exhaustive literal" {

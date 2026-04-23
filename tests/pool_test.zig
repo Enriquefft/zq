@@ -973,3 +973,109 @@ test "prefilter: correctness — no false negatives on matching records" {
         \\
     , out.data);
 }
+
+test "prefilter: \\uXXXX escape hole — record with escape-encoded literal matches" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // RFC 8259 §7 lets the string "foo" be serialized as "foo".
+    // The raw-byte scan for "foo" would miss. The escape-aware prefilter must
+    // keep the record because the `\` presence means an escape-encoded
+    // occurrence is still possible. The full regex run (which works on the
+    // DECODED string value) then confirms the match.
+    const input =
+        \\{"note":"foo bar"}
+        \\{"note":"no match here"}
+        \\{"note":"raw foo is fine too"}
+        \\
+    ;
+    var cq = try compile("select(.note | test(\"foo\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    pool_mod.prefilter_stats.reset();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    // Both escape-encoded AND raw occurrences must be kept.
+    try std.testing.expectEqualStrings(
+        \\{"note":"foo bar"}
+        \\{"note":"raw foo is fine too"}
+        \\
+    , out.data);
+}
+
+test "prefilter: short-escape hole — record with \\t inside string keeps literal match" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // Literal `hello` must match `hel\tlo` decoded. The raw bytes do not
+    // contain "hello" (they contain `hel\tlo`), but the `\` in the record
+    // forces the escape-aware prefilter to keep it.
+    const input =
+        "{\"x\":\"hel\\tlo world\"}\n" ++
+        "{\"x\":\"zero match\"}\n";
+    var cq = try compile("select(.x | test(\"hello\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    pool_mod.prefilter_stats.reset();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    // Record with \t between `hel` and `lo` DECODES to "hel\tlo world"
+    // which does not match /hello/. No records match. But crucially the
+    // prefilter must have ACCEPTED the first record (no false negative) —
+    // skipped count should be 1 (the second record), not 2.
+    try std.testing.expectEqualStrings("", out.data);
+    try std.testing.expectEqual(@as(u64, 2), pool_mod.prefilter_stats.evaluated());
+    try std.testing.expectEqual(@as(u64, 1), pool_mod.prefilter_stats.skipped());
+}
+
+test "prefilter: short-escape hole — match through \\u encoding verified end-to-end" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+
+    // Full-match path: abc decodes to "abc"; /abc/ matches.
+    // Without the escape-aware prefilter, raw bytes don't contain "abc" and
+    // the record would be silently rejected -> wrong output.
+    const input =
+        \\{"k":"prefix abc suffix"}
+        \\{"k":"unrelated"}
+        \\
+    ;
+    var cq = try compile("select(.k | test(\"abc\"))");
+    defer cq.deinit();
+    try std.testing.expect(cq.prefilter != null);
+
+    const file = try tmp_file_fd(input);
+    defer file.close();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    try std.testing.expectEqualStrings(
+        \\{"k":"prefix abc suffix"}
+        \\
+    , out.data);
+}
