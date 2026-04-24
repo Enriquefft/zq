@@ -343,6 +343,10 @@ fn runWithOptionalPrefilter(
     defer cq.prefilter = saved;
     if (!enable_prefilter) cq.prefilter = null;
 
+    // memfd_create is Linux-only and has a @compileError on other targets, so
+    // gate the call comptime. The rest of this harness is Linux-only anyway;
+    // non-Linux builds skip the test to keep cross-compilation green.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     const fd = std.posix.memfd_create("zq_fuzz_pf", 0) catch return error.MemfdFailed;
     errdefer std.posix.close(fd);
     _ = try std.posix.write(fd, input);

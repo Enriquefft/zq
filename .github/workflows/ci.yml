@@ -22,7 +22,7 @@ jobs:
       - run: zig fmt --check src/ tests/
 
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -30,14 +30,21 @@ jobs:
         include:
           - os: linux
             runner: ubuntu-latest
+            optimize: Debug
           - os: macos
             runner: macos-latest
+            optimize: Debug
+          # Guards BUG-001: mixing extern union inside a non-extern struct
+          # only mis-compiles under LLVM TBAA DCE at -O2/-O3. Debug skips it.
+          - os: linux
+            runner: ubuntu-latest
+            optimize: ReleaseSafe
     steps:
       - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-      - run: zig build test
+      - run: zig build test -Doptimize=${{ matrix.optimize }}
 
   cross-compile:
     name: Build (${{ matrix.target }})

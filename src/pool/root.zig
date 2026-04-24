@@ -152,6 +152,13 @@ const RecordMeta = struct {
     error_ip: u16 = 0,
 };
 
+/// Compile-time guard exported for tests: pins the current `RecordMeta`
+/// layout so any new per-record field fails the regression test in
+/// `tests/pool_test.zig`. Per-record fields scale linearly with record
+/// count; diagnostic side channels (e.g. `user_error_msg`) belong on
+/// `ChunkResult` instead — see the per-chunk slot nearby.
+pub const record_meta_size_for_test: usize = @sizeOf(RecordMeta);
+
 /// All serialized output for one chunk — one contiguous buffer, no per-record allocations.
 const SerializedChunk = struct {
     /// All records' bytes concatenated.
@@ -185,6 +192,15 @@ const ChunkResult = struct {
         /// Serialized path: one contiguous buffer + compact per-record metadata.
         serialized: SerializedChunk,
     },
+    /// Last user-facing error message produced by any record in this chunk.
+    /// Non-null only when at least one record raised `error("...")` or a
+    /// builtin that populates `ResultIterator.user_error_msg`. Last-write-wins
+    /// within a chunk; the message is arena-allocated (lifetime tied to the
+    /// chunk) so the collector can surface it to `formatDiagnostic` without
+    /// additional copies. The worker is the sole writer (before `post()`),
+    /// the collector is the sole reader (after `next_in_order()`), so no
+    /// synchronization is required beyond the `post()` release edge.
+    user_error_msg: ?[]const u8 = null,
     /// Owns all memory for `payload` and every OwnedValue/serialized byte within.
     /// Call arena.deinit() once the chunk is exhausted to free everything atomically.
     arena: std.heap.ArenaAllocator,
@@ -515,6 +531,14 @@ fn worker_fn(ctx: WorkerCtx) void {
             };
             chunk_buf.ensureTotalCapacity(aa, buf_estimate) catch {};
 
+            // Per-chunk diagnostic slot. Populated (last-write-wins) whenever
+            // the VM raises an error with `user_error_msg` set — e.g. jq-style
+            // `error("msg")`, `"Invalid path expression ..."`, `limit` on a
+            // negative count. The collector reads this once per chunk and
+            // forwards it to `formatDiagnostic`. Strings are duped into the
+            // chunk arena so lifetime ties to the chunk.
+            var chunk_user_error_msg: ?[]const u8 = null;
+
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
                 const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
@@ -541,6 +565,24 @@ fn worker_fn(ctx: WorkerCtx) void {
                     job.external_bindings,
                 );
 
+                // Capture any VM-side user error message before the iterator
+                // is reset on the next record. Only VM errors (not parse
+                // errors) populate this; `process_line_serialized` leaves the
+                // iterator valid after such an error.
+                if (meta.is_error) {
+                    if (opt_it) |*it| {
+                        if (it.user_error_msg) |msg| {
+                            switch (msg) {
+                                .string => |s| {
+                                    const duped = aa.dupe(u8, s) catch null;
+                                    if (duped) |d| chunk_user_error_msg = d;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+
                 meta_list.append(aa, meta) catch {
                     meta_list.append(aa, .{
                         .end_offset = @intCast(chunk_buf.items.len),
@@ -563,6 +605,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                     .data = data_slice,
                     .records = meta_slice,
                 } },
+                .user_error_msg = chunk_user_error_msg,
                 .arena = arena,
             });
         } else {
@@ -1383,6 +1426,12 @@ pub const Pool = struct {
     /// Instruction pointer of the last error (for diagnostics).
     last_error_ip: u32 = 0,
 
+    /// User-facing message for the last error (for diagnostics).
+    /// Points into the offending chunk's arena, valid until the next
+    /// collect()/collect_bytes() call advances past that chunk. Populated
+    /// by collect_bytes() whenever the chunk slot carries a message.
+    last_user_error_msg: ?[]const u8 = null,
+
     pub fn init(n_threads: usize, budget: MemoryBudget, allocator: std.mem.Allocator) error{OutOfMemory}!Pool {
         const shared = try allocator.create(SharedCtx);
         errdefer allocator.destroy(shared);
@@ -1691,6 +1740,13 @@ pub const Pool = struct {
 
                     if (meta.is_error) {
                         p.last_error_ip = meta.error_ip;
+                        // Surface the chunk's user error message (if any) so
+                        // the caller can pass it to `formatDiagnostic`. The
+                        // string is arena-backed; it stays valid until the
+                        // caller advances past this chunk (at which point the
+                        // arena is freed). Callers must consume it before the
+                        // next collect_bytes() call.
+                        p.last_user_error_msg = p._delivering.?.user_error_msg;
                         return @as(ZqError, @errorCast(@errorFromInt(meta.error_code)));
                     }
 

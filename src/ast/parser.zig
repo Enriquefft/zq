@@ -717,12 +717,48 @@ pub const Parser = struct {
         const start = p.lex.pos;
         const key = try p.parseObjectKey();
         _ = p.expectOrError(.colon, "expected ':' in object field");
-        const value = try p.parseAlternative();
+        const value = try p.parseObjectFieldValue();
         return .{
             .key = key,
             .value = value,
             .span = Span.from(start, value.span.end),
         };
+    }
+
+    /// Parse an object-field value. Matches jq's grammar: pipe is allowed, but
+    /// `,` is the field separator — NOT a generator. The base is
+    /// `parseAlternative` (skipping `parseComma`) so `,` is left for the outer
+    /// `parseObjectLiteral` loop to consume.
+    fn parseObjectFieldValue(p: *Parser) error{ParseFailed}!*Node {
+        if (p.peekIsUpdateAssign()) {
+            return p.parseUpdateAssign();
+        }
+
+        var left = try p.parseAlternative();
+        while (true) {
+            const tok = p.peek() orelse break;
+            if (tok.tag != .pipe) break;
+            _ = p.advance(); // consume |
+
+            const after = p.peek() orelse break;
+            if (after.tag == .def_kw) {
+                const right = p.parseFunctionDef() catch {
+                    p.syncToNextStatement();
+                    continue;
+                };
+                const span = Span.from(left.span.start, right.span.end);
+                left = p.createNode(.{ .pipe = .{ .left = left, .right = right } }, span);
+                break;
+            }
+
+            const right = p.parseAlternative() catch {
+                p.syncToNextStatement();
+                continue;
+            };
+            const span = Span.from(left.span.start, right.span.end);
+            left = p.createNode(.{ .pipe = .{ .left = left, .right = right } }, span);
+        }
+        return left;
     }
 
     fn parseObjectKey(p: *Parser) error{ParseFailed}!Node.ObjectKey {

@@ -350,13 +350,215 @@ test "jq:onig match-array-single-arg — SKIP: match([re]) not wired" {
     return error.SkipZigTest;
 }
 
-test "jq:onig test with n flag is rejected at compile time" {
-    // Historical delta: jq's `n` (no-empty-match) flag changes every regex
-    // builtin to treat zero-width matches as non-matches. zq previously
-    // accepted `n` and ignored it — silently producing jq-incompatible
-    // output. Per CLAUDE.md §4 (zero workarounds), we now reject it at
-    // compile time with RegexCompileError. Implementing `n` is a separate
-    // design task (needs per-builtin zero-width detection paths).
+// ── `n` flag — ignore-empty-match across all regex builtins ──────────────────
+//
+// jq's `n` flag, applied to every regex builtin (test/match/capture/scan/
+// sub/gsub/splits), filters zero-width overall matches. Zero-width optional
+// capture groups inside a non-empty match still surface as unmatched slots
+// with `offset:-1, length:0, string:null` (jq emits `null` for `capture`
+// named groups) — `n` only inspects the overall match span.
+//
+// Engine caveat: a narrow class of patterns that lead with an empty
+// alternative (e.g. `"|a"`) behaves differently between Oniguruma and
+// regex-automata under `n`. Oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY`
+// retries alternatives at the same position, so `match("|a"; "n")` lands
+// on `"a"` in jq; regex-automata has no equivalent knob, so zq advances
+// past the empty match and returns no match. Documented under "Compat
+// delta vs jq" in ROADMAP.md; not covered by the assertions below.
+
+test "jq:n-flag test filters zero-width matches" {
     try requireRegex();
-    try h.expectCompileError("test(\"( )*\"; \"gn\")");
+    const results = try h.runFilter(
+        "[test(\"\"; \"n\"), test(\"^\"; \"n\"), test(\"a\"; \"n\")]",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[false,false,true]", results[0]);
+}
+
+test "jq:n-flag match(g) filters zero-width matches" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[match(\"a|b\"; \"gn\")] | map({o: .offset, l: .length, s: .string})",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings(
+        "[{\"o\":0,\"l\":1,\"s\":\"a\"},{\"o\":1,\"l\":1,\"s\":\"b\"}]",
+        results[0],
+    );
+}
+
+test "jq:n-flag match drops empty-only pattern to no-match" {
+    try requireRegex();
+    // Non-global match with n-flag and a pattern that only ever matches
+    // empty surfaces a runtime TypeError (jq's "no match" path). We invert
+    // runFilter's catch into a direct expectation — a type error bubbles
+    // up as error.QueryRuntimeError via the helper's `catch return`.
+    const got = h.runFilter("match(\"\"; \"n\")", "\"\"");
+    if (got) |results| {
+        defer {
+            for (results) |s| h.alloc.free(s);
+            h.alloc.free(results);
+        }
+        return error.ExpectedRuntimeError;
+    } else |err| {
+        try std.testing.expectEqual(error.QueryRuntimeError, err);
+    }
+}
+
+test "jq:n-flag capture(g) skips zero-width alternatives" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[capture(\"(?<x>a)|\"; \"gn\")]",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[{\"x\":\"a\"}]", results[0]);
+}
+
+test "jq:n-flag scan filters empty tail matches" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[scan(\"a*\"; \"n\")]",
+        "\"aaa\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"aaa\"]", results[0]);
+}
+
+test "jq:n-flag scan empty pattern yields empty output" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[scan(\"\"; \"n\")]",
+        "\"aaa\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "jq:n-flag sub skips zero-width match" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "sub(\"^\"; \"X\"; \"n\")",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"abc\"", results[0]);
+}
+
+test "jq:n-flag gsub empty pattern is a no-op" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "gsub(\"\"; \"-\"; \"n\")",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"abc\"", results[0]);
+}
+
+test "jq:n-flag gsub non-empty pattern still replaces" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "gsub(\"a\"; \"-\"; \"n\")",
+        "\"aaa\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("\"---\"", results[0]);
+}
+
+test "jq:n-flag splits empty pattern returns input unchanged" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[splits(\"\"; \"n\")]",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"abc\"]", results[0]);
+}
+
+test "jq:n-flag splits trailing empty-alt collapses to same segmentation" {
+    try requireRegex();
+    // "b|" — zero-width alt at every position plus a concrete 'b' split;
+    // n-flag must only honour the concrete split, matching jq's output.
+    const results = try h.runFilter(
+        "[splits(\"b|\"; \"n\")]",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"a\",\"c\"]", results[0]);
+}
+
+test "jq:n-flag combines with i flag (case-insensitive still applies)" {
+    try requireRegex();
+    const results = try h.runFilter(
+        "[match(\"a\"; \"ni\")]",
+        "\"ABC\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings(
+        "[{\"offset\":0,\"length\":1,\"string\":\"A\",\"captures\":[]}]",
+        results[0],
+    );
+}
+
+test "jq:n-flag without-n-flag paths unchanged (regression)" {
+    // Guard that adding the operand bit didn't perturb the no-flag path.
+    try requireRegex();
+    const results = try h.runFilter(
+        "[match(\"\"; \"g\")] | length",
+        "\"abc\"",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    // Without n, match("";"g") yields four zero-width matches (one per
+    // position, inclusive of end). Exactly jq's behaviour pre-n.
+    try std.testing.expectEqualStrings("4", results[0]);
 }

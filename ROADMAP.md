@@ -606,8 +606,12 @@ Rust-free binary where every regex builtin surfaces `regex_not_compiled`.
 quantifiers, inline flag groups (`(?i:foo)`).
 
 **Supported flags (as 2nd/3rd arg):** `i` (case-insensitive), `m` (multi-line),
-`s` (dotall / `.` matches `\n`), `x` (ignore whitespace). `g`/`n` are accepted
-and treated as pattern-level no-ops. Unknown flag letters are a compile error.
+`s` (dotall / `.` matches `\n`), `x` (ignore whitespace), `g` (global — dispatches
+to the generator-mode match opcode at compile time; no-op for scan/sub/gsub/
+splits which already match globally), `n` (ignore zero-width overall matches —
+implemented across every regex builtin: `test`/`match`/`capture`/`scan`/`sub`/
+`gsub`/`splits`, threaded through via a `call_builtin` operand bit). Unknown
+flag letters are a compile error.
 
 **Compat delta vs jq (deliberate, documented):**
 
@@ -620,7 +624,7 @@ and treated as pattern-level no-ops. Unknown flag letters are a compile error.
 | `match(re; "g")` global-generator mode | yields all matches | yields all matches (implemented) | — |
 | `match([re, flags])` array overload | works | compile error | `match(re; flags)` |
 | `splits(re; flags)` regex split | works | works (implemented) | — |
-| `n` flag (ignore empty matches) | filters zero-width matches | rejected at compile time — `RegexCompileError`. See commit e69b413 for rationale. | use a non-empty pattern, or post-filter with `select(. != "")` |
+| `n` flag: empty-first alternation (`match("\|a"; "n")`) | Oniguruma's `ONIG_OPTION_FIND_NOT_EMPTY` retries non-empty alternatives at the same position, so `match("\|a"; "n")` lands on `"a"`. | `regex-automata` has no equivalent option — the engine commits to the empty alternative and the n-flag skip advances past it, yielding no match at that position. Rare pattern shape (leading empty alternative); all other `n`-flag semantics match jq. | rewrite the alternation with the non-empty branch first (`match("a\|"; "n")`) or use `scan`/`match`+`"g"` and filter manually. |
 
 **Performance targets vs measured** (release build, isMatch, per-worker clone, x86_64 ReleaseFast):
 

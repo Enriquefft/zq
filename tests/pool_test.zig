@@ -579,6 +579,39 @@ test "serialized: error propagation" {
     try std.testing.expectError(error.UnexpectedToken, result);
 }
 
+// Regression: `error("msg")` in the pool serialized path must surface the
+// user-facing message via `pool.last_user_error_msg` so the caller can pass
+// it to `formatDiagnostic`. Before this wiring the message was dropped and
+// stdin / file-arg mode printed only the generic "user error" header.
+test "serialized: user_error_msg surfaced for error(\"...\")" {
+    var cq = try compile(".foo // error(\"bad\")");
+    defer cq.deinit();
+
+    const file = try tmp_file_fd("\"x\"\n");
+    defer file.close();
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+
+    const result = p.collect_bytes();
+    try std.testing.expectError(error.UserError, result);
+    try std.testing.expect(p.last_user_error_msg != null);
+    try std.testing.expectEqualStrings("bad", p.last_user_error_msg.?);
+}
+
+// RecordMeta size guard: the compact per-record metadata struct (u32 end_offset,
+// 2×bool, 2×u16) packs to 12 bytes with natural alignment. The design intent
+// documented in `src/pool/root.zig` is "do not widen per-record fields" — any
+// new user-facing diagnostic channel should live per-chunk (Design A for the
+// `user_error_msg` plumbing) so 15M-record workloads do not regress RSS.
+// This test pins the current layout so future regressions are loud.
+test "RecordMeta stays compact per-record" {
+    const pool = @import("pool");
+    try std.testing.expectEqual(@as(usize, 12), pool.record_meta_size_for_test);
+}
+
 test "serialized: ordering with 4 workers" {
     var cq = try compile(".");
     defer cq.deinit();

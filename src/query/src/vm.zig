@@ -87,11 +87,35 @@ const PathFrame = struct {
     /// raise jq's "Invalid path expression with result <tojson>" error.
     /// Reset across generator iterations via `PathSnapshot` save/restore.
     path_broken: bool = false,
+    /// True when the body is a path-emitting builtin (`paths`, `leaf_paths`,
+    /// `..`/`recurse`) whose per-iteration current value already IS the path
+    /// array for this `path(f)` call. `path_end` yields that value directly
+    /// instead of building the array from `components` (which stays empty
+    /// because these builtins don't use navigation ops). The companion
+    /// each-iteration forkpoint must avoid appending an index/key component
+    /// when this flag is set — see `advanceEachForkpoint` and `.each`.
+    body_emits_paths_directly: bool = false,
 
     fn deinit(self: *PathFrame, alloc: std.mem.Allocator) void {
         self.components.deinit(alloc);
     }
 };
+
+/// True for builtins that, when called inside a `path(f)` frame, emit path
+/// arrays as their per-iteration value — so the outer `path()` yields those
+/// directly instead of tracking descent. Whitelisted:
+///   - `paths` / `leaf_paths`: define themselves in jq as `path(..) | ...`
+///   - `recurse` (and the `..` operator, compiled to the same builtin): jq's
+///     `def recurse: ., (.[]? | recurse);` — path tracking would produce the
+///     same paths as `paths`, including the root `[]`.
+/// These builtins populate the `PathFrame.body_emits_paths_directly` flag,
+/// and `path_end` yields the current value as the result.
+fn callBuiltinIsPathEmittingInFrame(bid: types.BuiltinId) bool {
+    return switch (bid) {
+        .paths, .leaf_paths, .recurse => true,
+        else => false,
+    };
+}
 
 const SkipState = struct {
     remaining: u64,
@@ -129,6 +153,9 @@ const ScanState = struct {
     /// match. When true, `scan` yields arrays of capture strings; when false
     /// (pattern has no user-written groups), `scan` yields the matched string.
     has_user_captures: bool,
+    /// jq `n` flag — skip zero-width overall matches on both the initial
+    /// draw and every backtrack advance. See `advanceScanForkpoint`.
+    n_flag: bool = false,
 };
 
 /// Fork state for `match(re; "g")` — yields one jq-match-object per
@@ -145,6 +172,8 @@ const MatchGState = struct {
     hay: []const u8,
     cursor: usize,
     slots: []regex_mod.MatchSlot,
+    /// jq `n` flag — skip zero-width overall matches during iteration.
+    n_flag: bool = false,
 };
 
 /// Fork state for `splits(re; flags)` — yields the segment between the
@@ -165,6 +194,10 @@ const SplitsState = struct {
     /// been yielded. Used to terminate the generator on the following
     /// backtrack without producing an extra empty segment.
     tail_yielded: bool,
+    /// jq `n` flag — zero-width overall matches do not split (they are
+    /// treated as non-matches; cursor advances past them without emitting
+    /// a segment boundary).
+    n_flag: bool = false,
 };
 
 const ForkAux = union(ForkType) {
@@ -228,6 +261,10 @@ const Forkpoint = struct {
     /// left-operand slots (e.g. `. * (a,b)` keeps `.` for the second branch).
     /// Null when no collect frame is active (the stack isn't truncated then).
     saved_stack: ?[]StackValue = null,
+    /// Snapshot of the three object-construction stacks taken at fork time.
+    /// See `ObjectConstructSnapshot`. Null when no object literal is being
+    /// constructed at fork time (the common case).
+    saved_object: ?ObjectConstructSnapshot = null,
 };
 
 /// State for one active function call (used for recursive user-defined functions).
@@ -275,6 +312,30 @@ pub const StackValue = union(enum) {
     float: f64,
     /// A view into the Tape for objects/arrays/strings.
     tape_value: Value,
+};
+
+/// One accumulated field during object literal construction.
+/// Declared at module level (rather than nested in ResultIterator) so
+/// Forkpoint can snapshot slices of the in-progress construct stack.
+const ObjectField = struct {
+    key: []const u8,
+    value: StackValue,
+};
+
+/// Snapshot of the three object-construction stacks captured at fork time.
+/// Restored on any backtrack path that re-enters code lexically inside an
+/// `{...}` literal's field-value expression (comma generators, `.each`,
+/// range, alt, and regex generators). Without this, `object_construct_end`
+/// inside the first iteration pops the input/depth frames and leaves the
+/// second iteration with no context to consume via `object_key`, surfacing
+/// as a spurious `type error` at the generator's second yield.
+///
+/// `null` when none of the three stacks had entries at fork time — keeps
+/// the common case (forks outside any `{...}` literal) allocation-free.
+const ObjectConstructSnapshot = struct {
+    fields: []ObjectField,
+    depth: []u32,
+    input: []Value,
 };
 
 /// Binding of an external variable (by compiler-assigned ID) to a concrete value.
@@ -521,6 +582,7 @@ pub const ResultIterator = struct {
         it.call_stack.deinit(it.alloc);
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
+            if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
         }
         it.fork_stack.deinit(it.alloc);
@@ -569,6 +631,7 @@ pub const ResultIterator = struct {
         it.call_stack.clearRetainingCapacity();
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
+            if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
         }
         it.fork_stack.clearRetainingCapacity();
@@ -636,6 +699,86 @@ pub const ResultIterator = struct {
         }
     }
 
+    /// Snapshot the value_stack contents above the current collect-frame
+    /// outer depth (or from 0 if no collect frame is active). Returns null
+    /// when no snapshot is needed — i.e., no collect frame AND no object
+    /// literal is under construction at fork time.
+    ///
+    /// Required whenever the fork may resume after intermediate execution
+    /// overwrites stack slots below `saved_value_stack_len`. Two cases need
+    /// it: (a) collect frames — `yield_output` truncates to outer_value_depth
+    /// so slots between outer and saved_len may be stale; (b) object
+    /// literals — `object_construct_end` pushes the obj through those same
+    /// slots and `yield_output` pops it, leaving stale bits for the next
+    /// branch/iteration to trip over.
+    fn snapshotValueStackForFork(it: *ResultIterator) error{OutOfMemory}!?[]StackValue {
+        const inside_object = it.object_construct_depth.items.len > 0;
+        const inside_collect = it.collect_stack.items.len > 0;
+        if (!inside_object and !inside_collect) return null;
+        const outer: usize = if (inside_collect)
+            it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
+        else
+            0;
+        const cur_len = it.value_stack.items.len;
+        if (cur_len <= outer) return null;
+        const slice = try it.alloc.alloc(StackValue, cur_len - outer);
+        @memcpy(slice, it.value_stack.items[outer..cur_len]);
+        return slice;
+    }
+
+    /// Restore value_stack from a `saved_stack` snapshot, truncating first
+    /// to the outer collect-frame depth (or 0). Frees the snapshot.
+    fn restoreValueStackFromSnapshot(it: *ResultIterator, snap: []StackValue) void {
+        const outer: usize = if (it.collect_stack.items.len > 0)
+            it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
+        else
+            0;
+        it.value_stack.items.len = outer;
+        it.value_stack.appendSliceAssumeCapacity(snap);
+        it.alloc.free(snap);
+    }
+
+    /// Snapshot the three object-construction stacks at fork time. Returns
+    /// null when all three are empty — the common case for forks outside any
+    /// `{...}` literal. Slices are owned by the returned snapshot.
+    fn snapshotObjectConstructState(it: *ResultIterator) error{OutOfMemory}!?ObjectConstructSnapshot {
+        const d = it.object_construct_depth.items.len;
+        const i = it.object_construct_input.items.len;
+        const f = it.object_construct.items.len;
+        if (d == 0 and i == 0 and f == 0) return null;
+        const fields = try it.alloc.alloc(ObjectField, f);
+        errdefer it.alloc.free(fields);
+        @memcpy(fields, it.object_construct.items);
+        const depth = try it.alloc.alloc(u32, d);
+        errdefer it.alloc.free(depth);
+        @memcpy(depth, it.object_construct_depth.items);
+        const input = try it.alloc.alloc(Value, i);
+        errdefer it.alloc.free(input);
+        @memcpy(input, it.object_construct_input.items);
+        return .{ .fields = fields, .depth = depth, .input = input };
+    }
+
+    /// Restore object-construction stacks from a fork-time snapshot. Replaces
+    /// current stack contents with the snapshot. Frees the snapshot buffers.
+    fn restoreObjectConstructState(it: *ResultIterator, snap: ObjectConstructSnapshot) void {
+        it.object_construct.items.len = 0;
+        it.object_construct.appendSliceAssumeCapacity(snap.fields);
+        it.object_construct_depth.items.len = 0;
+        it.object_construct_depth.appendSliceAssumeCapacity(snap.depth);
+        it.object_construct_input.items.len = 0;
+        it.object_construct_input.appendSliceAssumeCapacity(snap.input);
+        it.alloc.free(snap.fields);
+        it.alloc.free(snap.depth);
+        it.alloc.free(snap.input);
+    }
+
+    /// Free an object-construct snapshot without restoring.
+    fn freeObjectConstructSnapshot(it: *ResultIterator, snap: ObjectConstructSnapshot) void {
+        it.alloc.free(snap.fields);
+        it.alloc.free(snap.depth);
+        it.alloc.free(snap.input);
+    }
+
     /// Truncate the fork stack to `new_len`, freeing any `saved_stack`
     /// snapshots and scan-slot arrays on the forkpoints being discarded.
     fn truncateForkStack(it: *ResultIterator, new_len: usize) void {
@@ -646,6 +789,10 @@ pub const ResultIterator = struct {
             if (fp.saved_stack) |snap| {
                 it.alloc.free(snap);
                 fp.saved_stack = null;
+            }
+            if (fp.saved_object) |snap| {
+                it.freeObjectConstructSnapshot(snap);
+                fp.saved_object = null;
             }
             it.freeRegexForkSlots(fp);
             // Clear to avoid double-free on any subsequent pass.
@@ -812,8 +959,18 @@ pub const ResultIterator = struct {
         // A path-descent / restore-input op that follows clears the flag
         // (see `clearsPathBroken`) — that's applied after the op's body runs,
         // below, so the component/restore is actually performed.
+        //
+        // Exception: `call_builtin` with a path-emitting builtin (`paths`,
+        // `leaf_paths`, `recurse`/`..`) is treated as preserving inside a
+        // `path(f)` frame — these builtins yield path arrays directly and
+        // `path_end` uses the body's current value as the result. See
+        // `callBuiltinIsPathEmittingInFrame`.
         if (it.path_stack.items.len > 0 and instr.op.breaksPath()) {
-            it.path_stack.items[it.path_stack.items.len - 1].path_broken = true;
+            const is_path_emit = instr.op == .call_builtin and
+                callBuiltinIsPathEmittingInFrame(types.builtinIdOf(instr.operand.index));
+            if (!is_path_emit) {
+                it.path_stack.items[it.path_stack.items.len - 1].path_broken = true;
+            }
         }
 
         const result = try it.execOneInner(instr);
@@ -1150,12 +1307,16 @@ pub const ResultIterator = struct {
                     .saved_collect_len = @intCast(it.collect_stack.items.len),
                     .saved_call_len = @intCast(it.call_stack.items.len),
                 };
+                const saved_stack = try it.snapshotValueStackForFork();
+                const saved_object = try it.snapshotObjectConstructState();
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .alt_handler = handler_state },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = saved_stack,
+                    .saved_object = saved_object,
                 });
                 it.ip += 1;
                 return null;
@@ -1168,7 +1329,9 @@ pub const ResultIterator = struct {
                     idx -= 1;
                     switch (it.fork_stack.items[idx].aux) {
                         .try_handler, .alt_handler => {
-                            _ = it.fork_stack.orderedRemove(idx);
+                            const removed = it.fork_stack.orderedRemove(idx);
+                            if (removed.saved_stack) |snap| it.alloc.free(snap);
+                            if (removed.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                             break;
                         },
                         else => {},
@@ -1690,9 +1853,27 @@ pub const ResultIterator = struct {
 
                 // Discard only values pushed by the body — restore to saved depth.
                 it.value_stack.items.len = frame.saved_value_stack_len;
-                // path(f) returns the path array, not the value f produced.
-                const path_arr = try it.buildPathArray(frame.components.items);
+                // path(f) returns the path array. For most bodies this is
+                // built from the components recorded by navigation ops
+                // (load_key, navigate_index, each...). For path-emitting
+                // builtins (`paths` / `leaf_paths` / `..`) the current value
+                // IS the path array for this iteration — yield it directly.
+                const path_arr: Value = if (frame.body_emits_paths_directly)
+                    it.current
+                else
+                    try it.buildPathArray(frame.components.items);
                 it.pushValue(try valueToStackValue(path_arr));
+                // Nested path(path(f)): the value we just pushed is an
+                // array, which isn't a legitimate path component for the
+                // enclosing path() frame. The inner frame is NOT popped
+                // here (generators inside need it alive across backtracks —
+                // path_scope sentinel pops it on outer backtrack), so the
+                // outer path_end re-inspects the same frame as "innermost".
+                // Mark it broken so the outer path_end raises jq's
+                // "Invalid path expression with result <tojson>" error.
+                if (it.path_stack.items.len >= 2) {
+                    frame.path_broken = true;
+                }
                 it.ip += 1;
                 return null;
             },
@@ -1721,20 +1902,13 @@ pub const ResultIterator = struct {
             // ── Fork stack opcodes ──────────────────────────────────────────
 
             .fork => {
-                // Capture stack snapshot when inside a collect frame so the
-                // comma backtrack can restore left-operand slots consumed by
-                // the first iteration's binop (e.g. `[. * (a,b)]`).
-                var saved_stack: ?[]StackValue = null;
-                if (it.collect_stack.items.len > 0) {
-                    const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                    const outer: usize = cf.outer_value_depth;
-                    const cur_len = it.value_stack.items.len;
-                    if (cur_len > outer) {
-                        const slice = try it.alloc.alloc(StackValue, cur_len - outer);
-                        @memcpy(slice, it.value_stack.items[outer..cur_len]);
-                        saved_stack = slice;
-                    }
-                }
+                // Capture stack snapshot when inside a collect frame or an
+                // object literal so the second comma branch sees the same
+                // value-stack contents as the first (collect: left-operand
+                // of `[. * (a,b)]`; object: the key pushed before `object_key`
+                // — see `snapshotValueStackForFork` for details).
+                const saved_stack = try it.snapshotValueStackForFork();
+                const saved_object = try it.snapshotObjectConstructState();
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
@@ -1742,6 +1916,7 @@ pub const ResultIterator = struct {
                     .aux = .{ .normal = {} },
                     .saved_path = it.snapshotPathState(),
                     .saved_stack = saved_stack,
+                    .saved_object = saved_object,
                 });
                 it.ip += 1;
                 return null;
@@ -1779,6 +1954,8 @@ pub const ResultIterator = struct {
                                 .index = 0,
                             } },
                             .saved_path = it.snapshotPathState(),
+                            .saved_stack = try it.snapshotValueStackForFork(),
+                            .saved_object = try it.snapshotObjectConstructState(),
                         });
                         // Record path component (the array index 0).
                         if (it.path_stack.items.len > 0) {
@@ -1809,6 +1986,8 @@ pub const ResultIterator = struct {
                                 .index = 0,
                             } },
                             .saved_path = it.snapshotPathState(),
+                            .saved_stack = try it.snapshotValueStackForFork(),
+                            .saved_object = try it.snapshotObjectConstructState(),
                         });
                         // Record path component (the object key).
                         if (it.path_stack.items.len > 0) {
@@ -2494,11 +2673,6 @@ pub const ResultIterator = struct {
     }
 
     // ── Object construction operations ─────────────────────────────────────────────────
-
-    const ObjectField = struct {
-        key: []const u8,
-        value: StackValue,
-    };
 
     fn constructObjectFromFields(it: *ResultIterator) ZqError!StackValue {
         return it.constructObjectFromFieldsRange(0);
@@ -4820,6 +4994,8 @@ pub const ResultIterator = struct {
                         .is_float = false,
                     } },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = try it.snapshotValueStackForFork(),
+                    .saved_object = try it.snapshotObjectConstructState(),
                 });
                 it.current = .{ .int = 0 };
                 it.ip = resume_ip;
@@ -4843,6 +5019,8 @@ pub const ResultIterator = struct {
                         .is_float = true,
                     } },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = try it.snapshotValueStackForFork(),
+                    .saved_object = try it.snapshotObjectConstructState(),
                 });
                 it.current = .{ .float = 0 };
                 it.ip = resume_ip;
@@ -4888,6 +5066,8 @@ pub const ResultIterator = struct {
                     .is_float = true,
                 } },
                 .saved_path = it.snapshotPathState(),
+                .saved_stack = try it.snapshotValueStackForFork(),
+                .saved_object = try it.snapshotObjectConstructState(),
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4917,6 +5097,8 @@ pub const ResultIterator = struct {
                     .is_float = false,
                 } },
                 .saved_path = it.snapshotPathState(),
+                .saved_stack = try it.snapshotValueStackForFork(),
+                .saved_object = try it.snapshotObjectConstructState(),
             });
             it.current = .{ .int = from_i };
         }
@@ -4966,6 +5148,8 @@ pub const ResultIterator = struct {
                     .is_float = true,
                 } },
                 .saved_path = it.snapshotPathState(),
+                .saved_stack = try it.snapshotValueStackForFork(),
+                .saved_object = try it.snapshotObjectConstructState(),
             });
             it.current = .{ .float = from_f };
         } else {
@@ -4999,6 +5183,8 @@ pub const ResultIterator = struct {
                     .is_float = false,
                 } },
                 .saved_path = it.snapshotPathState(),
+                .saved_stack = try it.snapshotValueStackForFork(),
+                .saved_object = try it.snapshotObjectConstructState(),
             });
             it.current = .{ .int = from_i };
         }
@@ -5797,12 +5983,22 @@ pub const ResultIterator = struct {
             return null;
         }
 
+        // When called inside `path(paths)` / `path(leaf_paths)`, the each
+        // iteration would otherwise append a spurious `[0]`, `[1]`... to the
+        // frame's components because the iterated container is a list of
+        // pre-built path arrays (not a user value). Flag the frame so
+        // advanceEachForkpoint skips path recording and path_end yields the
+        // current value (the path array) as the result.
+        if (it.path_stack.items.len > 0) {
+            it.path_stack.items[it.path_stack.items.len - 1].body_emits_paths_directly = true;
+        }
+
         // Build a container array of all path arrays on runtime tape.
         const arr = try it.buildRuntimeArray(all_paths.items);
         it.current = try stackValueToValue(arr);
 
         // Set up fork-based iteration over the container.
-        if (!it.setupEachFromCurrent()) {
+        if (!(try it.setupEachFromCurrent())) {
             if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
@@ -5865,30 +6061,94 @@ pub const ResultIterator = struct {
     /// `..` (recursive descent): output current value, then recursively descend
     /// into all sub-values. Errors from non-iterable values are suppressed.
     /// Equivalent to jq's `def recurse: ., (.[]? | recurse);`
+    ///
+    /// Inside a `path(f)` frame: walk the same DFS but emit the PATH to each
+    /// visited node rather than the node itself. jq's `recurse` is defined in
+    /// terms of `.[]?` navigation, so `path(recurse)` yields `[]` for the
+    /// root then descends — matching `[], ["a"], ["b"], ["b","c"]` for a
+    /// nested object. The native builtin short-circuits that derivation but
+    /// still reproduces its path stream in path mode.
     fn builtinRecurse(it: *ResultIterator) ZqError!?StackValue {
-        var all_values = std.ArrayList(Value){};
-        defer all_values.deinit(it.alloc);
+        const in_path_frame = it.path_stack.items.len > 0;
 
-        try it.collectRecurse(it.current, &all_values);
+        var all_items = std.ArrayList(Value){};
+        defer all_items.deinit(it.alloc);
 
-        if (all_values.items.len == 0) {
+        if (in_path_frame) {
+            var path_buf = std.ArrayList(Value){};
+            defer path_buf.deinit(it.alloc);
+            try it.collectRecursePaths(it.current, &path_buf, &all_items);
+        } else {
+            try it.collectRecurse(it.current, &all_items);
+        }
+
+        if (all_items.items.len == 0) {
             if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
             return null;
         }
 
+        if (in_path_frame) {
+            // See builtinPathsImpl — flag the frame so each-iteration path
+            // recording is skipped and path_end yields the current value.
+            it.path_stack.items[it.path_stack.items.len - 1].body_emits_paths_directly = true;
+        }
+
         // Build a container array of all collected values on runtime tape.
-        const arr = try it.buildRuntimeArray(all_values.items);
+        const arr = try it.buildRuntimeArray(all_items.items);
         it.current = try stackValueToValue(arr);
 
         // Set up fork-based iteration over the container.
-        if (!it.setupEachFromCurrent()) {
+        if (!(try it.setupEachFromCurrent())) {
             if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
         }
         return null;
+    }
+
+    /// DFS mirror of `collectRecurse` that emits the PATH to each visited
+    /// node (root first, then children, depth-first, in source order).
+    /// `path_buf` is the running path being built; each append/pop matches
+    /// a descent/ascent in the walk. Matches jq's `path(recurse)` stream.
+    fn collectRecursePaths(
+        it: *ResultIterator,
+        val: Value,
+        path_buf: *std.ArrayList(Value),
+        all_paths: *std.ArrayList(Value),
+    ) ZqError!void {
+        // Emit the current path (root is empty — matches jq's `path(..)`).
+        const path_arr = try it.buildPathArray(path_buf.items);
+        try all_paths.append(it.alloc, path_arr);
+
+        switch (val) {
+            .array => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var i: i64 = 0;
+                while (pos < end) : (i += 1) {
+                    const child_val = tapeEntryToValue(span.tape, pos);
+                    try path_buf.append(it.alloc, .{ .int = i });
+                    try it.collectRecursePaths(child_val, path_buf, all_paths);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos);
+                }
+            },
+            .object => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    try path_buf.append(it.alloc, .{ .string = k });
+                    try it.collectRecursePaths(child_val, path_buf, all_paths);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+            },
+            else => {}, // leaf — no descent
+        }
     }
 
     /// Recursively collect the value itself and all sub-values via DFS.
@@ -6359,12 +6619,14 @@ pub const ResultIterator = struct {
     /// Set up fork-based iteration over it.current (must be array/object).
     /// Used by builtins (paths, recurse) that build a container and iterate.
     /// Returns false if container is empty (caller should backtrack or set ip past end).
-    fn setupEachFromCurrent(it: *ResultIterator) bool {
+    fn setupEachFromCurrent(it: *ResultIterator) error{OutOfMemory}!bool {
         switch (it.current) {
             .array => |span| {
                 const first = span.start + 1;
                 const end = span.end - 1;
                 if (first >= end) return false;
+                const saved_stack = try it.snapshotValueStackForFork();
+                const saved_object = try it.snapshotObjectConstructState();
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
@@ -6376,6 +6638,8 @@ pub const ResultIterator = struct {
                         .tape = span.tape,
                     } },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = saved_stack,
+                    .saved_object = saved_object,
                 });
                 it.current = tapeEntryToValue(span.tape, first);
                 it.ip += 1;
@@ -6385,6 +6649,8 @@ pub const ResultIterator = struct {
                 const first_key = span.start + 1;
                 const end = span.end - 1;
                 if (first_key >= end) return false;
+                const saved_stack = try it.snapshotValueStackForFork();
+                const saved_object = try it.snapshotObjectConstructState();
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
@@ -6396,6 +6662,8 @@ pub const ResultIterator = struct {
                         .tape = span.tape,
                     } },
                     .saved_path = it.snapshotPathState(),
+                    .saved_stack = saved_stack,
+                    .saved_object = saved_object,
                 });
                 it.current = tapeEntryToValue(span.tape, first_key + 1);
                 it.ip += 1;
@@ -6424,15 +6692,20 @@ pub const ResultIterator = struct {
             tapeEntryToValue(st.tape, next_pos);
         // Record path component for the new iteration. The fork's saved_path
         // restoration in backtrackToDepth will have already truncated the
-        // previous iteration's component, so we append fresh here.
+        // previous iteration's component, so we append fresh here. Skipped
+        // when the enclosing path frame is a path-emitting builtin — the
+        // container being iterated is a list of pre-built path arrays, not
+        // a user value being descended into.
         if (it.path_stack.items.len > 0) {
             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-            if (st.is_object) {
-                const key_entry = st.tape.entries[next_pos];
-                const key = st.tape.getString(key_entry.payload.string);
-                frame.components.append(it.alloc, .{ .string = key }) catch return false;
-            } else {
-                frame.components.append(it.alloc, .{ .int = @intCast(st.index) }) catch return false;
+            if (!frame.body_emits_paths_directly) {
+                if (st.is_object) {
+                    const key_entry = st.tape.entries[next_pos];
+                    const key = st.tape.getString(key_entry.payload.string);
+                    frame.components.append(it.alloc, .{ .string = key }) catch return false;
+                } else {
+                    frame.components.append(it.alloc, .{ .int = @intCast(st.index) }) catch return false;
+                }
             }
         }
         return true;
@@ -6475,22 +6748,21 @@ pub const ResultIterator = struct {
             switch (fp.aux) {
                 .normal => {
                     // If we captured a stack snapshot (fork nested in a
-                    // collect), restore the values that yield_output may have
-                    // truncated. Otherwise just restore the length.
+                    // collect or object literal), restore the value slots
+                    // that intervening ops may have overwritten. Otherwise
+                    // just restore the length.
                     if (fp.saved_stack) |snap| {
-                        const outer: usize = if (it.collect_stack.items.len > 0)
-                            it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
-                        else
-                            0;
-                        it.value_stack.items.len = outer;
-                        it.value_stack.appendSliceAssumeCapacity(snap);
-                        it.alloc.free(snap);
+                        it.restoreValueStackFromSnapshot(snap);
                     } else {
                         it.value_stack.items.len = fp.saved_value_stack_len;
                     }
                     it.current = fp.saved_current;
                     it.ip = fp.backtrack_ip;
                     const saved_path = fp.saved_path;
+                    // Restore object-construct stacks from fork-time snapshot
+                    // so the next comma branch's field-value expression sees
+                    // the same `{...}` context as the first branch (BUG-006).
+                    if (fp.saved_object) |snap| it.restoreObjectConstructState(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                     return true;
@@ -6501,34 +6773,81 @@ pub const ResultIterator = struct {
                     // be wiped out if we restored after.
                     it.restorePathState(fp.saved_path);
                     if (it.advanceEachForkpoint(fp)) {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        // Restore object-construct stacks FIRST so the
+                        // value-stack re-snapshot below sees the correct
+                        // "inside-object" flag (snapshotValueStackForFork
+                        // skips when neither a collect frame nor an object
+                        // literal is active at call time — the re-snapshot
+                        // would lose the fork-time values otherwise).
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        // Restore value stack (from snapshot if captured;
+                        // otherwise just truncate to saved length). Then
+                        // re-snapshot so the next advance still has a valid
+                        // snapshot — the value-stack slots may be clobbered
+                        // again by this iteration's execution.
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
                         it.ip = fp.backtrack_ip + 1; // resume AFTER the each instruction
                         return true;
                     }
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .range => {
                     it.restorePathState(fp.saved_path);
                     if (it.advanceRangeForkpoint(fp)) {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .try_handler => {
                     // Normal exhaustion — just pop, continue backtracking.
                     const saved_path = fp.saved_path;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                 },
                 .alt_handler => |state| {
                     // Left side exhausted (all falsy or no outputs) — fire right side.
-                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    // Restore value-stack from snapshot (if captured) so the
+                    // right-side expression starts with the same stack the
+                    // left side began with.
+                    if (fp.saved_stack) |snap| {
+                        it.restoreValueStackFromSnapshot(snap);
+                    } else {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                    }
                     it.current = fp.saved_current;
                     it.if_stack.items.len = state.saved_if_len;
                     while (it.collect_stack.items.len > state.saved_collect_len) {
@@ -6538,6 +6857,7 @@ pub const ResultIterator = struct {
                     it.call_stack.items.len = state.saved_call_len;
                     it.ip = fp.backtrack_ip; // right side IP
                     const saved_path = fp.saved_path;
+                    if (fp.saved_object) |snap| it.restoreObjectConstructState(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                     return true;
@@ -6545,6 +6865,7 @@ pub const ResultIterator = struct {
                 .label, .limit, .skip => {
                     // Label/limit/skip scope completed — just pop.
                     const saved_path = fp.saved_path;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                 },
@@ -6555,18 +6876,33 @@ pub const ResultIterator = struct {
                         var frame = it.path_stack.pop().?;
                         frame.deinit(it.alloc);
                     }
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .scan => {
                     // Mirror range: advance via iterNext; if exhausted, pop.
                     it.restorePathState(fp.saved_path);
                     if (try it.advanceScanForkpoint(fp)) {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -6574,12 +6910,26 @@ pub const ResultIterator = struct {
                 .match_g => {
                     it.restorePathState(fp.saved_path);
                     if (try it.advanceMatchGForkpoint(fp)) {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -6587,12 +6937,26 @@ pub const ResultIterator = struct {
                 .splits => {
                     it.restorePathState(fp.saved_path);
                     if (try it.advanceSplitsForkpoint(fp)) {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -7658,17 +8022,37 @@ pub const ResultIterator = struct {
     }
 
     /// `test(regex)`: bool — does the input match?
+    ///
+    /// With jq's `n` flag, zero-width matches do not count: we fall through
+    /// to the captures path and report `true` only when some non-empty match
+    /// exists in the input.
     fn builtinTest(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
-        const matched = clone.isMatch(input) catch |e| return it.mapRegexError(e);
-        return .{ .bool_val = matched };
+        const n_flag = types.regexBuiltinNFlagOf(operand);
+        if (!n_flag) {
+            const matched = clone.isMatch(input) catch |e| return it.mapRegexError(e);
+            return .{ .bool_val = matched };
+        }
+        // n-flag path: iterate until we find a non-empty match or exhaust.
+        // One slot pair is enough — we only care about slots[0].
+        var slot_buf: [1]regex_mod.MatchSlot = undefined;
+        var cursor: usize = 0;
+        while (true) {
+            const got = clone.iterNext(input, &cursor, slot_buf[0..1]) catch |e| return it.mapRegexError(e);
+            if (!got) return .{ .bool_val = false };
+            if (slot_buf[0].end > slot_buf[0].start) return .{ .bool_val = true };
+        }
     }
 
     /// `match(regex)`: full match-object (or raise TypeError if no match).
+    ///
+    /// With jq's `n` flag, zero-width matches are skipped — the first match
+    /// returned is the first non-empty one; if only zero-width matches exist
+    /// the call surfaces a no-match TypeError.
     fn builtinMatch(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
@@ -7680,9 +8064,21 @@ pub const ResultIterator = struct {
         const n_slots = regex.captureCount();
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         defer it.alloc.free(slots_buf);
-        const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
-        if (!matched) return error.TypeError;
-        return try it.buildMatchObject(regex, input, slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
+        if (!n_flag) {
+            const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
+            if (!matched) return error.TypeError;
+            return try it.buildMatchObject(regex, input, slots_buf);
+        }
+        // n-flag path: iterate until a non-empty overall match lands.
+        var cursor: usize = 0;
+        while (true) {
+            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            if (!got) return error.TypeError;
+            if (slots_buf[0].end > slots_buf[0].start) {
+                return try it.buildMatchObject(regex, input, slots_buf);
+            }
+        }
     }
 
     /// Resolve the shared compiled `Regex` (for metadata like captureCount and
@@ -7699,6 +8095,9 @@ pub const ResultIterator = struct {
     }
 
     /// `capture(regex)`: jq — object of NAMED groups only. Raises on no match.
+    ///
+    /// With jq's `n` flag, zero-width overall matches are skipped — see
+    /// `builtinMatch`'s doc comment for the precise semantics.
     fn builtinCapture(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
@@ -7710,9 +8109,20 @@ pub const ResultIterator = struct {
         const n_slots = regex.captureCount();
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         defer it.alloc.free(slots_buf);
-        const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
-        if (!matched) return error.TypeError;
-        return try it.buildCaptureObject(regex, input, slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
+        if (!n_flag) {
+            const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
+            if (!matched) return error.TypeError;
+            return try it.buildCaptureObject(regex, input, slots_buf);
+        }
+        var cursor: usize = 0;
+        while (true) {
+            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            if (!got) return error.TypeError;
+            if (slots_buf[0].end > slots_buf[0].start) {
+                return try it.buildCaptureObject(regex, input, slots_buf);
+            }
+        }
     }
 
     /// `sub(pattern; replacement)`: first-match replacement. Replacement
@@ -7746,6 +8156,7 @@ pub const ResultIterator = struct {
         const n_slots = regex.captureCount();
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         defer it.alloc.free(slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
 
         var out = std.ArrayList(u8){};
         defer out.deinit(it.alloc);
@@ -7758,6 +8169,11 @@ pub const ResultIterator = struct {
             if (!got) break;
             const m_start = slots_buf[0].start;
             const m_end = slots_buf[0].end;
+            // jq `n` flag: zero-width matches are no-ops (no replacement at
+            // that position). iterNext has already advanced the cursor past
+            // the empty match so the loop makes forward progress. Non-global
+            // sub with `n` keeps iterating until a non-empty match lands.
+            if (n_flag and m_end == m_start) continue;
             if (m_start > prev_end) try out.appendSlice(it.alloc, input[prev_end..m_start]);
             try expandReplacement(it.alloc, &out, regex, input, slots_buf, repl);
             prev_end = m_end;
@@ -7789,10 +8205,21 @@ pub const ResultIterator = struct {
         const has_user_captures = n_slots > 1;
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         errdefer it.alloc.free(slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
-        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-            it.alloc.free(slots_buf);
-            return it.mapRegexError(e);
+        // Draw matches until we find one the caller wants to see. With the
+        // jq `n` flag that skips zero-width matches; without it we take the
+        // first match as-is. iterNext advances past empty matches by +1 so
+        // the loop always terminates.
+        const got = blk: {
+            while (true) {
+                const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+                    it.alloc.free(slots_buf);
+                    return it.mapRegexError(e);
+                };
+                if (!ok) break :blk false;
+                if (!n_flag or slots_buf[0].end > slots_buf[0].start) break :blk true;
+            }
         };
         if (!got) {
             it.alloc.free(slots_buf);
@@ -7813,8 +8240,11 @@ pub const ResultIterator = struct {
                 .cursor = cursor,
                 .slots = slots_buf,
                 .has_user_captures = has_user_captures,
+                .n_flag = n_flag,
             } },
             .saved_path = it.snapshotPathState(),
+            .saved_stack = try it.snapshotValueStackForFork(),
+            .saved_object = try it.snapshotObjectConstructState(),
         });
         handles_transferred = true;
 
@@ -7835,11 +8265,15 @@ pub const ResultIterator = struct {
     /// exhausted (caller will pop the frame).
     fn advanceScanForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
         var st = &fp.aux.scan;
-        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
-        if (!got) return false;
-        const yield_sv = try it.buildScanYield(st.slots, st.hay, st.has_user_captures);
-        it.current = try stackValueToValue(yield_sv);
-        return true;
+        while (true) {
+            const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+            if (!got) return false;
+            // jq `n`: skip zero-width overall matches on every advance.
+            if (st.n_flag and st.slots[0].end == st.slots[0].start) continue;
+            const yield_sv = try it.buildScanYield(st.slots, st.hay, st.has_user_captures);
+            it.current = try stackValueToValue(yield_sv);
+            return true;
+        }
     }
 
     /// `match(pattern; "g")`: generator — one match object per non-overlapping
@@ -7860,10 +8294,17 @@ pub const ResultIterator = struct {
         const n_slots = handles.regexPtr().captureCount();
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         errdefer it.alloc.free(slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
-        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-            it.alloc.free(slots_buf);
-            return it.mapRegexError(e);
+        const got = blk: {
+            while (true) {
+                const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+                    it.alloc.free(slots_buf);
+                    return it.mapRegexError(e);
+                };
+                if (!ok) break :blk false;
+                if (!n_flag or slots_buf[0].end > slots_buf[0].start) break :blk true;
+            }
         };
         if (!got) {
             it.alloc.free(slots_buf);
@@ -7883,8 +8324,11 @@ pub const ResultIterator = struct {
                 .hay = input,
                 .cursor = cursor,
                 .slots = slots_buf,
+                .n_flag = n_flag,
             } },
             .saved_path = it.snapshotPathState(),
+            .saved_stack = try it.snapshotValueStackForFork(),
+            .saved_object = try it.snapshotObjectConstructState(),
         });
         handles_transferred = true;
 
@@ -7900,11 +8344,14 @@ pub const ResultIterator = struct {
 
     fn advanceMatchGForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
         var st = &fp.aux.match_g;
-        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
-        if (!got) return false;
-        const yield_sv = try it.buildMatchObject(st.regex, st.hay, st.slots);
-        it.current = try stackValueToValue(yield_sv);
-        return true;
+        while (true) {
+            const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+            if (!got) return false;
+            if (st.n_flag and st.slots[0].end == st.slots[0].start) continue;
+            const yield_sv = try it.buildMatchObject(st.regex, st.hay, st.slots);
+            it.current = try stackValueToValue(yield_sv);
+            return true;
+        }
     }
 
     /// `splits(pattern; flags)`: generator — yields the input split into
@@ -7924,10 +8371,17 @@ pub const ResultIterator = struct {
         const n_slots = handles.regexPtr().captureCount();
         const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
         errdefer it.alloc.free(slots_buf);
+        const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
-        const got = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-            it.alloc.free(slots_buf);
-            return it.mapRegexError(e);
+        const got = blk: {
+            while (true) {
+                const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
+                    it.alloc.free(slots_buf);
+                    return it.mapRegexError(e);
+                };
+                if (!ok) break :blk false;
+                if (!n_flag or slots_buf[0].end > slots_buf[0].start) break :blk true;
+            }
         };
 
         const resume_ip = it.ip + 1;
@@ -7949,6 +8403,8 @@ pub const ResultIterator = struct {
                 .backtrack_ip = @intCast(it.instructions.len),
                 .aux = .{ .normal = {} },
                 .saved_path = it.snapshotPathState(),
+                .saved_stack = try it.snapshotValueStackForFork(),
+                .saved_object = try it.snapshotObjectConstructState(),
             });
             it.current = try stackValueToValue(whole_sv);
             it.ip = resume_ip;
@@ -7976,8 +8432,11 @@ pub const ResultIterator = struct {
                 .prev_end = prev_end,
                 .slots = slots_buf,
                 .tail_yielded = false,
+                .n_flag = n_flag,
             } },
             .saved_path = it.snapshotPathState(),
+            .saved_stack = try it.snapshotValueStackForFork(),
+            .saved_object = try it.snapshotObjectConstructState(),
         });
         handles_transferred = true;
 
@@ -7992,7 +8451,16 @@ pub const ResultIterator = struct {
     fn advanceSplitsForkpoint(it: *ResultIterator, fp: *Forkpoint) ZqError!bool {
         var st = &fp.aux.splits;
         if (st.tail_yielded) return false;
-        const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+        // Draw the next *emittable* match. With the jq `n` flag active,
+        // zero-width matches don't split — skip them (cursor advances past
+        // each via iterNext's internal +1 bump, guaranteeing progress).
+        const got = blk: {
+            while (true) {
+                const ok = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
+                if (!ok) break :blk false;
+                if (!st.n_flag or st.slots[0].end > st.slots[0].start) break :blk true;
+            }
+        };
         if (!got) {
             // Yield final tail segment [prev_end, input.len), then terminate.
             const bytes = st.hay[st.prev_end..st.hay.len];

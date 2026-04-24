@@ -206,6 +206,67 @@ test "parse object construct" {
     }
 }
 
+// BUG-005 defect 1: pipe inside object-field value was rejected by both
+// parsers because `parseObjectField` dispatched to `parseAlternative` (which
+// only handles `//`), never to `parsePipe`. Mirrors jq's grammar where the
+// value slot accepts pipe but `,` remains the field separator.
+test "parse object construct: pipe in field value" {
+    var result = parse("{a: 1 | length}");
+    defer result.deinit();
+    try testing.expect(!result.hasErrors());
+    switch (result.root.kind) {
+        .object_construct => |oc| {
+            try testing.expectEqual(@as(usize, 1), oc.fields.len);
+            try testing.expect(oc.fields[0].value.kind == .pipe);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse object construct: pipe in field value followed by second field" {
+    var result = parse("{a: .x | length, b: 2}");
+    defer result.deinit();
+    try testing.expect(!result.hasErrors());
+    switch (result.root.kind) {
+        .object_construct => |oc| {
+            try testing.expectEqual(@as(usize, 2), oc.fields.len);
+            try testing.expect(oc.fields[0].value.kind == .pipe);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse object construct: comma still separates fields (not a generator)" {
+    var result = parse("{a: 1, b: 2}");
+    defer result.deinit();
+    try testing.expect(!result.hasErrors());
+    switch (result.root.kind) {
+        .object_construct => |oc| {
+            try testing.expectEqual(@as(usize, 2), oc.fields.len);
+            // Neither value folds `,` into a comma node.
+            try testing.expect(oc.fields[0].value.kind != .comma);
+            try testing.expect(oc.fields[1].value.kind != .comma);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse object construct: Nix mdbook anchors filter parses" {
+    // Reduced from the filter that broke `nixos-rebuild switch` (mdbook
+    // `anchors` preprocessor): `content: .Chapter.content | transformer,`
+    // was rejected with `query syntax error` before the fix.
+    var result = parse("{content: .Chapter.content | length}");
+    defer result.deinit();
+    try testing.expect(!result.hasErrors());
+    switch (result.root.kind) {
+        .object_construct => |oc| {
+            try testing.expectEqual(@as(usize, 1), oc.fields.len);
+            try testing.expect(oc.fields[0].value.kind == .pipe);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 // ── Variable reference ───────────────────────────────────────────────────
 
 test "parse variable ref" {

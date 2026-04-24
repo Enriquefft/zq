@@ -628,27 +628,45 @@ pub const BuiltinId = enum(u16) {
 // ─── Regex opcode payload packing ────────────────────────────────────────────
 //
 // Regex-taking builtins (`test_`, `match_`, `sub_`, `gsub_`, `capture_`,
-// `scan_`) piggy-back on `call_builtin`'s i64 operand. The low 16 bits carry
-// the `BuiltinId` (unchanged for every non-regex builtin); the next 32 bits
-// carry the filter-compile-time `RegexPool` index. Non-regex builtins and
-// dynamic-pattern regex calls leave the upper slot at the sentinel below.
+// `scan_`, `splits_`, `match_g_`) piggy-back on `call_builtin`'s i64 operand.
+// Bit layout (LSB→MSB):
+//   bits [ 0..16)  BuiltinId
+//   bits [16..48)  RegexPool index (or REGEX_POOL_DYNAMIC sentinel)
+//   bit  48        jq `n` flag — "ignore empty (zero-width) matches".
+//                  Parsed at compile time; threaded through to the handler.
+// Remaining high bits are reserved for future per-pattern flag bits.
 //
 // Single source of truth: compiler packs via `packRegexBuiltinOperand`, the
-// VM unpacks via `regexPoolIndexOf` / `builtinIdOf`. No other code inspects
-// the bit layout.
+// VM unpacks via `regexPoolIndexOf` / `builtinIdOf` / `regexBuiltinNFlagOf`.
+// No other code inspects the bit layout.
 
 /// Sentinel in the pool-index slot meaning "compile at runtime" — the pattern
 /// argument was not a string literal so no entry was interned at compile time.
 /// Phase D's VM wires this to the per-worker `LruCache`.
 pub const REGEX_POOL_DYNAMIC: u32 = std.math.maxInt(u32);
 
+/// Bit position of the jq `n` flag in the `call_builtin` operand.
+const REGEX_N_FLAG_BIT_POS: u6 = 48;
+const REGEX_N_FLAG_BIT: u64 = @as(u64, 1) << REGEX_N_FLAG_BIT_POS;
+
 /// Pack a `(BuiltinId, regex_pool_index)` pair into a `call_builtin` operand.
 /// Non-regex builtins should pass `REGEX_POOL_DYNAMIC` — it is harmless because
 /// they never inspect the upper bits.
 pub fn packRegexBuiltinOperand(bid: BuiltinId, regex_pool_index: u32) i64 {
+    return packRegexBuiltinOperandFlags(bid, regex_pool_index, false);
+}
+
+/// Variant of `packRegexBuiltinOperand` that also records the jq `n` flag in
+/// bit 48. Only meaningful for regex-taking builtins.
+pub fn packRegexBuiltinOperandFlags(
+    bid: BuiltinId,
+    regex_pool_index: u32,
+    n_flag: bool,
+) i64 {
     const low: u64 = @intFromEnum(bid);
     const high: u64 = @as(u64, regex_pool_index) << 16;
-    return @bitCast(low | high);
+    const n_bits: u64 = if (n_flag) REGEX_N_FLAG_BIT else 0;
+    return @bitCast(low | high | n_bits);
 }
 
 /// Extract the `BuiltinId` from any `call_builtin` operand. Safe for every
@@ -663,6 +681,13 @@ pub fn builtinIdOf(operand_index: i64) BuiltinId {
 pub fn regexPoolIndexOf(operand_index: i64) u32 {
     const bits: u64 = @bitCast(operand_index);
     return @truncate(bits >> 16);
+}
+
+/// Extract the jq `n` flag from a regex-builtin operand. Returns `false` for
+/// any non-regex builtin (they never set the bit).
+pub fn regexBuiltinNFlagOf(operand_index: i64) bool {
+    const bits: u64 = @bitCast(operand_index);
+    return (bits & REGEX_N_FLAG_BIT) != 0;
 }
 
 // ─── Slice Args ──────────────────────────────────────────────────────────────

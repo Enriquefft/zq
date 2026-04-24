@@ -2895,6 +2895,7 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "unique")) return .unique;
     if (std.mem.eql(u8, name, "paths")) return .paths;
     if (std.mem.eql(u8, name, "leaf_paths")) return .leaf_paths;
+    if (std.mem.eql(u8, name, "recurse")) return .recurse;
 
     // Math builtins (zero-arg)
     if (std.mem.eql(u8, name, "abs")) return .abs;
@@ -3238,11 +3239,11 @@ fn compileRegexBuiltin1FastLiteral(
     var pattern_buf = std.ArrayList(u8){};
     defer pattern_buf.deinit(ctx.alloc);
 
-    var has_g_flag: bool = false;
+    var flag_result: RegexFlagResult = .{ .has_g = false, .has_n = false };
     if (flags_tok) |ft| {
         const raw_flags = ft.slice(ctx.src);
         const flag_body = raw_flags[1 .. raw_flags.len - 1];
-        has_g_flag = try emitFlagPrefix(ctx, &pattern_buf, flag_body, str_tok.offset, str_tok.len);
+        flag_result = try emitFlagPrefix(ctx, &pattern_buf, flag_body, str_tok.offset, str_tok.len);
     }
     try decodeStringLiteralInto(&pattern_buf, ctx.alloc, body);
 
@@ -3267,9 +3268,21 @@ fn compileRegexBuiltin1FastLiteral(
     // jq-level surface stays `match(re; flags)`; the `g` flag is parsed here
     // at compile time and dispatches to a distinct VM opcode so there is one
     // opcode per distinct runtime behavior.
-    const effective_bid = if (bid == .match_ and has_g_flag) types.BuiltinId.match_g_ else bid;
-    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(effective_bid, pool_idx) });
+    const effective_bid = if (bid == .match_ and flag_result.has_g) types.BuiltinId.match_g_ else bid;
+    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperandFlags(effective_bid, pool_idx, flag_result.has_n) });
 }
+
+/// Parsed regex-flag string, split into the inline-flag prefix that we
+/// prepend to the pattern and the two opcode-level switches we hoist to
+/// bytecode operands.
+const RegexFlagResult = struct {
+    /// `g` — select the generator-mode match opcode in the caller.
+    has_g: bool,
+    /// `n` — "ignore empty matches". Threaded to the VM handler via the
+    /// `call_builtin` operand so every regex builtin can filter zero-width
+    /// matches per jq's semantics. See `types.regexBuiltinNFlagOf`.
+    has_n: bool,
+};
 
 /// Translate a jq flag string like "gi" into a `regex-automata` inline flag
 /// group `(?i)` that we prepend to the pattern. Flag semantics:
@@ -3281,29 +3294,24 @@ fn compileRegexBuiltin1FastLiteral(
 ///           value so `match(re;"g")` dispatches to the generator-mode
 ///           opcode at compile time. For scan/sub/gsub/capture/test it is
 ///           ignored (they already match globally or the flag is meaningless).
-///   - `n`  ignore empty matches — NOT SUPPORTED. jq's `n` changes every
-///           regex builtin (test/match/capture/scan/sub/gsub/splits) to
-///           treat zero-width matches as non-matches. Threading that
-///           through every opcode variant correctly is a separate design
-///           task; silently accepting `n` and producing jq-incompatible
-///           output is worse than rejecting it outright (CLAUDE.md §4,
-///           zero workarounds). Rejected at compile time with a diagnostic.
+///   - `n`  ignore empty matches — surfaced via `RegexFlagResult.has_n`. The
+///           caller packs this into the `call_builtin` operand bit; the VM
+///           handler filters zero-width overall matches per jq (`test`,
+///           `match`, `capture`, `scan`, `sub`, `gsub`, `splits`).
 ///   - `p`  perl-mode — unsupported; compile error.
 ///   - `l`  find-longest — unsupported; compile error.
 /// Unknown letters → compile error.
-///
-/// Returns `true` iff the flag string contained `g`.
 fn emitFlagPrefix(
     ctx: *Ctx,
     out: *std.ArrayList(u8),
     flag_body: []const u8,
     pat_offset: u32,
     pat_len: u32,
-) (ZqError || error{OutOfMemory})!bool {
+) (ZqError || error{OutOfMemory})!RegexFlagResult {
     var has_inline: bool = false;
     var inline_buf: [8]u8 = undefined;
     var inline_len: usize = 0;
-    var has_g: bool = false;
+    var result: RegexFlagResult = .{ .has_g = false, .has_n = false };
 
     for (flag_body) |ch| {
         switch (ch) {
@@ -3313,12 +3321,15 @@ fn emitFlagPrefix(
                 has_inline = true;
             },
             'g' => {
-                has_g = true;
+                result.has_g = true;
+            },
+            'n' => {
+                result.has_n = true;
             },
             else => {
-                // `n`, `p`, `l`, and everything else: reject. `n` in
-                // particular was previously accepted-but-ignored — that
-                // footgun is now closed. See doc comment above.
+                // `p`, `l`, and everything else: reject. Unknown letters
+                // are a compile error — silently accepting them would be a
+                // jq-incompatibility footgun (CLAUDE.md §4, zero workarounds).
                 ctx.last_regex_pattern_offset = pat_offset;
                 ctx.last_regex_pattern_len = pat_len;
                 return error.RegexCompileError;
@@ -3331,7 +3342,7 @@ fn emitFlagPrefix(
         try out.appendSlice(ctx.alloc, inline_buf[0..inline_len]);
         try out.append(ctx.alloc, ')');
     }
-    return has_g;
+    return result;
 }
 
 /// Slow/dynamic path for regex builtins. Delegates to the general
@@ -3954,7 +3965,7 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
 
     var final_key = std.ArrayList(u8){};
     defer final_key.deinit(ctx.alloc);
-    const has_g_flag = try emitFlagPrefix(ctx, &final_key, flags_body, pat_tok.offset, pat_tok.len);
+    const flag_result = try emitFlagPrefix(ctx, &final_key, flags_body, pat_tok.offset, pat_tok.len);
     try final_key.appendSlice(ctx.alloc, pending_pattern.items);
 
     ctx.last_regex_pattern_offset = pat_tok.offset;
@@ -3971,10 +3982,10 @@ fn compileRegexBuiltin2(ctx: *Ctx, bid: types.BuiltinId) (ZqError || error{OutOf
     // to the global-mode opcode at compile time. `gsub` with `g` is a no-op
     // (already global). Single source of truth: one opcode per distinct
     // runtime behavior; no runtime flag peek on the stack.
-    const effective_bid = if (bid == .sub_ and has_g_flag) types.BuiltinId.gsub_ else bid;
+    const effective_bid = if (bid == .sub_ and flag_result.has_g) types.BuiltinId.gsub_ else bid;
 
     try ctx.emit(.restore_input, .{ .none = {} });
-    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperand(effective_bid, regex_pool_idx) });
+    try ctx.emit(.call_builtin, .{ .index = types.packRegexBuiltinOperandFlags(effective_bid, regex_pool_idx, flag_result.has_n) });
 }
 
 /// Compile a three-arg math builtin: `fma(x;y;z)`.
@@ -6785,6 +6796,33 @@ fn parseFunctionDef(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try parseFilter(ctx);
 }
 
+/// Parse an object-field value. jq's grammar accepts `|` inside the value but
+/// treats `,` as the field separator — not a generator. Mirrors
+/// `parsePipe` but bases on `parseCommaOperand` (which in turn calls
+/// `parseAlternative`) so `,` is left for the outer `parseObjectLiteral` loop.
+/// Update assignments (`=`, `|=`, ...) remain supported via `parseCommaOperand`.
+fn parseObjectFieldValue(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
+    try parseCommaOperand(ctx);
+    while (true) {
+        const t = try ctx.lex.peek();
+        if (t.tag != .pipe) break;
+        _ = try ctx.nextToken();
+
+        // If the right side starts with `def`, delegate to parseFilter which
+        // handles function definitions. This supports `expr | def f: body; cont`.
+        const after_pipe = try ctx.lex.peek();
+        if (after_pipe.tag == .def_kw) {
+            try ctx.emit(.pipe, .{ .none = {} });
+            _ = try ctx.nextToken(); // consume 'def'
+            try parseFunctionDef(ctx);
+            break;
+        }
+
+        try ctx.emit(.pipe, .{ .none = {} });
+        try parseCommaOperand(ctx);
+    }
+}
+
 /// Parse an object literal: {key1: value1, key2: value2, ...}
 fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
     try ctx.emit(.object_construct_start, .{ .none = {} });
@@ -6815,7 +6853,7 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
                     try ctx.emit(.load_variable, .{ .index = var_id_k });
                 }
                 _ = try ctx.nextToken(); // consume ':'
-                try parseAlternative(ctx);
+                try parseObjectFieldValue(ctx);
             } else {
                 // {$x} shorthand — key is "x", value is $x
                 const key_ref = try internStr(&ctx.intern, ctx.alloc, var_name);
@@ -6838,7 +6876,7 @@ fn parseObjectLiteral(ctx: *Ctx) (ZqError || error{OutOfMemory})!void {
             const after_key = try ctx.lex.peek();
             if (after_key.tag == .colon) {
                 _ = try ctx.nextToken();
-                try parseAlternative(ctx);
+                try parseObjectFieldValue(ctx);
             } else if (key_ref) |ref| {
                 // Literal shorthand: {a} is equivalent to {a: .a}
                 try ctx.emit(.load_key, .{ .str_ref = ref });

@@ -60,12 +60,79 @@ fn expectCompileError(src: []const u8) !void {
     }
 }
 
-fn collectAll(q: *const CompiledQuery, t: Tape) ![]Value {
-    var it = try q.execute(t, &.{}, alloc);
-    defer it.deinit();
+/// Caller-owned bundle of Values returned from the test iterator.
+///
+/// Every string/object/array in `items` is backed by `tape` — a heap-allocated
+/// RuntimeTape that is materialized BEFORE the source iterator is deinited.
+/// That keeps the Values valid for the duration of the test, decoupling them
+/// from the VM's transient `runtime_tape` (whose `string_buf` would otherwise
+/// be freed alongside the iterator). See BUG-004 in bugs.md.
+const OwnedValues = struct {
+    items: []Value,
+    tape: *types.RuntimeTape,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *OwnedValues) void {
+        self.tape.deinit(self.allocator);
+        self.allocator.destroy(self.tape);
+        self.allocator.free(self.items);
+    }
+};
+
+/// Deep-copy `v` into `owned`, rewriting every string slice and TapeSpan
+/// so they reference `owned` (not the source iterator's tape). Primitive
+/// Values (null/bool/int/float) pass through unchanged.
+fn materializeValue(v: Value, owned: *types.RuntimeTape, allocator: std.mem.Allocator) !Value {
+    return switch (v) {
+        .null_val, .bool_val, .int, .float => v,
+        .string => |s| blk: {
+            const ref = try owned.internString(allocator, s);
+            // Resolve against the *owned* view so the returned slice points
+            // into `owned.string_buf` — stable for the lifetime of OwnedValues.
+            break :blk .{ .string = owned.view.string_buf[ref.offset..][0..ref.len] };
+        },
+        .array, .object => |span| blk: {
+            const base: u32 = @intCast(owned.entries.items.len);
+            try owned.copySpan(span.tape.*, span.start, span.end, allocator);
+            const new_end: u32 = @intCast(owned.entries.items.len);
+            const tape_span: Value.TapeSpan = .{
+                .tape = &owned.view,
+                .start = base,
+                .end = new_end,
+            };
+            break :blk if (v == .array)
+                .{ .array = tape_span }
+            else
+                .{ .object = tape_span };
+        },
+    };
+}
+
+fn collectAll(q: *const CompiledQuery, t: Tape) !OwnedValues {
+    // Heap-allocate the RuntimeTape so its `view` has a stable address — Values
+    // returned to the caller embed `&owned_tape.view` inside their TapeSpans.
+    const owned_tape = try alloc.create(types.RuntimeTape);
+    errdefer alloc.destroy(owned_tape);
+    owned_tape.* = try types.RuntimeTape.init(alloc);
+    errdefer owned_tape.deinit(alloc);
+
     var out = std.ArrayList(Value){};
-    while (try it.next()) |v| try out.append(alloc, v);
-    return out.toOwnedSlice(alloc);
+    errdefer out.deinit(alloc);
+
+    {
+        var it = try q.execute(t, &.{}, alloc);
+        defer it.deinit();
+        while (try it.next()) |v| {
+            const owned_v = try materializeValue(v, owned_tape, alloc);
+            try out.append(alloc, owned_v);
+        }
+    }
+
+    return .{
+        .items = try out.toOwnedSlice(alloc),
+        .tape = owned_tape,
+        .allocator = alloc,
+    };
 }
 
 // ── Identity ─────────────────────────────────────────────────────────────────
@@ -77,11 +144,11 @@ test "identity: . returns root integer" {
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 42 } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 42), vals.items[0].int);
 }
 
 test "identity: . returns root null" {
@@ -91,11 +158,11 @@ test "identity: . returns root null" {
     const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 // ── Key access ────────────────────────────────────────────────────────────────
@@ -119,11 +186,11 @@ test ".foo: returns value for present key" {
     var q = try compile(".foo");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
 }
 
 test ".foo: missing key returns null (jq-compatible)" {
@@ -140,10 +207,10 @@ test ".foo: missing key returns null (jq-compatible)" {
     var q = try compile(".foo"); // key "foo" absent
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 test ".foo: missing key returns null with allow_null_propagation" {
@@ -160,11 +227,11 @@ test ".foo: missing key returns null with allow_null_propagation" {
     var q = try compileNull(".foo");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 test ".foo: TypeError on non-object (array)" {
@@ -216,10 +283,10 @@ test ".a.b: returns nested value" {
     defer q2.deinit();
 
     for ([_]*const CompiledQuery{ &q1, &q2 }) |q| {
-        const vals = try collectAll(q, t);
-        defer alloc.free(vals);
-        try std.testing.expectEqual(@as(usize, 1), vals.len);
-        try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+        var vals = try collectAll(q, t);
+        defer vals.deinit();
+        try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+        try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
     }
 }
 
@@ -239,11 +306,11 @@ test ".[1]: returns element at index" {
     var q = try compile(".[1]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 20), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 20), vals.items[0].int);
 }
 
 test ".[0]: returns first element" {
@@ -257,11 +324,11 @@ test ".[0]: returns first element" {
     var q = try compile(".[0]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 5), vals.items[0].int);
 }
 
 test ".[5]: out of bounds read returns null" {
@@ -275,11 +342,11 @@ test ".[5]: out of bounds read returns null" {
     var q = try compile(".[5]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(Value.null_val, vals[0]);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(Value.null_val, vals.items[0]);
 }
 
 // ── Iterate ───────────────────────────────────────────────────────────────────
@@ -298,13 +365,13 @@ test ".[] on array: yields all elements" {
     var q = try compile(".[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
-    try std.testing.expectEqual(@as(i64, 3), vals[2].int);
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[2].int);
 }
 
 test ".[] on empty array: yields nothing" {
@@ -317,10 +384,10 @@ test ".[] on empty array: yields nothing" {
     var q = try compile(".[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test ".[] on object: yields values only" {
@@ -339,12 +406,12 @@ test ".[] on object: yields values only" {
     var q = try compile(".[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
 }
 
 test ".[] on non-array: TypeError" {
@@ -405,12 +472,12 @@ test ".[] | .name: yields name field from each element" {
     var q = try compile(".[] | .name");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqualStrings("a", vals[0].string);
-    try std.testing.expectEqualStrings("b", vals[1].string);
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqualStrings("a", vals.items[0].string);
+    try std.testing.expectEqualStrings("b", vals.items[1].string);
 }
 
 // ── Nested iterate ────────────────────────────────────────────────────────────
@@ -442,13 +509,13 @@ test ".[] | .[]: flattens nested arrays" {
     var q = try compile(".[] | .[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
-    try std.testing.expectEqual(@as(i64, 3), vals[2].int);
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[2].int);
 }
 
 test ".[] | .[]: empty inner array produces no output for that element" {
@@ -467,11 +534,11 @@ test ".[] | .[]: empty inner array produces no output for that element" {
     var q = try compile(".[] | .[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
 }
 
 // ── allow_null_propagation ────────────────────────────────────────────────────
@@ -491,20 +558,20 @@ test ".a.b: null propagation through null intermediate value" {
     {
         var q = try compile(".a | .b");
         defer q.deinit();
-        const vals = try collectAll(&q, t);
-        defer alloc.free(vals);
-        try std.testing.expectEqual(@as(usize, 1), vals.len);
-        try std.testing.expect(vals[0] == .null_val);
+        var vals = try collectAll(&q, t);
+        defer vals.deinit();
+        try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+        try std.testing.expect(vals.items[0] == .null_val);
     }
 
     // allow_null_propagation: null propagates silently.
     {
         var q = try compileNull(".a | .b");
         defer q.deinit();
-        const vals = try collectAll(&q, t);
-        defer alloc.free(vals);
-        try std.testing.expectEqual(@as(usize, 1), vals.len);
-        try std.testing.expect(vals[0] == .null_val);
+        var vals = try collectAll(&q, t);
+        defer vals.deinit();
+        try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+        try std.testing.expect(vals.items[0] == .null_val);
     }
 }
 
@@ -516,10 +583,10 @@ test "key on integer returns null (jq-compatible)" {
     // jq-compatible: .foo on integer returns null.
     var q = try compileNull(".foo");
     defer q.deinit();
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 // ── Syntax errors ─────────────────────────────────────────────────────────────
@@ -549,6 +616,282 @@ test "compile: . is valid" {
     // Simply verify it compiled without error. Execution tested in identity tests.
 }
 
+// ── BUG-005 defect 1: pipe in object-field value ──────────────────────────────
+//
+// Both parsers (AST and compile-path) routed object-field VALUE through
+// `parseAlternative` — which handles `//` only. Any `|` inside `{k: v}`
+// produced `query syntax error`. In jq, the field VALUE is parsed at the pipe
+// level, with `,` reserved as the field separator (not a generator).
+
+test "BUG-005: compile accepts pipe in object-field value" {
+    var q = try compile("{a: 1 | length}");
+    defer q.deinit();
+}
+
+test "BUG-005: compile accepts pipe in field value followed by second field" {
+    var q = try compile("{a: .x | length, b: 2}");
+    defer q.deinit();
+}
+
+test "BUG-005: comma still separates fields — {a: 1, b: 2}" {
+    var q = try compile("{a: 1, b: 2}");
+    defer q.deinit();
+}
+
+test "BUG-005: Nix mdbook-anchors filter compiles (parses without syntax error)" {
+    // Reduced from `content: .Chapter.content | transformer,` — the filter
+    // that broke `nixos-rebuild switch` when zq overlayed jq.
+    var q = try compile("{content: .Chapter.content | length}");
+    defer q.deinit();
+}
+
+test "BUG-005 execute: {a: 1 | length} on {} yields {\"a\": 1}" {
+    // jq: 1 | length == 1. Verifies the pipe is parsed AND executed inside
+    // the object-field frame, not only parsed.
+    var q = try compile("{a: 1 | length}");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .object);
+    const span = vals.items[0].object;
+    const rt = span.tape;
+    try std.testing.expectEqual(Tag.object_start, rt.entries[span.start].tag);
+    try std.testing.expectEqualStrings("a", rt.getString(rt.entries[span.start + 1].payload.string));
+    try std.testing.expectEqual(@as(i64, 1), rt.entries[span.start + 2].payload.int);
+}
+
+test "BUG-005 execute: {a: .x | length, b: 2} on {\"x\":\"hi\"} yields {\"a\":2,\"b\":2}" {
+    var q = try compile("{a: .x | length, b: 2}");
+    defer q.deinit();
+    const sb = "xhi";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "x"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 1, .len = 2 } } }, // "hi"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .object);
+    const span = vals.items[0].object;
+    const rt = span.tape;
+    // Result: {"a":2, "b":2}
+    try std.testing.expectEqualStrings("a", rt.getString(rt.entries[span.start + 1].payload.string));
+    try std.testing.expectEqual(@as(i64, 2), rt.entries[span.start + 2].payload.int);
+    try std.testing.expectEqualStrings("b", rt.getString(rt.entries[span.start + 3].payload.string));
+    try std.testing.expectEqual(@as(i64, 2), rt.entries[span.start + 4].payload.int);
+}
+
+test "BUG-005 does not regress BUG-006: {a: (1,2,3)} still compiles" {
+    // BUG-005 regression guard: the parser accepts `(1,2,3)` in object-value
+    // position without a SYNTAX error. Runtime semantics are exercised by the
+    // BUG-006 regression tests below — this test only pins parser acceptance.
+    var q = try compile("{a: (1,2,3)}");
+    defer q.deinit();
+}
+
+// ── BUG-006: generator in object-value position ──────────────────────────────
+//
+// Pre-fix, any generator yielding N > 1 values inside `{a: <gen>}` raised a
+// runtime `type error` on the second yield. Fix lives in
+// `src/query/src/vm.zig` — `Forkpoint.saved_object` captures the
+// object-construction stacks at fork time; `backtrackToDepth` restores them
+// on every resume path (comma, each, range, alt, regex generators).
+// `saved_stack` was also broadened to fire when inside an object literal so
+// the per-iteration value slots survive the object_construct_end push/pop.
+
+/// Build a tape holding a single integer for BUG-006 regression inputs.
+fn intTape(entries: *[1]Entry, value: i64) Tape {
+    entries[0] = .{ .tag = .int, .payload = .{ .int = value } };
+    return Tape{ .entries = entries, .string_buf = "" };
+}
+
+/// Assert the n-th emitted value is an object with exactly the given
+/// `{key: int}` field. Fails the test otherwise.
+fn expectObjectWithIntField(v: Value, key: []const u8, value: i64) !void {
+    try std.testing.expect(v == .object);
+    const span = v.object;
+    const rt = span.tape;
+    // [object_start, key, int, object_end]
+    try std.testing.expectEqual(Tag.object_start, rt.entries[span.start].tag);
+    try std.testing.expectEqualStrings(key, rt.getString(rt.entries[span.start + 1].payload.string));
+    try std.testing.expectEqual(Tag.int, rt.entries[span.start + 2].tag);
+    try std.testing.expectEqual(value, rt.entries[span.start + 2].payload.int);
+    try std.testing.expectEqual(Tag.object_end, rt.entries[span.start + 3].tag);
+}
+
+test "BUG-006: comma generator in object value — 5 | {a:(1,2,3)}" {
+    var q = try compile("{a:(1,2,3)}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "a", 1);
+    try expectObjectWithIntField(vals.items[1], "a", 2);
+    try expectObjectWithIntField(vals.items[2], "a", 3);
+}
+
+test "BUG-006: each in object value — [1,2,3] | {a:.[]}" {
+    var q = try compile("{a:.[]}");
+    defer q.deinit();
+    // Tape: [1,2,3]
+    const arr_entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&arr_entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "a", 1);
+    try expectObjectWithIntField(vals.items[1], "a", 2);
+    try expectObjectWithIntField(vals.items[2], "a", 3);
+}
+
+test "BUG-006: generator in second field — 5 | {a:1, b:(1,2)}" {
+    var q = try compile("{a:1, b:(1,2)}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    // Each object has {"a":1, "b":N}. Verify full shape on the first result.
+    {
+        const v = vals.items[0];
+        try std.testing.expect(v == .object);
+        const span = v.object;
+        const rt = span.tape;
+        try std.testing.expectEqualStrings("a", rt.getString(rt.entries[span.start + 1].payload.string));
+        try std.testing.expectEqual(@as(i64, 1), rt.entries[span.start + 2].payload.int);
+        try std.testing.expectEqualStrings("b", rt.getString(rt.entries[span.start + 3].payload.string));
+        try std.testing.expectEqual(@as(i64, 1), rt.entries[span.start + 4].payload.int);
+    }
+    {
+        const v = vals.items[1];
+        try std.testing.expect(v == .object);
+        const span = v.object;
+        const rt = span.tape;
+        try std.testing.expectEqual(@as(i64, 2), rt.entries[span.start + 4].payload.int);
+    }
+}
+
+test "BUG-006: nested generator — 5 | {a:{b:(1,2,3)}}" {
+    var q = try compile("{a:{b:(1,2,3)}}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    // Each outer object has `{a: {b: N}}` — verify b's value in the inner
+    // object on the first result to pin the generator iteration.
+    const v = vals.items[0];
+    try std.testing.expect(v == .object);
+    const outer = v.object;
+    const rt = outer.tape;
+    try std.testing.expectEqualStrings("a", rt.getString(rt.entries[outer.start + 1].payload.string));
+    try std.testing.expectEqual(Tag.object_start, rt.entries[outer.start + 2].tag);
+    try std.testing.expectEqualStrings("b", rt.getString(rt.entries[outer.start + 3].payload.string));
+    try std.testing.expectEqual(@as(i64, 1), rt.entries[outer.start + 4].payload.int);
+}
+
+test "BUG-006: single-yield regression guard — 5 | {a:(1)}" {
+    var q = try compile("{a:(1)}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "a", 1);
+}
+
+test "BUG-006: empty-generator regression guard — 5 | {a:empty}" {
+    var q = try compile("{a:empty}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    // `empty` yields nothing — the whole object-construct scope yields nothing.
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
+}
+
+test "BUG-006: outer generator into object — 5 | (1,2,3) | {a:.}" {
+    var q = try compile("(1,2,3) | {a:.}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "a", 1);
+    try expectObjectWithIntField(vals.items[1], "a", 2);
+    try expectObjectWithIntField(vals.items[2], "a", 3);
+}
+
+test "BUG-006: outer generator into collected object — 5 | [(1,2,3) | {a:.}]" {
+    var q = try compile("[(1,2,3) | {a:.}]");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    const v = vals.items[0];
+    try std.testing.expect(v == .array);
+    const arr = v.array;
+    const rt = arr.tape;
+    // [array_start, {a:1}, {a:2}, {a:3}, array_end]
+    try std.testing.expectEqual(Tag.array_start, rt.entries[arr.start].tag);
+    try std.testing.expectEqual(Tag.object_start, rt.entries[arr.start + 1].tag);
+}
+
+test "BUG-006: range in object value — 5 | {a:range(3)}" {
+    var q = try compile("{a:range(3)}");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "a", 0);
+    try expectObjectWithIntField(vals.items[1], "a", 1);
+    try expectObjectWithIntField(vals.items[2], "a", 2);
+}
+
 // ── Empty tape ────────────────────────────────────────────────────────────────
 
 test "empty tape: next() returns null immediately" {
@@ -572,23 +915,23 @@ test "boolean and float values round-trip through identity" {
     // true
     {
         const entries = [_]Entry{.{ .tag = .true_val, .payload = .{ .none = {} } }};
-        const vals = try collectAll(&q, tape(&entries, ""));
-        defer alloc.free(vals);
-        try std.testing.expectEqual(true, vals[0].bool_val);
+        var vals = try collectAll(&q, tape(&entries, ""));
+        defer vals.deinit();
+        try std.testing.expectEqual(true, vals.items[0].bool_val);
     }
     // false
     {
         const entries = [_]Entry{.{ .tag = .false_val, .payload = .{ .none = {} } }};
-        const vals = try collectAll(&q, tape(&entries, ""));
-        defer alloc.free(vals);
-        try std.testing.expectEqual(false, vals[0].bool_val);
+        var vals = try collectAll(&q, tape(&entries, ""));
+        defer vals.deinit();
+        try std.testing.expectEqual(false, vals.items[0].bool_val);
     }
     // float
     {
         const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = 3.14 } }};
-        const vals = try collectAll(&q, tape(&entries, ""));
-        defer alloc.free(vals);
-        try std.testing.expectApproxEqAbs(@as(f64, 3.14), vals[0].float, 1e-9);
+        var vals = try collectAll(&q, tape(&entries, ""));
+        defer vals.deinit();
+        try std.testing.expectApproxEqAbs(@as(f64, 3.14), vals.items[0].float, 1e-9);
     }
 }
 
@@ -688,11 +1031,11 @@ test "unary negation: -1 literal yields int -1" {
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, -1), vals.items[0].int);
 }
 
 test "unary negation: -5 literal preserves int type" {
@@ -702,12 +1045,12 @@ test "unary negation: -5 literal preserves int type" {
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // -5 is parsed as a single int_lit token; result is int not float
-    try std.testing.expectEqual(@as(i64, -5), vals[0].int);
+    try std.testing.expectEqual(@as(i64, -5), vals.items[0].int);
 }
 
 test "unary negation: -.foo negates integer field, preserves int type" {
@@ -724,11 +1067,11 @@ test "unary negation: -.foo negates integer field, preserves int type" {
     var q = try compile("-.x");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, -7), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, -7), vals.items[0].int);
 }
 
 test "unary negation: -.foo negates float field, preserves float type" {
@@ -745,11 +1088,11 @@ test "unary negation: -.foo negates float field, preserves float type" {
     var q = try compile("-.v");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectApproxEqAbs(@as(f64, -3.14), vals[0].float, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, -3.14), vals.items[0].float, 1e-9);
 }
 
 test "unary negation: -(.x) negates via parenthesized field" {
@@ -766,11 +1109,11 @@ test "unary negation: -(.x) negates via parenthesized field" {
     var q = try compile("-(.x)");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, -9), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, -9), vals.items[0].int);
 }
 
 test "unary negation: TypeError on non-numeric field" {
@@ -803,11 +1146,11 @@ test "if/then/else: true condition takes then-branch" {
     var q = try compile("if . > 5 then true else false end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "if/then/else: false condition takes else-branch" {
@@ -818,11 +1161,11 @@ test "if/then/else: false condition takes else-branch" {
     var q = try compile("if . > 5 then true else false end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(false, vals[0].bool_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
 }
 
 test "if/then/else: branches evaluate against original input" {
@@ -839,11 +1182,11 @@ test "if/then/else: branches evaluate against original input" {
     var q = try compile("if .x > 5 then .x else 0 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 10), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 10), vals.items[0].int);
 }
 
 test "if/then/else: null is falsy" {
@@ -854,11 +1197,11 @@ test "if/then/else: null is falsy" {
     var q = try compile("if . then true else false end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(false, vals[0].bool_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
 }
 
 test "if/then/else: false is falsy" {
@@ -869,11 +1212,11 @@ test "if/then/else: false is falsy" {
     var q = try compile("if . then true else false end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(false, vals[0].bool_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
 }
 
 test "if/then/else: 0 is truthy (jq semantics)" {
@@ -884,11 +1227,11 @@ test "if/then/else: 0 is truthy (jq semantics)" {
     var q = try compile("if . then true else false end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "if/then without else: implicit else is identity — true branch" {
@@ -899,11 +1242,11 @@ test "if/then without else: implicit else is identity — true branch" {
     var q = try compile("if . > 5 then 99 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
 }
 
 test "if/then without else: false branch returns input" {
@@ -914,11 +1257,11 @@ test "if/then without else: false branch returns input" {
     var q = try compile("if . > 5 then 99 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 3), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[0].int);
 }
 
 test "elif: first condition true" {
@@ -929,11 +1272,11 @@ test "elif: first condition true" {
     var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, -1), vals.items[0].int);
 }
 
 test "elif: second condition true" {
@@ -944,11 +1287,11 @@ test "elif: second condition true" {
     var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
 }
 
 test "elif: else branch" {
@@ -959,11 +1302,11 @@ test "elif: else branch" {
     var q = try compile("if . < 0 then -1 elif . > 0 then 1 else 0 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vals.items[0].int);
 }
 
 test "nested if: if inside then-branch" {
@@ -974,11 +1317,11 @@ test "nested if: if inside then-branch" {
     var q = try compile("if . > 10 then if . > 20 then 99 else 50 end else 0 end");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 50), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 50), vals.items[0].int);
 }
 
 test "if: syntax error — missing then" {
@@ -998,12 +1341,12 @@ test "array construction: [] yields empty array" {
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 1 } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // Empty array: span.end - span.start == 2 (array_start + array_end, no elements).
-    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 2), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: [.] wraps input in array" {
@@ -1015,13 +1358,13 @@ test "array construction: [.] wraps input in array" {
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
     const t = tape(&entries, "");
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // One scalar element: array_start + int + array_end = 3 entries → span.end - span.start = 3.
-    try std.testing.expectEqual(@as(u32, 3), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 3), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: [.foo] wraps field in array" {
@@ -1038,13 +1381,13 @@ test "array construction: [.foo] wraps field in array" {
     var q = try compile("[.x]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // One scalar: start + int + end = 3 entries.
-    try std.testing.expectEqual(@as(u32, 3), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 3), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: [.[]] collects all array elements" {
@@ -1061,13 +1404,13 @@ test "array construction: [.[]] collects all array elements" {
     var q = try compile("[.[]]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // 3 scalar elements: start + 3 ints + end = 5 entries.
-    try std.testing.expectEqual(@as(u32, 5), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 5), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: [.[] | .id] maps field from each element" {
@@ -1090,13 +1433,13 @@ test "array construction: [.[] | .id] maps field from each element" {
     var q = try compile("[.[] | .id]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // 2 scalar elements: start + 2 ints + end = 4 entries.
-    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 4), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: [.[]] on empty array yields empty array" {
@@ -1109,13 +1452,13 @@ test "array construction: [.[]] on empty array yields empty array" {
     var q = try compile("[.[]]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // empty: start + end = 2 entries → span.end - span.start = 2.
-    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 2), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "array construction: syntax error — unclosed bracket" {
@@ -1138,11 +1481,11 @@ test ".['key']: string literal bracket access returns field value" {
     var q = try compile(".[ \"name\"]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("alice", vals[0].string);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("alice", vals.items[0].string);
 }
 
 test ".['key'] equivalent to .key" {
@@ -1159,11 +1502,11 @@ test ".['key'] equivalent to .key" {
     var q = try compile(".[\"x\"]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
 }
 
 test ".[.key_field]: computed string key from field value" {
@@ -1182,11 +1525,11 @@ test ".[.key_field]: computed string key from field value" {
     var q = try compile(".[.k]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("Bob", vals[0].string);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("Bob", vals.items[0].string);
 }
 
 test ".[.idx]: computed integer index from field value" {
@@ -1206,11 +1549,11 @@ test ".[.idx]: computed integer index from field value" {
     var q = try compile(".[1]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 20), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 20), vals.items[0].int);
 }
 
 test ".[expr]: allow_null_propagation on missing key" {
@@ -1227,11 +1570,11 @@ test ".[expr]: allow_null_propagation on missing key" {
     var q = try compileNull(".[\"missing\"]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 test ".['key']: syntax error on unterminated string" {
@@ -1247,12 +1590,12 @@ test "comma: 1,2 produces two outputs" {
     var q = try compile("1,2");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
 }
 
 test "comma: 1,2,3 produces three outputs" {
@@ -1262,13 +1605,13 @@ test "comma: 1,2,3 produces three outputs" {
     var q = try compile("1,2,3");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
-    try std.testing.expectEqual(@as(i64, 3), vals[2].int);
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[2].int);
 }
 
 // ── Alternative operator (//) ─────────────────────────────────────────────────
@@ -1281,11 +1624,11 @@ test "alternative: null // literal returns literal" {
     var q = try compile(". // 42");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 42), vals.items[0].int);
 }
 
 test "alternative: false // literal returns literal" {
@@ -1296,11 +1639,11 @@ test "alternative: false // literal returns literal" {
     var q = try compile(". // 99");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
 }
 
 test "alternative: truthy value passes through" {
@@ -1311,11 +1654,11 @@ test "alternative: truthy value passes through" {
     var q = try compile(". // 99");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "alternative: 0 is truthy (jq semantics)" {
@@ -1326,11 +1669,11 @@ test "alternative: 0 is truthy (jq semantics)" {
     var q = try compile(". // 42");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vals.items[0].int);
 }
 
 test "alternative: .foo // literal when key is null" {
@@ -1348,11 +1691,11 @@ test "alternative: .foo // literal when key is null" {
     var q = try compile(".foo // \"default\"");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("default", vals[0].string);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("default", vals.items[0].string);
 }
 
 test "alternative: .foo // literal when key is present and truthy" {
@@ -1370,11 +1713,11 @@ test "alternative: .foo // literal when key is present and truthy" {
     var q = try compile(".foo // 99");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 5), vals.items[0].int);
 }
 
 test "alternative: .foo // .bar when foo is null, bar is used with original input" {
@@ -1395,11 +1738,11 @@ test "alternative: .foo // .bar when foo is null, bar is used with original inpu
     var q = try compile(".foo // .bar");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 42), vals.items[0].int);
 }
 
 test "alternative: missing key falls back to right side" {
@@ -1419,11 +1762,11 @@ test "alternative: missing key falls back to right side" {
     var q = try compile(".foo // .bar");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 77), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 77), vals.items[0].int);
 }
 
 test "alternative: chained a // b // c, first truthy" {
@@ -1434,11 +1777,11 @@ test "alternative: chained a // b // c, first truthy" {
     var q = try compile(". // 2 // 3");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
 }
 
 test "alternative: chained a // b // c, first two null" {
@@ -1449,11 +1792,11 @@ test "alternative: chained a // b // c, first two null" {
     var q = try compile(". // null // 99");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 99), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
 }
 
 test "alternative: in pipe context" {
@@ -1471,11 +1814,11 @@ test "alternative: in pipe context" {
     var q = try compile(". | .x // 0");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vals.items[0].int);
 }
 
 // ── Try-catch ────────────────────────────────────────────────────────────────
@@ -1494,11 +1837,11 @@ test "try: no error - yields value" {
     var q = try compile("try .foo");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 42), vals.items[0].int);
 }
 
 test "try: missing key - yields null (jq-compatible)" {
@@ -1515,12 +1858,12 @@ test "try: missing key - yields null (jq-compatible)" {
     var q = try compile("try .foo");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
     // Missing key returns null (no error to suppress), so try passes it through.
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 test "try: type error - yields nothing" {
@@ -1530,10 +1873,10 @@ test "try: type error - yields nothing" {
     var q = try compile("try .foo");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "try-catch: missing key yields null (jq-compatible, no error to catch)" {
@@ -1550,12 +1893,12 @@ test "try-catch: missing key yields null (jq-compatible, no error to catch)" {
     var q = try compile("try .foo catch \"fallback\"");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
     // Missing key returns null (no error), so catch handler is not invoked.
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .null_val);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .null_val);
 }
 
 test "try-catch: catch receives error name string" {
@@ -1581,11 +1924,11 @@ test "try-catch: no error - yields try body, skips catch" {
     var q = try compile("try . catch \"err\"");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "try: index out of bounds - yields nothing" {
@@ -1599,12 +1942,12 @@ test "try: index out of bounds - yields nothing" {
     var q = try compile("try .[5]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
     // Out-of-bounds index returns null (jq-compatible); try does not suppress it.
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(Value.null_val, vals[0]);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(Value.null_val, vals.items[0]);
 }
 
 test "try-catch: out-of-bounds index yields null (no error to catch)" {
@@ -1618,12 +1961,12 @@ test "try-catch: out-of-bounds index yields null (no error to catch)" {
     var q = try compile("try .[5] catch -1");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
     // Out-of-bounds read returns null, not an error; catch handler is not invoked.
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(Value.null_val, vals[0]);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(Value.null_val, vals.items[0]);
 }
 
 test "try: iterate non-array - yields nothing" {
@@ -1633,10 +1976,10 @@ test "try: iterate non-array - yields nothing" {
     var q = try compile("try .[]");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "try: nested - inner catch fires, outer not needed" {
@@ -1646,11 +1989,11 @@ test "try: nested - inner catch fires, outer not needed" {
     var q = try compile("try (try .foo catch \"inner\") catch \"outer\"");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("inner", vals[0].string);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("inner", vals.items[0].string);
 }
 
 test "try: division by zero - yields nothing" {
@@ -1660,10 +2003,10 @@ test "try: division by zero - yields nothing" {
     var q = try compile("try (1 / 0)");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "try-catch: modulo by zero uses catch" {
@@ -1673,11 +2016,11 @@ test "try-catch: modulo by zero uses catch" {
     var q = try compile("try (1 % 0) catch \"div0\"");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("div0", vals[0].string);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("div0", vals.items[0].string);
 }
 
 // ── Optional operator (?) ─────────────────────────────────────────────────────
@@ -1696,11 +2039,11 @@ test "optional: .foo? on object with key returns value" {
     var q = try compile(".foo?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "optional: .foo? on non-object suppresses error, yields nothing" {
@@ -1710,10 +2053,10 @@ test "optional: .foo? on non-object suppresses error, yields nothing" {
     var q = try compile(".foo?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "optional: .[]? on array yields all elements" {
@@ -1728,12 +2071,12 @@ test "optional: .[]? on array yields all elements" {
     var q = try compile(".[]?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
 }
 
 test "optional: .[]? on non-array suppresses error, yields nothing" {
@@ -1743,10 +2086,10 @@ test "optional: .[]? on non-array suppresses error, yields nothing" {
     var q = try compile(".[]?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "optional: .[] | .foo? skips non-object elements, yields rest" {
@@ -1776,12 +2119,12 @@ test "optional: .[] | .foo? skips non-object elements, yields rest" {
     var q = try compile(".[] | .foo?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 3), vals[1].int);
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[1].int);
 }
 
 test "optional: .foo.bar? suppresses error from either step" {
@@ -1799,10 +2142,10 @@ test "optional: .foo.bar? suppresses error from either step" {
     var q = try compile(".foo.bar?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "optional: .foo?.bar leaves .bar outside the try" {
@@ -1824,11 +2167,11 @@ test "optional: .foo?.bar leaves .bar outside the try" {
     var q = try compile(".foo?.bar");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 9), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 9), vals.items[0].int);
 }
 
 test "optional: .[0]? on array returns first element" {
@@ -1842,11 +2185,11 @@ test "optional: .[0]? on array returns first element" {
     var q = try compile(".[0]?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 5), vals.items[0].int);
 }
 
 test "optional: .[0]? on non-array suppresses error, yields nothing" {
@@ -1856,10 +2199,10 @@ test "optional: .[0]? on non-array suppresses error, yields nothing" {
     var q = try compile(".[0]?");
     defer q.deinit();
 
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 // ── Slicing ───────────────────────────────────────────────────────────────────
@@ -1905,12 +2248,12 @@ test "slice: .[2:] extracts from index 2 to end" {
     const t = tape(&entries, "");
     var q = try compile(".[2:]");
     defer q.deinit();
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // [30, 40]: array_start + 2 ints + array_end = 4 entries
-    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 4), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "slice: .[:2] extracts first two elements" {
@@ -1970,12 +2313,12 @@ test "slice: .[:-1] extracts all but last element" {
     const t = tape(&entries, "");
     var q = try compile(".[:-1]");
     defer q.deinit();
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // [10, 20]: array_start + 2 ints + array_end = 4 entries
-    try std.testing.expectEqual(@as(u32, 4), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 4), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "slice: .[0:0] returns empty array" {
@@ -1988,12 +2331,12 @@ test "slice: .[0:0] returns empty array" {
     const t = tape(&entries, "");
     var q = try compile(".[0:0]");
     defer q.deinit();
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
     // empty: array_start + array_end = 2 entries
-    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+    try std.testing.expectEqual(@as(u32, 2), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "slice: out-of-bounds indices are clamped, returns empty" {
@@ -2006,11 +2349,11 @@ test "slice: out-of-bounds indices are clamped, returns empty" {
     const t = tape(&entries, "");
     var q = try compile(".[100:200]");
     defer q.deinit();
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expect(vals[0] == .array);
-    try std.testing.expectEqual(@as(u32, 2), vals[0].array.end - vals[0].array.start);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .array);
+    try std.testing.expectEqual(@as(u32, 2), vals.items[0].array.end - vals.items[0].array.start);
 }
 
 test "slice: string slice extracts byte range" {
@@ -2553,7 +2896,7 @@ fn stringTape(entries: *[1]Entry, buf: []const u8) Tape {
     return Tape{ .entries = entries, .string_buf = buf };
 }
 
-fn runFilterStr(src: []const u8, input: []const u8) ![]Value {
+fn runFilterStr(src: []const u8, input: []const u8) !OwnedValues {
     var q = try compile(src);
     defer q.deinit();
     var entries: [1]Entry = undefined;
@@ -2563,31 +2906,31 @@ fn runFilterStr(src: []const u8, input: []const u8) ![]Value {
 
 test "regex runtime: test() literal matches" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("test(\"bar\")", "foo bar baz");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    var vals = try runFilterStr("test(\"bar\")", "foo bar baz");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "regex runtime: test() literal no match" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("test(\"qux\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(false, vals[0].bool_val);
+    var vals = try runFilterStr("test(\"qux\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
 }
 
 test "regex runtime: test() dynamic pattern" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("(\"ba\" + \"r\") as $p | test($p)", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    var vals = try runFilterStr("(\"ba\" + \"r\") as $p | test($p)", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "regex runtime: test() unicode class" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("test(\"\\\\p{L}+\")", "café");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    var vals = try runFilterStr("test(\"\\\\p{L}+\")", "café");
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "regex runtime: test() non-string input errors" {
@@ -2618,9 +2961,9 @@ test "regex runtime: match() has jq shape" {
     defer q.deinit();
     var entries: [1]Entry = undefined;
     const t = stringTape(&entries, "foo bar");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(i64, 0), vals.items[0].int);
 }
 
 test "regex runtime: match() char offset for multibyte" {
@@ -2629,20 +2972,20 @@ test "regex runtime: match() char offset for multibyte" {
     defer q.deinit();
     var entries: [1]Entry = undefined;
     const t = stringTape(&entries, "café bar");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
     // "café" is 4 chars, space=5, then "bar" starts at char 5.
-    try std.testing.expectEqual(@as(i64, 5), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 5), vals.items[0].int);
 }
 
 test "regex runtime: scan() yields strings on pattern without captures" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("[scan(\"\\\\w+\")]", "foo bar baz");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    var vals = try runFilterStr("[scan(\"\\\\w+\")]", "foo bar baz");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // Result is an array of 3 strings. Verify by compiling a sub-query that
     // extracts each element. Lazy way: just assert array has 3 entries.
-    const arr = vals[0].array;
+    const arr = vals.items[0].array;
     const len = arr.end - arr.start - 2; // exclude array_start/end markers
     // rough sanity
     try std.testing.expect(len >= 3);
@@ -2650,93 +2993,93 @@ test "regex runtime: scan() yields strings on pattern without captures" {
 
 test "regex runtime: scan() yields arrays on captured pattern" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("[scan(\"(\\\\w+)\")]", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals[0]));
+    var vals = try runFilterStr("[scan(\"(\\\\w+)\")]", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals.items[0]));
 }
 
 test "regex runtime: capture() named groups" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("capture(\"(?<a>\\\\d+)-(?<b>\\\\d+)\") | .a + \"|\" + .b", "12-34");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("12|34", vals[0].string);
+    var vals = try runFilterStr("capture(\"(?<a>\\\\d+)-(?<b>\\\\d+)\") | .a + \"|\" + .b", "12-34");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("12|34", vals.items[0].string);
 }
 
 test "regex runtime: sub() with backref" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("sub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("<foo> bar", vals[0].string);
+    var vals = try runFilterStr("sub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("<foo> bar", vals.items[0].string);
 }
 
 test "regex runtime: gsub() with backref" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("gsub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("<foo> <bar>", vals[0].string);
+    var vals = try runFilterStr("gsub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("<foo> <bar>", vals.items[0].string);
 }
 
 test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("gsub(\"\"; \"X\")", "abc");
-    defer alloc.free(vals);
+    var vals = try runFilterStr("gsub(\"\"; \"X\")", "abc");
+    defer vals.deinit();
     // regex-automata matches empty at every position → Xs interleaved.
     // Just assert it terminates and produces a string.
-    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals[0]));
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals.items[0]));
 }
 
 test "regex runtime: optional unmatched group sentinel in match" {
     if (!regex.enabled) return error.SkipZigTest;
     // match result.captures[0].offset == -1 when group didn't match.
-    const vals = try runFilterStr("match(\"foo(bar)?baz\") | .captures[0].offset", "foobaz");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(i64, -1), vals[0].int);
+    var vals = try runFilterStr("match(\"foo(bar)?baz\") | .captures[0].offset", "foobaz");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(i64, -1), vals.items[0].int);
 }
 
 // ── Phase E: flags overload ─────────────────────────────────────────────────
 
 test "regex flags: test() case-insensitive literal flag" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("test(\"FOO\"; \"i\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    var vals = try runFilterStr("test(\"FOO\"; \"i\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "regex flags: test() no-op 'g' flag still compiles" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("test(\"foo\"; \"g\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(true, vals[0].bool_val);
+    var vals = try runFilterStr("test(\"foo\"; \"g\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
 }
 
 test "regex flags: capture() case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("capture(\"(?<a>[A-Z]+)\"; \"i\") | .a", "hello");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("hello", vals[0].string);
+    var vals = try runFilterStr("capture(\"(?<a>[A-Z]+)\"; \"i\") | .a", "hello");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("hello", vals.items[0].string);
 }
 
 test "regex flags: scan() case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("[scan(\"[A-Z]+\"; \"i\")]", "abCDef");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals[0]));
+    var vals = try runFilterStr("[scan(\"[A-Z]+\"; \"i\")]", "abCDef");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .array), std.meta.activeTag(vals.items[0]));
 }
 
 test "regex flags: sub() 3-arg with case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("sub(\"FOO\"; \"X\"; \"i\")", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("X bar", vals[0].string);
+    var vals = try runFilterStr("sub(\"FOO\"; \"X\"; \"i\")", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("X bar", vals.items[0].string);
 }
 
 test "regex flags: gsub() 3-arg with case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("gsub(\"A\"; \"X\"; \"i\")", "aAbBcA");
-    defer alloc.free(vals);
-    try std.testing.expectEqualStrings("XXbBcX", vals[0].string);
+    var vals = try runFilterStr("gsub(\"A\"; \"X\"; \"i\")", "aAbBcA");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("XXbBcX", vals.items[0].string);
 }
 
 test "regex flags: unknown flag letter is a compile error" {
@@ -2790,76 +3133,76 @@ test "regex runtime: match(re; \"g\") yields three match strings" {
     if (!regex.enabled) return error.SkipZigTest;
     // Non-collecting generator path: each yielded match object becomes a
     // separate output value via runFilterStr.
-    const vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .string", "foo bar baz");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
-    try std.testing.expectEqualStrings("foo", vals[0].string);
-    try std.testing.expectEqualStrings("bar", vals[1].string);
-    try std.testing.expectEqualStrings("baz", vals[2].string);
+    var vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .string", "foo bar baz");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try std.testing.expectEqualStrings("foo", vals.items[0].string);
+    try std.testing.expectEqualStrings("bar", vals.items[1].string);
+    try std.testing.expectEqualStrings("baz", vals.items[2].string);
 }
 
 test "regex runtime: match(re; \"g\") offsets and lengths match each occurrence" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .offset", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqual(@as(i64, 0), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 4), vals[1].int);
+    var vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .offset", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 0), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 4), vals.items[1].int);
 }
 
 test "regex runtime: match(re; \"ig\") combines case-insensitive and global" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("match(\"FOO\"; \"ig\") | .string", "foo Foo FOO bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
+    var vals = try runFilterStr("match(\"FOO\"; \"ig\") | .string", "foo Foo FOO bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
 }
 
 test "regex runtime: match(re; \"g\") no matches yields no values" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("match(\"xyz\"; \"g\") | .string", "foo bar");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 0), vals.len);
+    var vals = try runFilterStr("match(\"xyz\"; \"g\") | .string", "foo bar");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 0), vals.items.len);
 }
 
 test "regex runtime: splits(re) yields four segments around three matches" {
     if (!regex.enabled) return error.SkipZigTest;
     // "a1b22c333" split on /[0-9]+/ → "a", "b", "c", "" (jq semantics).
-    const vals = try runFilterStr("splits(\"[0-9]+\")", "a1b22c333");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 4), vals.len);
-    try std.testing.expectEqualStrings("a", vals[0].string);
-    try std.testing.expectEqualStrings("b", vals[1].string);
-    try std.testing.expectEqualStrings("c", vals[2].string);
-    try std.testing.expectEqualStrings("", vals[3].string);
+    var vals = try runFilterStr("splits(\"[0-9]+\")", "a1b22c333");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 4), vals.items.len);
+    try std.testing.expectEqualStrings("a", vals.items[0].string);
+    try std.testing.expectEqualStrings("b", vals.items[1].string);
+    try std.testing.expectEqualStrings("c", vals.items[2].string);
+    try std.testing.expectEqualStrings("", vals.items[3].string);
 }
 
 test "regex runtime: splits() with no match yields whole input" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("splits(\"[0-9]+\")", "nodigits");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("nodigits", vals[0].string);
+    var vals = try runFilterStr("splits(\"[0-9]+\")", "nodigits");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("nodigits", vals.items[0].string);
 }
 
 test "regex runtime: splits() with flags case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("splits(\"X\"; \"i\")", "aXbxcXd");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 4), vals.len);
-    try std.testing.expectEqualStrings("a", vals[0].string);
-    try std.testing.expectEqualStrings("b", vals[1].string);
-    try std.testing.expectEqualStrings("c", vals[2].string);
-    try std.testing.expectEqualStrings("d", vals[3].string);
+    var vals = try runFilterStr("splits(\"X\"; \"i\")", "aXbxcXd");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 4), vals.items.len);
+    try std.testing.expectEqualStrings("a", vals.items[0].string);
+    try std.testing.expectEqualStrings("b", vals.items[1].string);
+    try std.testing.expectEqualStrings("c", vals.items[2].string);
+    try std.testing.expectEqualStrings("d", vals.items[3].string);
 }
 
 test "regex runtime: splits() dynamic pattern works through LRU" {
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr("(\"[0-9]+\") as $p | splits($p)", "a1b22");
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 3), vals.len);
-    try std.testing.expectEqualStrings("a", vals[0].string);
-    try std.testing.expectEqualStrings("b", vals[1].string);
-    try std.testing.expectEqualStrings("", vals[2].string);
+    var vals = try runFilterStr("(\"[0-9]+\") as $p | splits($p)", "a1b22");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 3), vals.items.len);
+    try std.testing.expectEqualStrings("a", vals.items[0].string);
+    try std.testing.expectEqualStrings("b", vals.items[1].string);
+    try std.testing.expectEqualStrings("", vals.items[2].string);
 }
 
 test "regex runtime: dynamic scan() survives LRU eviction mid-fork" {
@@ -2885,14 +3228,14 @@ test "regex runtime: dynamic scan() survives LRU eviction mid-fork" {
     // overall shape / length here — behaviour across the LRU churn is
     // what matters.
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr(
+    var vals = try runFilterStr(
         "(\"a\") as $p | [scan($p) as $s | (range(100) | tostring | test(.)) as $_ignore | $s] | length",
         "aaaaaaaaaa",
     );
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // 10 scan matches × 100 inner range iterations = 1000 yields.
-    try std.testing.expectEqual(@as(i64, 1000), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 1000), vals.items[0].int);
 }
 
 // NOTE: The match-g generator path always requires a compile-time literal
@@ -2909,15 +3252,15 @@ test "regex runtime: dynamic splits() survives LRU eviction mid-fork" {
     // clone pointer in SplitsState; the fork persists across many
     // inter-match yields, giving the LRU plenty of chances to evict it.
     if (!regex.enabled) return error.SkipZigTest;
-    const vals = try runFilterStr(
+    var vals = try runFilterStr(
         "(\"a\") as $p | [splits($p) as $s | (range(80) | tostring | test(.)) as $_ignore | $s] | length",
         "aXaXaXaXa",
     );
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // Input has 5 'a's, so splits produces 6 segments (leading empty,
     // 4 "X" segments, trailing empty). 6 × 80 = 480.
-    try std.testing.expectEqual(@as(i64, 480), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 480), vals.items[0].int);
 }
 
 // ── Full-matrix disabled-build tests ────────────────────────────────────────
@@ -3064,10 +3407,10 @@ test "comment: leading # then identity" {
     defer q.deinit();
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
     const t = tape(&entries, "");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "comment: trailing # after expression (no final newline)" {
@@ -3075,10 +3418,10 @@ test "comment: trailing # after expression (no final newline)" {
     defer q.deinit();
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
     const t = tape(&entries, "");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "comment: multiple comments between tokens" {
@@ -3086,10 +3429,10 @@ test "comment: multiple comments between tokens" {
     defer q.deinit();
     const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 7 } }};
     const t = tape(&entries, "");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqual(@as(i64, 7), vals[0].int);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
 }
 
 test "comment: # inside string literal is NOT a comment" {
@@ -3097,10 +3440,10 @@ test "comment: # inside string literal is NOT a comment" {
     defer q.deinit();
     const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
     const t = tape(&entries, "");
-    const vals = try collectAll(&q, t);
-    defer alloc.free(vals);
-    try std.testing.expectEqual(@as(usize, 1), vals.len);
-    try std.testing.expectEqualStrings("#x", vals[0].string);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("#x", vals.items[0].string);
 }
 
 // ── path(f) validation (jq compat) ───────────────────────────────────────────
@@ -3352,4 +3695,152 @@ test "path(f): [path(.[])] on [1,2] yields [[0],[1]] (generator + collect)" {
     defer buf.deinit(alloc);
     try dumpCompact(&buf, v.?);
     try std.testing.expectEqualStrings("[[0],[1]]", buf.items);
+}
+
+// ── Gap fixes: nested path() and path-emitting builtins (paths, leaf_paths,
+//    recurse, ..) inside path() frames. Prior behaviour pre-f43d8b3 either
+//    swallowed these silently or returned unrelated garbage; jq errors on
+//    nested path() and yields the actual traversal paths for recurse/paths.
+
+test "path(f): path(path(.a)) errors (nested path)" {
+    const sb = "a";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile("path(path(.a))");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.UserError, it.next());
+    try std.testing.expectEqualStrings(
+        "Invalid path expression with result [\"a\"]",
+        it.user_error_msg.?.string,
+    );
+}
+
+test "path(f): path(.a) still returns [\"a\"] (single level unaffected)" {
+    const sb = "a";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile("path(.a)");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    const v = try it.next();
+    try std.testing.expect(v != null);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[\"a\"]", buf.items);
+    try std.testing.expect((try it.next()) == null);
+}
+
+// Helper: drive a filter on `{"a":1,"b":{"c":2}}` and collect per-result
+// tojson strings. Used by the path(recurse)/path(paths)/path(..) tests.
+fn runNestedObjectCollect(src: []const u8, results: *std.ArrayList([]const u8)) !void {
+    const sb = "abc";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } }, // {
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } }, // {
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 2, .len = 1 } } }, // "c"
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(src);
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    while (try it.next()) |v| {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(alloc);
+        try dumpCompact(&buf, v);
+        try results.append(alloc, try alloc.dupe(u8, buf.items));
+    }
+}
+
+test "path(f): path(paths) on nested object yields descent paths" {
+    var results = std.ArrayList([]const u8){};
+    defer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+    try runNestedObjectCollect("path(paths)", &results);
+    try std.testing.expectEqual(@as(usize, 3), results.items.len);
+    try std.testing.expectEqualStrings("[\"a\"]", results.items[0]);
+    try std.testing.expectEqualStrings("[\"b\"]", results.items[1]);
+    try std.testing.expectEqualStrings("[\"b\",\"c\"]", results.items[2]);
+}
+
+test "path(f): path(leaf_paths) on nested object yields only leaf paths" {
+    var results = std.ArrayList([]const u8){};
+    defer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+    try runNestedObjectCollect("path(leaf_paths)", &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqualStrings("[\"a\"]", results.items[0]);
+    try std.testing.expectEqualStrings("[\"b\",\"c\"]", results.items[1]);
+}
+
+test "path(f): path(..) on nested object yields root plus descent paths" {
+    var results = std.ArrayList([]const u8){};
+    defer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+    try runNestedObjectCollect("path(..)", &results);
+    try std.testing.expectEqual(@as(usize, 4), results.items.len);
+    try std.testing.expectEqualStrings("[]", results.items[0]);
+    try std.testing.expectEqualStrings("[\"a\"]", results.items[1]);
+    try std.testing.expectEqualStrings("[\"b\"]", results.items[2]);
+    try std.testing.expectEqualStrings("[\"b\",\"c\"]", results.items[3]);
+}
+
+test "path(f): path(recurse) matches path(..) (same definition)" {
+    var results = std.ArrayList([]const u8){};
+    defer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+    try runNestedObjectCollect("path(recurse)", &results);
+    try std.testing.expectEqual(@as(usize, 4), results.items.len);
+    try std.testing.expectEqualStrings("[]", results.items[0]);
+    try std.testing.expectEqualStrings("[\"a\"]", results.items[1]);
+    try std.testing.expectEqualStrings("[\"b\"]", results.items[2]);
+    try std.testing.expectEqualStrings("[\"b\",\"c\"]", results.items[3]);
+}
+
+test "path(f): path($x.a) with bound variable still returns [\"a\"] (phantom gap stays closed)" {
+    const sb = "a";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var q = try compile(". as $x | path($x.a)");
+    defer q.deinit();
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    const v = try it.next();
+    try std.testing.expect(v != null);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[\"a\"]", buf.items);
 }

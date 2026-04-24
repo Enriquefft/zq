@@ -77,7 +77,19 @@ const Config = struct {
 const QueryDiag = struct {
     last_ip: u32 = 0,
     user_error_msg: ?[]const u8 = null,
+    /// When true, `user_error_msg` was allocated by the caller's allocator and
+    /// the consumer must free it. Set by code paths (e.g. pool file-arg mode)
+    /// where the original message pointer outlives its arena only after a copy.
+    user_error_msg_owned: bool = false,
     error_kind: ?err_mod.ErrorKind = null,
+
+    fn deinit(d: *QueryDiag, allocator: std.mem.Allocator) void {
+        if (d.user_error_msg_owned) {
+            if (d.user_error_msg) |s| allocator.free(s);
+            d.user_error_msg_owned = false;
+            d.user_error_msg = null;
+        }
+    }
 };
 
 /// Map an ErrorKind to the appropriate exit code.
@@ -551,7 +563,7 @@ pub fn main() !u8 {
             const maybe = pool.collect_bytes() catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (pool.last_error_ip < cq.source_map.len) cq.source_map[pool.last_error_ip] else 0;
-                err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, null, allocator, diag_format);
+                err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, pool.last_user_error_msg, allocator, diag_format);
                 const code = exitCodeForKind(kind);
                 if (pool_error_exit == null or code > pool_error_exit.?) pool_error_exit = code;
                 continue;
@@ -574,6 +586,7 @@ pub fn main() !u8 {
             defer file.close();
 
             var diag = QueryDiag{};
+            defer diag.deinit(allocator);
             last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
@@ -614,7 +627,20 @@ fn processFile(
     const budget = pool_mod.MemoryBudget.detect();
     var pool = try pool_mod.Pool.init(n_threads, budget, allocator);
     defer pool.deinit();
-    errdefer diag.last_ip = pool.last_error_ip;
+    errdefer {
+        diag.last_ip = pool.last_error_ip;
+        // Dupe into the caller's allocator: the source string is arena-backed
+        // by the chunk that raised the error, and `pool.deinit()` (the
+        // preceding `defer`) will free that arena before main's catch runs.
+        // We intentionally do not free — the process is exiting with an error
+        // and `allocator` is the gpa whose memory is reclaimed at teardown.
+        if (pool.last_user_error_msg) |msg| {
+            if (allocator.dupe(u8, msg)) |copy| {
+                diag.user_error_msg = copy;
+                diag.user_error_msg_owned = true;
+            } else |_| {}
+        }
+    }
 
     try pool.submit_file(file, cq, format, color, opts, raw_input, ext_bindings);
 

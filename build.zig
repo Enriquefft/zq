@@ -9,6 +9,12 @@ pub fn build(b: *std.Build) void {
     const ver = b.option([]const u8, "version", "Version string") orelse version;
     const regex_enabled = b.option(bool, "regex", "Enable regex builtins (requires rustc+cargo)") orelse true;
     const lsp_enabled = b.option(bool, "lsp", "Enable LSP server (--lsp flag). Disable to shrink CLI binary.") orelse true;
+    // `-Dprofile=true` compiles in the body of every `microbench/hooks.zig`
+    // `markPhase` call site. Default is `false`: hooks expand to no-ops at
+    // comptime and the production binary is byte-identical to a no-hooks
+    // build. Consulted ONLY by `src/microbench/hooks.zig` — no production
+    // module branches on this flag.
+    const profile_enabled = b.option(bool, "profile", "Enable microbench comptime hooks (zero-cost when false)") orelse false;
     // Absolute path to a pre-built libzq_regex_shim.a. When set, skip the
     // in-tree cargo invocation and link this archive directly. Used by Nix
     // packaging so `nix build` stays hermetic (no cargo/rustc at build time).
@@ -18,6 +24,7 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", ver);
     options.addOption(bool, "regex_enabled", regex_enabled);
     options.addOption(bool, "lsp_enabled", lsp_enabled);
+    options.addOption(bool, "profile_enabled", profile_enabled);
     // One concrete options module, imported everywhere via addImport. Using
     // `addOptions(...)` on each consumer module would create *separate*
     // modules backed by the same generated source file — that collides when
@@ -438,6 +445,59 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
     fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);
 
+    // ── AST-walk compile equivalence harness (NOT in test_step) ──────────
+    // Runs the Stage 0/1 equivalence check between the legacy token-driven
+    // compiler and the new AST walker at `src/ast/compiler.zig`. Exits
+    // nonzero on any mismatch. See `research/phase-2-ast-walk-plan.md` §3.
+    //
+    // Invocation: `zig build ast-compile-equiv`.
+    // Optional `-Dast-equiv-verbose=true` for raw-instruction dumps.
+    const ast_equiv_verbose = b.option(bool, "ast-equiv-verbose", "Dump per-fixture instructions from ast-compile-equiv") orelse false;
+    const ast_equiv_options = b.addOptions();
+    ast_equiv_options.addOption(bool, "ast_equiv_verbose", ast_equiv_verbose);
+    const ast_equiv_options_module = ast_equiv_options.createModule();
+
+    // Legacy compiler exposed as a sibling module so the harness can call
+    // `compile(src, external_vars, alloc)` directly. This mirrors the module
+    // wiring used by `query_module` but targets `src/query/src/compiler.zig`
+    // directly — production `query_module` is untouched.
+    const compiler_legacy_module = b.createModule(.{
+        .root_source_file = b.path("src/query/src/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_legacy_module.addImport("error", error_module);
+    compiler_legacy_module.addImport("types", types_module);
+    compiler_legacy_module.addImport("lexer", lexer_module);
+    compiler_legacy_module.addImport("regex", regex_module);
+    compiler_legacy_module.addImport("ast", ast_module);
+
+    // AST walker exposed as a sibling module. Parallel to the legacy
+    // compiler. Stage 13 cutover collapses these into one.
+    const compiler_ast_module = b.createModule(.{
+        .root_source_file = b.path("src/ast/compiler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_ast_module.addImport("ast", ast_module);
+    compiler_ast_module.addImport("types", types_module);
+    compiler_ast_module.addImport("error", error_module);
+    compiler_ast_module.addImport("regex", regex_module);
+
+    const ast_equiv_step = b.step("ast-compile-equiv", "Run AST-walk compile equivalence harness (Phase 2)");
+    const ast_equiv_mod = b.createModule(.{
+        .root_source_file = b.path("tests/ast_compile_equiv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ast_equiv_mod.addImport("compiler_legacy", compiler_legacy_module);
+    ast_equiv_mod.addImport("compiler_ast", compiler_ast_module);
+    ast_equiv_mod.addImport("types", types_module);
+    ast_equiv_mod.addImport("build_options", ast_equiv_options_module);
+    const ast_equiv_tests = b.addTest(.{ .root_module = ast_equiv_mod });
+    if (shim_build_step) |step| ast_equiv_tests.step.dependOn(&step.step);
+    ast_equiv_step.dependOn(&b.addRunArtifact(ast_equiv_tests).step);
+
     // ── Regex bench (NOT in test_step) ────────────────────────────────────
     // Latency probe. Prints median/p99 per pattern class to stderr. Not part
     // of the default test step to keep CI runs fast. Invoke with
@@ -454,6 +514,35 @@ pub fn build(b: *std.Build) void {
     const bench_regex_tests = b.addTest(.{ .root_module = bench_regex_mod });
     if (shim_build_step) |step| bench_regex_tests.step.dependOn(&step.step);
     bench_regex_step.dependOn(&b.addRunArtifact(bench_regex_tests).step);
+
+    // ── Microbench (NOT in test_step) ─────────────────────────────────────
+    // Per-stage latency harness — Phase 0 of the research roadmap. Drives
+    // production modules (parser/query/output) directly and emits NDJSON
+    // (schema zq.microbench.v2) to stdout. See research/phase-0-design.md.
+    //
+    // Invocation: `zig build microbench -Dprofile=true -- --inline '{"id":1}' --iterations 10000`.
+    // `-Dprofile` toggles the comptime hook bodies in microbench/hooks.zig;
+    // production binary is unchanged either way.
+    const microbench_step = b.step("microbench", "Per-stage microbench harness (Phase 0)");
+    const microbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/microbench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    microbench_mod.addImport("parser", parser_module);
+    microbench_mod.addImport("query", query_module);
+    microbench_mod.addImport("output", output_module);
+    microbench_mod.addImport("types", types_module);
+    microbench_mod.addImport("build_options", build_options_module);
+    const microbench_exe = b.addExecutable(.{
+        .name = "zq-microbench",
+        .root_module = microbench_mod,
+    });
+    if (shim_build_step) |step| microbench_exe.step.dependOn(&step.step);
+    const microbench_run = b.addRunArtifact(microbench_exe);
+    microbench_run.stdio = .inherit;
+    if (b.args) |args| microbench_run.addArgs(args);
+    microbench_step.dependOn(&microbench_run.step);
 
     const compat_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/compat/root.zig"),
