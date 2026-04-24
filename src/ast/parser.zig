@@ -1624,6 +1624,10 @@ fn isZeroArgBuiltin(name: []const u8) bool {
 
 fn isBuiltinName(name: []const u8) bool {
     if (isZeroArgBuiltin(name)) return true;
+    // Kept in sync with legacy `isArgBuiltin` at
+    // `src/query/src/compiler.zig:2995-3066`. Every name legacy treats as a
+    // builtin (not a user function) when called with args must appear here,
+    // so the AST emits `.builtin_call` instead of `.func_call`.
     const arg_builtins = [_][]const u8{
         "map",       "select",       "has",      "in",         "range",
         "flatten",   "contains",     "inside",   "indices",    "index",
@@ -1634,8 +1638,11 @@ fn isBuiltinName(name: []const u8) bool {
         "atan2",     "remainder",    "hypot",    "scalb",      "scalbln",
         "ldexp",     "fma",          "drem",     "map_values", "isempty",
         "debug",     "halt_error",   "split",    "join",       "startswith",
-        "endswith",  "ltrimstr",     "rtrimstr", "test",       "match",
-        "sub",       "gsub",         "bsearch",  "error",
+        "endswith",  "ltrimstr",     "rtrimstr", "trimstr",    "test",
+        "match",     "sub",          "gsub",     "capture",    "scan",
+        "splits",    "bsearch",      "strftime", "strptime",   "strflocaltime",
+        "error",     "skip",         "nth",      "INDEX",      "IN",
+        "JOIN",      "walk",         "path",     "pick",
     };
     for (arg_builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;

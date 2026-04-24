@@ -27,7 +27,7 @@
 //!   - `.paren` — `(EXPR)` grouping (Stage 6, transparent)
 //!   - `.try_catch` — `try BODY [catch HANDLER]` (Stage 6)
 //!   - `.if_expr` — `if COND then THEN [elif COND then THEN]* [else ELSE] end` (Stage 6)
-//!   - `.builtin_call("path", [EXPR])` / `.func_call("path", [EXPR])` — Stage 6
+//!   - `.builtin_call("path", [EXPR])` — Stage 6
 //!   - `.object_construct` — `{...}` with static / shorthand / computed /
 //!     string-interp keys, and `{__loc__}` marker shorthand (Stage 7)
 //!   - `.array_construct` — `[...]` with zero or more items (Stage 7)
@@ -1193,12 +1193,8 @@ const Walker = struct {
             .builtin_call => |bc| {
                 // Stage 6 handles ONLY `path(EXPR)` here. Every other builtin
                 // stays at AstCompilerStageIncomplete. The AST parser's
-                // `isBuiltinName` (at `src/ast/parser.zig:1484-1503`) does NOT
-                // include "path" — so `path(.a)` actually arrives as a
-                // `func_call` node (see `.func_call` branch below for the
-                // primary dispatch). This arm is kept for defensive coverage:
-                // if a future parser fix adds "path" to isBuiltinName, the
-                // walker already handles it.
+                // `isBuiltinName` includes "path", so `path(.a)` arrives as a
+                // `builtin_call` node.
                 if (std.mem.eql(u8, bc.name, "path") and bc.args.len == 1) {
                     try emitPathCall(w, node.span, bc.args[0]);
                     return;
@@ -1249,16 +1245,6 @@ const Walker = struct {
             },
 
             .func_call => |fc| {
-                // Stage 6 handles ONLY `path(EXPR)` here. The AST routes
-                // `path(.a)` through the `func_call` branch because
-                // `isBuiltinName` omits "path" (known AST latent mismatch —
-                // see comment on `.builtin_call`). Every other func_call
-                // stays at Stage 9/10.
-                if (std.mem.eql(u8, fc.name, "path") and fc.args.len == 1) {
-                    try emitPathCall(w, node.span, fc.args[0]);
-                    return;
-                }
-
                 // Stage 9 — user-defined function call with arguments.
                 // During scanning_body, legacy emits a placeholder load_key
                 // (the instrs are discarded by the caller). We mirror by
