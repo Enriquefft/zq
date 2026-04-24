@@ -5959,28 +5959,40 @@ pub const ResultIterator = struct {
                 return try stackValueToValue(arr_sv);
             },
             .object => |span| {
-                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
-                    .tag = .object_start,
-                    .payload = .{ .skip = 0 },
-                });
+                // Collect (key_pos, walked_value) pairs before touching
+                // runtime_tape. A child walk that produces a composite appends
+                // entries to runtime_tape and then re-copies them into place
+                // via stackValueToRuntimeTapeEntry — the originals become
+                // orphans. If obj_start were appended first, those orphans
+                // would sit inside [obj_start..obj_end] and corrupt the tape.
+                // Appending obj_start after all child walks keeps orphans
+                // before the outer span, matching the array branch above.
+                const Pair = struct { key_pos: u32, val: Value };
+                var pairs = std.ArrayList(Pair){};
+                defer pairs.deinit(it.alloc);
 
                 var pos = span.start + 1;
                 const end = span.end - 1;
                 while (pos < end) {
-                    const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    const walked_val = try it.walkApplyBody(child_val, body_start, body_end, depth + 1);
+                    try pairs.append(it.alloc, .{ .key_pos = pos, .val = walked_val });
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
+                });
+                for (pairs.items) |p| {
+                    const key_str = span.tape.getString(span.tape.entries[p.key_pos].payload.string);
                     const key_ref = try it.runtime_tape.internString(it.alloc, key_str);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
                         .tag = .key,
                         .payload = .{ .string = key_ref },
                     });
-
-                    const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    const walked_val = try it.walkApplyBody(child_val, body_start, body_end, depth + 1);
-                    try it.stackValueToRuntimeTapeEntry(try valueToStackValue(walked_val));
-
-                    pos = skipEntry(span.tape.*, pos + 1);
+                    try it.stackValueToRuntimeTapeEntry(try valueToStackValue(p.val));
                 }
-
                 const obj_end_idx = try it.runtime_tape.appendEntry(it.alloc, .{
                     .tag = .object_end,
                     .payload = .{ .none = {} },
