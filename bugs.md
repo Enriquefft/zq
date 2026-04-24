@@ -1,6 +1,9 @@
 # zq Bug Findings
 
-A record of non-obvious bugs and root causes. Check here before debugging similar symptoms.
+A record of non-obvious bugs and root causes. Check here before debugging
+similar symptoms.
+
+Last verified: 2026-04-23.
 
 ---
 
@@ -8,7 +11,10 @@ A record of non-obvious bugs and root causes. Check here before debugging simila
 
 **Symptom**: SIGSEGV or wrong opcode in release builds. Debug builds work fine.
 
-**Root cause**: Mixing `extern union` inside a non-`extern struct` gives LLVM two contradictory memory layout stories. LLVM uses the `extern union`'s ABI authority to conclude a write to another field in the same struct is dead code — and deletes it silently.
+**Root cause**: Mixing `extern union` inside a non-`extern struct` gives LLVM
+two contradictory memory layout stories. LLVM uses the `extern union`'s ABI
+authority to conclude a write to another field in the same struct is dead
+code — and deletes it silently.
 
 **Example**:
 ```zig
@@ -27,146 +33,200 @@ const RawInstr = extern struct {
 };
 ```
 
-**Rule**: If a struct contains an `extern union`, the struct must also be `extern struct`.
+**Rule**: If a struct contains an `extern union`, the struct must also be
+`extern struct`.
 
-**Fixed in**: `RawInstr` + `RawOp` (compiler.zig), `Instruction.Operand` (types.zig) — commit after d37a5e7. `Tape.Entry` (types.zig:19) and `Instruction` (types.zig:691) are now `extern struct` as well. No remaining occurrences.
+**Fixed in**: `RawInstr` + `RawOp` (commit after `d37a5e7`);
+`Instruction.Operand` (`src/types.zig`). Re-verified 2026-04-23:
+`RawInstr` (`src/query/src/compiler.zig:68`), `Tape.Entry`
+(`src/types.zig:19`), and `Instruction` (`src/types.zig:691`) are all
+`extern struct`. No non-extern outer structs remain around the codebase's
+three `extern union`s.
 
-**Why only release builds**: LLVM's TBAA dead-code elimination only runs at `-O2`/`-O3`. Debug skips it.
+**Why only release builds**: LLVM's TBAA dead-code elimination only runs at
+`-O2`/`-O3`. Debug skips it.
 
-**CI fix**: Always run `zig build test -Doptimize=ReleaseSafe` in CI — it keeps safety checks active while enabling the optimizations that expose this class of bug.
+**CI status (open)**: `.github/workflows/ci.yml:40` runs `zig build test` at
+the default optimization level. Line 74 builds ReleaseSafe as a
+cross-compile step but does not run tests. Adding a dedicated
+`zig build test -Doptimize=ReleaseSafe` job would keep safety checks active
+while enabling the optimizations that expose this class of bug. Not yet in
+CI.
 
 ---
 
 ## BUG-002: Silent test inflation via SkipZigTest
 
-**Symptom**: Test suite reports 500+ passing. After refactor, drops to ~327. Looks like a regression.
+**Symptom**: Test suite reports 500+ passing. After refactor, drops to ~327.
+Looks like a regression.
 
-**Root cause**: Unimplemented filters returned `error.QuerySyntaxError`, which was caught and converted to `error.SkipZigTest`. Zig's test runner counts skipped tests alongside passes in some output modes. ~228 tests were never executing.
+**Root cause**: Unimplemented filters returned `error.QuerySyntaxError`,
+which was caught and converted to `error.SkipZigTest`. Zig's test runner
+counts skipped tests alongside passes in some output modes. ~228 tests were
+never executing.
 
 **Rule**:
 
-1. Never use `error.SkipZigTest` to hide unimplemented features. A test for a missing
-   feature must fail loudly — silently passing an unimplemented case hides regressions
-   and inflates the passing denominator.
-2. `error.SkipZigTest` IS acceptable for build-time feature gates. `-Dregex=false`
-   disables the Rust shim at build time; regex-dependent tests legitimately skip in
-   that configuration (see the `if (!regex.enabled) return error.SkipZigTest` pattern
-   across `src/regex/`, `src/query/src/prefilter.zig`, `tests/pool_test.zig`, etc).
-   Gate on the build option, not on "someone will implement it eventually".
+1. Never use `error.SkipZigTest` to hide unimplemented features. A test for
+   a missing feature must fail loudly — silently passing an unimplemented
+   case hides regressions and inflates the passing denominator.
+2. `error.SkipZigTest` IS acceptable for build-time feature gates.
+   `-Dregex=false` disables the Rust shim at build time; regex-dependent
+   tests legitimately skip in that configuration (see the
+   `if (!regex.enabled) return error.SkipZigTest` pattern across
+   `src/regex/`, `src/query/src/prefilter.zig`, `tests/pool_test.zig`,
+   etc). Gate on the build option, not on "someone will implement it
+   eventually".
 
-**Fixed in**: Domain-split test refactor (post-2e8eb29). True denominator: 533 tests, 0 silently skipped.
+**Fixed in**: Domain-split test refactor (post-`2e8eb29`). Re-verified
+2026-04-23: all 116 `SkipZigTest` callsites are either build-option gates
+(mostly `if (!regex.enabled)`) or legitimate stress/bench skips. Compat
+denominator remains 533.
 
 ---
 
 ## BUG-003: Prefilter false negatives on escape-encoded JSON strings
 
-**Symptom**: `select(.k | test("LIT"))` silently drops records whose `k` serializes
-`LIT`'s bytes as JSON escapes (`\uXXXX`, short escapes like `\n`/`\t`, or `\"` / `\\`).
-Spec-legal JSON records are eliminated before the query ever runs.
+**Symptom**: `select(.k | test("LIT"))` silently drops records whose `k`
+serializes `LIT`'s bytes as JSON escapes (`\uXXXX`, short escapes like
+`\n`/`\t`, or `\"` / `\\`). Spec-legal JSON records are eliminated before
+the query ever runs.
 
-**Root cause**: The prefilter performed a raw-byte SIMD scan for required literals
-over record bytes. RFC 8259 §7 permits a string like `"foo"` to be serialized as
-`"foo"`; the raw scan misses the escape-encoded form. The earlier workaround
-(`canPrefilterLiteral` rejecting anything containing `\`, quotes, controls, or
-non-ASCII) discarded whole classes of literals instead of handling the escape forms,
-so the hole was merely narrowed, not closed.
+**Root cause**: The prefilter performed a raw-byte SIMD scan for required
+literals over record bytes. RFC 8259 §7 permits a string like `"foo"` to be
+serialized as `"foo"`; the raw scan misses the escape-encoded form.
+The earlier workaround (`canPrefilterLiteral` rejecting anything containing
+`\`, quotes, controls, or non-ASCII) discarded whole classes of literals
+instead of handling the escape forms, so the hole was merely narrowed, not
+closed.
 
-**Rule**: Any soundness property that depends on source encoding must either (a)
-handle every spec-legal encoding or (b) degrade to the general path on evidence that
-the encoding might differ. Never ship a raw-byte optimization that silently assumes
-one canonical form.
+**Rule**: Any soundness property that depends on source encoding must
+either (a) handle every spec-legal encoding or (b) degrade to the general
+path on evidence that the encoding might differ. Never ship a raw-byte
+optimization that silently assumes one canonical form.
 
-**Fixed in**: commit `8a73a20` — escape-aware fallback. A record is accepted by a
-required literal if EITHER its raw bytes appear OR the record contains any `\` byte
-(0x5C). Every JSON escape form requires a backslash; if none is present, no
-escape-encoded occurrence is possible and the record can soundly be rejected. Every
-literal with `len >= 2` is now prefilter-safe (including `"`, `\`, control chars,
-non-ASCII UTF-8). Regression tests in `tests/pool_test.zig` cover the `\uXXXX`, `\t`,
-and raw paths end-to-end; `zig build fuzz-regex` runs a differential harness that
-diffs zq-with-prefilter vs zq-without vs jq (0 divergences over 1000 iterations).
-
----
-
-## BUG-004: `capture()` with named groups aborts with StringRef OOB
-
-**Symptom**: `capture("(?<a>\\d+)-(?<b>\\d+)") | .a + "|" + .b` on input `"12-34"`
-terminates with signal 6 and `index out of bounds: index 6, len 2` at
-`src/types.zig:56 getString`. Reproduces on both Linux and macOS.
-
-**Root cause**: Not yet root-caused. The capture object written by the `capture`
-builtin contains `StringRef { offset, len }` entries into a string buffer whose
-addressable length is 2, but one of the capture slots records an offset of 6 —
-a stale pointer into a reallocated or already-freed buffer. Likely the match slot
-survives across a `RuntimeTape.internString` call that reallocates the underlying
-`string_buf`, invalidating the earlier offset. Confirm by instrumenting the capture
-emission path and the tape-grow paths around `+` concatenation.
-
-**Lives in**: `tests/query_test.zig:2659-2664`. Currently counted inside the
-"107 pre-existing failures" number but is NOT a compat-gap test — it's a regex
-test shipped by this codebase. Separating it out surfaces the real defect count.
-
-**Fixed in**: _pending_. See also `TODO.md` for triage priority once AST-walk
-pipeline (Phase 2) lands, since the capture-emission path may move.
+**Fixed in**: commit `8a73a20` — escape-aware fallback. A record is
+accepted by a required literal if EITHER its raw bytes appear OR the record
+contains any `\` byte (0x5C). Every JSON escape form requires a backslash;
+if none is present, no escape-encoded occurrence is possible and the record
+can soundly be rejected. Every literal with `len >= 2` is now
+prefilter-safe (including `"`, `\`, control chars, non-ASCII UTF-8).
+Re-verified 2026-04-23 at `src/query/src/prefilter.zig:128-149` (logic
+intact) with regression tests in `tests/pool_test.zig` (`\uXXXX`, `\t`,
+and raw paths, gated on `regex.enabled`). `zig build fuzz-regex` runs a
+differential harness that diffs zq-with-prefilter vs zq-without vs jq
+(0 divergences over 1000 iterations).
 
 ---
 
-## BUG-005: Query syntax error on nix-manual mdbook filter (+ leak on error path)
+## BUG-004: `capture()` named-group test aborts with StringRef OOB (test-harness UAF, NOT a runtime defect)
 
-**Symptom**: `sudo nixos-rebuild switch` against a NixOS flake that overlays `jq`
-with `zq` fails while rebuilding `nix-manual-2.34.6.drv`. mdbook invokes the
-`anchors` preprocessor, which shells out to `jq` (now `zq`). zq rejects the
-filter:
+**Symptom in test**: `zig build test` — `tests/query_test.zig:2659-2664`
+panics with `index out of bounds: index 6, len 2` at `src/types.zig:56
+getString`.
+
+**Symptom in CLI**: **None.** Re-verified 2026-04-23:
+```
+$ echo '"12-34"' | ./zig-out/bin/zq 'capture("(?<a>\\d+)-(?<b>\\d+)") | .a + "|" + .b'
+"12|34"
+```
+Exit 0, correct output, no diagnostics.
+
+**Revised root cause** (sharper than the earlier hypothesis): the panic is a
+test-harness use-after-free, not a defect in the capture builtin.
+
+- `runFilterStr` (`tests/query_test.zig:2556-2562`) calls `collectAll`, which
+  owns and defers `it.deinit()` before returning — that tears down the
+  `RuntimeTape` along with its `string_buf`.
+- The returned `vals[]` slice contains `StringRef { offset, len }` entries
+  that pointed into the now-freed `string_buf`.
+- The test then asserts on `vals[0].string`, which dereferences freed
+  memory. Whatever garbage sits at offset 6 produces the OOB.
+
+The CLI works because `src/main.zig` keeps the `RuntimeTape` alive through
+serialization. The capture emission path (`buildCaptureObject` at
+`src/query/src/vm.zig:8102-8134`) correctly uses `&it.runtime_tape.view`
+and calls `internString` before the captures are consumed.
+
+**Fix direction**: change the test harness, not the runtime. Either (a)
+have `runFilterStr` materialize string `Value`s into caller-owned memory
+before `it.deinit()`, or (b) return a guard struct that keeps the tape
+alive until the test frees its result. The capture code does not need to
+change.
+
+**Lives in**: `tests/query_test.zig:2659-2664`. Was being miscounted in the
+compat-failure bucket; reclassifying it as a test-infrastructure issue
+makes the runtime behavior claim accurate.
+
+**Fixed in**: _pending_. Test-only; no user-visible CLI impact.
+
+---
+
+## BUG-005: Pipe in object-field value — parser rejects; leak claim unreproduced
+
+Surfaced during the hermetic-Nix-build rollout (commit `1f57ce1`) while
+rebuilding `nix-manual-2.34.6.drv`: mdbook's `anchors` preprocessor shelled
+out to the overlayed `zq` with a filter that zq rejected, breaking
+`nixos-rebuild switch`.
+
+### Defect 1 — parser gap (confirmed, minimal repro)
+
+Both parsers route object-field values through `parseAlternative()`, which
+handles only the `//` operator — not `|`. Any pipe in a field value fails:
 
 ```
-zq: query syntax error at line 18, col 31
-              content: .Chapter.content | transformer,
-                              ^
-error(gpa): memory address 0x7ffff7e60000 leaked:
-Unable to print stack trace: Unable to open debug info: MissingDebugInfo
- WARN Error writing the RenderContext to the backend, Broken pipe (os error 32)
-ERROR The "anchors" preprocessor exited unsuccessfully with exit status: 3 status
-ninja: build stopped: subcommand failed.
+$ echo '{}' | ./zig-out/bin/zq '{a: 1 | length}'
+zq: query syntax error at line 1, col 5
 ```
 
-**Two defects**:
-1. **Compat gap** — the filter (a jq program mdbook's anchors preprocessor
-   feeds over stdin) uses a construct zq rejects. The shown context
-   `content: .Chapter.content | transformer,` suggests an object-constructor
-   value calling a user-defined function `transformer` (likely declared via
-   `def transformer: ...;` earlier in the filter). Unconfirmed whether zq's
-   parser rejects `def`-call inside an object value, or chokes on something
-   else at col 31.
-2. **Leak on error path** — zq's syntax-error exit leaks an allocation
-   (`0x7ffff7e60000`). Error paths must free before exit; the GPA leak check
-   fires because the allocator is not short-circuited on `QuerySyntaxError`.
+Same shape as the observed nix-manual rejection (`content:
+.Chapter.content | transformer,`). Verified call sites:
 
-**Repro strategy**: capture the exact filter by running nix-manual's build
-under a strace/ptrace that records argv+stdin to jq, or grep the nixpkgs
-source tree for the mdbook `anchors` preprocessor invocation. Minimize to a
-single `.jq` file; then `zq -f min.jq < sample.json`.
+- AST parser — `src/ast/parser.zig:720` (`parseObjectField`) dispatches to
+  `parseAlternative`.
+- Compile-path parser — `src/query/src/compiler.zig:6841`
+  (`parseObjectLiteral`) also dispatches to `parseAlternative` inside
+  object value position.
+
+**Fix direction**: call a pipe-aware parser inside object-value position
+that still respects `,` as the field separator. Must land in both parsers
+so compiled behavior and LSP diagnostics agree.
 
 **Blast radius**: any NixOS configuration that substitutes `jq` → `zq` via
-overlay cannot rebuild `nix` itself (because nix ships the mdbook-built
-manual). Breaks `nixos-rebuild switch`.
+overlay cannot rebuild `nix` itself (nix ships the mdbook-built manual);
+also blocks any jq script that pipes inside an object literal without
+explicit parenthesization.
 
-**Fixed in**: _pending_. Triage: (1) first isolate the minimal filter;
-(2) classify — parser limitation vs. interpreter limitation; (3) fix the
-leak on `QuerySyntaxError` regardless of (1)/(2) progress, since any
-syntax error path will leak today.
+### Defect 2 — leak on error path (not reproduced)
 
-**Context**: Surfaced during the hermetic-Nix-build rollout
-(commit `1f57ce1`). The hermetic flake itself works — `nix build .#default`
-is green, the overlay is live, and zq is actually being invoked by nix's
-build graph. This is a separate zq compat gap, not a Nix packaging issue.
+The original report included a GPA leak on `QuerySyntaxError` exit
+(`memory address 0x7ffff7e60000 leaked` during `nixos-rebuild switch`).
+
+Re-verification 2026-04-23 against a Debug build with a simple bad-token
+input (`./zig-out/bin/zq 'invalid @@@ syntax' <<< '{}'`) produced **no
+leak**. Code audit of `compile()` (`src/query/src/compiler.zig:1304-1489`)
+shows defers covering `ctx.raw`, the function table, pattern allocations,
+the intern table, the regex pool, prefilter groups, and the scope chain,
+all executing on `parseFilter`'s error return at `:1408`.
+
+The earlier leak may have been path-specific (not triggered by a simple
+bad-token case) or fixed incidentally. Do not treat as real until a
+specific filter-input pair reproduces it. Suggested repro strategy:
+overlay-wrap zq with a shell script that tees stdin + argv into a log
+file, run the failing `nixos-rebuild switch`, replay the captured
+filter under a Debug build.
+
+**Fixed in**: _pending_. Defect 1 is the ship-blocker; defect 2 stays
+parked until reproduced.
 
 ---
 
 ## BUG-006: Generator in object-value position errors with "type error"
 
-**Symptom**: Any generator yielding more than one value in object-construction
-value position raises a runtime `type error` at the position where the
-generator emits its second value. jq produces N separate objects, one per
-generator yield.
+**Symptom**: Any generator yielding more than one value in object-
+construction value position raises a runtime `type error` at the position
+where the generator emits its second value. jq produces N separate
+objects, one per generator yield.
 
 ```
 $ echo 5 | zq '{a:(1,2,3)}'
@@ -181,44 +241,38 @@ $ echo 5 | jq '{a:(1,2,3)}'
 {"a":3}
 ```
 
-Same failure mode for `.[]` in value position (`[1,2,3] | {a:.[]}`),
-multi-yield user functions, and bare commas (`{a:1,2}` — note jq parses
-this as `{a:1, 2:???}` and errors differently, but `{"a":(1,2)}` is the
-clean form).
+Re-verified 2026-04-23. Same failure for `[1,2,3] | {a:.[]}` and for
+generators in any key's value position (`{a:1, b:(1,2)}` fails,
+`{a:{b:(1,2,3)}}` fails).
 
-**Single-yield works** (`{a:(1)}` ✓, `{a:(empty)}` ✓ — produces nothing).
-**Generator outside the object literal works** (`(1,2,3) | {a:.}` ✓).
+**Single-yield works** (`{a:(1)}` ✓, `{a:(empty)}` ✓). **Generator outside
+the object literal works** (`(1,2,3) | {a:.}` ✓, `[(1,2,3) | {a:.}]` ✓).
 
-**Root cause hypothesis**: `object_key` opcode consumes one value off the
-stack, emits one ObjectField, advances `ip`. When the value expression is a
-generator, the generator's first yield is consumed cleanly but the
-forkpoint backtracks to the generator's "next value" rather than to
-`object_construct_start` — so on backtrack, the second yield arrives at
-`object_key` with the field-stack already populated from the first
-iteration, the `it.current` pointing at a non-input intermediate, or
-similar invariant violation that surfaces as `type error`.
+**Verified root cause**: `backtrackToDepth` (`src/query/src/vm.zig:6464-
+6484`) restores `value_stack`, `current`, `ip`, and path state on a
+`.normal` forkpoint restore — but does not touch the three
+object-construction stacks the VM maintains:
 
-The compiler does NOT wrap the entire `object_construct_start … object_construct_end`
-range in a save/restore frame keyed for the generator forkpoint. This is
-why the parallel pattern `[(1,2,3) | {a:.}]` — where the comma operator
-sits OUTSIDE the object literal — works correctly.
+- `it.object_construct` (accumulated `ObjectField` list)
+- `it.object_construct_depth` (nested-object depth stack)
+- `it.object_construct_input` (per-frame input snapshot)
 
-**Surfaced during**: contains() fix work (commit `dbd53e2`). Reviewer ran
-`5 | {a:(1,2,3)}` as an edge-case probe; pre-existing pre-fix failure, NOT
-a regression of the contains fix. Filed as separate bug rather than rolled
-into that scope.
+These are managed by `object_construct_start` / `object_key` /
+`object_construct_end` in `src/query/src/vm.zig:1200-1258`. The compiler's
+comma-generator emission (`parseComma` at
+`src/query/src/compiler.zig:2504`, which emits `.fork` at `:2522`) has no
+knowledge that it sits inside an object-construction frame, so the fork
+instruction does not teach the VM to snapshot those stacks.
 
-**Fix sketch**: emit the object construction sequence inside a forkpoint
-frame so generator backtrack restores `object_construct.items.len`,
-`object_construct_depth`, `object_construct_input`, and `it.current` to
-their `object_construct_start`-time snapshots. Likely lives in
-`src/query/src/compiler.zig` around object-literal compilation; the VM
-opcodes themselves should not need to know about generators.
+**Fix direction**: either (a) push a dedicated `object_construct_mark` /
+`object_construct_rewind` opcode pair around the field-value subexpression
+so backtrack rewinds the stacks explicitly; or (b) extend `Forkpoint` with
+saved lengths for all three object-construct stacks and have
+`backtrackToDepth` restore them when the frame unwinds. Option (b) is
+symmetric with the `saved_stack` snapshot approach already in place for
+binop left-operand survival (see roadmap Quick Status update 2026-04-23).
 
-**Blast radius**: blocks any jq pattern that builds multiple objects per
-input record via in-value generators. Common in transformations that
-expand one record into many (logs → events, batch → items). Likely a
-contributor to compat-test failures involving `with_entries` /
-`from_entries` / object reshaping pipelines.
+**Surfaced during**: contains() fix work (commit `dbd53e2`). Pre-existing
+pre-fix failure, NOT a regression of the contains fix.
 
 **Fixed in**: _pending_.

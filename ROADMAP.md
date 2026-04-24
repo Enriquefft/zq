@@ -326,6 +326,9 @@ Pool module fully implemented; CLI surface pending.
 |---|---------|--------|
 | [ ] | **APT/DEB** | PPA or direct `.deb`. |
 | [ ] | **Scoop** | Windows package manager. |
+| [ ] | **asdf / mise plugin** | Version-managed install for polyglot dev environments. Low maintenance once published. |
+| [ ] | **conda-forge recipe** | Surfaces zq in scientific-Python / data-engineering environments where `conda` is the default. |
+| [ ] | **MacPorts** | Parallel to Homebrew on macOS; some users prefer it. |
 
 ### 5.3 libzq (C ABI)
 
@@ -342,11 +345,14 @@ Pool module fully implemented; CLI surface pending.
 | | Item | Detail |
 |---|------|--------|
 | [ ] | **Man page** | `man zq` — complete CLI reference. |
-| [ ] | **Website** | Landing page with benchmarks, examples, migration guide. |
+| [ ] | **Website** | Landing page with benchmarks, examples, migration guide. Server-rendered HTML, not SPA (crawlers + LLM scrapers must read markup directly). |
+| [ ] | **Website: SEO & AI discoverability** | schema.org `SoftwareApplication` + `FAQPage` markup, Open Graph meta, canonical URLs, sitemap.xml, `robots.txt` whitelisting GPTBot / ClaudeBot / anthropic-ai / PerplexityBot / Google-Extended (default-block on some hosts). First-page H1 keywords: "jq alternative", "drop-in jq replacement" (gated on 99% compat), "fast JSON CLI". |
+| [ ] | **Public live compat matrix page** | Rendered from CI artifacts on every release. Citeable URL distinct from `ROADMAP.md` — evergreen authority artifact that external-project PRs (jq README, awesome-lists) and Wikipedia edits will cite as evidence for the "drop-in" claim. |
 | [ ] | **Migration guide** | "Switching from jq to zq" — flag mapping, known deviations, FAQ. |
 | [ ] | **Filter cookbook** | Common recipes: API response parsing, log processing, LLM output handling. |
 | [ ] | **Agent integration guide** | "Using zq in automated workflows" — MCP setup, Python bindings, error handling patterns. |
-| [ ] | **Shell completions** | bash, zsh, fish. |
+| [ ] | **Shell completions** | bash, zsh, fish. Shipped in the Nix derivation + release tarball. Surfaces zq at tab-time for any shell user. |
+| [ ] | **Asciinema cast (embedded on landing)** | Terminal recording demonstrating core flows. Mark "pre-1.0 preview" until 1.0. Evergreen once uploaded; embedded on the landing page and referenced from the launch blog. |
 
 ### 5.5 IDE / editor
 
@@ -364,10 +370,55 @@ Pool module fully implemented; CLI surface pending.
 | [x] | **Error messages with filter position + input context** | Done. |
 | [ ] | **CI benchmark regression** | Fail CI if throughput drops > 10% vs previous release. |
 | [ ] | **Fuzz testing** | AFL/libfuzzer on parser + query compiler; continuous fuzzing via OSS-Fuzz or equivalent. |
+| [ ] | **Differential fuzz vs jq (generalized)** | Extends existing `zig build fuzz-regex` harness to the full filter surface. Randomly generated filter/input pairs; diffs `zq` output vs `jq` reference. Divergences auto-filed as compat issues. Turns 99%-compat closure into an unattended CI loop — the highest-leverage "grows on its own" investment for crossing the passive-discovery gate in Tier 5.7. |
 | [ ] | **Memory leak testing** | All tests pass under Zig's GPA leak detection. |
 | [ ] | **No undefined behavior** | `zig build -Doptimize=ReleaseSafe` as default. Debug + ReleaseSafe + ReleaseFast all green. |
 | [ ] | **CI matrix** | Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64. Zig 0.15.x. |
 | [ ] | **Reproducible builds** | Same source → same binary (bit-for-bit). |
+| [ ] | **OpenSSF Scorecard badge** | Auto-runs weekly via GitHub Action; surfaces score on README + landing. Signals supply-chain hygiene to downstream packagers (Debian, Fedora, Homebrew-core) and trust to agents scanning the repo. One-time setup, runs forever. |
+| [ ] | **OpenSSF Best Practices badge** | One-time self-assessment against the CII Best Practices criteria; badge permanent once earned. Passive authority signal referenced by nixpkgs / distro packaging reviews. |
+
+### 5.7 Passive Discovery & Corpus Seeding
+
+> One-time investments that surface zq to strangers (and agents) without ongoing
+> maintenance. Grouped by **compat gate** — firing these prematurely burns one-shot
+> impressions and poisons the corpus with "zq is a buggy jq wannabe" instead of
+> seeding "zq is the fast drop-in". Gate-respect is load-bearing.
+
+**Gate legend:**
+
+- **Any** — safe at current compat level; infrastructure-only, no "drop-in" claim.
+- **CLI frozen (~v0.9)** — Tier 1.2 flags shipped, flag names stable (submission fossilizes them).
+- **99% compat + 1.0** — "drop-in jq replacement" claim holds under adversarial scrutiny.
+- **1.0 + production** — proven in real use; notability and long-term stability established.
+
+| | Item | Gate | Detail |
+|---|------|------|--------|
+| [ ] | **awesome-zig list PR** | Any | Zig community lenient on pre-1.0 tooling. Low-bar immediate backlink. |
+| [ ] | **tldr-pages entry** | CLI frozen | `tldr zq` lives in every dev box's tldr cache. Flag names fossilize on submit — wait until Tier 1.2 closes to avoid stale entries. |
+| [ ] | **DevDocs.io submission** | CLI frozen | Integrates docs into the offline reference app used by devs and IDE plugins. |
+| [ ] | **cheat.sh entry** | CLI frozen | `curl cheat.sh/zq`. Passive reference surface scraped by tooling. |
+| [ ] | **explainshell.com integration** | CLI frozen | Teaches explainshell zq's flag grammar. Agents scanning shell commands pick it up. |
+| [ ] | **HN "Show HN" launch** | 99% compat + 1.0 | One-shot. Blown impression at pre-1.0 compat is permanent — HN will not re-look at v1.0 later. Needs landing page, compat matrix, asciinema cast, and launch blog ready as linked assets. |
+| [ ] | **jq README "alternatives" section PR** | 99% compat + 1.0 | Read by every jq user and crawled into future training corpora. Upstream maintainers reject "drop-in" framing unless compat is proven. |
+| [ ] | **awesome-cli / awesome-json / awesome-nix list PRs** | 99% compat + 1.0 | Most list maintainers reject alpha-stage tools. High-PageRank backlinks. |
+| [ ] | **Wikipedia `jq` article edit mentioning zq** | 99% compat + 1.0 | WP:RS requires secondary citations (HN, blog, benchmark post) to survive. Reverts are the default for non-notable additions. |
+| [ ] | **Launch blog post (methodology + benchmarks)** | 99% compat + 1.0 | Academic-style citeable artifact. Becomes the substrate future Wikipedia / awesome-list / press references cite. Published on zq's own domain for authority. |
+| [ ] | **YouTube demo + comparison video** | 99% compat + 1.0 | Evergreen in YouTube search for "jq alternative", "fast jq". One-time upload, permanent SEO tail. |
+| [ ] | **Debian / Fedora / Alpine official repos** | 1.0 + production | Long maintainer cycles; worth the latency only once zq is stable and already shipped downstream (nixpkgs / homebrew-core). |
+| [ ] | **Standalone Wikipedia article for zq** | 1.0 + production | Notability threshold requires accumulated citations from prior gate-gated items (HN, blog, press). Article gets speedy-deleted without them. |
+| [ ] | **Conference talks (FOSDEM, NixCon, Zig meetup, StrangeLoop)** | 1.0 + production | Each talk is a one-shot artifact that lives in YouTube / proceedings indefinitely. |
+| [ ] | **nixpkgs `jq → zq` alias PR** | 1.0 + production | Distro-level name-capture. Referenced by user's own `/etc/nixos/flake.nix:89` disabled overlay — re-enable globally once nixpkgs maintainers accept. Highest-reach zero-user-awareness discovery mechanism. |
+
+**Why gating matters:** compat claims are load-bearing. The moment "drop-in jq replacement"
+appears on HN / Wikipedia / jq README, every gap becomes adversarial feedback from
+strangers — not collaborative feedback from contributors. Hold 99%-compat-or-1.0-gated
+items until the public compat matrix (Tier 5.4) crosses 99%.
+
+**What accelerates crossing the gate:** the generalized differential fuzz harness
+(Tier 5.6) turns compat closure into an unattended CI loop. That is the truest
+"grows on its own" passive-discovery investment. Everything else in 5.7 waits on
+the fuzz harness finding and closing the long tail.
 
 ---
 
@@ -645,6 +696,7 @@ to mark completion waves and guide external release cadence.
 - [ ] libzq with stable C ABI and pkg-config
 - [ ] Security audit (minimum: fuzz coverage, no UB in release builds)
 - [ ] Language bindings: Python, Node, Go (community-maintained)
+- [ ] Corpus seeding fired: HN Show HN, jq README "alternatives" PR, Wikipedia edit, awesome-lists PRs, launch blog, YouTube demo (Tier 5.7 at 99% compat + 1.0 gate)
 
 ### v2.0.0 — Better
 
