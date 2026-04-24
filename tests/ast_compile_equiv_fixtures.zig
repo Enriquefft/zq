@@ -828,18 +828,69 @@ pub const stage10b_supported: []const []const u8 = &.{
     "limit(3; range(10)) | . + 1",
 };
 
-/// Stage 10c fixtures that remain outside the walker. Legacy accepts; the
-/// walker currently returns `AstCompilerStageIncomplete`. Stage 10c will
-/// land `del` / `pick` / `INDEX` / `IN` / `JOIN`.
-pub const stage10c_unsupported: []const []const u8 = &.{
-    // `del` / `pick` — path arg + delpaths, Stage 10c.
+/// Supported in Stage 10c — del / pick / INDEX / IN / JOIN. Every entry must
+/// yield byte-identical `Instruction[]` + `source_map` across the legacy
+/// compiler and the AST walker. See `research/phase-2-ast-walk-plan.md` §4
+/// Stage 10.
+///
+/// Stage 10c completes the 26 Stage-10 builtins. Each desugars to a reduce /
+/// delpaths pattern that allocates hidden temp variables (`$orig`, `$paths`,
+/// `$in`, `$acc`, `$x`, `$y`, `$saved_input`, `$elem`, `$key`, `$lookup`).
+/// The walker's allocation order MUST match legacy exactly; the equivalence
+/// harness catches any divergence via operand bit-compare on
+/// `capture_variable` / `load_variable` / `pop_variable` ids.
+///
+/// Legacy-arity notes:
+///   - `INDEX` requires 2 args; `INDEX(.id)` is a legacy compile error too
+///     (the 1-arg form would need a preceding `[.[]]`-style collector).
+///     Only 2-arg `INDEX(STREAM; KEY)` fixtures appear below.
+///   - `IN` accepts 1 or 2 args; the legacy dispatcher at
+///     `src/query/src/compiler.zig:5228-5254` scans for `;` at depth 1.
+///   - `JOIN` accepts exactly 2 args: `JOIN($idx; idx_expr)`.
+///   - `del` / `pick` accept a single path expression.
+pub const stage10c_supported: []const []const u8 = &.{
+    // ── del(PATH_EXPR) — delpaths desugar ──────────────────────────
     "del(.a)",
+    "{a:1,b:2} | del(.a)",
+    "[1,2,3] | del(.[1])",
+    "{a:{b:1,c:2}} | del(.a.b)",
+    "[{x:1},{x:2}] | del(.[].x)",
+    "del(.a, .b)",
+    "{a:1,b:2,c:3} | del(.a, .c)",
+
+    // ── pick(PATH_EXPR) — reduce + setpath desugar ─────────────────
     "pick(.a)",
-    // `INDEX` / `IN` / `JOIN` — reduce desugar, Stage 10c.
-    // NOTE: legacy's `compileINDEX` requires a 2-arg form; `INDEX(.id)` is
-    // actually a compile error in legacy too, so the harness contract
-    // ("unsupported = legacy accepts, walker rejects") would fail. Using a
-    // 2-arg form instead so the fixture has legacy parity.
+    "{a:1,b:2,c:3} | pick(.a, .c)",
+    "{a:{b:1,c:2}} | pick(.a.b)",
+    "[1,2,3] | pick(.[0], .[2])",
+    "pick(.x.y)",
+
+    // ── INDEX(STREAM; KEY) — reduce-over-stream desugar ────────────
     "INDEX([{id:1}][]; .id)",
+    "[{id:1,n:\"a\"},{id:2,n:\"b\"}] | INDEX(.[]; .id)",
+    "INDEX(range(3); .)",
+    "[{k:\"x\",v:1},{k:\"y\",v:2}] | INDEX(.[]; .k)",
+
+    // ── IN(STREAM) — 1-arg membership reduce ───────────────────────
     "IN(1, 2, 3)",
+    "1 | IN(1,2,3)",
+    "\"a\" | IN(\"a\",\"b\")",
+    "5 | IN(range(10))",
+
+    // ── IN(SOURCE; STREAM) — 2-arg nested reduce ───────────────────
+    "IN([1,2,3][]; 1,2,3)",
+    "IN(.[]; range(5))",
+
+    // ── JOIN($IDX; IDX_EXPR) — 2-arg pair-construction ─────────────
+    ". as $i | [{id:1}] | JOIN($i; .id)",
+    "{a:1,b:2} as $idx | [\"a\",\"b\"] | JOIN($idx; .)",
+
+    // ── Intersection with earlier stages ───────────────────────────
+    "def f: del(.a); f",
+    "[del(.a)]",
+    "{a: pick(.b.c)}",
 };
+
+/// Stage 10c fixtures that remain outside the walker. All Stage 10c shapes
+/// are now handled; empty list acts as the scaffold contract marker.
+pub const stage10c_unsupported: []const []const u8 = &.{};

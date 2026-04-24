@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–10b landed; 10c, 11–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–10 complete; 11–13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -19,7 +19,7 @@ Last verified: 2026-04-23.
    canonical representation (see `CLAUDE.md` §3).
 
    **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5
-   + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a + Stage 10b.
+   + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10 (10a + 10b + 10c).
    Walker covers: literal/identity/
    recurse/unary_neg (Stage 1), field_access/index_access/iterate/slice/
    suffix chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including
@@ -58,31 +58,26 @@ Last verified: 2026-04-23.
    **Plan:** `research/phase-2-ast-walk-plan.md` — full stage breakdown,
    risk register, and cutover strategy.
 
+   **Stage 10 (landed — full 26-builtin surface byte-identical):**
+   - 10a: `select`, `map`, `map_values`, `walk`, `while`, `until`, `repeat`,
+     `any` / `all` (0/1/2-arg), `add(f)`, `first(f)`, `last(f)`. Straight
+     `( arg )` descent with no reorder / no hidden vars. Dispatch at
+     `dispatchStage10aBuiltin`.
+   - 10b: `reduce`, `foreach`, `label`/`break`, `range` (1/2/3-arg),
+     `limit`, `skip`, `nth`. EXPR-after-INIT splice via `rebaseExprBuf`;
+     `label_var_ids` side-table for `break` verification;
+     `parseArgToArrayEmit` Cartesian collector; legacy `compileRange`
+     lookahead quirk (advances `last_tok_offset` without restoring)
+     reproduced byte-for-byte.
+   - 10c: `del`, `pick`, `INDEX` (2-arg), `IN` (1/2-arg), `JOIN` (2-arg).
+     `del` desugars to `[path(f)] as $paths | . | delpaths($paths)`;
+     `pick` to the reduce+setpath rebuild; `INDEX` / `IN` / `JOIN` each
+     capture stream and idx-expr AST subtrees up-front (mirroring legacy's
+     skip-parse to burn var_ids, then re-parse to emit), splicing via
+     `appendRebasedInstrsCopy` in place of legacy's `rebaseExprBuf` +
+     `ctx.lex.pos` rewind dance. Dispatch at `dispatchStage10cBuiltin`.
+
    **Remaining stages (per plan §4):**
-   - Stage 10 — SPLIT into 10a / 10b / 10c for bite-sized byte-equivalence
-     verification. The full Stage 10 builtin surface (~26 entries) carries
-     enough per-builtin emission quirks (EXPR-after-INIT reorder in reduce /
-     foreach, hidden var-id allocation in lock-step with legacy, label-frame
-     plumbing, Cartesian-product argument collection, path-expression
-     embedding in del/pick) that landing it in one commit would pile
-     divergences faster than the harness could surface them.
-     - Stage 10a (landed): `select`, `map`, `map_values`, `walk`, `while`,
-       `until`, `repeat`, `any` / `all` (0/1/2-arg), `add(f)`, `first(f)`,
-       `last(f)`. Straight `( arg )` descent with no reorder / no hidden
-       vars. Dispatch lives in `dispatchStage10aBuiltin` at
-       `src/ast/compiler.zig`; per-builtin emitters follow.
-     - Stage 10b (landed): `reduce`, `foreach`, `label`/`break`, `range`
-       (1/2/3-arg), `limit`, `skip`, `nth`. Walker ports the legacy
-       EXPR-after-INIT splice via `rebaseExprBuf` for `reduce`/`foreach`;
-       registers label variables in a `label_var_ids` side-table for
-       compile-time `break` verification; mirrors the legacy's Cartesian-
-       product argument collection via a `parseArgToArrayEmit` helper; and
-       reproduces the `compileRange` lookahead quirk (which advances
-       `ctx.last_tok_offset` without restoring it) so the src_offset of
-       range's first `array_collect_start` matches legacy byte-for-byte.
-     - Stage 10c (pending): `del`, `pick`, `INDEX`, `IN`, `JOIN`. These
-       each desugar to a larger reduce/setpath pattern and build on Stage
-       10b's reduce machinery.
    - Stage 11: regex builtins and string-ops remainder.
    - Stage 12: prefilter integration (fold into single AST pass).
    - Stage 13: cutover — delete legacy compiler, swap in walker.

@@ -1296,6 +1296,9 @@ const Walker = struct {
                 // ── Stage 10b: range / limit / skip / nth ─────────────
                 if (try dispatchStage10bBuiltin(w, bc, node.span)) return;
 
+                // ── Stage 10c: del / pick / INDEX / IN / JOIN ─────────
+                if (try dispatchStage10cBuiltin(w, bc, node.span)) return;
+
                 return error.AstCompilerStageIncomplete;
             },
 
@@ -5299,6 +5302,718 @@ fn emitCounterGatedBuiltin(
         w.raw.items[pos].operand = .{ .index = @intCast(w.raw.items.len) };
     }
     w.raw.items[outer_ip].operand = .{ .index = @intCast(w.raw.items.len) };
+}
+
+// ── Stage 10c: del / pick / INDEX / IN / JOIN ──────────────────────────────
+//
+// Legacy references:
+//   - `compileDel`   — `src/query/src/compiler.zig:5654-5695`
+//   - `compilePick`  — `src/query/src/compiler.zig:4875-4961`
+//   - `compileINDEX` — `src/query/src/compiler.zig:5104-5223`
+//   - `compileIN`    — `src/query/src/compiler.zig:5228-5254` (dispatch)
+//     - `compileIN1` — `src/query/src/compiler.zig:5260-5355`
+//     - `compileIN2` — `src/query/src/compiler.zig:5361-5521`
+//   - `compileJOIN`  — `src/query/src/compiler.zig:5529-5651`
+//
+// Source-offset policy — verbatim mirror of legacy's `ctx.last_tok_offset`
+// state after each `nextToken`/`parsePipe` call:
+//   - `lparen_off` — offset of `(` opening the call (legacy emits stamped
+//     here after `nextToken` consumes `(`).
+//   - After `parsePipe(arg)` emits the arg's instructions, `last_tok_offset`
+//     advances to the arg's last token; `w.last_emit_offset` mirrors this
+//     because every `w.emit` updates it.
+//   - After `nextToken(';')` or `nextToken(')')` in legacy, all subsequent
+//     emits stamp at the semi / rparen offset.
+//   - After a skip-parse-and-truncate (legacy's technique for advancing the
+//     lexer past a stored source range), `last_tok_offset` remains at the
+//     skipped arg's last token — the truncate does not undo the token-state
+//     updates that happened during parsing.
+//   - `appendSlice` of a captured raw-instr buffer does NOT update
+//     `last_tok_offset`; legacy's prior state carries over verbatim. The
+//     walker's `appendRebasedInstrsCopy` DOES bump `last_emit_offset` to the
+//     spliced block's last src_offset, so any emitter that splices must
+//     explicitly restore `w.last_emit_offset` before its next stamp-by-
+//     last-emit emission.
+
+/// Dispatch a Stage 10c builtin_call. Returns true on handled, false for
+/// fall-through (caller returns `AstCompilerStageIncomplete`).
+fn dispatchStage10cBuiltin(
+    w: *Walker,
+    bc: Node.BuiltinCall,
+    call_span: ast.Span,
+) Walker.Error!bool {
+    if (std.mem.eql(u8, bc.name, "del") and bc.args.len == 1) {
+        try emitDel(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "pick") and bc.args.len == 1) {
+        try emitPick(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "INDEX") and bc.args.len == 2) {
+        try emitINDEX(w, call_span, bc.args[0], bc.args[1]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "IN")) {
+        if (bc.args.len == 1) {
+            try emitIN1(w, call_span, bc.args[0]);
+            return true;
+        }
+        if (bc.args.len == 2) {
+            try emitIN2(w, call_span, bc.args[0], bc.args[1]);
+            return true;
+        }
+    }
+    if (std.mem.eql(u8, bc.name, "JOIN") and bc.args.len == 2) {
+        try emitJOIN(w, call_span, bc.args[0], bc.args[1]);
+        return true;
+    }
+    return false;
+}
+
+/// Emit `del(PATH_EXPR)`. Legacy `compileDel` desugar:
+///   . as $orig | [path(f)] as $paths | $orig | delpaths($paths)
+///
+/// Bytecode (every emit stamp mirrors legacy):
+///   push_current                     @ lparen
+///   capture_variable(orig)           @ lparen
+///   array_collect_start(end)         @ lparen   (backpatched)
+///   path_begin(end)                  @ lparen   (backpatched)
+///   <f walk>                         (arg's offsets; w.last_emit_offset = arg_last)
+///   path_end                         @ arg_last
+///   yield_output                     @ arg_last
+///   array_collect_end                @ arg_last
+///   capture_variable(paths)          @ arg_last
+///   load_variable(orig)              @ arg_last
+///   pipe                             @ arg_last
+///   load_variable(paths)             @ arg_last
+///   call_builtin(delpaths)           @ arg_last
+fn emitDel(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+
+    try pushScope(w);
+    defer popScope(w);
+
+    const orig_var = w.next_var_id;
+    w.next_var_id += 1;
+    const paths_var = w.next_var_id;
+    w.next_var_id += 1;
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(orig_var) }, lparen_off);
+
+    const ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    const path_begin_ip = w.raw.items.len;
+    try w.emit(.path_begin, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+    const arg_last = w.last_emit_offset;
+
+    try w.emit(.path_end, .{ .none = {} }, arg_last);
+    // path_begin's operand points at path_end's raw IP (= raw.len - 1 now).
+    w.raw.items[path_begin_ip].operand = .{ .index = @intCast(w.raw.items.len - 1) };
+
+    try w.emit(.yield_output, .{ .none = {} }, arg_last);
+
+    const ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, arg_last);
+    w.raw.items[ace_start].operand = .{ .index = @intCast(ace_end) };
+
+    try w.emit(.capture_variable, .{ .index = @intCast(paths_var) }, arg_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, arg_last);
+    try w.emit(.pipe, .{ .none = {} }, arg_last);
+    try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, arg_last);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.delpaths) },
+        arg_last,
+    );
+
+    // Legacy consumes `)` AFTER the final call_builtin via nextToken (see
+    // `compileDel` at `src/query/src/compiler.zig:5691`), updating
+    // `ctx.last_tok_offset` to the rparen position. Subsequent emits (e.g.
+    // the outer trailing yield_output, or an enclosing arithmetic op that
+    // stamps with `last_tok_offset`) observe the rparen offset. Mirror by
+    // setting `w.last_emit_offset` explicitly.
+    const rparen_off = builtinRparenOff(call_span);
+    w.last_emit_offset = rparen_off;
+}
+
+/// Emit `pick(PATH_EXPR)`. Legacy `compilePick` builds a reduce over the
+/// collected `[path(f)]` that rebuilds an object/array with only the listed
+/// paths preserved from `$in`.
+///
+/// Legacy consumes `)` BEFORE emitting `path_end`; from that point on every
+/// remaining emit is stamped at rparen_off.
+///
+/// Bytecode (stamps mirror legacy precisely):
+///   push_current                     @ lparen
+///   capture_variable(in)             @ lparen
+///   array_collect_start(end)         @ lparen   (backpatched)
+///   path_begin(end)                  @ lparen   (backpatched)
+///   <f walk>                         arg's offsets
+///   path_end                         @ rparen
+///   yield_output                     @ rparen
+///   array_collect_end                @ rparen
+///   capture_variable(arr)            @ rparen
+///   push_null                        @ rparen
+///   capture_variable(acc)            @ rparen
+///   load_variable(arr)               @ rparen
+///   pipe                             @ rparen
+///   array_collect_start(end2)        @ rparen   (backpatched)
+///   each                             @ rparen
+///   capture_variable(p)              @ rparen
+///   load_variable(acc)               @ rparen
+///   pipe                             @ rparen
+///   save_input                       @ rparen
+///   load_variable(p)                 @ rparen
+///   restore_input                    @ rparen
+///   save_input                       @ rparen
+///   load_variable(in)                @ rparen
+///   pipe                             @ rparen
+///   load_variable(p)                 @ rparen
+///   call_builtin(getpath)            @ rparen
+///   restore_input                    @ rparen
+///   call_builtin(setpath)            @ rparen
+///   capture_variable(acc)            @ rparen
+///   backtrack                        @ rparen
+///   array_collect_end                @ rparen
+///   pipe                             @ rparen
+///   load_variable(acc)               @ rparen
+///   pop_variable(p)                  @ rparen
+///   pop_variable(acc)                @ rparen
+///   pop_variable(arr)                @ rparen
+///   pop_variable(in)                 @ rparen
+fn emitPick(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    // Legacy var-id allocation order: in, acc, p, arr — BEFORE pushScope.
+    const in_var_id = w.next_var_id;
+    w.next_var_id += 1;
+    const acc_id = w.next_var_id;
+    w.next_var_id += 1;
+    const p_var_id = w.next_var_id;
+    w.next_var_id += 1;
+    const arr_var_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try pushScope(w);
+    defer popScope(w);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(in_var_id) }, lparen_off);
+
+    const ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    const path_begin_ip = w.raw.items.len;
+    try w.emit(.path_begin, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.path_end, .{ .none = {} }, rparen_off);
+    w.raw.items[path_begin_ip].operand = .{ .index = @intCast(w.raw.items.len - 1) };
+
+    try w.emit(.yield_output, .{ .none = {} }, rparen_off);
+
+    const ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[ace_start].operand = .{ .index = @intCast(ace_end) };
+
+    try w.emit(.capture_variable, .{ .index = @intCast(arr_var_id) }, rparen_off);
+
+    try w.emit(.push_null, .{ .none = {} }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(arr_var_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const inner_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, rparen_off);
+    try w.emit(.each, .{ .none = {} }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(p_var_id) }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    // setpath($p; $in | getpath($p))
+    try w.emit(.save_input, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var_id) }, rparen_off);
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(.save_input, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(in_var_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var_id) }, rparen_off);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.getpath) },
+        rparen_off,
+    );
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.setpath) },
+        rparen_off,
+    );
+
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.backtrack, .{ .none = {} }, rparen_off);
+
+    const inner_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[inner_ace_start].operand = .{ .index = @intCast(inner_ace_end) };
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+
+    try w.emit(.pop_variable, .{ .index = @intCast(p_var_id) }, rparen_off);
+    try w.emit(.pop_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.pop_variable, .{ .index = @intCast(arr_var_id) }, rparen_off);
+    try w.emit(.pop_variable, .{ .index = @intCast(in_var_id) }, rparen_off);
+}
+
+/// Emit `INDEX(STREAM; IDX_EXPR)`. Legacy `compileINDEX` desugar:
+///   reduce STREAM as $x ({}; . + {($x | IDX_EXPR | tostring): $x})
+///
+/// Variable-id allocation order (legacy `:5108-5113`): saved_input, acc, x.
+///
+/// Stamping mirrors legacy's `ctx.last_tok_offset` trajectory:
+///   - lparen consumed → `@ lparen`
+///   - parsePipe STREAM → `@ stream's own offsets`, ends at stream_last
+///   - semi consumed → `@ semi`
+///   - skip-parse IDX_EXPR → ends at idx_last (legacy parses+discards to
+///     advance the lexer; we walk+capture to the same effect, burning the
+///     same var_ids in the process)
+///   - rparen consumed → `@ rparen` (all emits until the re-parse of IDX_EXPR)
+///   - splicing captured STREAM does NOT advance legacy's last_tok_offset —
+///     after the splice, emits are still `@ rparen`
+///   - splicing captured IDX_EXPR likewise does not advance legacy's
+///     last_tok_offset directly, BUT legacy's `ctx.lex.pos = idx_expr_src_start;
+///     parsePipe(ctx)` emits fresh and DOES update last_tok_offset to the
+///     IDX_EXPR's final token. Restoring `ctx.lex.pos = saved_lex_pos` does
+///     NOT roll last_tok back. So every emit AFTER the idx splice is stamped
+///     at idx_last.
+fn emitINDEX(
+    w: *Walker,
+    call_span: ast.Span,
+    stream: *const Node,
+    idx: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const saved_input_id = w.next_var_id;
+    w.next_var_id += 1;
+    const acc_id = w.next_var_id;
+    w.next_var_id += 1;
+    const x_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try pushScope(w);
+    defer popScope(w);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(saved_input_id) }, lparen_off);
+
+    // Walk STREAM and capture+truncate for later splicing.
+    const stream_start: usize = w.raw.items.len;
+    try w.walk(stream);
+    const stream_end: usize = w.raw.items.len;
+    const captured_stream = try captureAndTruncate(w, stream_start, stream_end);
+    defer w.alloc.free(captured_stream.instrs);
+
+    // Walk IDX_EXPR purely to burn var_ids (mirrors legacy's skip-parse) and
+    // capture the instructions so we can splice them later where legacy
+    // re-parses from source.
+    const idx_start: usize = w.raw.items.len;
+    try w.walk(idx);
+    const idx_end: usize = w.raw.items.len;
+    const captured_idx = try captureAndTruncate(w, idx_start, idx_end);
+    defer w.alloc.free(captured_idx.instrs);
+    const idx_last = w.last_emit_offset;
+
+    // From here (rparen consumed) every emit is stamped at rparen until we
+    // splice IDX_EXPR, at which point the stamps become idx_last.
+    try w.emit(.object_construct_start, .{ .none = {} }, rparen_off);
+    try w.emit(.object_construct_end, .{ .none = {} }, rparen_off);
+
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(saved_input_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const fork_pos = w.raw.items.len;
+    try w.emit(.fork, .{ .index = 0 }, rparen_off);
+
+    // Splice STREAM. Legacy's `appendSlice` does not touch last_tok_offset,
+    // so we restore `w.last_emit_offset = rparen_off` after the splice.
+    try appendRebasedInstrsCopy(w, captured_stream);
+    w.last_emit_offset = rparen_off;
+
+    try w.emit(.capture_variable, .{ .index = @intCast(x_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    // UPDATE body: . + {($x | IDX_EXPR | tostring): $x}
+    try w.emit(.push_current, .{ .none = {} }, rparen_off);
+
+    try w.emit(.object_construct_start, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(x_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    // Splice IDX_EXPR — legacy's re-parse updates last_tok to idx_last, and
+    // the splice's last instruction's src_offset matches that.
+    try appendRebasedInstrsCopy(w, captured_idx);
+    w.last_emit_offset = idx_last;
+
+    try w.emit(.pipe, .{ .none = {} }, idx_last);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.tostring) },
+        idx_last,
+    );
+    try w.emit(.load_variable, .{ .index = @intCast(x_id) }, idx_last);
+    try w.emit(.object_key, .{ .none = {} }, idx_last);
+    try w.emit(.object_construct_end, .{ .none = {} }, idx_last);
+
+    try w.emit(.add, .{ .none = {} }, idx_last);
+
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, idx_last);
+    try w.emit(.backtrack, .{ .none = {} }, idx_last);
+
+    const l_done: u32 = @intCast(w.raw.items.len);
+    w.raw.items[fork_pos].operand = .{ .index = @intCast(l_done) };
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, idx_last);
+}
+
+/// Emit 1-arg `IN(S)`. Legacy `compileIN1` desugar:
+///   reduce S as $y (false; if . then . elif $y == $x then true else . end)
+///
+/// Variable-id allocation order (legacy `:5262-5269`): x, acc, y, saved_input.
+///
+/// Stamping mirrors legacy:
+///   - lparen `@ lparen`
+///   - parsePipe S → s's own offsets; last_tok ends at s_last
+///   - rparen `@ rparen`
+///   - splice S — appendSlice preserves last_tok (still rparen), every
+///     subsequent emit `@ rparen`.
+fn emitIN1(w: *Walker, call_span: ast.Span, s: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const x_id = w.next_var_id;
+    w.next_var_id += 1;
+    const acc_id = w.next_var_id;
+    w.next_var_id += 1;
+    const y_id = w.next_var_id;
+    w.next_var_id += 1;
+    const saved_input_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try pushScope(w);
+    defer popScope(w);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(x_id) }, lparen_off);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(saved_input_id) }, lparen_off);
+
+    const s_start: usize = w.raw.items.len;
+    try w.walk(s);
+    const s_end: usize = w.raw.items.len;
+    const captured_s = try captureAndTruncate(w, s_start, s_end);
+    defer w.alloc.free(captured_s.instrs);
+
+    try w.emit(.push_bool, .{ .bool = false }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(saved_input_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const fork_pos = w.raw.items.len;
+    try w.emit(.fork, .{ .index = 0 }, rparen_off);
+
+    try appendRebasedInstrsCopy(w, captured_s);
+    w.last_emit_offset = rparen_off;
+
+    try w.emit(.capture_variable, .{ .index = @intCast(y_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    try w.emit(.push_current, .{ .none = {} }, rparen_off);
+    const jf_already_true = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, rparen_off);
+    const jump_to_capture = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, rparen_off);
+
+    w.raw.items[jf_already_true].operand = .{ .index = @intCast(w.raw.items.len) };
+    try w.emit(.load_variable, .{ .index = @intCast(y_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.push_current, .{ .none = {} }, rparen_off);
+    try w.emit(.load_variable, .{ .index = @intCast(x_id) }, rparen_off);
+    try w.emit(.eq, .{ .none = {} }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    w.raw.items[jump_to_capture].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+    try w.emit(.backtrack, .{ .none = {} }, rparen_off);
+
+    w.raw.items[fork_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_id) }, rparen_off);
+}
+
+/// Emit 2-arg `IN(S; T)`. Legacy `compileIN2` desugar:
+///   reduce S as $x (false; . or ($x | IN(T)))
+///
+/// The inner `IN(T)` is itself a reduce, so the full bytecode nests two
+/// reductions. Variable-id allocation order:
+///   - Outer: saved_input, outer_acc, x (legacy `:5363-5368`)
+///   - Inner (after outer's fork): inner_acc, y (legacy `:5446-5449`)
+fn emitIN2(
+    w: *Walker,
+    call_span: ast.Span,
+    s: *const Node,
+    t: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const saved_input_id = w.next_var_id;
+    w.next_var_id += 1;
+    const outer_acc_id = w.next_var_id;
+    w.next_var_id += 1;
+    const x_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try pushScope(w);
+    defer popScope(w);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(saved_input_id) }, lparen_off);
+
+    // Walk S and capture+truncate.
+    const s_start: usize = w.raw.items.len;
+    try w.walk(s);
+    const s_end: usize = w.raw.items.len;
+    const captured_s = try captureAndTruncate(w, s_start, s_end);
+    defer w.alloc.free(captured_s.instrs);
+
+    // Skip-walk T to burn var_ids and capture for the inner re-parse.
+    const t_start: usize = w.raw.items.len;
+    try w.walk(t);
+    const t_end: usize = w.raw.items.len;
+    const captured_t = try captureAndTruncate(w, t_start, t_end);
+    defer w.alloc.free(captured_t.instrs);
+    const t_last = w.last_emit_offset;
+
+    // From here until the inner T splice, stamps are rparen.
+    try w.emit(.push_bool, .{ .bool = false }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(outer_acc_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(saved_input_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const fork_pos = w.raw.items.len;
+    try w.emit(.fork, .{ .index = 0 }, rparen_off);
+
+    try appendRebasedInstrsCopy(w, captured_s);
+    w.last_emit_offset = rparen_off;
+
+    try w.emit(.capture_variable, .{ .index = @intCast(x_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(outer_acc_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    try w.emit(.push_current, .{ .none = {} }, rparen_off);
+    const jf_already_true = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, rparen_off);
+    const jump_to_capture = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, rparen_off);
+
+    w.raw.items[jf_already_true].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    // Inner IN(T): new var_ids allocated HERE, after outer's fork (mirrors
+    // legacy `:5446-5449`).
+    const inner_acc_id = w.next_var_id;
+    w.next_var_id += 1;
+    const y_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try w.emit(.push_bool, .{ .bool = false }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(inner_acc_id) }, rparen_off);
+
+    try w.emit(.load_variable, .{ .index = @intCast(saved_input_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const inner_fork = w.raw.items.len;
+    try w.emit(.fork, .{ .index = 0 }, rparen_off);
+
+    // Splice T. Legacy's inner re-parse updates last_tok to t_last, so
+    // subsequent emits stamp there.
+    try appendRebasedInstrsCopy(w, captured_t);
+    w.last_emit_offset = t_last;
+
+    try w.emit(.capture_variable, .{ .index = @intCast(y_id) }, t_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(inner_acc_id) }, t_last);
+    try w.emit(.pipe, .{ .none = {} }, t_last);
+
+    try w.emit(.push_current, .{ .none = {} }, t_last);
+    const inner_jf = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, t_last);
+    const inner_jt = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, t_last);
+
+    w.raw.items[inner_jf].operand = .{ .index = @intCast(w.raw.items.len) };
+    try w.emit(.load_variable, .{ .index = @intCast(y_id) }, t_last);
+    try w.emit(.pipe, .{ .none = {} }, t_last);
+    try w.emit(.push_current, .{ .none = {} }, t_last);
+    try w.emit(.load_variable, .{ .index = @intCast(x_id) }, t_last);
+    try w.emit(.eq, .{ .none = {} }, t_last);
+    try w.emit(.pipe, .{ .none = {} }, t_last);
+
+    w.raw.items[inner_jt].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.capture_variable, .{ .index = @intCast(inner_acc_id) }, t_last);
+    try w.emit(.backtrack, .{ .none = {} }, t_last);
+
+    w.raw.items[inner_fork].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.load_variable, .{ .index = @intCast(inner_acc_id) }, t_last);
+    try w.emit(.pipe, .{ .none = {} }, t_last);
+
+    w.raw.items[jump_to_capture].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.capture_variable, .{ .index = @intCast(outer_acc_id) }, t_last);
+    try w.emit(.backtrack, .{ .none = {} }, t_last);
+
+    w.raw.items[fork_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.load_variable, .{ .index = @intCast(outer_acc_id) }, t_last);
+}
+
+/// Emit `JOIN($IDX; IDX_EXPR)`. Legacy `compileJOIN` desugar:
+///   [.[] | [., $idx[idx_expr|tostring]]]
+///
+/// Variable-id allocation order (legacy `:5533-5586`):
+///   input, idx, elem, key, lookup — note elem/key/lookup are allocated
+///   mid-body, AFTER the skip-parse burns idx_expr's var_ids.
+fn emitJOIN(
+    w: *Walker,
+    call_span: ast.Span,
+    idx: *const Node,
+    idx_expr: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const input_id = w.next_var_id;
+    w.next_var_id += 1;
+    const idx_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    try pushScope(w);
+    defer popScope(w);
+
+    try w.emit(.push_current, .{ .none = {} }, lparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(input_id) }, lparen_off);
+
+    // Walk idx — a VALUE expression. Emits happen in place at idx's offsets.
+    try w.walk(idx);
+    const idx_arg_last = w.last_emit_offset;
+    try w.emit(.capture_variable, .{ .index = @intCast(idx_id) }, idx_arg_last);
+
+    // Skip-walk idx_expr to burn var_ids and capture for later re-splice.
+    const idx_expr_start: usize = w.raw.items.len;
+    try w.walk(idx_expr);
+    const idx_expr_end: usize = w.raw.items.len;
+    const captured_idx_expr = try captureAndTruncate(w, idx_expr_start, idx_expr_end);
+    defer w.alloc.free(captured_idx_expr.instrs);
+    const idx_expr_last = w.last_emit_offset;
+
+    // From here until the idx_expr splice, legacy stamps at rparen.
+    try w.emit(.load_variable, .{ .index = @intCast(input_id) }, rparen_off);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+
+    const outer_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, rparen_off);
+
+    try w.emit(.each, .{ .none = {} }, rparen_off);
+
+    // elem_id allocated mid-body; mirrors legacy's `:5579-5580`.
+    const elem_id = w.next_var_id;
+    w.next_var_id += 1;
+    try w.emit(.push_current, .{ .none = {} }, rparen_off);
+    try w.emit(.capture_variable, .{ .index = @intCast(elem_id) }, rparen_off);
+
+    // key_id allocated next; mirrors legacy's `:5585-5586`.
+    const key_id = w.next_var_id;
+    w.next_var_id += 1;
+
+    // Splice IDX_EXPR — legacy's re-parse updates last_tok to idx_expr_last.
+    try appendRebasedInstrsCopy(w, captured_idx_expr);
+    w.last_emit_offset = idx_expr_last;
+
+    try w.emit(.pipe, .{ .none = {} }, idx_expr_last);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.tostring) },
+        idx_expr_last,
+    );
+    try w.emit(.capture_variable, .{ .index = @intCast(key_id) }, idx_expr_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(idx_id) }, idx_expr_last);
+    try w.emit(.pipe, .{ .none = {} }, idx_expr_last);
+    try w.emit(.save_input, .{ .none = {} }, idx_expr_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(key_id) }, idx_expr_last);
+
+    const try_pos = w.raw.items.len;
+    try w.emit(.fork_try, .{ .index = 0 }, idx_expr_last);
+
+    try w.emit(.load_computed, .{ .none = {} }, idx_expr_last);
+
+    try w.emit(.pop_try, .{ .none = {} }, idx_expr_last);
+    const jump_past_null = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, idx_expr_last);
+
+    w.raw.items[try_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+    try w.emit(.push_null, .{ .none = {} }, idx_expr_last);
+
+    w.raw.items[jump_past_null].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    // lookup_id allocated after the try block; mirrors legacy's `:5623-5624`.
+    const lookup_id = w.next_var_id;
+    w.next_var_id += 1;
+    try w.emit(.capture_variable, .{ .index = @intCast(lookup_id) }, idx_expr_last);
+
+    const inner_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, idx_expr_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(elem_id) }, idx_expr_last);
+    try w.emit(.yield_output, .{ .none = {} }, idx_expr_last);
+
+    try w.emit(.load_variable, .{ .index = @intCast(lookup_id) }, idx_expr_last);
+    try w.emit(.yield_output, .{ .none = {} }, idx_expr_last);
+
+    const inner_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, idx_expr_last);
+    w.raw.items[inner_start].operand = .{ .index = @intCast(inner_end) };
+
+    try w.emit(.yield_output, .{ .none = {} }, idx_expr_last);
+
+    const outer_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, idx_expr_last);
+    w.raw.items[outer_start].operand = .{ .index = @intCast(outer_end) };
 }
 
 // ── insertRawInstr ────────────────────────────────────────────────────────────
