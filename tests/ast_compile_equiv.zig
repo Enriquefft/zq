@@ -279,15 +279,15 @@ fn dumpBoth(
     }
 }
 
-test "ast compile equivalence — Stage 1 + Stage 2" {
+test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3" {
     const alloc = std.testing.allocator;
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr = std.fs.File.stderr().writer(&stderr_buf);
     const out = &stderr.interface;
 
-    const total_supported = fixtures.stage1_supported.len + fixtures.stage2_supported.len;
-    const total_unsupported = fixtures.stage1_unsupported.len + fixtures.stage2_unsupported.len;
+    const total_supported = fixtures.stage1_supported.len + fixtures.stage2_supported.len + fixtures.stage3_supported.len;
+    const total_unsupported = fixtures.stage1_unsupported.len + fixtures.stage2_unsupported.len + fixtures.stage3_unsupported.len;
     try out.print(
         "ast-compile-equiv: {d} supported + {d} unsupported fixtures\n",
         .{ total_supported, total_unsupported },
@@ -312,6 +312,14 @@ test "ast compile equivalence — Stage 1 + Stage 2" {
         }
     }
 
+    for (fixtures.stage3_supported) |filter| {
+        const outcome = try runSupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
     for (fixtures.stage1_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
@@ -321,6 +329,14 @@ test "ast compile equivalence — Stage 1 + Stage 2" {
     }
 
     for (fixtures.stage2_unsupported) |filter| {
+        const outcome = try runUnsupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
+    for (fixtures.stage3_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
             .pass => passed += 1,

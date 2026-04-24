@@ -429,6 +429,117 @@ const Walker = struct {
                 };
             },
 
+            .pipe => {
+                // Stage 3 — `a | b` emits `<A>, pipe, <B>`. Pipe opcode's
+                // src_offset = `|` token offset. AST is left-leaning for
+                // chains (`a | b | c` → `pipe(pipe(a, b), c)`); flattening
+                // the chain mirrors the legacy iterative `parsePipe` at
+                // `src/query/src/compiler.zig:2449-2471` byte-for-byte.
+                var buf: std.ArrayList(*const Node) = .{};
+                defer buf.deinit(w.alloc);
+                try flattenPipeOperands(w.alloc, &buf, node);
+                // Emit first operand.
+                try w.walk(buf.items[0]);
+                // For each subsequent operand, emit .pipe at the `|` token
+                // offset between the previous operand and this one, then
+                // walk the operand.
+                var prev_end: u32 = buf.items[0].span.end;
+                var i: usize = 1;
+                while (i < buf.items.len) : (i += 1) {
+                    const op = buf.items[i];
+                    const pipe_off = scanForSkipWs(w.src, prev_end, '|') orelse prev_end;
+                    try w.emit(.pipe, .{ .none = {} }, pipe_off);
+                    try w.walk(op);
+                    prev_end = op.span.end;
+                }
+            },
+
+            .comma => {
+                // Stage 3 — `a, b, c` emits the chained FORK/JUMP generator
+                // pattern from legacy `parseComma` at
+                // `src/query/src/compiler.zig:2504-2558`. The resulting
+                // byte layout for an N-way comma is:
+                //
+                //   FORK(k1), <A>, JUMP(end), FORK(k2), <B>, JUMP(end),
+                //   ..., FORK(kN-1), <N-1>, JUMP(end), <N>
+                //
+                // where each FORK's target points at the next FORK (or, for
+                // the last, at the last operand), and every JUMP lands just
+                // past the final operand. FORKs are injected via
+                // `insertRawInstr` with src_offset = 0 (the RawInstr literal
+                // in legacy omits the field); JUMPs are emitted via
+                // `ctx.emit` after `ctx.nextToken` consumed the `,` token,
+                // so their src_offset = that comma's byte offset.
+                //
+                // AST builds comma chains left-leaning
+                // (`comma(comma(a, b), c)`), so we flatten to walk the
+                // legacy iterative pattern exactly.
+                var buf: std.ArrayList(*const Node) = .{};
+                defer buf.deinit(w.alloc);
+                try flattenCommaOperands(w.alloc, &buf, node);
+
+                var jump_fixups: std.ArrayList(usize) = .{};
+                defer jump_fixups.deinit(w.alloc);
+
+                var left_start: usize = w.raw.items.len;
+                try w.walk(buf.items[0]);
+
+                var prev_fork_pos: ?usize = null;
+                // Track source cursor to locate each `,` token between
+                // operand[i-1] and operand[i]. Start scanning from the end
+                // of the first operand.
+                var prev_end: u32 = buf.items[0].span.end;
+
+                var i: usize = 1;
+                while (i < buf.items.len) : (i += 1) {
+                    const comma_off = scanForSkipWs(w.src, prev_end, ',') orelse prev_end;
+
+                    // Insert FORK at left_start. src_offset=0 matches the
+                    // legacy RawInstr literal which omits the field.
+                    try insertRawInstr(w, left_start, .{
+                        .op = .fork,
+                        .operand = .{ .index = 0 },
+                        .src_offset = 0,
+                    });
+
+                    // Point previous FORK at this new FORK so backtracking
+                    // from the earlier branch lands here. Legacy sets this
+                    // BEFORE the insertRawInstr adjusts IPs, but since the
+                    // previous FORK's current target was left_start (set by
+                    // the prior backpatch) and insertRawInstr's ">pos" rule
+                    // only bumps strictly-greater targets, the prior target
+                    // (== left_start) is preserved — unlike the legacy code
+                    // which overwrites it to the same value.
+                    if (prev_fork_pos) |pfp| {
+                        w.raw.items[pfp].operand.index = @intCast(left_start);
+                    }
+
+                    // Emit JUMP(0) placeholder. src = comma_off (legacy's
+                    // last_tok_offset after nextToken consumed `,`).
+                    const jump_pos = w.raw.items.len;
+                    try w.emit(.jump, .{ .index = 0 }, comma_off);
+                    try jump_fixups.append(w.alloc, jump_pos);
+
+                    const current_fork_pos = left_start;
+
+                    // Parse the right side.
+                    left_start = w.raw.items.len;
+                    try w.walk(buf.items[i]);
+
+                    // Backpatch FORK target to the start of this operand.
+                    w.raw.items[current_fork_pos].operand.index = @intCast(left_start);
+                    prev_fork_pos = current_fork_pos;
+
+                    prev_end = buf.items[i].span.end;
+                }
+
+                // Backpatch all JUMP targets to end-of-block.
+                const end_pos: i64 = @intCast(w.raw.items.len);
+                for (jump_fixups.items) |fixup| {
+                    w.raw.items[fixup].operand.index = end_pos;
+                }
+            },
+
             .error_node => |en| {
                 // Error nodes surface the parser's best-effort recovery. They
                 // must reject as a compile error, not return "stage incomplete".
@@ -442,8 +553,6 @@ const Walker = struct {
             },
 
             // ── Scaffold boundary: every other kind is a future stage. ──
-            .pipe,
-            .comma,
             .func_def,
             .alternative,
             .or_expr,
@@ -594,6 +703,39 @@ fn scanDotIdentOffset(w: *Walker, name: []const u8) u32 {
     // Ident — source length == name length (idents have no escapes).
     w.scan_cursor = @intCast(tok_off + name.len);
     return tok_off;
+}
+
+/// Flatten a left-leaning `pipe(pipe(a, b), c)` chain into `[a, b, c]`.
+/// Any non-pipe node is emitted as-is; pipe children are recursed into on the
+/// left only (matching the parser's left-to-right accumulation at
+/// `src/ast/parser.zig:148-173`).
+fn flattenPipeOperands(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(*const Node),
+    node: *const Node,
+) error{OutOfMemory}!void {
+    switch (node.kind) {
+        .pipe => |p| {
+            try flattenPipeOperands(alloc, out, p.left);
+            try out.append(alloc, p.right);
+        },
+        else => try out.append(alloc, node),
+    }
+}
+
+/// Flatten a left-leaning `comma(comma(a, b), c)` chain into `[a, b, c]`.
+fn flattenCommaOperands(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(*const Node),
+    node: *const Node,
+) error{OutOfMemory}!void {
+    switch (node.kind) {
+        .comma => |c| {
+            try flattenCommaOperands(alloc, out, c.left);
+            try out.append(alloc, c.right);
+        },
+        else => try out.append(alloc, node),
+    }
 }
 
 fn base_segment_start(base: *const Node, w: *Walker) usize {
@@ -750,6 +892,14 @@ fn fuse(
                 },
                 .pop_try => .{ .none = {} },
                 .yield_output => .{ .none = {} },
+                // Stage 3: `fork` and `jump` carry raw-IP operands that must be
+                // remapped through index_map after load_key/load_path fusion.
+                // Mirrors `src/query/src/compiler.zig:7427-7431, 7482-7486`.
+                .fork, .jump => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
                 else => .{ .none = {} },
             },
         };
@@ -823,10 +973,39 @@ test "walker: negative integer emits push_int + negate" {
     try std.testing.expectEqual(Instruction.Op.negate, ins[1].op);
 }
 
-test "walker: pipe is scaffold-boundary (Stage 1 unsupported)" {
+test "walker: pipe emits <A> pipe <B> (Stage 3)" {
     const alloc = std.testing.allocator;
-    const res = compile(alloc, ". | .", null);
-    try std.testing.expectError(error.AstCompilerStageIncomplete, res);
+    var result = try compile(alloc, ". | .", null);
+    defer switch (result) {
+        .ok => |*c| @constCast(c).deinit(alloc),
+        .err => {},
+    };
+    try std.testing.expect(result == .ok);
+    const ins = result.ok.instructions;
+    // push_current, pipe, push_current, yield_output.
+    try std.testing.expectEqual(@as(usize, 4), ins.len);
+    try std.testing.expectEqual(Instruction.Op.push_current, ins[0].op);
+    try std.testing.expectEqual(Instruction.Op.pipe, ins[1].op);
+    try std.testing.expectEqual(Instruction.Op.push_current, ins[2].op);
+    try std.testing.expectEqual(Instruction.Op.yield_output, ins[3].op);
+}
+
+test "walker: comma chain emits FORK/JUMP pattern (Stage 3)" {
+    const alloc = std.testing.allocator;
+    var result = try compile(alloc, "1, 2", null);
+    defer switch (result) {
+        .ok => |*c| @constCast(c).deinit(alloc),
+        .err => {},
+    };
+    try std.testing.expect(result == .ok);
+    const ins = result.ok.instructions;
+    // FORK(3), push_int(1), JUMP(4), push_int(2), yield_output.
+    try std.testing.expectEqual(@as(usize, 5), ins.len);
+    try std.testing.expectEqual(Instruction.Op.fork, ins[0].op);
+    try std.testing.expectEqual(Instruction.Op.push_int, ins[1].op);
+    try std.testing.expectEqual(Instruction.Op.jump, ins[2].op);
+    try std.testing.expectEqual(Instruction.Op.push_int, ins[3].op);
+    try std.testing.expectEqual(Instruction.Op.yield_output, ins[4].op);
 }
 
 test "walker: .foo emits load_key" {
