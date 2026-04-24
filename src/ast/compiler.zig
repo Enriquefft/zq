@@ -1,4 +1,4 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a + Stage 10b).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a + Stage 10b + Stage 10c + Stage 11).
 //!
 //! Stage 10 is split into multiple partials because the total scope (reduce /
 //! foreach / label / break + 11+ generator/reducing builtins) is too large to
@@ -185,6 +185,7 @@ pub fn compileWithExternals(
         .scope_marks = .{},
         .func_table = .{},
         .filter_bindings = .{},
+        .regex_pool = regex_mod.RegexPool.init(alloc),
     };
     defer walker.raw.deinit(alloc);
     defer walker.scope_vars.deinit(alloc);
@@ -197,6 +198,8 @@ pub fn compileWithExternals(
     defer walker.label_var_ids.deinit(alloc);
     var intern_consumed = false;
     defer if (!intern_consumed) walker.intern.deinit(alloc);
+    var regex_pool_consumed = false;
+    defer if (!regex_pool_consumed) walker.regex_pool.deinit();
 
     walker.walk(parsed.root) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -216,8 +219,14 @@ pub fn compileWithExternals(
         });
     }
 
-    const compiled = try fuse(alloc, walker.raw.items, &walker.intern);
+    var compiled = try fuse(alloc, walker.raw.items, &walker.intern);
     intern_consumed = true; // fuse took ownership via toOwnedSlice.
+    // Transfer regex-pool ownership into the Compiled. `fuse` seeded an empty
+    // pool; deinit it before swapping in the walker's pool (matching legacy's
+    // dance at `src/query/src/compiler.zig:1462-1464`).
+    compiled.regex_pool.deinit();
+    compiled.regex_pool = walker.regex_pool;
+    regex_pool_consumed = true;
     return .{ .ok = compiled };
 }
 
@@ -380,6 +389,23 @@ const Walker = struct {
     /// at `src/query/src/compiler.zig:120` (populated at `:3766`, checked
     /// at `:6380-6385`).
     label_var_ids: std.ArrayList(u32) = .{},
+
+    // ── Stage 11 — regex builtin state ────────────────────────────────────
+    /// Compile-time regex intern pool. Fast-path regex builtins
+    /// (`test("lit")`, `match("lit"; "flags")`, …) compile the literal
+    /// pattern bytes through this pool and pack the resulting u32 index into
+    /// the `call_builtin` operand's upper slot. Slow/dynamic paths emit the
+    /// `REGEX_POOL_DYNAMIC` sentinel instead. Mirrors legacy's
+    /// `ctx.regex_pool` at `src/query/src/compiler.zig:1321`. Ownership is
+    /// transferred to the final `Compiled` in `fuse` (see `regex_pool_consumed`).
+    regex_pool: regex_mod.RegexPool,
+    /// When a regex pattern literal fails to compile, `emitFlagPrefix` /
+    /// `internRegexPattern` record the span of the offending literal here so
+    /// the CompileResult.err can point its caret at the pattern. Mirrors
+    /// legacy's `ctx.last_regex_pattern_offset` / `_len` at
+    /// `src/query/src/compiler.zig:128-131`.
+    last_regex_pattern_offset: u32 = 0,
+    last_regex_pattern_len: u32 = 0,
 
     const Error = error{ OutOfMemory, AstCompilerStageIncomplete, AstCompileError };
 
@@ -1298,6 +1324,9 @@ const Walker = struct {
 
                 // ── Stage 10c: del / pick / INDEX / IN / JOIN ─────────
                 if (try dispatchStage10cBuiltin(w, bc, node.span)) return;
+
+                // ── Stage 11: regex / datetime / string-ops remainder ─
+                if (try dispatchStage11Builtin(w, bc, node.span)) return;
 
                 return error.AstCompilerStageIncomplete;
             },
@@ -3583,6 +3612,52 @@ fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
     if (std.mem.eql(u8, name, "tojson")) return .tojson;
     if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
     if (std.mem.eql(u8, name, "transpose")) return .transpose_;
+
+    // Stage 11 additions: date/time + misc zero-arg names. Legacy's
+    // `zeroArgBuiltinId` at `src/query/src/compiler.zig:2962-2989` lists
+    // them; the AST parser's `isZeroArgBuiltin` omits them (they come
+    // through as `field_access` instead). We translate here.
+    if (std.mem.eql(u8, name, "now")) return .now_;
+    if (std.mem.eql(u8, name, "gmtime")) return .gmtime_;
+    if (std.mem.eql(u8, name, "mktime")) return .mktime_;
+    if (std.mem.eql(u8, name, "todate")) return .todate_;
+    if (std.mem.eql(u8, name, "fromdate")) return .fromdate_;
+    if (std.mem.eql(u8, name, "todateiso8601")) return .todateiso8601_;
+    if (std.mem.eql(u8, name, "fromdateiso8601")) return .fromdateiso8601_;
+
+    if (std.mem.eql(u8, name, "env")) return .env_;
+    if (std.mem.eql(u8, name, "builtins")) return .builtins_;
+    if (std.mem.eql(u8, name, "debug")) return .debug_;
+    if (std.mem.eql(u8, name, "stderr")) return .stderr_;
+    if (std.mem.eql(u8, name, "input")) return .input_;
+    if (std.mem.eql(u8, name, "inputs")) return .inputs_;
+    if (std.mem.eql(u8, name, "halt")) return .halt_;
+
+    if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+    if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+    if (std.mem.eql(u8, name, "trim")) return .trim_;
+    if (std.mem.eql(u8, name, "ltrim")) return .ltrim_;
+    if (std.mem.eql(u8, name, "rtrim")) return .rtrim_;
+
+    // Type-filter builtins.
+    if (std.mem.eql(u8, name, "arrays")) return .arrays_;
+    if (std.mem.eql(u8, name, "objects")) return .objects_;
+    if (std.mem.eql(u8, name, "strings")) return .strings_;
+    if (std.mem.eql(u8, name, "numbers")) return .numbers_;
+    if (std.mem.eql(u8, name, "booleans")) return .booleans_;
+    if (std.mem.eql(u8, name, "nulls")) return .nulls_;
+    if (std.mem.eql(u8, name, "scalars")) return .scalars_;
+    if (std.mem.eql(u8, name, "normals")) return .normals_;
+    if (std.mem.eql(u8, name, "iterables")) return .iterables_;
+
+    // Math extras.
+    if (std.mem.eql(u8, name, "significand")) return .significand_;
+    if (std.mem.eql(u8, name, "logb")) return .logb_;
+    if (std.mem.eql(u8, name, "j0")) return .j0_;
+    if (std.mem.eql(u8, name, "j1")) return .j1_;
+    if (std.mem.eql(u8, name, "lgamma")) return .lgamma_;
+    if (std.mem.eql(u8, name, "tgamma")) return .tgamma_;
+
     return null;
 }
 
@@ -3656,6 +3731,17 @@ fn tryDispatchBareIdent(
     // Zero-arg user function lookup.
     if (lookupUserFunc(w, name, 0)) |idx| {
         try expandFunctionCall(w, idx, &.{}, span);
+        return true;
+    }
+
+    // Stage 11: zero-arg builtins that the AST parser doesn't list in
+    // `isZeroArgBuiltin` (e.g. `now`, `gmtime`, `env`, `debug`, trim, etc.)
+    // arrive here as bare-ident `field_access` nodes. Legacy resolves them
+    // via the full `zeroArgBuiltinId` table (compiler.zig:2874-2991) BEFORE
+    // emitting `load_key`. Mirror by consulting the walker's `zeroArgBuiltinId`
+    // (extended to match legacy's full table) after the user-func check.
+    if (zeroArgBuiltinId(name)) |bid| {
+        try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, span.start);
         return true;
     }
 
@@ -6014,6 +6100,960 @@ fn emitJOIN(
     const outer_end: u32 = @intCast(w.raw.items.len);
     try w.emit(.array_collect_end, .{ .none = {} }, idx_expr_last);
     w.raw.items[outer_start].operand = .{ .index = @intCast(outer_end) };
+}
+
+// ── Stage 11: regex / datetime / string-ops remainder ─────────────────────────
+//
+// Legacy references:
+//   - `compileRegexBuiltin1`                @ src/query/src/compiler.zig:3184
+//   - `compileRegexBuiltin1FastLiteral`     @ :3229
+//   - `emitFlagPrefix`                      @ :3304
+//   - `compileRegexBuiltinSlow`             @ :3351
+//   - `compileRegexBuiltin2`                @ :3867
+//   - `compileValueArgBuiltin1Collecting`   @ :3091
+//   - `compileTwoArgMath` / `compileThreeArgMath` @ :3832 / :3992
+//   - `compileFilterArgBuiltin`             @ :4597
+//   - `compileWithEntries`                  @ :4629
+//   - `compileSetpath`                      @ :3801
+//   - `compileIsempty`                      @ :4037
+//   - `compileDebugArg` / `compileHaltErrorArg` / `compileErrorArg` @ :4061/:4071/:4081
+//   - `compileIn` (1-arg generator-aware)   @ :4401
+//
+// Stamp policy (mirrors legacy's `ctx.last_tok_offset`):
+//   For a builtin-call `name(ARG1[; ARG2[; ARG3]])`:
+//     - `(` consumption updates last_tok_offset to `lparen_off`.
+//     - Each `ctx.emit` between argN walk and argN+1 is stamped at the
+//       offset of the most recent non-EXPR token (lparen/semi/rparen).
+//     - After the final `)`, every trailing emit stamps at `rparen_off`.
+//   The walker reconstructs each offset via source-byte scans (scanForSkipWs,
+//   scanBuiltinLparen) and `w.last_emit_offset` bookkeeping.
+
+/// Dispatch a Stage 11 builtin_call. Returns true if handled, false for
+/// fall-through. Each helper asserts arity and emits byte-identical bytecode
+/// to legacy. On compile error inside a regex path, the caller surfaces
+/// `error.AstCompileError` via `w.compile_err` (set by `internRegexPattern`
+/// or `emitFlagPrefixInto` before returning).
+fn dispatchStage11Builtin(
+    w: *Walker,
+    bc: Node.BuiltinCall,
+    call_span: ast.Span,
+) Walker.Error!bool {
+    // ── Regex builtins: 1-arg (pattern[; flags]) ──────────────────────────
+    if (std.mem.eql(u8, bc.name, "test") and (bc.args.len == 1 or bc.args.len == 2)) {
+        try emitRegex1(w, call_span, bc.args, .test_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "match") and (bc.args.len == 1 or bc.args.len == 2)) {
+        try emitRegex1(w, call_span, bc.args, .match_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "capture") and (bc.args.len == 1 or bc.args.len == 2)) {
+        try emitRegex1(w, call_span, bc.args, .capture_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "scan") and (bc.args.len == 1 or bc.args.len == 2)) {
+        try emitRegex1(w, call_span, bc.args, .scan_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "splits") and (bc.args.len == 1 or bc.args.len == 2)) {
+        try emitRegex1(w, call_span, bc.args, .splits_);
+        return true;
+    }
+    // ── Regex builtins: 2-arg / 3-arg (pattern; repl[; flags]) ────────────
+    if (std.mem.eql(u8, bc.name, "sub") and (bc.args.len == 2 or bc.args.len == 3)) {
+        try emitRegex2(w, call_span, bc.args, .sub_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "gsub") and (bc.args.len == 2 or bc.args.len == 3)) {
+        try emitRegex2(w, call_span, bc.args, .gsub_);
+        return true;
+    }
+
+    // ── Datetime / one-arg format builtins ────────────────────────────────
+    if (std.mem.eql(u8, bc.name, "strftime") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .strftime_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "strptime") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .strptime_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "strflocaltime") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .strflocaltime_);
+        return true;
+    }
+
+    // ── 1-arg string / path / value builtins ──────────────────────────────
+    if (std.mem.eql(u8, bc.name, "has") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .has);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "contains") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .contains);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "inside") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .inside);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "indices") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .indices);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "index") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .index_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "rindex") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .rindex);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "flatten") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .flatten_n);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "bsearch") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .bsearch_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "split") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .split_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "join") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .join_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "startswith") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .startswith_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "endswith") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .endswith_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "ltrimstr") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .ltrimstr_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "rtrimstr") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .rtrimstr_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "trimstr") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .trimstr_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "getpath") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .getpath);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "delpaths") and bc.args.len == 1) {
+        try emitValueArg1(w, call_span, bc.args, .delpaths);
+        return true;
+    }
+
+    // ── Filter-arg builtins ───────────────────────────────────────────────
+    if (std.mem.eql(u8, bc.name, "sort_by") and bc.args.len == 1) {
+        try emitFilterArgBuiltin(w, call_span, bc.args[0], .sort_by);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "group_by") and bc.args.len == 1) {
+        try emitFilterArgBuiltin(w, call_span, bc.args[0], .group_by);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "min_by") and bc.args.len == 1) {
+        try emitFilterArgBuiltin(w, call_span, bc.args[0], .min_by);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "max_by") and bc.args.len == 1) {
+        try emitFilterArgBuiltin(w, call_span, bc.args[0], .max_by);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "unique_by") and bc.args.len == 1) {
+        try emitFilterArgBuiltin(w, call_span, bc.args[0], .unique_by);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "with_entries") and bc.args.len == 1) {
+        try emitWithEntries(w, call_span, bc.args[0]);
+        return true;
+    }
+
+    // ── 2-arg and 3-arg math builtins ─────────────────────────────────────
+    if (std.mem.eql(u8, bc.name, "pow") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .pow_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "atan2") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .atan2_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "remainder") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .remainder_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "hypot") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .hypot_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "scalb") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .scalb_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "scalbln") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .scalbln_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "ldexp") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .ldexp_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "drem") and bc.args.len == 2) {
+        try emitTwoArgMath(w, call_span, bc.args[0], bc.args[1], .drem_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "fma") and bc.args.len == 3) {
+        try emitThreeArgMath(w, call_span, bc.args, .fma_);
+        return true;
+    }
+
+    // ── Setpath(PATH; VALUE) ──────────────────────────────────────────────
+    if (std.mem.eql(u8, bc.name, "setpath") and bc.args.len == 2) {
+        try emitSetpath(w, call_span, bc.args[0], bc.args[1]);
+        return true;
+    }
+
+    // ── Debug/halt_error/error/isempty (1-arg) ────────────────────────────
+    if (std.mem.eql(u8, bc.name, "debug") and bc.args.len == 1) {
+        try emitSimpleCall1(w, call_span, bc.args[0], .debug_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "halt_error") and bc.args.len == 1) {
+        try emitSimpleCall1(w, call_span, bc.args[0], .halt_error_);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "error") and bc.args.len == 1) {
+        try emitErrorArg(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "isempty") and bc.args.len == 1) {
+        try emitIsempty(w, call_span, bc.args[0]);
+        return true;
+    }
+
+    // ── in(expr) — 1-arg, save_input/restore_input style ──────────────────
+    if (std.mem.eql(u8, bc.name, "in") and bc.args.len == 1) {
+        try emitInExpr(w, call_span, bc.args[0]);
+        return true;
+    }
+
+    return false;
+}
+
+// ── Stage 11 emission helpers ─────────────────────────────────────────────────
+
+/// Pack regex compile-error CompileError and surface via the walker's
+/// `compile_err` field. Callers `return error.AstCompileError` immediately
+/// after so `compileWithExternals` maps to `CompileResult.err`.
+fn setRegexCompileErr(w: *Walker, offset: u32, len: u32) void {
+    w.compile_err = .{
+        .kind = .regex_compile_error,
+        .offset = offset,
+        .len = len,
+    };
+}
+
+/// Intern a decoded regex pattern string (optionally flag-prefixed) into the
+/// walker's `regex_pool`. Sets `last_regex_pattern_*` on failure so callers
+/// can surface diagnostics. Mirrors legacy's `regex_pool.intern` branches
+/// at `src/query/src/compiler.zig:3253-3258` / `:3931-3936` / `:3974-3979`.
+fn internRegexPattern(
+    w: *Walker,
+    pattern: []const u8,
+    pat_offset: u32,
+    pat_len: u32,
+) Walker.Error!u32 {
+    return w.regex_pool.intern(pattern) catch |e| switch (e) {
+        regex_mod.Error.RegexCompileFailed,
+        regex_mod.Error.RegexInternalError,
+        regex_mod.Error.RegexNotCompiled,
+        => {
+            w.last_regex_pattern_offset = pat_offset;
+            w.last_regex_pattern_len = pat_len;
+            setRegexCompileErr(w, pat_offset, pat_len);
+            return error.AstCompileError;
+        },
+        regex_mod.Error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Jq flag-letter parser for regex builtins. Mirrors
+/// `src/query/src/compiler.zig:3304-3346` `emitFlagPrefix` exactly:
+///   - `i` / `m` / `s` / `x` → inline `(?imsx)` prefix prepended to pattern.
+///   - `g` → select generator-mode opcode (flagged via `has_g`).
+///   - `n` → record `has_n` for the caller to pack into operand bit 48.
+///   - `p` / `l` / anything else → compile error; walker's `compile_err` set.
+const RegexFlagResult = struct { has_g: bool = false, has_n: bool = false };
+
+fn emitFlagPrefixInto(
+    w: *Walker,
+    out: *std.ArrayList(u8),
+    flag_body: []const u8,
+    pat_offset: u32,
+    pat_len: u32,
+) Walker.Error!RegexFlagResult {
+    var has_inline: bool = false;
+    var inline_buf: [8]u8 = undefined;
+    var inline_len: usize = 0;
+    var result: RegexFlagResult = .{};
+
+    for (flag_body) |ch| {
+        switch (ch) {
+            'i', 'x', 'm', 's' => {
+                inline_buf[inline_len] = ch;
+                inline_len += 1;
+                has_inline = true;
+            },
+            'g' => result.has_g = true,
+            'n' => result.has_n = true,
+            else => {
+                // `p`, `l`, and everything else reject identically.
+                w.last_regex_pattern_offset = pat_offset;
+                w.last_regex_pattern_len = pat_len;
+                setRegexCompileErr(w, pat_offset, pat_len);
+                return error.AstCompileError;
+            },
+        }
+    }
+
+    if (has_inline) {
+        try out.appendSlice(w.alloc, "(?");
+        try out.appendSlice(w.alloc, inline_buf[0..inline_len]);
+        try out.append(w.alloc, ')');
+    }
+    return result;
+}
+
+/// Locate the span of a string-literal AST arg. The legacy probe uses a
+/// cloned lexer; here we inspect the AST node and compute `name_tok.offset`
+/// and `name_tok.len` from the source bytes by scanning the `"…"` around the
+/// literal's `span.start`. For a literal whose AST `span.start` is at the
+/// opening `"`, the slice is `span.end - span.start`.
+fn literalStringArg(arg: *const Node) ?[]const u8 {
+    if (arg.kind != .literal) return null;
+    return switch (arg.kind.literal) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Emit a 1-arg regex builtin: `test(p)`, `match(p)`, `capture(p)`, `scan(p)`,
+/// `splits(p)`. Optionally `test(p; flags)`, `match(p; "g")`, etc.
+///
+/// Legacy flow:
+///   Fast path (both args literal): `compileRegexBuiltin1FastLiteral`.
+///     - Consume `(` → last_tok = `(`.offset
+///     - Consume pattern literal → last_tok = `"p"`.offset
+///     - Consume `;` / flag literal / `)` in turn.
+///     - Final `call_builtin` stamps at `)`.offset.
+///   Slow path (non-literal pattern): `compileRegexBuiltinSlow` →
+///     `compileValueArgBuiltin1Collecting` with `REGEX_POOL_DYNAMIC` sentinel.
+///     Emission shape matches the generic value-arg-builtin (no flags accepted).
+///
+/// The walker: if `args[0]` is `.literal.string` AND — when present — `args[1]`
+/// is also `.literal.string`, take fast path. Otherwise slow path (and only
+/// 1 arg — legacy rejects `test("literal"; dynamic)` because probe sees
+/// string+semi then checks the third tok is a string_lit; non-literal flags
+/// fall through to `compileRegexBuiltinSlow`, which only handles 1 arg — the
+/// emitted arg walks the raw 1 arg, not `pattern; flags`. To stay byte-
+/// identical, the walker only takes fast path when both are literals; for
+/// `args.len == 2` with non-literal flags we return AstCompilerStageIncomplete
+/// since legacy's slow path would consume the semicolon/flag as part of the
+/// arg expression (parsePipe), which is grammatically ill-formed and legacy
+/// would syntax-error on it.
+fn emitRegex1(
+    w: *Walker,
+    call_span: ast.Span,
+    args: []const *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const rparen_off = builtinRparenOff(call_span);
+    const pat = literalStringArg(args[0]);
+    const flags: ?[]const u8 = if (args.len == 2) literalStringArg(args[1]) else null;
+
+    // Fast path: literal pattern (+ literal flags if 2 args).
+    if (pat != null and (args.len == 1 or flags != null)) {
+        var pattern_buf = std.ArrayList(u8){};
+        defer pattern_buf.deinit(w.alloc);
+
+        const pat_span = args[0].span;
+        const pat_off = pat_span.start;
+        const pat_len: u32 = if (pat_span.end > pat_span.start)
+            pat_span.end - pat_span.start
+        else
+            0;
+
+        var flag_result: RegexFlagResult = .{};
+        if (flags) |f| {
+            flag_result = try emitFlagPrefixInto(w, &pattern_buf, f, pat_off, pat_len);
+        }
+        try pattern_buf.appendSlice(w.alloc, pat.?);
+
+        w.last_regex_pattern_offset = pat_off;
+        w.last_regex_pattern_len = pat_len;
+
+        const pool_idx = try internRegexPattern(w, pattern_buf.items, pat_off, pat_len);
+
+        // `match(re; "g")` rewrites to match_g_ at compile time.
+        const effective_bid: types.BuiltinId =
+            if (bid == .match_ and flag_result.has_g) .match_g_ else bid;
+
+        try w.emit(
+            .call_builtin,
+            .{ .index = types.packRegexBuiltinOperandFlags(effective_bid, pool_idx, flag_result.has_n) },
+            rparen_off,
+        );
+        return;
+    }
+
+    // Slow path — legacy only supports 1 non-literal arg (dynamic pattern,
+    // no flags). For `args.len == 2` with non-literal-flags, legacy would
+    // syntax-error; we reject by AstCompilerStageIncomplete (the probe in
+    // legacy falls through and the caller ends up on `compileRegexBuiltinSlow`
+    // which then sees an unexpected `;` at parsePipe — so legacy rejects).
+    if (args.len != 1) return error.AstCompilerStageIncomplete;
+
+    try emitRegexBuiltinSlow(w, call_span, args[0], bid);
+}
+
+/// Emit the slow-path regex lowering. Delegates to `emitValueArg1`'s comma
+/// fold and then retrofits every `call_builtin` operand to carry the
+/// `REGEX_POOL_DYNAMIC` sentinel. Mirrors legacy `compileRegexBuiltinSlow`
+/// at `src/query/src/compiler.zig:3351-3366`.
+fn emitRegexBuiltinSlow(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    var sink = std.ArrayList(u32){};
+    defer sink.deinit(w.alloc);
+    try emitValueArg1Collecting(w, call_span, arg, bid, &sink);
+
+    const packed_operand = types.packRegexBuiltinOperand(bid, types.REGEX_POOL_DYNAMIC);
+    for (sink.items) |idx| {
+        w.raw.items[idx].operand.index = packed_operand;
+    }
+}
+
+/// Emit a 2-arg or 3-arg regex builtin: `sub(p; r)`, `gsub(p; r)`, or
+/// `sub(p; r; flags)`. Legacy `compileRegexBuiltin2` at
+/// `src/query/src/compiler.zig:3867-3989`.
+///
+/// 2-arg bytecode (byte-identical):
+///   save_input                @ lparen
+///   <pattern>                 (literal fast path: nothing emitted; decoded
+///                              into pending_pattern. dynamic: parsePipe
+///                              emits the expression evaluating to a string.)
+///   restore_input             @ semi (after consuming `;`)
+///   save_input                @ semi
+///   <replacement>             (parsePipe)
+///   restore_input             @ rparen (after consuming `)`)
+///   call_builtin(bid)         @ rparen
+///     — operand = packRegexBuiltinOperand(bid, pool_idx_or_DYNAMIC).
+///
+/// 3-arg (`sub(lit; repl; lit_flags)`): literal flags ONLY — any non-literal
+/// flag rejects at compile time identically. Final `sub` rewrites to `gsub_`
+/// when `g` present.
+fn emitRegex2(
+    w: *Walker,
+    call_span: ast.Span,
+    args: []const *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+    const semi1_off = scanForSkipWs(w.src, args[0].span.end, ';') orelse args[0].span.end;
+    const semi2_off: ?u32 = if (args.len == 3)
+        (scanForSkipWs(w.src, args[1].span.end, ';') orelse args[1].span.end)
+    else
+        null;
+
+    // Fast-path probe: pattern is literal string AND followed by `;` at the
+    // AST-arg separator. `args.len >= 2` always in this branch.
+    const pat_lit = literalStringArg(args[0]);
+    var flags_lit: ?[]const u8 = null;
+    if (args.len == 3) {
+        flags_lit = literalStringArg(args[2]);
+        if (flags_lit == null) {
+            // Legacy surfaces a compile error with `flags_tok.offset` — we
+            // point at args[2].span.
+            setRegexCompileErr(w, args[2].span.start, 0);
+            return error.AstCompileError;
+        }
+    }
+    if (args.len == 3 and pat_lit == null) {
+        // Legacy: 3-arg with non-literal pattern also rejects via
+        // `fast_path_handled == false`. Mirror.
+        setRegexCompileErr(w, args[2].span.start, 0);
+        return error.AstCompileError;
+    }
+
+    // The fast-path branch decodes the pattern into `pending_pattern` BEFORE
+    // interning. Interning happens only once — with flag-prefix baked in for
+    // the 3-arg form.
+    var pending_pattern = std.ArrayList(u8){};
+    defer pending_pattern.deinit(w.alloc);
+
+    const fast_path = (pat_lit != null);
+    var pat_off: u32 = 0;
+    var pat_len: u32 = 0;
+    if (pat_lit) |p| {
+        try pending_pattern.appendSlice(w.alloc, p);
+        pat_off = args[0].span.start;
+        pat_len = if (args[0].span.end > args[0].span.start)
+            args[0].span.end - args[0].span.start
+        else
+            0;
+        w.last_regex_pattern_offset = pat_off;
+        w.last_regex_pattern_len = pat_len;
+    }
+
+    // save_input — stamp lparen.
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+
+    if (!fast_path) {
+        // Dynamic pattern: evaluate the expression into the stack.
+        try w.walk(args[0]);
+    }
+
+    try w.emit(.restore_input, .{ .none = {} }, semi1_off);
+    try w.emit(.save_input, .{ .none = {} }, semi1_off);
+
+    try w.walk(args[1]);
+
+    if (args.len == 2) {
+        // 2-arg: intern now if fast path; leave sentinel otherwise.
+        var pool_idx: u32 = types.REGEX_POOL_DYNAMIC;
+        if (fast_path) {
+            pool_idx = try internRegexPattern(w, pending_pattern.items, pat_off, pat_len);
+        }
+        try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+        try w.emit(
+            .call_builtin,
+            .{ .index = types.packRegexBuiltinOperand(bid, pool_idx) },
+            rparen_off,
+        );
+        return;
+    }
+
+    // 3-arg: literal flags form.
+    var final_key = std.ArrayList(u8){};
+    defer final_key.deinit(w.alloc);
+    const flag_result = try emitFlagPrefixInto(w, &final_key, flags_lit.?, pat_off, pat_len);
+    try final_key.appendSlice(w.alloc, pending_pattern.items);
+
+    const pool_idx = try internRegexPattern(w, final_key.items, pat_off, pat_len);
+
+    const effective_bid: types.BuiltinId =
+        if (bid == .sub_ and flag_result.has_g) .gsub_ else bid;
+
+    // Legacy consumes flags + `)` tokens then emits restore + call_builtin —
+    // both stamped at `)`.offset. semi2_off is unused by the emit path but
+    // captured for parity with comment.
+    _ = semi2_off;
+
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(
+        .call_builtin,
+        .{ .index = types.packRegexBuiltinOperandFlags(effective_bid, pool_idx, flag_result.has_n) },
+        rparen_off,
+    );
+}
+
+/// Emit a 1-arg value-argument builtin — the comma-fold pattern used by
+/// `has(x)`, `contains(x)`, `indices(s)`, `getpath(p)`, `strftime(fmt)`, etc.
+/// Delegates to the collecting variant with no sink.
+fn emitValueArg1(
+    w: *Walker,
+    call_span: ast.Span,
+    args: []const *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    try emitValueArg1Collecting(w, call_span, args[0], bid, null);
+}
+
+/// Comma-fold emission: mirrors legacy `compileValueArgBuiltin1Collecting` at
+/// `src/query/src/compiler.zig:3091-3161`.
+///
+/// For a non-comma arg, this is simple:
+///   <arg>                  @ arg walk
+///   call_builtin(bid)      @ rparen
+///
+/// For a comma chain `a, b, c`, legacy builds a FORK/JUMP generator:
+///   FORK    L2                    (inserted before the entire 'a' subtree)
+///   <a>                           (emits into left_start..mid1)
+///   call_builtin(bid)             (after 'a', at rparen-ish offset)
+///   JUMP end
+///   L2:
+///   FORK    L3                    (nested fork; previous fork's target patched)
+///   <b>
+///   call_builtin(bid)
+///   JUMP end
+///   L3:
+///   <c>
+///   call_builtin(bid)
+///   end:
+///
+/// Stamp policy: legacy's emits for `call_builtin` / `jump` stamp with
+/// `last_tok_offset`, which after comma consumption = `,`.offset. The final
+/// tail `call_builtin` stamps after `)` consumption = `)`.offset.
+fn emitValueArg1Collecting(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+    bid: types.BuiltinId,
+    call_sink: ?*std.ArrayList(u32),
+) Walker.Error!void {
+    const rparen_off = builtinRparenOff(call_span);
+
+    // Flatten comma tree into linear list of alternatives (top-level commas
+    // only — parens break the chain; the AST represents that via wrapping
+    // in a paren node, so flattening here is correct).
+    var alts = std.ArrayList(*const Node){};
+    defer alts.deinit(w.alloc);
+    try flattenCommaForBuiltin(w.alloc, &alts, arg);
+
+    // Gather comma offsets between each pair (used as last_tok_offset stamps
+    // in the middle of the chain).
+    var comma_offs = std.ArrayList(u32){};
+    defer comma_offs.deinit(w.alloc);
+    {
+        var i: usize = 0;
+        while (i + 1 < alts.items.len) : (i += 1) {
+            const co = scanForSkipWs(w.src, alts.items[i].span.end, ',') orelse alts.items[i].span.end;
+            try comma_offs.append(w.alloc, co);
+        }
+    }
+
+    // Emit first alternative. `left_start` tracks the insertion point for the
+    // FORK splice before the first alternative's instrs.
+    var left_start: usize = w.raw.items.len;
+    try w.walk(alts.items[0]);
+
+    var jump_fixups = std.ArrayList(usize){};
+    defer jump_fixups.deinit(w.alloc);
+
+    var prev_fork_pos: ?usize = null;
+
+    var i: usize = 1;
+    while (i < alts.items.len) : (i += 1) {
+        const comma_off = comma_offs.items[i - 1];
+
+        // Emit call_builtin for the left side before inserting FORK.
+        const call_idx: u32 = @intCast(w.raw.items.len);
+        try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, comma_off);
+        if (call_sink) |sink| try sink.append(w.alloc, call_idx);
+
+        // Insert FORK at `left_start`. The call_idx we just pushed shifts
+        // by +1 because insertRawInstr shifts everything after left_start.
+        try insertRawInstr(w, left_start, .{
+            .op = .fork,
+            .operand = .{ .index = 0 },
+            .src_offset = 0,
+        });
+        if (call_sink) |sink| {
+            const last = &sink.items[sink.items.len - 1];
+            last.* += 1;
+        }
+        if (prev_fork_pos) |pfp| {
+            w.raw.items[pfp].operand.index = @intCast(left_start);
+        }
+
+        // Emit JUMP past all remaining alternatives.
+        const jump_pos = w.raw.items.len;
+        try w.emit(.jump, .{ .index = 0 }, comma_off);
+        try jump_fixups.append(w.alloc, jump_pos);
+
+        const current_fork_pos = left_start;
+        left_start = w.raw.items.len;
+
+        try w.walk(alts.items[i]);
+
+        w.raw.items[current_fork_pos].operand.index = @intCast(left_start);
+        prev_fork_pos = current_fork_pos;
+    }
+
+    // Tail `call_builtin` — stamped at `)`.offset (legacy consumed `)` via
+    // nextToken just before this emit).
+    const tail_call_idx: u32 = @intCast(w.raw.items.len);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+    if (call_sink) |sink| try sink.append(w.alloc, tail_call_idx);
+
+    // Backpatch JUMPs to end.
+    const end_pos: i64 = @intCast(w.raw.items.len);
+    for (jump_fixups.items) |fixup| {
+        w.raw.items[fixup].operand.index = end_pos;
+    }
+}
+
+/// Flatten top-level commas in a subtree into a linear alternative list.
+/// Commas inside parens, brackets, braces, pipes, etc. are NOT flattened —
+/// they show up as AST nodes other than `.comma`. The AST's `.comma` is
+/// left-leaning, matching legacy's left-to-right parse.
+fn flattenCommaForBuiltin(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(*const Node),
+    node: *const Node,
+) error{OutOfMemory}!void {
+    switch (node.kind) {
+        .comma => |c| {
+            try flattenCommaForBuiltin(alloc, out, c.left);
+            try flattenCommaForBuiltin(alloc, out, c.right);
+        },
+        else => {
+            try out.append(alloc, node);
+        },
+    }
+}
+
+/// Emit 2-arg math builtin: `pow(a; b)`, `atan2(y; x)`, etc.
+/// Legacy `compileTwoArgMath` at `src/query/src/compiler.zig:3832-3858`:
+///   save_input                @ lparen
+///   <a>                       @ a walk
+///   restore_input             @ semi
+///   save_input                @ semi
+///   <b>                       @ b walk
+///   restore_input             @ rparen
+///   call_builtin(bid)         @ rparen
+fn emitTwoArgMath(
+    w: *Walker,
+    call_span: ast.Span,
+    a: *const Node,
+    b: *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+    const semi_off = scanForSkipWs(w.src, a.span.end, ';') orelse a.span.end;
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+    try w.walk(a);
+    try w.emit(.restore_input, .{ .none = {} }, semi_off);
+    try w.emit(.save_input, .{ .none = {} }, semi_off);
+    try w.walk(b);
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+}
+
+/// Emit 3-arg math builtin: `fma(x; y; z)`. Legacy `compileThreeArgMath` at
+/// `src/query/src/compiler.zig:3992-4023`.
+fn emitThreeArgMath(
+    w: *Walker,
+    call_span: ast.Span,
+    args: []const *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+    const semi1_off = scanForSkipWs(w.src, args[0].span.end, ';') orelse args[0].span.end;
+    const semi2_off = scanForSkipWs(w.src, args[1].span.end, ';') orelse args[1].span.end;
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+    try w.walk(args[0]);
+    try w.emit(.restore_input, .{ .none = {} }, semi1_off);
+    try w.emit(.save_input, .{ .none = {} }, semi1_off);
+    try w.walk(args[1]);
+    try w.emit(.restore_input, .{ .none = {} }, semi2_off);
+    try w.emit(.save_input, .{ .none = {} }, semi2_off);
+    try w.walk(args[2]);
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+}
+
+/// Emit `setpath(PATH; VALUE)`. Legacy `compileSetpath` at
+/// `src/query/src/compiler.zig:3801-3828`:
+///   save_input                @ lparen
+///   <PATH>                    @ PATH walk
+///   restore_input             @ semi
+///   save_input                @ semi
+///   <VALUE>                   @ VALUE walk
+///   restore_input             @ rparen
+///   call_builtin(setpath)     @ rparen
+fn emitSetpath(
+    w: *Walker,
+    call_span: ast.Span,
+    path: *const Node,
+    value: *const Node,
+) Walker.Error!void {
+    try emitTwoArgMath(w, call_span, path, value, .setpath);
+}
+
+/// Emit `debug(f)` / `halt_error(n)` — consume arg via parsePipe, then a
+/// single `call_builtin`. Legacy `compileDebugArg` / `compileHaltErrorArg`.
+fn emitSimpleCall1(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const rparen_off = builtinRparenOff(call_span);
+    try w.walk(arg);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+}
+
+/// Emit `error(msg)`. Legacy `compileErrorArg`:
+///   <msg>                 @ msg walk
+///   pipe                  @ rparen
+///   call_builtin(error)   @ rparen
+fn emitErrorArg(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+) Walker.Error!void {
+    const rparen_off = builtinRparenOff(call_span);
+    try w.walk(arg);
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.error_) }, rparen_off);
+}
+
+/// Emit `isempty(f)`. Legacy `compileIsempty`:
+///   save_input                 @ lparen
+///   array_collect_start(end)   @ lparen (backpatched)
+///   <f>                        @ f walk
+///   yield_output               @ f_last
+///   array_collect_end          @ rparen
+///   call_builtin(isempty_)     @ rparen
+fn emitIsempty(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.isempty_) }, rparen_off);
+}
+
+/// Emit `with_entries(f)`. Legacy `compileWithEntries`:
+///   call_builtin(to_entries)      @ lparen
+///   pipe                          @ lparen
+///   array_collect_start(end)      @ lparen
+///   each                          @ lparen
+///   <f>                           @ f walk
+///   yield_output                  @ f_last
+///   array_collect_end             @ rparen
+///   pipe                          @ rparen
+///   call_builtin(from_entries)    @ rparen
+fn emitWithEntries(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.to_entries) }, lparen_off);
+    try w.emit(.pipe, .{ .none = {} }, lparen_off);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+    try w.emit(.each, .{ .none = {} }, lparen_off);
+
+    try w.walk(arg);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.from_entries) },
+        rparen_off,
+    );
+}
+
+/// Emit `in(expr)` — 1-arg in/IN. Legacy `compileIn` at
+/// `src/query/src/compiler.zig:4401-4436`. This has a more complex shape
+/// than `compileValueArgBuiltin1` because each alternative wraps in a
+/// save_input/restore_input envelope with an explicit yield_output.
+///
+/// 1-alt shape:
+///   save_input                   @ lparen
+///   <arg>                        @ arg walk
+///   call_builtin(in_)            @ rparen
+///
+/// Multi-alt (`in(a, b)`) shape:
+///   save_input (inserted)        (inserted at chain_start, src_offset=0)
+///   save_input                   @ lparen
+///   <a>                          @ a walk
+///   call_builtin(in_)            @ comma
+///   yield_output                 @ comma
+///   restore_input                @ comma
+///   save_input                   @ comma
+///   <b>                          @ b walk
+///   call_builtin(in_)            @ rparen
+fn emitInExpr(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    var alts = std.ArrayList(*const Node){};
+    defer alts.deinit(w.alloc);
+    try flattenCommaForBuiltin(w.alloc, &alts, arg);
+
+    var comma_offs = std.ArrayList(u32){};
+    defer comma_offs.deinit(w.alloc);
+    {
+        var i: usize = 0;
+        while (i + 1 < alts.items.len) : (i += 1) {
+            const co = scanForSkipWs(w.src, alts.items[i].span.end, ',') orelse alts.items[i].span.end;
+            try comma_offs.append(w.alloc, co);
+        }
+    }
+
+    const chain_start: usize = w.raw.items.len;
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+    try w.walk(alts.items[0]);
+
+    var i: usize = 1;
+    while (i < alts.items.len) : (i += 1) {
+        const comma_off = comma_offs.items[i - 1];
+
+        // Insert save_input at chain_start before the left subtree.
+        try insertRawInstr(w, chain_start, .{
+            .op = .save_input,
+            .operand = .{ .none = {} },
+            .src_offset = 0,
+        });
+
+        // Emit call_builtin / yield_output / restore_input for the LEFT side.
+        try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.in_) }, comma_off);
+        try w.emit(.yield_output, .{ .none = {} }, comma_off);
+        try w.emit(.restore_input, .{ .none = {} }, comma_off);
+
+        try w.emit(.save_input, .{ .none = {} }, comma_off);
+        try w.walk(alts.items[i]);
+    }
+
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.in_) }, rparen_off);
 }
 
 // ── insertRawInstr ────────────────────────────────────────────────────────────

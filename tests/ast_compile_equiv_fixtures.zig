@@ -894,3 +894,172 @@ pub const stage10c_supported: []const []const u8 = &.{
 /// Stage 10c fixtures that remain outside the walker. All Stage 10c shapes
 /// are now handled; empty list acts as the scaffold contract marker.
 pub const stage10c_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 11 — regex builtins, datetime, and the remaining
+/// 1-arg / 2-arg string/path/math builtins. Every entry must yield
+/// byte-identical `Instruction[]` + `source_map` across the legacy compiler
+/// and the AST walker. See `research/phase-2-ast-walk-plan.md` §4 Stage 11.
+pub const stage11_supported: []const []const u8 = &.{
+    // ── Regex: test (literal pattern, no flags) ────────────────────
+    "test(\"err\")",
+    "\"foo123\" | test(\"[0-9]+\")",
+    ".msg | test(\"err\")",
+
+    // ── Regex: test (literal pattern + single-flag) ────────────────
+    "\"AbC\" | test(\"abc\"; \"i\")",
+    "\"a\\nb\" | test(\".\"; \"s\")",
+    "\"abc\" | test(\"a b c\"; \"x\")",
+    "\"a\\nb\" | test(\"^b\"; \"m\")",
+
+    // ── Regex: test (combined flag letters) ────────────────────────
+    "\"AbC\" | test(\"ab\"; \"gi\")",
+    "\"a b\" | test(\"a  b\"; \"xi\")",
+    "\"A\\nB\" | test(\"^b\"; \"mi\")",
+    "\"abc\" | test(\"\"; \"ni\")",
+
+    // ── Regex: match ───────────────────────────────────────────────
+    "\"abc\" | match(\"b\")",
+    "\"abc\" | match(\"B\"; \"i\")",
+    "[\"abcabc\" | match(\"a\"; \"g\")]",
+
+    // ── Regex: capture with named groups ───────────────────────────
+    "\"12-34\" | capture(\"(?<a>[0-9]+)-(?<b>[0-9]+)\")",
+
+    // ── Regex: scan generator ──────────────────────────────────────
+    "[\"abc123\" | scan(\"[0-9]+\")]",
+    "[\"aaa\" | scan(\"a\")]",
+
+    // ── Regex: splits ──────────────────────────────────────────────
+    "[\"a,b,c\" | splits(\",\")]",
+    "[\"a b  c\" | splits(\" +\")]",
+
+    // ── Regex: sub / gsub ──────────────────────────────────────────
+    "\"abc\" | sub(\"b\"; \"X\")",
+    "\"ababab\" | gsub(\"a\"; \"Z\")",
+    "\"AbC\" | sub(\"b\"; \"X\"; \"i\")",
+    "\"ababab\" | sub(\"a\"; \"Z\"; \"g\")",
+
+    // ── Regex: `n` flag ────────────────────────────────────────────
+    "\"\" | test(\"\"; \"n\")",
+    "[\"\" | scan(\"\"; \"n\")]",
+    "\"abc\" | sub(\"^\"; \"X\"; \"n\")",
+
+    // ── Regex: slow/dynamic path ───────────────────────────────────
+    ". | test(.p)",
+    ".msg | test(.pat)",
+
+    // ── Datetime ───────────────────────────────────────────────────
+    "now",
+    "gmtime",
+    "mktime",
+    "now | strftime(\"%Y\")",
+    "\"2024-01-01\" | strptime(\"%Y-%m-%d\")",
+    "0 | strflocaltime(\"%H\")",
+    "0 | todate",
+    "0 | todateiso8601",
+    "\"1970-01-01T00:00:00Z\" | fromdate",
+    "\"1970-01-01T00:00:00Z\" | fromdateiso8601",
+
+    // ── Core zero-arg shapes w/ trailing operations ────────────────
+    ". | length",
+    ". | type",
+    "[1,2,3] | length",
+    "{a:1,b:2} | keys",
+    "{a:1,b:2} | keys_unsorted",
+    "{a:1,b:2} | values",
+
+    // ── has / contains (1-arg) ─────────────────────────────────────
+    "{a:1} | has(\"a\")",
+    "{a:1} | has(\"b\")",
+    "\"hello\" | contains(\"ell\")",
+    "[1,2,3] | contains([2])",
+    "\"abc\" | inside(\"abcdef\")",
+
+    // ── Sort / group / sort_by / group_by / min_by / max_by ───────
+    "[3,1,2] | sort",
+    "[{k:1},{k:2}] | sort_by(.k)",
+    "[{a:1},{a:1},{a:2}] | group_by(.a)",
+    "[{v:1},{v:2}] | min_by(.v)",
+    "[{v:1},{v:2}] | max_by(.v)",
+    "[3,1,1,2] | unique",
+    "[{v:1},{v:1},{v:2}] | unique_by(.v)",
+    "[3,1,2] | min",
+    "[3,1,2] | max",
+
+    // ── to_entries / from_entries / with_entries ──────────────────
+    "{a:1,b:2} | to_entries",
+    "[{key:\"a\",value:1}] | from_entries",
+    "{a:1,b:2} | with_entries(.value += 1)",
+
+    // ── trim / ltrimstr / rtrimstr ─────────────────────────────────
+    "\"  hi  \" | ltrimstr(\" \")",
+    "\"foo.bar\" | rtrimstr(\".bar\")",
+    "\"xxhixx\" | trimstr(\"xx\")",
+
+    // ── case / encode ──────────────────────────────────────────────
+    "\"AbC\" | ascii_downcase",
+    "\"abc\" | ascii_upcase",
+    "\"hi\" | explode",
+    "[104, 105] | implode",
+    ". | tojson",
+    "\"null\" | fromjson",
+    "\"42\" | tonumber",
+    "42 | tostring",
+
+    // ── Path builtins ──────────────────────────────────────────────
+    "{a:{b:1}} | getpath([\"a\",\"b\"])",
+    "{} | setpath([\"a\"]; 1)",
+    "{a:1,b:2} | delpaths([[\"a\"]])",
+    "{a:{b:1}} | [paths]",
+    "{a:{b:1}} | [leaf_paths]",
+
+    // ── Math (zero-arg + 1-arg) ────────────────────────────────────
+    "4 | sqrt",
+    "-1 | abs",
+    "1.5 | floor",
+    "1.5 | ceil",
+    "1.5 | round",
+    "1 | exp",
+    "2.718 | log",
+    "0 | sin",
+    "0 | cos",
+
+    // ── Math (2-arg / 3-arg) ───────────────────────────────────────
+    "2 | pow(2; 3)",
+    "1 | atan2(1; 1)",
+    "5 | fma(2; 3; 4)",
+
+    // ── I/O / debug / halt_error / error ───────────────────────────
+    ". | debug",
+    ". | debug(.)",
+
+    // ── Env / builtins ─────────────────────────────────────────────
+    "env",
+    "builtins | length",
+
+    // ── String 1-arg: split / join / startswith / endswith ─────────
+    "\"a,b,c\" | split(\",\")",
+    "[\"a\",\"b\",\"c\"] | join(\",\")",
+    "\"hello\" | startswith(\"he\")",
+    "\"hello\" | endswith(\"lo\")",
+
+    // ── index / rindex / indices ───────────────────────────────────
+    "\"abcabc\" | indices(\"b\")",
+    "\"abcabc\" | index(\"b\")",
+    "\"abcabc\" | rindex(\"b\")",
+
+    // ── flatten (1-arg) / bsearch ──────────────────────────────────
+    "[[1,2],[3,4]] | flatten(1)",
+    "[1,2,3] | bsearch(2)",
+};
+
+/// Stage 11 fixtures that compile cleanly in legacy but are expected to
+/// reject (regex or unsupported-flag compile error) — both paths must
+/// reject identically.
+///
+/// NOTE: the `expectCompileError` fixtures below use compile errors (both
+/// paths return `.err`), so they cannot be stage11_unsupported (the harness
+/// expects legacy to succeed for `_unsupported`). Instead, they belong in
+/// a hypothetical `_reject_equiv` bucket — deferred for now, documented
+/// here so the fixture enumeration captures the intent.
+pub const stage11_unsupported: []const []const u8 = &.{};

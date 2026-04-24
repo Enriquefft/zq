@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–10 complete; 11–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–11 complete; 12–13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -19,7 +19,8 @@ Last verified: 2026-04-23.
    canonical representation (see `CLAUDE.md` §3).
 
    **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5
-   + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10 (10a + 10b + 10c).
+   + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10 (10a + 10b + 10c)
+   + Stage 11.
    Walker covers: literal/identity/
    recurse/unary_neg (Stage 1), field_access/index_access/iterate/slice/
    suffix chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including
@@ -77,7 +78,42 @@ Last verified: 2026-04-23.
      `appendRebasedInstrsCopy` in place of legacy's `rebaseExprBuf` +
      `ctx.lex.pos` rewind dance. Dispatch at `dispatchStage10cBuiltin`.
 
+   **Stage 11 (landed — regex + datetime + 1/2/3-arg builtin remainder):**
+   - Regex 1-arg (`test` / `match` / `capture` / `scan` / `splits`) with
+     both fast literal path (compile-time `regex_pool.intern`, flag prefix
+     via `emitFlagPrefixInto`, `match_g_` variant on `g` flag, `n` flag
+     packed into operand bit 48) and slow dynamic path (emit value-arg
+     FORK/JUMP chain, retrofit every `call_builtin` operand with
+     `REGEX_POOL_DYNAMIC` sentinel).
+   - Regex 2-arg / 3-arg (`sub` / `gsub`) with single-intern discipline:
+     decode pattern into `pending_pattern` up front, intern exactly once
+     after flag-prefix baking (3-arg form), or after the arg walk (2-arg).
+     `sub(p; r; "g")` rewrites to `gsub_` at compile time. `p` / `l` /
+     non-literal-flags reject identically to legacy.
+   - Datetime (`now`, `gmtime`, `mktime`, `strftime(fmt)`,
+     `strptime(fmt)`, `strflocaltime(fmt)`, `todate`, `todateiso8601`,
+     `fromdate`, `fromdateiso8601`).
+   - Extended `zeroArgBuiltinId` (now covers every name legacy's table
+     at `compiler.zig:2874-2991` handles), plus bare-ident fallback in
+     `tryDispatchBareIdent` so the AST parser's narrower
+     `isZeroArgBuiltin` doesn't break parity for names like `now` /
+     `env` / `debug` / `trim`.
+   - 1-arg value-arg builtins via `emitValueArg1Collecting` (legacy
+     byte-identical FORK/JUMP comma-fold): `has` / `contains` / `inside`
+     / `indices` / `index` / `rindex` / `flatten(n)` / `bsearch` /
+     `split` / `join` / `startswith` / `endswith` / `ltrimstr` /
+     `rtrimstr` / `trimstr` / `getpath` / `delpaths` / `strftime` /
+     `strptime` / `strflocaltime`.
+   - Filter-arg builtins: `sort_by` / `group_by` / `min_by` / `max_by`
+     / `unique_by` / `with_entries`.
+   - 2-arg/3-arg math: `pow` / `atan2` / `remainder` / `hypot` /
+     `scalb` / `scalbln` / `ldexp` / `drem` (two-arg save/eval/restore
+     envelope), `fma` (three-arg variant), plus `setpath` (shares
+     two-arg shape).
+   - Misc: `debug(f)` / `halt_error(n)` / `error(msg)` (with pipe +
+     call pattern) / `isempty(f)` / `in(expr)` (generator-aware
+     save_input/yield/restore envelope with chain_start splice).
+
    **Remaining stages (per plan §4):**
-   - Stage 11: regex builtins and string-ops remainder.
    - Stage 12: prefilter integration (fold into single AST pass).
    - Stage 13: cutover — delete legacy compiler, swap in walker.
