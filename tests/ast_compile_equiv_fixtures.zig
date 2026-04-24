@@ -230,14 +230,9 @@ pub const stage4_supported: []const []const u8 = &.{
 
 /// Stage 4 fixtures blocked by later stages.
 ///
-/// `$__loc__` lowers to an `object_construct_*` opcode sequence in the
-/// legacy compiler (`src/query/src/compiler.zig:6574-6577` + `emitLocObject`
-/// at `:6586-6605`). Those opcodes are Stage 7 scope, so Stage 4's walker
-/// rejects `$__loc__` with `AstCompilerStageIncomplete` — legacy accepts it,
-/// the walker doesn't yet, which is exactly what this list records.
-pub const stage4_unsupported: []const []const u8 = &.{
-    "$__loc__",
-};
+/// `$__loc__` moved to `stage7_supported` once the Stage 7 walker gained
+/// `emitLocObject`; this list stays so later stages can re-use it.
+pub const stage4_unsupported: []const []const u8 = &.{};
 
 /// Supported in Stage 5 — arithmetic, comparison, logical, alternative (`//`),
 /// and non-literal `unary_neg`. Every entry must yield byte-identical
@@ -440,3 +435,89 @@ pub const stage6_supported: []const []const u8 = &.{
 /// parser fix moves `path` into `isBuiltinName`, the `.builtin_call`
 /// branch already has the emission.
 pub const stage6_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 7 — object literals, array constructors, string
+/// interpolation, format strings, and the `$__loc__` marker-object shorthand.
+/// Every entry must yield byte-identical `Instruction[]` + `source_map`
+/// across the legacy compiler and the AST walker. See
+/// `research/phase-2-ast-walk-plan.md` §4 Stage 7.
+pub const stage7_supported: []const []const u8 = &.{
+    // ── Array construct ────────────────────────────────────────────
+    "[]",
+    "[1]",
+    "[1,2,3]",
+    "[\"a\",\"b\"]",
+    "[.a, .b, .c]",
+    "[.items[0], .items[1]]",
+    "[.items[]]",
+    "[1,2,3] | [.[]]",
+    "[[1,2],[3,4]]",
+    "[[]]",
+    "[1+2, 3*4]",
+    "[.a+1, .b-1]",
+    "[if .a then 1 else 2 end]",
+    "[try .a catch 0]",
+
+    // ── Object construct — static keys ─────────────────────────────
+    "{}",
+    "{a: 1}",
+    "{a: 1, b: 2}",
+    "{\"key\": .value}",
+    "{a: 1, b: .c, c: [1,2]}",
+
+    // ── Object construct — shorthand ───────────────────────────────
+    "{a}",
+    "{a, b}",
+    ". as $x | {$x}",
+    ". as $x | {$x, y: 1}",
+
+    // ── Object construct — computed key ────────────────────────────
+    "{(.name): .value}",
+    "{(.k): 1}",
+    "{(.key): 42}",
+
+    // ── Object construct — pipe value (BUG-005 d1 coverage) ────────
+    "{a: . | 1}",
+    "{a: .x | .y}",
+    "{a: .items[0] | .name}",
+
+    // ── Object construct — __loc__ marker ──────────────────────────
+    "$__loc__",
+
+    // ── String interpolation ───────────────────────────────────────
+    "\"\\(.a)\"",
+    "\"hello \\(.name)\"",
+    "\"\\(.a) and \\(.b)\"",
+    "\"\\(.x)-\\(.y)-\\(.z)\"",
+    "\"\\(.items[0].name)\"",
+    "\"\\(.a + .b)\"",
+
+    // ── Format string — standalone (pipe target) ───────────────────
+    ". | @base64",
+    ". | @uri",
+    ". | @json",
+    ". | @tsv",
+    ". | @text",
+    ". | @csv",
+    ". | @html",
+    ". | @sh",
+    ". | @base64d",
+
+    // ── Format string — with plain literal (no interp) ─────────────
+    "@text \"literal\"",
+    "@json \"hello\"",
+
+    // ── Format string — with interpolation ─────────────────────────
+    "@json \"\\(.a)\"",
+    "@uri \"\\(.path)\"",
+    "@text \"\\(.name)\"",
+    "@csv \"\\(.a),\\(.b)\"",
+
+    // ── Pipe composition of format builtins ────────────────────────
+    ". | @base64 | @base64d",
+};
+
+/// Stage 7 fixtures that depend on a later stage. Currently none — every
+/// Stage 7 node kind (object_construct, array_construct, string_interp,
+/// format_string) is handled.
+pub const stage7_unsupported: []const []const u8 = &.{};

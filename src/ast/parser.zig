@@ -721,9 +721,92 @@ pub const Parser = struct {
 
     fn parseObjectField(p: *Parser) error{ParseFailed}!Node.ObjectField {
         const start = p.lex.pos;
+        // Legacy's `parseObjectLiteral` in `src/query/src/compiler.zig:6836-
+        // 6869` dispatches `$var` as a dedicated field shape BEFORE calling
+        // `parseObjectKey`. The AST parser mirrors that fork here so the
+        // variable-key shapes (`{$x}`, `{$y: 4}`) produce the right node
+        // structure without fighting `parseObjectKey`'s `.dollar` branch.
+        const first_tok = p.peek() orelse return error.ParseFailed;
+
+        if (first_tok.tag == .dollar) {
+            _ = p.advance(); // consume '$'
+            const var_tok = p.advance() orelse return error.ParseFailed;
+            if (!isVarNameToken(var_tok.tag)) {
+                p.addError("expected variable name after '$'", Span.from(var_tok.offset, var_tok.offset + var_tok.len));
+                return error.ParseFailed;
+            }
+            const var_name = p.internName(p.tokenSlice(var_tok));
+            const dollar_span = Span.from(first_tok.offset, var_tok.offset + var_tok.len);
+
+            const after_dollar = p.peek();
+            const has_colon = if (after_dollar) |t| t.tag == .colon else false;
+
+            // Key shape in the AST for both `{$x}` and `{$x: VALUE}` is
+            // `.ident` carrying the variable *name*. The walker detects the
+            // `$` prefix by looking at the source byte at the cursor — see
+            // `emitObjectField` in `src/ast/compiler.zig`.
+            const key: Node.ObjectKey = .{ .ident = var_name };
+
+            if (has_colon) {
+                _ = p.advance(); // consume ':'
+                const value = try p.parseObjectFieldValue();
+                return .{
+                    .key = key,
+                    .value = value,
+                    .span = Span.from(start, value.span.end),
+                };
+            }
+
+            // Shorthand `{$x}` — synthesized value is the variable reference
+            // itself. The walker then emits push_string(name) +
+            // load_variable(id) — no replay (legacy compiler.zig:6859-6868).
+            const value = p.createNode(.{ .variable_ref = .{
+                .name = var_name,
+            } }, dollar_span);
+
+            return .{
+                .key = key,
+                .value = value,
+                .span = Span.from(start, value.span.end),
+            };
+        }
+
+        // Non-dollar key shapes.
+        const key_start = p.lex.pos;
         const key = try p.parseObjectKey();
-        _ = p.expectOrError(.colon, "expected ':' in object field");
-        const value = try p.parseObjectFieldValue();
+
+        const after_key = p.peek();
+        const has_colon = if (after_key) |t| t.tag == .colon else false;
+
+        if (has_colon) {
+            _ = p.advance(); // consume ':'
+            const value = try p.parseObjectFieldValue();
+            return .{
+                .key = key,
+                .value = value,
+                .span = Span.from(start, value.span.end),
+            };
+        }
+
+        // No `:` — synthesize the shorthand value. Legacy's per-shape logic
+        // (`src/query/src/compiler.zig:6880-6894`):
+        //   ident   `{a}`      → value = `.a`   (field_access)
+        //   string  `{"a"}`    → value = `."a"` (field_access on decoded name)
+        //   (expr)  `{(expr)}` → DYNAMIC shorthand (save_input / replay /
+        //                        load_computed) — walker rejects until the
+        //                        shorthand-expr path is plumbed through
+        //                        (Stage 7 does not need this path; fixtures
+        //                        cover only colon-separated computed keys).
+        const value: *Node = switch (key) {
+            .ident => |name| p.createNode(.{ .field_access = .{
+                .name = p.internName(name),
+            } }, Span.from(key_start, p.lex.pos)),
+            .string => |name| p.createNode(.{ .field_access = .{
+                .name = p.internName(name),
+            } }, Span.from(key_start, p.lex.pos)),
+            .expr => |expr| expr,
+        };
+
         return .{
             .key = key,
             .value = value,

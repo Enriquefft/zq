@@ -1,9 +1,9 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7).
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
 //! This file is the future replacement for that compiler; for now it covers only
-//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–6:
+//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–7:
 //!   - `.literal` (int, float, string, bool, null)
 //!   - `.identity` (bare `.`)
 //!   - `.recurse` (`..` operator → `call_builtin(recurse)`)
@@ -17,7 +17,7 @@
 //!   - `.suffix` — `.a.b`, `.a[0]`, `.a[]`, `.a?.b`, etc.
 //!   - `.pipe` — `a | b`, chained
 //!   - `.comma` — `a, b, c`
-//!   - `.variable_ref` — `$name`
+//!   - `.variable_ref` — `$name` (including `$__loc__` marker object)
 //!   - `.as_pattern` — `. as $x | body`, array/object destructuring
 //!   - `.destruct_alt` — `. as PAT1 ?// PAT2 | body`
 //!   - `.arithmetic` — `+`, `-`, `*`, `/`, `%`
@@ -28,10 +28,16 @@
 //!   - `.try_catch` — `try BODY [catch HANDLER]` (Stage 6)
 //!   - `.if_expr` — `if COND then THEN [elif COND then THEN]* [else ELSE] end` (Stage 6)
 //!   - `.builtin_call("path", [EXPR])` / `.func_call("path", [EXPR])` — Stage 6
+//!   - `.object_construct` — `{...}` with static / shorthand / computed /
+//!     string-interp keys, and `{__loc__}` marker shorthand (Stage 7)
+//!   - `.array_construct` — `[...]` with zero or more items (Stage 7)
+//!   - `.string_interp` — `"\(expr)..."` (Stage 7)
+//!   - `.format_string` — `@base64`, `@csv "literal"`, `@csv "\(.x),\(.y)"` (Stage 7)
+//!   - `.builtin_call("@name", [])` — standalone `@base64`/etc. pipe target
 //!
 //! Every other node kind returns `error.AstCompilerStageIncomplete`. This is NOT
 //! a workaround — it is the scaffold boundary, to be removed as later stages
-//! (7–13) extend coverage. See the plan doc for the full stage breakdown.
+//! (8–13) extend coverage. See the plan doc for the full stage breakdown.
 //!
 //! Production code is unaffected. The legacy compiler at
 //! `src/query/src/compiler.zig` remains the definitional compiler until Stage 13
@@ -755,12 +761,16 @@ const Walker = struct {
                 // byte to one-past the ident's last byte, so the ident's
                 // offset is `span.end - name.len` (idents have no escapes).
                 //
-                // `$__loc__` expands to a synthesized object at legacy
-                // `compiler.zig:6574-6577`; that requires `object_construct_*`
-                // opcodes, which land in Stage 7. Reject here so the scaffold
-                // boundary stays honest.
+                // `$__loc__` expands to a synthesized marker object via
+                // `emitLocObject` — same opcode sequence the legacy compiler
+                // produces at `src/query/src/compiler.zig:6574-6577`. Stamp
+                // every emit with the ident offset (`__loc__` token's byte
+                // position), matching legacy's `last_tok_offset` after
+                // `parseVariableReference` consumed the ident token.
                 if (std.mem.eql(u8, vr.name, "__loc__")) {
-                    return error.AstCompilerStageIncomplete;
+                    const ident_off = identOffsetOfVarRef(node.span, vr.name);
+                    try emitLocObject(w, ident_off);
+                    return;
                 }
                 const var_id = lookupVariable(w, vr.name) orelse {
                     // Undefined variable — legacy raises query_syntax_error
@@ -1093,6 +1103,26 @@ const Walker = struct {
                     try emitPathCall(w, node.span, bc.args[0]);
                     return;
                 }
+
+                // Stage 7 — standalone format builtins (`. | @base64`,
+                // `. | @uri`, …). The AST parser stores the leading `@` in the
+                // name via `internFormatName` (parser.zig:1441), so any
+                // builtin whose first byte is `@` is a format call. Legacy
+                // emits `call_builtin(format_*)` stamped with the format-name
+                // ident offset (= `@`.offset + 1), matching `ctx.last_tok_offset`
+                // after `nextToken` consumed the ident token in
+                // `parsePrimaryInner`'s `.at` branch at
+                // `src/query/src/compiler.zig:6330-6357`.
+                if (bc.name.len >= 2 and bc.name[0] == '@' and bc.args.len == 0) {
+                    if (formatBuiltinId(bc.name[1..])) |bid| {
+                        try w.emit(
+                            .call_builtin,
+                            .{ .index = @intFromEnum(bid) },
+                            node.span.start + 1,
+                        );
+                        return;
+                    }
+                }
                 return error.AstCompilerStageIncomplete;
             },
 
@@ -1109,12 +1139,142 @@ const Walker = struct {
                 return error.AstCompilerStageIncomplete;
             },
 
+            // ── Stage 7: array / object / string-interp / format-string ──
+
+            .array_construct => |ac| {
+                // Legacy `parseArrayConstruct` at
+                // `src/query/src/compiler.zig:6535-6564` emits:
+                //
+                //   array_collect_start(end_ip)      @ `[`.offset
+                //   (if non-empty body:
+                //     save_input                     @ `[`.offset
+                //     <EXPR>                         (parsePipe — includes
+                //                                     comma handling!)
+                //     yield_output                   @ expr's final token
+                //     restore_input                  @ expr's final token
+                //   )
+                //   array_collect_end                @ `]`.offset
+                //   (backpatch start → raw.len - 1 == end's IP pre-fuse)
+                //
+                // Note: the legacy outer while-comma loop at 6546-6552 is
+                // dead code — `parsePipe` already consumes the entire comma
+                // chain via its internal `parseComma`. So the AST walker
+                // just walks `ac.expr` (which IS a `comma` tree for
+                // comma-joined items) and the comma walker emits the
+                // FORK/JUMP generator pattern exactly like Stage 3.
+                const lbracket_off = node.span.start;
+                const rbracket_off = if (node.span.end > node.span.start)
+                    node.span.end - 1
+                else
+                    node.span.start;
+
+                const start_pos = w.raw.items.len;
+                try w.emit(.array_collect_start, .{ .index = 0 }, lbracket_off);
+
+                if (ac.expr) |expr| {
+                    try w.emit(.save_input, .{ .none = {} }, lbracket_off);
+                    try w.walk(expr);
+                    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+                    try w.emit(.restore_input, .{ .none = {} }, w.last_emit_offset);
+                }
+
+                try w.emit(.array_collect_end, .{ .none = {} }, rbracket_off);
+                // start operand points at end's raw IP = raw.len - 1.
+                w.raw.items[start_pos].operand = .{ .index = @intCast(w.raw.items.len - 1) };
+            },
+
+            .object_construct => |oc| {
+                // Legacy `parseObjectLiteral` at
+                // `src/query/src/compiler.zig:6827-6907` emits
+                // `object_construct_start`, a (key, value, object_key) triad
+                // per field, and `object_construct_end`. See the per-field
+                // helper below for the field lowering detail — it must match
+                // legacy byte-for-byte including the dynamic-key replay dance.
+                try w.emit(.object_construct_start, .{ .none = {} }, node.span.start);
+
+                // Track the cursor for per-field source-byte scanning. The
+                // first field starts immediately after `{`.
+                var field_cursor: u32 = node.span.start + 1;
+                for (oc.fields, 0..) |field, idx| {
+                    field_cursor = skipTrivia(w.src, field_cursor);
+                    try emitObjectField(w, field, &field_cursor);
+
+                    if (idx + 1 < oc.fields.len) {
+                        // Field separator `,` — consumes last_tok_offset.
+                        // We don't emit anything for the comma itself but
+                        // we DO need to advance the cursor past it for the
+                        // next field's scan.
+                        const comma_off = scanForSkipWs(w.src, field_cursor, ',') orelse field_cursor;
+                        field_cursor = comma_off + 1;
+                    }
+                }
+
+                const rbrace_off = if (node.span.end > node.span.start)
+                    node.span.end - 1
+                else
+                    node.span.start;
+                try w.emit(.object_construct_end, .{ .none = {} }, rbrace_off);
+            },
+
+            .string_interp => |si| {
+                // Legacy `compileStringInterpolation` at
+                // `src/query/src/compiler.zig:5729-5793` with no format.
+                //
+                // The AST's `.span.start` equals `first_part_tok.offset`
+                // (parser.zig:959), which is the first byte AFTER the opening
+                // `"`. That is the offset legacy stamps on the initial
+                // `push_string(first_literal)` because `parsePrimaryInner`'s
+                // `.string_part` branch consumes the first string_part token
+                // whose offset is `content_start`.
+                try emitStringInterp(w, node.span, si.parts, null);
+            },
+
+            .format_string => |fs| {
+                // Two AST shapes flow through here:
+                //   (A) `@name "literal"` with NO interpolation — parser path
+                //       at `src/ast/parser.zig:902-911` builds a format_string
+                //       whose `parts = [.literal(decoded)]` and whose span
+                //       starts at `@`.offset.
+                //   (B) `@name "...\(expr)..."` (interp) — parser path at
+                //       `src/ast/parser.zig:898-901` reuses `parseStringInterp`
+                //       whose span starts at `first_part_tok.offset`
+                //       (= content_start after the opening `"`).
+                //
+                // Plan §6.6 call-out: legacy routes (A) through a bare
+                // `push_string(decoded)` (compiler.zig:6344-6350) stamped at
+                // the `"`.offset (= string_lit.offset). Route (B) goes through
+                // `compileStringInterpolation` with the format bid threaded in.
+                // The walker must discriminate on structure AND on span shape.
+
+                const bid = formatBuiltinId(fs.format) orelse
+                    return error.AstCompilerStageIncomplete;
+
+                const is_pure_literal = fs.parts.len == 1 and
+                    fs.parts[0] == .literal;
+
+                // Shape (A) is detectable because the span starts at `@` (not
+                // at a string content byte) AND there are no `.expr` parts.
+                // We probe by checking the first byte at span.start.
+                const starts_with_at = node.span.start < w.src.len and
+                    w.src[node.span.start] == '@';
+
+                if (is_pure_literal and starts_with_at) {
+                    // (A) — locate `"`.offset by scanning past `@name`.
+                    const quote_off = scanOpeningQuoteAfterFormat(w.src, node.span.start);
+                    const ref = try internStr(
+                        &w.intern,
+                        w.alloc,
+                        fs.parts[0].literal,
+                    );
+                    try w.emit(.push_string, .{ .str_ref = ref }, quote_off);
+                } else {
+                    // (B) — interp path with format bid.
+                    try emitStringInterp(w, node.span, fs.parts, bid);
+                }
+            },
+
             // ── Scaffold boundary: every other kind is a future stage. ──
             .func_def,
-            .array_construct,
-            .object_construct,
-            .string_interp,
-            .format_string,
             .reduce,
             .foreach,
             .label_expr,
@@ -1799,6 +1959,467 @@ fn scanBracePairEndFrom(src: []const u8, open_lbrace: u32) u32 {
     return @intCast(src.len - 1);
 }
 
+// ── Stage 7 helpers: object / array / string-interp / format ────────────────
+
+/// Emit the `{__loc__}` / `$__loc__` marker-object opcode sequence. Mirrors
+/// `emitLocObject` at `src/query/src/compiler.zig:6586-6605`. All emits are
+/// stamped with `stamp`, which is the `last_tok_offset` legacy carried when
+/// entering this helper — for `$__loc__` that is the `__loc__` ident offset;
+/// for `{__loc__}` it is the `__loc__` ident offset consumed inside the field.
+fn emitLocObject(w: *Walker, stamp: u32) Walker.Error!void {
+    try w.emit(.object_construct_start, .{ .none = {} }, stamp);
+
+    const file_key = try internStr(&w.intern, w.alloc, "file");
+    try w.emit(.push_string, .{ .str_ref = file_key }, stamp);
+
+    const file_val = try internStr(&w.intern, w.alloc, "<top-level>");
+    try w.emit(.push_string, .{ .str_ref = file_val }, stamp);
+
+    try w.emit(.object_key, .{ .none = {} }, stamp);
+
+    const line_key = try internStr(&w.intern, w.alloc, "line");
+    try w.emit(.push_string, .{ .str_ref = line_key }, stamp);
+
+    try w.emit(.push_int, .{ .int = 1 }, stamp);
+    try w.emit(.object_key, .{ .none = {} }, stamp);
+
+    try w.emit(.object_construct_end, .{ .none = {} }, stamp);
+}
+
+/// Emit one object field. `cursor` is the walker's running source-byte cursor
+/// pointing at (or just before) the field's first token; updated in-place to
+/// point just past the field's last token for the outer loop to pick up.
+///
+/// Mirrors `parseObjectLiteral`'s per-field lowering at
+/// `src/query/src/compiler.zig:6836-6903` with careful src_offset parity:
+///   - Static key: emit `push_string(key)` stamped with ident/string_lit
+///     offset. Legacy's `parseObjectKey` consumes an ident/string_lit and
+///     `ctx.last_tok_offset` becomes that token's offset.
+///   - `{a}` (shorthand, static): emit `push_string("a")` then `load_key("a")`,
+///     both stamped with ident.offset (legacy does not consume any further
+///     token before the `load_key` emit — `last_tok_offset` stays at ident).
+///   - `{$x}` (dollar shorthand): consume `$` then ident → last_tok_offset =
+///     ident.offset. Emit push_string(name) + load_variable(var_id) both at
+///     ident.offset, then `object_key`.
+///   - `{$x: value}`: read VALUE of $x as key (legacy: load_variable) then
+///     parseObjectFieldValue for value, then `object_key`.
+///   - `{(expr): value}`: parseObjectKey consumes `(`, parseLogical, `)`.
+///     last_tok_offset = `)`.offset. Then `:`, then value. Then `object_key`
+///     stamped with value's last token.
+///   - `{(expr)}` (computed shorthand): like above but with no colon. Replay
+///     the key-producing raw instrs between `save_input` and `load_computed`,
+///     all stamped with `)`.offset. Then `object_key` stamped with `)`.offset.
+///   - `{"\(.x)": value}`: string-interp key — `compileStringInterpolation`.
+///   - `{__loc__}`: bare ident shorthand AST → field_access("__loc__") as
+///     VALUE with key ident "__loc__". Compiler path in legacy is
+///     `parseObjectLiteral`'s ident branch plus `parseObjectFieldValue`.
+fn emitObjectField(
+    w: *Walker,
+    field: Node.ObjectField,
+    cursor: *u32,
+) Walker.Error!void {
+    const field_start_cursor = cursor.*;
+
+    switch (field.key) {
+        .ident => |name| {
+            // Two subtleties collide here:
+            //   1. `{$x}` and `{$x: expr}` both come through the parser as an
+            //      ObjectKey.ident — the AST treats `$x` and `x` uniformly at
+            //      the key-ident level. We disambiguate via source: the byte
+            //      at `cursor` is `$` iff this is the dollar form.
+            //   2. `{__loc__}` and `{__loc__: expr}` are possible. Legacy
+            //      hard-codes `__loc__` in the DOLLAR branch only (parsing
+            //      `$__loc__`), not in the bare-ident branch.
+            const is_dollar = cursor.* < w.src.len and w.src[cursor.*] == '$';
+
+            if (is_dollar) {
+                // Consume `$` and the ident name in source.
+                cursor.* += 1;
+                cursor.* = skipTrivia(w.src, cursor.*);
+                const ident_off = cursor.*;
+                cursor.* = advancePastIdentBytes(w.src, ident_off);
+
+                // Is this `{$x: VALUE}` or shorthand `{$x}`?
+                const after = skipTrivia(w.src, cursor.*);
+                const is_pair = after < w.src.len and w.src[after] == ':';
+
+                if (is_pair) {
+                    // `{$x: VALUE}` — KEY is the VALUE of $x. Legacy at
+                    // compiler.zig:6847-6855 emits `load_variable($x)` (or
+                    // `emitLocObject` for __loc__) stamped with ident offset.
+                    if (std.mem.eql(u8, name, "__loc__")) {
+                        try emitLocObject(w, ident_off);
+                    } else {
+                        const var_id = lookupVariable(w, name) orelse {
+                            w.compile_err = .{
+                                .kind = .query_syntax_error,
+                                .offset = ident_off,
+                                .len = 0,
+                            };
+                            return error.AstCompileError;
+                        };
+                        try w.emit(
+                            .load_variable,
+                            .{ .index = @as(i64, @intCast(var_id)) },
+                            ident_off,
+                        );
+                    }
+                    // Consume `:` then parse value. Advance cursor past the
+                    // value's source span so the outer loop's comma scan
+                    // finds the field separator after the value, not somewhere
+                    // inside it.
+                    cursor.* = field.value.span.end;
+                    try w.walk(field.value);
+                } else {
+                    // Shorthand `{$x}` — key is literal "x", value is $x.
+                    const key_ref = try internStr(&w.intern, w.alloc, name);
+                    try w.emit(.push_string, .{ .str_ref = key_ref }, ident_off);
+                    if (std.mem.eql(u8, name, "__loc__")) {
+                        try emitLocObject(w, ident_off);
+                    } else {
+                        const var_id = lookupVariable(w, name) orelse {
+                            w.compile_err = .{
+                                .kind = .query_syntax_error,
+                                .offset = ident_off,
+                                .len = 0,
+                            };
+                            return error.AstCompileError;
+                        };
+                        try w.emit(
+                            .load_variable,
+                            .{ .index = @as(i64, @intCast(var_id)) },
+                            ident_off,
+                        );
+                    }
+                }
+
+                try w.emit(.object_key, .{ .none = {} }, w.last_emit_offset);
+            } else {
+                // Bare-ident key. Static key, optionally followed by `:` and
+                // value, or shorthand `{a}` → `{a: .a}`.
+                const ident_off = cursor.*;
+                cursor.* = advancePastIdentBytes(w.src, ident_off);
+                const name_len: u32 = @intCast(name.len);
+                _ = name_len;
+
+                const key_ref = try internStr(&w.intern, w.alloc, name);
+                try w.emit(.push_string, .{ .str_ref = key_ref }, ident_off);
+
+                const after = skipTrivia(w.src, cursor.*);
+                const is_pair = after < w.src.len and w.src[after] == ':';
+
+                if (is_pair) {
+                    // `{a: VALUE}`. Advance cursor past the value's span so
+                    // the outer loop's comma scan doesn't trip on bytes
+                    // inside the value.
+                    cursor.* = field.value.span.end;
+                    try w.walk(field.value);
+                } else {
+                    // `{a}` shorthand — legacy at compiler.zig:6880-6882 emits
+                    // `load_key(name)` stamped with last_tok_offset (= ident
+                    // offset). The AST stores `field.value` as a synthesized
+                    // `field_access(name)` — but we do NOT walk that here;
+                    // `field_access.span.start` is the same ident byte position
+                    // so it would stamp `load_key` with the same offset, but
+                    // we prefer the explicit emission to keep stamp policy
+                    // obvious and avoid any walker-drift.
+                    try w.emit(.load_key, .{ .str_ref = key_ref }, ident_off);
+                }
+
+                try w.emit(.object_key, .{ .none = {} }, w.last_emit_offset);
+            }
+        },
+        .string => |content| {
+            // `"literal"` key. Legacy `parseObjectKey` at compiler.zig:6924-
+            // 6931 consumes string_lit → last_tok_offset = `"`.offset, then
+            // emits `push_string(decoded)`.
+            const quote_off = cursor.*;
+            const key_ref = try internStr(&w.intern, w.alloc, content);
+            try w.emit(.push_string, .{ .str_ref = key_ref }, quote_off);
+
+            // Advance cursor past the closing `"`.
+            cursor.* = skipStringLiteral(w.src, quote_off);
+
+            const after = skipTrivia(w.src, cursor.*);
+            if (after < w.src.len and w.src[after] == ':') {
+                cursor.* = field.value.span.end;
+                try w.walk(field.value);
+            } else {
+                // `{"a"}` shorthand — legacy emits `load_key(decoded_key)`
+                // stamped with `"`.offset. Same as ident branch above.
+                try w.emit(.load_key, .{ .str_ref = key_ref }, quote_off);
+            }
+            try w.emit(.object_key, .{ .none = {} }, w.last_emit_offset);
+        },
+        .expr => |key_node| {
+            // Two variants, distinguished by AST shape:
+            //   (1) `{(expr): value}` — the parser's `parseObjectKey`
+            //       `.lparen` branch produces ObjectKey.expr; the value comes
+            //       next via `parseObjectFieldValue`. Legacy also uses this
+            //       straight `(expr): value` path at compiler.zig:6916-6923.
+            //   (2) `{"\(.x)": value}` — string-interp key. Parser
+            //       `parseObjectKey` `.string_part` branch produces
+            //       ObjectKey.expr wrapping a `string_interp` node.
+            //
+            // Legacy's dynamic-key-replay (`save_input`/<key>/`load_computed`)
+            // ONLY fires for the SHORTHAND (no colon) form:
+            //   `{(expr)}` or `{"\(.x)"}` — both implicit-self-key forms.
+            // With a `:` present, the key instrs push a string onto the
+            // value-stack which `object_key` pops, and the value is compiled
+            // straight after. No replay.
+            //
+            // Since the AST's ObjectField always has a value (parser.zig:722-
+            // 732 makes the value mandatory via parseObjectFieldValue), we
+            // never see the shorthand form here. BUT: for
+            // `{(expr)}`/`{"\(.x)"}` jq's legacy compiler special-cases the
+            // "no colon" path via peek in parseObjectLiteral. If the AST
+            // parser emits a synthesized value for shorthand forms, this
+            // branch handles them transparently. Today the AST parser does
+            // NOT accept this shorthand: `parseObjectField` unconditionally
+            // expects `:` (parser.zig:725). So only the (1) shape reaches us
+            // here with a user-written colon.
+            //
+            // Stamp policy: legacy's `parseObjectKey` `.lparen` branch
+            // consumes `(`, parseLogical, `)` — so last_tok_offset =
+            // `)`.offset at key-end. Then `:` is consumed →
+            // last_tok_offset = `:`.offset. Then value emits update
+            // last_tok_offset. Finally `object_key` stamps with the value's
+            // last token. Our walker's `w.last_emit_offset` tracks the most
+            // recent emit's stamp — which for the key subtree ends at the
+            // key's last-emit offset, not `)`. But the `object_key` stamp
+            // comes from the VALUE phase in this branch, so no drift.
+            //
+            // For `{"\(.x)": v}`: parser produces ObjectKey.expr wrapping
+            // string_interp. We walk that node; its emits go to the raw
+            // buffer the same as any other. Then colon is located, value is
+            // compiled, object_key emitted with value's last stamp.
+
+            // Scan the key's source extent so we can advance the cursor past
+            // `)` (for `(expr)`) or `"` (for interp key).
+            const first_byte = if (cursor.* < w.src.len) w.src[cursor.*] else 0;
+            if (first_byte == '(') {
+                // `(expr)` key — walk the inner expression.
+                try w.walk(key_node);
+                // Advance cursor past the matching `)`.
+                const rparen = scanParenPairEndFrom(w.src, cursor.*);
+                cursor.* = rparen + 1;
+            } else {
+                // `"...interp..."` key — walk the string_interp node; it
+                // covers the entire span from opening `"` through closing `"`.
+                try w.walk(key_node);
+                cursor.* = key_node.span.end;
+            }
+
+            const after = skipTrivia(w.src, cursor.*);
+            if (after < w.src.len and w.src[after] == ':') {
+                // `{(expr): value}` or `{"\(.x)": value}` — value emits.
+                cursor.* = field.value.span.end;
+                try w.walk(field.value);
+                try w.emit(.object_key, .{ .none = {} }, w.last_emit_offset);
+            } else {
+                // Shorthand — replay key subtree between save_input and
+                // load_computed. Not reachable with today's AST parser, but
+                // kept here as the byte-identical port of legacy's
+                // compiler.zig:6884-6894 for forward-compat when the parser
+                // gains shorthand-expr-key support.
+                return error.AstCompilerStageIncomplete;
+            }
+        },
+    }
+    _ = field_start_cursor;
+}
+
+/// Emit a `string_interp` or interp-format `format_string` parts sequence.
+/// When `format_bid` is `null`, this mirrors `compileStringInterpolation`
+/// with no format; when non-null, each interpolation expression is routed
+/// through `call_builtin(format_bid)` before `tostring`.
+///
+/// `node_span.start` holds the `first_part_tok.offset` (parser.zig:959 /
+/// :955), which is the byte AFTER the opening `"`. We drive the source
+/// cursor from that position.
+fn emitStringInterp(
+    w: *Walker,
+    node_span: ast.Span,
+    parts: []const Node.StringPart,
+    format_bid: ?types.BuiltinId,
+) Walker.Error!void {
+    // Legacy's initial `push_string(first_literal)` stamp is
+    // first_part_tok.offset.
+    const content_start = node_span.start;
+    var current_stamp: u32 = content_start;
+    var cursor: u32 = content_start;
+
+    // parts[0] is always a literal (possibly empty). Emit push_string of it.
+    // Legacy uses `internDecodedStr(raw)`; AST pre-decodes in decodeString so
+    // the bytes identical via plain `internStr`.
+    const first = parts[0].literal;
+    const first_ref = try internStr(&w.intern, w.alloc, first);
+    try w.emit(.push_string, .{ .str_ref = first_ref }, current_stamp);
+
+    // Advance cursor past the first literal's source bytes (scanning stops
+    // at `\(` or `"`). For string_interp the first literal ends at `\(`.
+    cursor = scanStringSegmentEnd(w.src, cursor);
+
+    var i: usize = 1;
+    while (i < parts.len) : (i += 1) {
+        switch (parts[i]) {
+            .expr => |expr| {
+                // Legacy save_input stamp = last_tok_offset BEFORE walking the
+                // expr: for iter 1 that's string_part.offset (first content
+                // byte); for subsequent iters it's the previous `)`.offset.
+                try w.emit(.save_input, .{ .none = {} }, current_stamp);
+
+                try w.walk(expr);
+
+                // After walking expr, last_emit_offset = expr's last emit.
+                const expr_last = w.last_emit_offset;
+                try w.emit(.pipe, .{ .none = {} }, expr_last);
+
+                if (format_bid) |bid| {
+                    try w.emit(
+                        .call_builtin,
+                        .{ .index = @intFromEnum(bid) },
+                        expr_last,
+                    );
+                    try w.emit(.pipe, .{ .none = {} }, expr_last);
+                }
+
+                try w.emit(
+                    .call_builtin,
+                    .{ .index = @intFromEnum(types.BuiltinId.tostring) },
+                    expr_last,
+                );
+                try w.emit(.add, .{ .none = {} }, expr_last);
+
+                // Advance cursor to just past the matching `)` of the
+                // interpolation. Legacy's nextToken on `)` sets
+                // last_tok_offset = `)`.offset.
+                const rparen_off = scanForSkipWs(w.src, expr.span.end, ')') orelse expr.span.end;
+                current_stamp = rparen_off;
+                cursor = rparen_off + 1;
+
+                try w.emit(.restore_input, .{ .none = {} }, current_stamp);
+            },
+            .literal => |content| {
+                // Middle or trailing literal. Legacy scans string tail via
+                // `lex.scanStringTail` — which does NOT update
+                // `last_tok_offset`. So the push_string + add both remain
+                // stamped at the prior `)`.offset == current_stamp.
+                if (content.len > 0) {
+                    const ref = try internStr(&w.intern, w.alloc, content);
+                    try w.emit(.push_string, .{ .str_ref = ref }, current_stamp);
+                    try w.emit(.add, .{ .none = {} }, current_stamp);
+                }
+                cursor = scanStringSegmentEnd(w.src, cursor);
+            },
+        }
+    }
+}
+
+/// Scan source from `start` (just past an opening `"` or a closing `)`) until
+/// the next `\(` or closing `"`. Returns the offset of the START of that
+/// delimiter. Handles JSON-style `\"`, `\\` and other escape sequences by
+/// skipping the backslash+next byte. Used to walk past a string-interpolation
+/// literal segment's source bytes.
+fn scanStringSegmentEnd(src: []const u8, start: u32) u32 {
+    var i: usize = start;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '\\') {
+            if (i + 1 >= src.len) return @intCast(i);
+            if (src[i + 1] == '(') return @intCast(i);
+            i += 2; // skip backslash + next byte
+            continue;
+        }
+        if (c == '"') return @intCast(i);
+        i += 1;
+    }
+    return @intCast(src.len);
+}
+
+/// Locate the opening `"` after `@name` starting at `@`.offset. Scans past
+/// the `@` byte, past the format-name ident bytes, past whitespace, and
+/// returns the offset of the `"` byte. Used for shape (A) of format_string
+/// (the zero-interp `@name "literal"` path).
+fn scanOpeningQuoteAfterFormat(src: []const u8, at_off: u32) u32 {
+    var i: u32 = at_off;
+    if (i < src.len and src[i] == '@') i += 1;
+    // Skip ident bytes.
+    while (i < src.len and isIdentByte(src[i])) : (i += 1) {}
+    // Skip trivia (whitespace + comments).
+    i = skipTrivia(src, i);
+    return i;
+}
+
+/// Advance past an identifier starting at `start`. Returns the offset of the
+/// first non-ident byte (or src.len).
+fn advancePastIdentBytes(src: []const u8, start: u32) u32 {
+    var i: usize = start;
+    while (i < src.len and isIdentByte(src[i])) : (i += 1) {}
+    return @intCast(i);
+}
+
+/// Given an offset of an opening `"`, return the offset one-past the closing
+/// `"`. Handles JSON escape sequences (`\"`, `\\`, `\uXXXX`, etc.) by skipping
+/// the backslash and its paired byte.
+fn skipStringLiteral(src: []const u8, quote_off: u32) u32 {
+    std.debug.assert(quote_off < src.len and src[quote_off] == '"');
+    var i: usize = quote_off + 1;
+    while (i < src.len) {
+        if (src[i] == '\\') {
+            if (i + 1 < src.len) i += 2 else i += 1;
+            continue;
+        }
+        if (src[i] == '"') return @intCast(i + 1);
+        i += 1;
+    }
+    return @intCast(src.len);
+}
+
+/// Given an offset of an opening `(`, return the offset of the matching `)`.
+/// Handles nested parens and `"..."` string literals with escapes.
+fn scanParenPairEndFrom(src: []const u8, open_lparen: u32) u32 {
+    std.debug.assert(open_lparen < src.len and src[open_lparen] == '(');
+    var i: usize = open_lparen + 1;
+    var depth: u32 = 1;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (c == '"') {
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '\\') {
+                    if (i + 1 < src.len) i += 1;
+                    continue;
+                }
+                if (src[i] == '"') break;
+            }
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return @intCast(i);
+        }
+    }
+    return @intCast(src.len - 1);
+}
+
+/// Map a format name (without the leading `@`) to its BuiltinId. Mirrors
+/// `formatBuiltinId` at `src/query/src/compiler.zig:5698-5710`.
+fn formatBuiltinId(name: []const u8) ?types.BuiltinId {
+    if (std.mem.eql(u8, name, "text")) return .format_text;
+    if (std.mem.eql(u8, name, "json")) return .format_json;
+    if (std.mem.eql(u8, name, "csv")) return .format_csv;
+    if (std.mem.eql(u8, name, "tsv")) return .format_tsv;
+    if (std.mem.eql(u8, name, "html")) return .format_html;
+    if (std.mem.eql(u8, name, "uri")) return .format_uri;
+    if (std.mem.eql(u8, name, "urid")) return .format_urid;
+    if (std.mem.eql(u8, name, "sh")) return .format_sh;
+    if (std.mem.eql(u8, name, "base64")) return .format_base64;
+    if (std.mem.eql(u8, name, "base64d")) return .format_base64d;
+    return null;
+}
+
 // ── insertRawInstr ────────────────────────────────────────────────────────────
 
 /// Insert `instr` at position `pos`, shifting later instructions forward by
@@ -1992,6 +2613,25 @@ fn fuse(
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
                 .path_end => .{ .none = {} },
+                // Stage 7: array_collect_start carries a raw-IP operand
+                // pointing at its paired `array_collect_end` that must be
+                // remapped through index_map. Mirrors
+                // `src/query/src/compiler.zig:7434-7439`.
+                .array_collect_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .array_collect_end => .{ .none = {} },
+                // Stage 7: object-construct opcodes carry no operand.
+                // Mirrors `src/query/src/compiler.zig:7423-7425`.
+                .object_construct_start,
+                .object_key,
+                .object_construct_end,
+                => .{ .none = {} },
+                // Stage 7: load_computed carries no operand. Legacy at
+                // `src/query/src/compiler.zig:7400`.
+                .load_computed => .{ .none = {} },
                 else => .{ .none = {} },
             },
         };
