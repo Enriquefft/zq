@@ -51,7 +51,11 @@ fn dumpOperand(
             try out.print("str=\"{s}\" @{d}+{d}", .{ s, operand.str_ref.offset, operand.str_ref.len });
         },
         .push_null, .push_current, .identity, .pipe, .negate, .yield_output => try out.print("(none)", .{}),
+        .save_input, .restore_input, .backtrack, .pop_try => try out.print("(none)", .{}),
         .call_builtin => try out.print("builtin_idx={d}", .{operand.index}),
+        .capture_variable, .load_variable, .pop_variable => try out.print("var_id={d}", .{operand.index}),
+        .fork, .jump, .fork_try, .fork_alt => try out.print("ip={d}", .{operand.index}),
+        .load_index => try out.print("idx={d}", .{operand.index}),
         else => try out.print("<unprinted>", .{}),
     }
 }
@@ -137,6 +141,9 @@ fn operandsEqual(
             return std.mem.eql(u8, as, bs);
         },
         .push_null, .push_current, .identity, .pipe, .negate, .yield_output => return true,
+        .save_input, .restore_input, .backtrack, .pop_try => return true,
+        .capture_variable, .load_variable, .pop_variable => return a.index == b.index,
+        .fork, .jump, .fork_try, .fork_alt, .load_index => return a.index == b.index,
         .call_builtin => return a.index == b.index,
         else => {
             // Opcodes outside Stage 1 scope — fall back to raw byte equality.
@@ -279,15 +286,21 @@ fn dumpBoth(
     }
 }
 
-test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3" {
+test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4" {
     const alloc = std.testing.allocator;
 
     var stderr_buf: [4096]u8 = undefined;
     var stderr = std.fs.File.stderr().writer(&stderr_buf);
     const out = &stderr.interface;
 
-    const total_supported = fixtures.stage1_supported.len + fixtures.stage2_supported.len + fixtures.stage3_supported.len;
-    const total_unsupported = fixtures.stage1_unsupported.len + fixtures.stage2_unsupported.len + fixtures.stage3_unsupported.len;
+    const total_supported = fixtures.stage1_supported.len +
+        fixtures.stage2_supported.len +
+        fixtures.stage3_supported.len +
+        fixtures.stage4_supported.len;
+    const total_unsupported = fixtures.stage1_unsupported.len +
+        fixtures.stage2_unsupported.len +
+        fixtures.stage3_unsupported.len +
+        fixtures.stage4_unsupported.len;
     try out.print(
         "ast-compile-equiv: {d} supported + {d} unsupported fixtures\n",
         .{ total_supported, total_unsupported },
@@ -320,6 +333,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3" {
         }
     }
 
+    for (fixtures.stage4_supported) |filter| {
+        const outcome = try runSupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
     for (fixtures.stage1_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
@@ -337,6 +358,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3" {
     }
 
     for (fixtures.stage3_unsupported) |filter| {
+        const outcome = try runUnsupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
+    for (fixtures.stage4_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
             .pass => passed += 1,

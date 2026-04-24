@@ -222,9 +222,15 @@ pub const Parser = struct {
                 var patterns_list: std.ArrayList(Pattern) = .{};
                 patterns_list.append(p.arena.allocator(), pattern) catch return expr;
 
-                while (p.peekIsDestructAlt()) {
+                // peekIsDestructAlt above already consumed the first `?//`, so
+                // the next pattern follows immediately. Parse each subsequent
+                // pattern, then check for another `?//` (which consumes it if
+                // present). Mirrors legacy's `parseDestructAlt` loop order at
+                // `src/query/src/compiler.zig:2705-2710`.
+                while (true) {
                     const pat = p.parsePattern() catch break;
                     patterns_list.append(p.arena.allocator(), pat) catch break;
+                    if (!p.peekIsDestructAlt()) break;
                 }
 
                 // Parse | body

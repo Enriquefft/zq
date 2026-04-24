@@ -161,3 +161,80 @@ pub const stage3_supported: []const []const u8 = &.{
 
 /// Stage 3 fixtures that depend on a later-stage node kind.
 pub const stage3_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 4 — variables, `as`-pattern, destructuring, `?//`.
+/// Every entry here must yield byte-identical `Instruction[]` + `source_map`
+/// across the legacy compiler and the AST walker. See
+/// `research/phase-2-ast-walk-plan.md` §4 Stage 4.
+///
+/// Fixtures are restricted to Stage 1/2/3 primaries + variable refs + `as`
+/// patterns + `?//`. No arithmetic, comparison, builtins, parens, array/
+/// object constructors — those are later stages. Every `expr as PAT | body`
+/// fixture uses a Stage 1/2/3 primary as the LHS expression.
+pub const stage4_supported: []const []const u8 = &.{
+    // Simple pattern: `expr as $x | body`.
+    ". as $x | $x",
+    "1 as $n | $n",
+    ".a as $y | $y.b",
+    ".items as $i | $i",
+    ". as $x | $x.foo",
+    "42 as $n | $n",
+    ".foo as $v | $v",
+
+    // Array pattern — LHS is `.` (Stage 2), a literal, or a field access.
+    ". as [$a, $b] | $a",
+    ". as [$a, $b] | $b",
+    ". as [$a, $b, $c] | $a",
+    ". as [$a, $b, $c] | $c",
+    ". as [$x] | $x",
+    ".items as [$a, $b] | $a",
+
+    // Object pattern — explicit `key: $var` form.
+    ". as {a: $x} | $x",
+    ". as {a: $x, b: $y} | $x",
+    ". as {a: $x, b: $y} | $y",
+    ".config as {a: $x} | $x",
+
+    // Object pattern — `$k` shorthand.
+    ". as {$a} | $a",
+    ". as {$a, $b} | $a",
+    ". as {$a, $b} | $b",
+
+    // Nested patterns.
+    ". as [$a, [$b]] | $b",
+    ". as {a: [$x, $y]} | $x",
+    ". as {a: {b: $z}} | $z",
+    ". as [[$a, $b], $c] | $a",
+    ". as {a: $x, b: [$y, $z]} | $y",
+
+    // ?// destructure alt — two-pattern.
+    ". as {$a} ?// [$a] | $a",
+    ". as [$a] ?// {$a} | $a",
+    ". as [$a, $b] ?// {a: $a, b: $b} | $a",
+
+    // ?// destructure alt — three-pattern.
+    ". as {$a} ?// [$a] ?// $a | $a",
+
+    // Variable references in comma/pipe bodies (Stage 3 comma + pipe).
+    "1 as $x | $x, $x",
+    ". as [$a, $b] | $a, $b",
+    ". as $x | .a | $x",
+    ". as $x | . as $y | $x, $y",
+    ". as $x | . as $y | $y, $x",
+
+    // Shadowing: inner `$x` rebinding gets a fresh id; the inner body's
+    // `$x` resolves to the new slot.
+    "1 as $x | 2 as $x | $x",
+    ". as $x | 1 as $x | $x",
+};
+
+/// Stage 4 fixtures blocked by later stages.
+///
+/// `$__loc__` lowers to an `object_construct_*` opcode sequence in the
+/// legacy compiler (`src/query/src/compiler.zig:6574-6577` + `emitLocObject`
+/// at `:6586-6605`). Those opcodes are Stage 7 scope, so Stage 4's walker
+/// rejects `$__loc__` with `AstCompilerStageIncomplete` — legacy accepts it,
+/// the walker doesn't yet, which is exactly what this list records.
+pub const stage4_unsupported: []const []const u8 = &.{
+    "$__loc__",
+};

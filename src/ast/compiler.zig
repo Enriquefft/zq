@@ -1,9 +1,9 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4).
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
 //! This file is the future replacement for that compiler; for now it covers only
-//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0/1/2:
+//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–4:
 //!   - `.literal` (int, float, string, bool, null)
 //!   - `.identity` (bare `.`)
 //!   - `.recurse` (`..` operator → `call_builtin(recurse)`)
@@ -14,10 +14,15 @@
 //!   - `.slice` — `.[a:b]`, `.[:b]`, `.[a:]`, `.[:]`
 //!   - `.optional` — `expr?`
 //!   - `.suffix` — `.a.b`, `.a[0]`, `.a[]`, `.a?.b`, etc.
+//!   - `.pipe` — `a | b`, chained
+//!   - `.comma` — `a, b, c`
+//!   - `.variable_ref` — `$name`
+//!   - `.as_pattern` — `. as $x | body`, array/object destructuring
+//!   - `.destruct_alt` — `. as PAT1 ?// PAT2 | body`
 //!
 //! Every other node kind returns `error.AstCompilerStageIncomplete`. This is NOT
 //! a workaround — it is the scaffold boundary, to be removed as later stages
-//! (3–13) extend coverage. See the plan doc for the full stage breakdown.
+//! (5–13) extend coverage. See the plan doc for the full stage breakdown.
 //!
 //! Production code is unaffected. The legacy compiler at
 //! `src/query/src/compiler.zig` remains the definitional compiler until Stage 13
@@ -124,8 +129,12 @@ pub fn compileWithExternals(
         .src = src,
         .raw = .{},
         .intern = .{},
+        .scope_vars = .{},
+        .scope_marks = .{},
     };
     defer walker.raw.deinit(alloc);
+    defer walker.scope_vars.deinit(alloc);
+    defer walker.scope_marks.deinit(alloc);
     var intern_consumed = false;
     defer if (!intern_consumed) walker.intern.deinit(alloc);
 
@@ -174,6 +183,17 @@ const RawInstr = extern struct {
     src_offset: u32 = 0,
 };
 
+/// Stage 4 — variable scope entry. A name→id mapping added whenever an
+/// `as` pattern declares a new variable. Legacy's `VariableScope` at
+/// `src/query/src/compiler.zig:186` is a linked list of per-function-body
+/// scopes; Stage 4's walker has no user functions (Stage 9), so a single
+/// flat list of entries with shadow-by-update semantics (see
+/// `declareVariable` at `compiler.zig:312`) is sufficient.
+const VarEntry = struct {
+    name: []const u8,
+    id: u32,
+};
+
 const Walker = struct {
     alloc: std.mem.Allocator,
     src: []const u8,
@@ -191,6 +211,22 @@ const Walker = struct {
     /// `last_tok_offset`. Each suffix op's scanner advances the cursor past
     /// the bytes it consumed.
     scan_cursor: u32 = 0,
+    /// Stage 4 — monotonically increasing variable id counter. Matches legacy's
+    /// `ctx.next_var_id`. IDs stay unique across the entire compile; even
+    /// shadowed rebindings allocate a new id (legacy does the same via
+    /// `declareVariable` at `compiler.zig:312-324`).
+    next_var_id: u32 = 0,
+    /// Stage 4 — flat scope list. Shadowing is an update-in-place on the
+    /// same entry (mirrors legacy's behavior in `declareVariable`). The
+    /// walker has no Stage 4 construct that opens/closes a sub-scope, so a
+    /// single list suffices. Stage 9 (user functions) will introduce
+    /// push/pop. Uses `scope_marks` as a stack of saved lengths so that
+    /// scope restoration is cheap when it is needed by later stages.
+    scope_vars: std.ArrayList(VarEntry),
+    /// Stage 4 — saved-length stack for nested scopes (currently unused by
+    /// Stage 4 shapes but populated as groundwork for Stage 9). Pushed on
+    /// `pushScope`, popped on `popScope`.
+    scope_marks: std.ArrayList(usize),
 
     const Error = error{ OutOfMemory, AstCompilerStageIncomplete, AstCompileError };
 
@@ -540,6 +576,222 @@ const Walker = struct {
                 }
             },
 
+            .variable_ref => |vr| {
+                // Stage 4 — `$name` evaluates a previously-captured variable
+                // and pushes its value onto the value stack. Legacy equivalent:
+                // `parseVariableReference` at `src/query/src/compiler.zig:6567`.
+                //
+                // Legacy stamps `load_variable` with `ctx.last_tok_offset`,
+                // which is the offset of the ident token after `$name` is
+                // consumed. The AST's `variable_ref.span` runs from the `$`
+                // byte to one-past the ident's last byte, so the ident's
+                // offset is `span.end - name.len` (idents have no escapes).
+                //
+                // `$__loc__` expands to a synthesized object at legacy
+                // `compiler.zig:6574-6577`; that requires `object_construct_*`
+                // opcodes, which land in Stage 7. Reject here so the scaffold
+                // boundary stays honest.
+                if (std.mem.eql(u8, vr.name, "__loc__")) {
+                    return error.AstCompilerStageIncomplete;
+                }
+                const var_id = lookupVariable(w, vr.name) orelse {
+                    // Undefined variable — legacy raises query_syntax_error
+                    // at `last_tok_offset` with len=0. AST walker mirrors.
+                    const ident_off = identOffsetOfVarRef(node.span, vr.name);
+                    w.compile_err = .{
+                        .kind = .query_syntax_error,
+                        .offset = ident_off,
+                        .len = 0,
+                    };
+                    return error.AstCompileError;
+                };
+                const ident_off = identOffsetOfVarRef(node.span, vr.name);
+                try w.emit(.load_variable, .{ .index = @as(i64, @intCast(var_id)) }, ident_off);
+            },
+
+            .as_pattern => |ap| {
+                // Stage 4 — `expr as PATTERN | body`.
+                //
+                // Legacy flow in `parseLogical` at
+                // `src/query/src/compiler.zig:2624-2643`:
+                //   1. Compile `expr`. Result is on the value stack.
+                //   2. Consume `as`.
+                //   3. `scanAndDeclarePattern` allocates variable IDs in
+                //      left-to-right, depth-first order as they are
+                //      encountered in the pattern.
+                //   4. `emitPatternCapture` emits the capture sequence using
+                //      `ctx.last_tok_offset`, which is the offset of the
+                //      pattern's final token (the ident for simple; `]`/`}`
+                //      for array/object).
+                //   5. `parseLogical` returns, the surrounding `parsePipe`
+                //      sees `|`, emits `.pipe` stamped at `|`.offset, and
+                //      compiles the body.
+                //
+                // No `pop_variable` is emitted — legacy leaves the variable
+                // live in the flat scope list. Stage 4 mirrors this.
+                try w.walk(ap.expr);
+
+                // Locate the pattern's token-span in source. This must match
+                // what legacy's lexer would have tracked via `last_tok_offset`
+                // at the moment `emitPatternCapture` starts firing.
+                //
+                // The scanner expects to begin at the pattern's first byte,
+                // so we first advance past the `as` keyword.
+                const after_as = advancePastAsKeyword(w.src, ap.expr.span.end);
+                const pat_layout = scanPatternLayout(w.src, after_as, ap.pattern);
+
+                // Declare pattern variables in the same traversal order as
+                // legacy's `scanAndDeclarePattern`. IDs are allocated into the
+                // flat `scope_vars` list.
+                try declarePatternVars(w, ap.pattern);
+
+                try emitPatternCapture(w, ap.pattern, pat_layout.last_tok_offset);
+
+                // Emit `.pipe` for the `|` token between pattern-end and body.
+                const pipe_off = scanForSkipWs(w.src, pat_layout.end_after, '|') orelse pat_layout.end_after;
+                try w.emit(.pipe, .{ .none = {} }, pipe_off);
+
+                try w.walk(ap.body);
+            },
+
+            .destruct_alt => |da| {
+                // Stage 4 — `expr as PAT1 ?// PAT2 [?// PAT3 ...] | body`.
+                //
+                // Legacy flow: after `parseLogical` scans PAT1 and sees `?//`,
+                // `parseDestructAlt` at `src/query/src/compiler.zig:2698`
+                // takes over. Variables from subsequent patterns REUSE ids
+                // when a name collides (`scanAndDeclarePatternReuse` at
+                // `compiler.zig:443`), ensuring all alternatives write to
+                // the same slots.
+                //
+                // Emission shape (legacy `parseDestructAlt` body):
+                //   - For each unique var_id in pattern-iteration order:
+                //       push_null ; capture_variable(var_id)   (null-init)
+                //   - .pipe ; save_input
+                //   - For each pattern (i):
+                //       if i > 0: restore_input ; save_input
+                //       fork_try(0)             [catch backpatched to next block]
+                //       push_current
+                //       <emitPatternCaptureStrict pattern>
+                //       pop_try
+                //       restore_input
+                //       jump(body)              [backpatched later]
+                //       (if last:) restore_input ; backtrack
+                //
+                // All emits inside parseDestructAlt use `ctx.last_tok_offset`
+                // which is the last consumed token during pattern scanning —
+                // the pattern-end offset of the *most recent pattern* that
+                // was scanned. Tracking this precisely requires walking each
+                // pattern's source range in turn.
+                try w.walk(da.expr);
+
+                // Scan each pattern's source range to learn the final
+                // pattern's closing-token offset. That offset rules every
+                // emit in this node (see legacy-parity comment below).
+                const patterns = da.patterns;
+
+                // Cursor starts just past the `as` keyword; advance through
+                // each pattern, skipping the `?//` separators between them.
+                var cursor = advancePastAsKeyword(w.src, da.expr.span.end);
+                var final_last_tok_scan: u32 = 0;
+                for (patterns, 0..) |pat, i| {
+                    const layout = scanPatternLayout(w.src, cursor, pat);
+                    final_last_tok_scan = layout.last_tok_offset;
+                    cursor = layout.end_after;
+                    if (i + 1 < patterns.len) {
+                        // Advance past `?` and `//`.
+                        cursor = skipTrivia(w.src, cursor);
+                        if (cursor < w.src.len and w.src[cursor] == '?') cursor += 1;
+                        cursor = skipTrivia(w.src, cursor);
+                        if (cursor + 1 < w.src.len and w.src[cursor] == '/' and w.src[cursor + 1] == '/') cursor += 2;
+                    }
+                }
+
+                // Declare pattern variables. First pattern allocates new ids;
+                // later patterns reuse by-name when an id already exists in
+                // the current scope (legacy `scanAndDeclarePatternReuse`).
+                for (patterns, 0..) |pat, i| {
+                    if (i == 0) {
+                        try declarePatternVars(w, pat);
+                    } else {
+                        try declarePatternVarsReuse(w, pat);
+                    }
+                }
+
+                // Collect all unique var ids in pattern-iteration order —
+                // mirrors legacy's `collectPatternVarIds` loop at
+                // `compiler.zig:2715-2717`.
+                var all_ids = std.ArrayList(u32){};
+                defer all_ids.deinit(w.alloc);
+                for (patterns) |pat| {
+                    try collectPatternVarIds(w, pat, &all_ids);
+                }
+
+                // Null-init all variables. Legacy stamps both ops with
+                // `last_tok_offset` = offset of the FINAL pattern's last
+                // token (since pattern scanning ended there).
+                const final_last_tok = final_last_tok_scan;
+                for (all_ids.items) |vid| {
+                    try w.emit(.push_null, .{ .none = {} }, final_last_tok);
+                    try w.emit(.capture_variable, .{ .index = @as(i64, @intCast(vid)) }, final_last_tok);
+                }
+
+                // pipe ; save_input — stamp with final pattern's last tok.
+                try w.emit(.pipe, .{ .none = {} }, final_last_tok);
+                try w.emit(.save_input, .{ .none = {} }, final_last_tok);
+
+                var jump_to_body = std.ArrayList(usize){};
+                defer jump_to_body.deinit(w.alloc);
+
+                // Per plan §6.2 / legacy behavior at
+                // `src/query/src/compiler.zig:2698-2779`: every emit inside
+                // `parseDestructAlt` uses `ctx.last_tok_offset`, which has
+                // been advanced to the FINAL pattern's last token by the
+                // time the emit phase starts. `peekIsDestructAlt` reads
+                // `?//` via raw `lex.next()` without stamping
+                // `last_tok_offset`, so the final pattern's closing-token
+                // offset rules every emit — including those conceptually
+                // attached to earlier patterns.
+                for (patterns, 0..) |pat, i| {
+                    const is_last = (i == patterns.len - 1);
+
+                    if (i > 0) {
+                        try w.emit(.restore_input, .{ .none = {} }, final_last_tok);
+                        try w.emit(.save_input, .{ .none = {} }, final_last_tok);
+                    }
+
+                    const fork_try_pos = w.raw.items.len;
+                    try w.emit(.fork_try, .{ .index = 0 }, final_last_tok);
+                    try w.emit(.push_current, .{ .none = {} }, final_last_tok);
+                    try emitPatternCaptureStrict(w, pat, final_last_tok);
+                    try w.emit(.pop_try, .{ .none = {} }, final_last_tok);
+                    try w.emit(.restore_input, .{ .none = {} }, final_last_tok);
+
+                    const jmp_pos = w.raw.items.len;
+                    try w.emit(.jump, .{ .index = 0 }, final_last_tok);
+                    try jump_to_body.append(w.alloc, jmp_pos);
+
+                    const catch_ip: u32 = @intCast(w.raw.items.len);
+                    w.raw.items[fork_try_pos].operand = .{ .index = @intCast(catch_ip) };
+
+                    if (is_last) {
+                        try w.emit(.restore_input, .{ .none = {} }, final_last_tok);
+                        try w.emit(.backtrack, .{ .none = {} }, final_last_tok);
+                    }
+                }
+
+                const body_ip: u32 = @intCast(w.raw.items.len);
+                for (jump_to_body.items) |jmp_pos| {
+                    w.raw.items[jmp_pos].operand = .{ .index = @intCast(body_ip) };
+                }
+
+                // Emit `.pipe` for the `|` between final pattern end and body.
+                const pipe_off = scanForSkipWs(w.src, cursor, '|') orelse cursor;
+                try w.emit(.pipe, .{ .none = {} }, pipe_off);
+
+                try w.walk(da.body);
+            },
+
             .error_node => |en| {
                 // Error nodes surface the parser's best-effort recovery. They
                 // must reject as a compile error, not return "stage incomplete".
@@ -559,10 +811,7 @@ const Walker = struct {
             .and_expr,
             .comparison,
             .arithmetic,
-            .as_pattern,
-            .destruct_alt,
             .paren,
-            .variable_ref,
             .array_construct,
             .object_construct,
             .string_interp,
@@ -747,6 +996,352 @@ fn base_segment_start(base: *const Node, w: *Walker) usize {
     return w.raw.items.len;
 }
 
+// ── Stage 4 helpers: variables + patterns ───────────────────────────────────
+
+/// Compute the offset of the ident after the `$` in a `variable_ref` node.
+/// The AST records `span.start = $.offset` and `span.end = ident.offset +
+/// ident.len` (see `src/ast/parser.zig:685`), and idents have no escapes, so
+/// `ident.offset = span.end - name.len`.
+fn identOffsetOfVarRef(span: ast.Span, name: []const u8) u32 {
+    if (span.end > name.len) return span.end - @as(u32, @intCast(name.len));
+    return span.start;
+}
+
+/// Look up `name` in the walker's flat scope. Mirrors legacy's
+/// `lookupVariable` at `src/query/src/compiler.zig:353`. Since Stage 4 has
+/// no sub-scopes, the flat list doubles as the scope chain.
+fn lookupVariable(w: *Walker, name: []const u8) ?u32 {
+    // Walk in reverse so that a shadowing entry (appended later) wins. The
+    // legacy implementation uses `declareVariable` which UPDATES an existing
+    // entry in place, preserving insertion order; either order is equivalent
+    // here because we also update-in-place when declaring.
+    var i = w.scope_vars.items.len;
+    while (i > 0) {
+        i -= 1;
+        const ve = w.scope_vars.items[i];
+        if (std.mem.eql(u8, ve.name, name)) return ve.id;
+    }
+    return null;
+}
+
+/// Declare a variable in the current (only) scope, allocating a fresh id.
+/// Matches legacy's `declareVariable` at `compiler.zig:312-332`:
+///   - If the name already exists in the current scope, REPLACE its id
+///     (shadowing); a fresh id is still allocated.
+///   - Otherwise append a new entry.
+fn declareVariable(w: *Walker, name: []const u8) error{OutOfMemory}!u32 {
+    const new_id = w.next_var_id;
+    w.next_var_id += 1;
+    for (w.scope_vars.items) |*ve| {
+        if (std.mem.eql(u8, ve.name, name)) {
+            ve.id = new_id;
+            return new_id;
+        }
+    }
+    try w.scope_vars.append(w.alloc, .{ .name = name, .id = new_id });
+    return new_id;
+}
+
+/// Reuse an existing id if the name is already bound in the current scope;
+/// otherwise allocate a new one. Matches legacy's `reuseOrDeclareVariable`
+/// at `compiler.zig:339-350`. Used for the non-first patterns in a `?//`
+/// chain so that shared names map to the same slot.
+fn reuseOrDeclareVariable(w: *Walker, name: []const u8) error{OutOfMemory}!u32 {
+    for (w.scope_vars.items) |ve| {
+        if (std.mem.eql(u8, ve.name, name)) return ve.id;
+    }
+    return declareVariable(w, name);
+}
+
+/// Walk a pattern in left-to-right, depth-first order, allocating a fresh
+/// id for every `simple` variable slot. Matches legacy's
+/// `scanAndDeclarePattern` / `scanAndDeclarePatternWithComputed` traversal.
+/// For object patterns with `$k` shorthand, the key name AND the pattern
+/// name are the same string (see AST parser at `src/ast/parser.zig:1336`).
+fn declarePatternVars(w: *Walker, pat: ast.Pattern) Walker.Error!void {
+    switch (pat) {
+        .simple => |name| {
+            _ = try declareVariable(w, name);
+        },
+        .array => |elems| {
+            for (elems) |elem| try declarePatternVars(w, elem);
+        },
+        .object => |fields| {
+            for (fields) |field| {
+                // Computed keys `({expr}): pat` are Stage 7 scope: they
+                // require compiling the key expression (object_construct
+                // dynamic keys). Stage 4 rejects so the scaffold boundary
+                // stays visible. Simple + static-key objects cover the
+                // Stage 4 fixtures.
+                switch (field.key) {
+                    .static => {},
+                    .computed => return error.AstCompilerStageIncomplete,
+                }
+                try declarePatternVars(w, field.pattern);
+            }
+        },
+    }
+}
+
+/// Like `declarePatternVars` but REUSES ids when a name already exists.
+/// Mirrors legacy's `scanAndDeclarePatternReuse` at `compiler.zig:443`.
+fn declarePatternVarsReuse(w: *Walker, pat: ast.Pattern) Walker.Error!void {
+    switch (pat) {
+        .simple => |name| {
+            _ = try reuseOrDeclareVariable(w, name);
+        },
+        .array => |elems| {
+            for (elems) |elem| try declarePatternVarsReuse(w, elem);
+        },
+        .object => |fields| {
+            for (fields) |field| {
+                switch (field.key) {
+                    .static => {},
+                    .computed => return error.AstCompilerStageIncomplete,
+                }
+                try declarePatternVarsReuse(w, field.pattern);
+            }
+        },
+    }
+}
+
+/// Collect all variable ids referenced by a pattern in iteration order.
+/// Mirrors legacy's `collectPatternVarIds` at `compiler.zig:965`.
+fn collectPatternVarIds(w: *Walker, pat: ast.Pattern, list: *std.ArrayList(u32)) error{OutOfMemory}!void {
+    switch (pat) {
+        .simple => |name| {
+            // Look up the id assigned during declaration. The walk order here
+            // matches the one in `declarePatternVars`, so ids come out in
+            // allocation order.
+            const id = lookupVariable(w, name) orelse return;
+            try list.append(w.alloc, id);
+        },
+        .array => |elems| {
+            for (elems) |elem| try collectPatternVarIds(w, elem, list);
+        },
+        .object => |fields| {
+            for (fields) |field| try collectPatternVarIds(w, field.pattern, list);
+        },
+    }
+}
+
+/// Emit destructuring bytecode for `pat` against the value on the stack.
+/// Mirrors legacy's `emitPatternCapture` at
+/// `src/query/src/compiler.zig:601-702`. Every emitted instruction is
+/// stamped with `last_tok_offset` — the offset of the pattern's closing
+/// token (`]`/`}`), or the ident offset for `simple`.
+fn emitPatternCapture(w: *Walker, pat: ast.Pattern, last_tok: u32) Walker.Error!void {
+    switch (pat) {
+        .simple => |name| {
+            const id = lookupVariable(w, name) orelse unreachable;
+            try w.emit(.capture_variable, .{ .index = @as(i64, @intCast(id)) }, last_tok);
+        },
+        .array => |elems| {
+            try w.emit(.pipe, .{ .none = {} }, last_tok);
+
+            for (elems, 0..) |elem, idx| {
+                try w.emit(.save_input, .{ .none = {} }, last_tok);
+
+                const fork_pos = w.raw.items.len;
+                try w.emit(.fork_try, .{ .index = 0 }, last_tok);
+
+                try w.emit(.load_index, .{ .index = @as(i64, @intCast(idx)) }, last_tok);
+
+                try w.emit(.pop_try, .{ .none = {} }, last_tok);
+
+                const jump_pos = w.raw.items.len;
+                try w.emit(.jump, .{ .index = 0 }, last_tok);
+
+                const catch_ip: u32 = @intCast(w.raw.items.len);
+                w.raw.items[fork_pos].operand = .{ .index = @intCast(catch_ip) };
+                try w.emit(.push_null, .{ .none = {} }, last_tok);
+
+                const continue_ip: u32 = @intCast(w.raw.items.len);
+                w.raw.items[jump_pos].operand = .{ .index = @intCast(continue_ip) };
+
+                try emitPatternCapture(w, elem, last_tok);
+
+                try w.emit(.restore_input, .{ .none = {} }, last_tok);
+            }
+        },
+        .object => |fields| {
+            try w.emit(.pipe, .{ .none = {} }, last_tok);
+
+            for (fields) |field| {
+                try w.emit(.save_input, .{ .none = {} }, last_tok);
+
+                switch (field.key) {
+                    .static => |key_name| {
+                        const fork_pos = w.raw.items.len;
+                        try w.emit(.fork_try, .{ .index = 0 }, last_tok);
+
+                        const ref = try internStr(&w.intern, w.alloc, key_name);
+                        try w.emit(.load_key, .{ .str_ref = ref }, last_tok);
+
+                        try w.emit(.pop_try, .{ .none = {} }, last_tok);
+
+                        const jump_pos = w.raw.items.len;
+                        try w.emit(.jump, .{ .index = 0 }, last_tok);
+
+                        const catch_ip: u32 = @intCast(w.raw.items.len);
+                        w.raw.items[fork_pos].operand = .{ .index = @intCast(catch_ip) };
+                        try w.emit(.push_null, .{ .none = {} }, last_tok);
+
+                        const continue_ip: u32 = @intCast(w.raw.items.len);
+                        w.raw.items[jump_pos].operand = .{ .index = @intCast(continue_ip) };
+                    },
+                    .computed => return error.AstCompilerStageIncomplete,
+                }
+
+                try emitPatternCapture(w, field.pattern, last_tok);
+
+                try w.emit(.restore_input, .{ .none = {} }, last_tok);
+            }
+        },
+    }
+}
+
+/// Like `emitPatternCapture` but without the try/catch-per-element wrapping.
+/// Used inside `?//` alternatives — errors propagate up to the outer
+/// `fork_try` in `parseDestructAlt`. Mirrors legacy's
+/// `emitPatternCaptureStrict` at `compiler.zig:709-756`.
+fn emitPatternCaptureStrict(w: *Walker, pat: ast.Pattern, last_tok: u32) Walker.Error!void {
+    switch (pat) {
+        .simple => |name| {
+            const id = lookupVariable(w, name) orelse unreachable;
+            try w.emit(.capture_variable, .{ .index = @as(i64, @intCast(id)) }, last_tok);
+        },
+        .array => |elems| {
+            try w.emit(.pipe, .{ .none = {} }, last_tok);
+
+            for (elems, 0..) |elem, idx| {
+                try w.emit(.save_input, .{ .none = {} }, last_tok);
+                try w.emit(.load_index, .{ .index = @as(i64, @intCast(idx)) }, last_tok);
+                try emitPatternCaptureStrict(w, elem, last_tok);
+                try w.emit(.restore_input, .{ .none = {} }, last_tok);
+            }
+        },
+        .object => |fields| {
+            try w.emit(.pipe, .{ .none = {} }, last_tok);
+
+            for (fields) |field| {
+                try w.emit(.save_input, .{ .none = {} }, last_tok);
+
+                switch (field.key) {
+                    .static => |key_name| {
+                        const ref = try internStr(&w.intern, w.alloc, key_name);
+                        try w.emit(.load_key, .{ .str_ref = ref }, last_tok);
+                    },
+                    .computed => return error.AstCompilerStageIncomplete,
+                }
+
+                try emitPatternCaptureStrict(w, field.pattern, last_tok);
+                try w.emit(.restore_input, .{ .none = {} }, last_tok);
+            }
+        },
+    }
+}
+
+/// Result of scanning a pattern's source range:
+///   - `last_tok_offset` — offset of the pattern's closing token start
+///     (`]`/`}` for array/object; the ident byte for `simple`). This is the
+///     `ctx.last_tok_offset` that legacy's lexer would land on after
+///     consuming the pattern.
+///   - `end_after` — byte offset just past the closing token (= one-past
+///     `]`/`}` for nested patterns; = ident.end for simple). Used by
+///     callers to advance their source cursor.
+const PatternLayout = struct {
+    last_tok_offset: u32,
+    end_after: u32,
+};
+
+/// Scan a pattern in source starting at `start` (which must be at or before
+/// the first pattern byte). Returns the pattern's layout. The pattern
+/// structure (kind + element count) is already known from the AST; this
+/// scanner only needs to skip past matching brackets and quoted strings.
+fn scanPatternLayout(src: []const u8, start: u32, pat: ast.Pattern) PatternLayout {
+    const cursor = skipTrivia(src, start);
+    switch (pat) {
+        .simple => {
+            // `$name` — advance past `$` then the ident characters.
+            std.debug.assert(cursor < src.len and src[cursor] == '$');
+            const name_start = skipTrivia(src, cursor + 1);
+            var i: usize = name_start;
+            while (i < src.len and isIdentByte(src[i])) : (i += 1) {}
+            return .{
+                .last_tok_offset = @intCast(name_start),
+                .end_after = @intCast(i),
+            };
+        },
+        .array => {
+            std.debug.assert(cursor < src.len and src[cursor] == '[');
+            const rb = scanBracketPairEndFrom(src, cursor);
+            return .{
+                .last_tok_offset = rb,
+                .end_after = rb + 1,
+            };
+        },
+        .object => {
+            std.debug.assert(cursor < src.len and src[cursor] == '{');
+            const rb = scanBracePairEndFrom(src, cursor);
+            return .{
+                .last_tok_offset = rb,
+                .end_after = rb + 1,
+            };
+        },
+    }
+}
+
+/// Skip trivia starting at `start`, then consume the literal `as` keyword
+/// (exactly two bytes: `a` then `s`) and return the offset just past it.
+/// If the expected bytes are not present the original `start` is returned
+/// (defensive; the AST's well-formedness guarantees `as` exists for any
+/// `as_pattern`/`destruct_alt` node).
+fn advancePastAsKeyword(src: []const u8, start: u32) u32 {
+    var cursor = skipTrivia(src, start);
+    if (@as(usize, cursor) + 2 <= src.len and src[cursor] == 'a' and src[cursor + 1] == 's') {
+        cursor += 2;
+    }
+    return cursor;
+}
+
+/// Return true if `c` is a valid identifier continuation character.
+fn isIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '_';
+}
+
+/// Given an offset of a `{`, return the offset of the matching `}`.
+/// Handles nested braces and `"..."` string literals with escapes. Mirrors
+/// `scanBracketPairEndFrom` but for curly braces.
+fn scanBracePairEndFrom(src: []const u8, open_lbrace: u32) u32 {
+    std.debug.assert(open_lbrace < src.len and src[open_lbrace] == '{');
+    var i: usize = open_lbrace + 1;
+    var depth: u32 = 1;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (c == '"') {
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] == '\\') {
+                    if (i + 1 < src.len) i += 1;
+                    continue;
+                }
+                if (src[i] == '"') break;
+            }
+            continue;
+        }
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return @intCast(i);
+        }
+    }
+    return @intCast(src.len - 1);
+}
+
 // ── insertRawInstr ────────────────────────────────────────────────────────────
 
 /// Insert `instr` at position `pos`, shifting later instructions forward by
@@ -900,6 +1495,13 @@ fn fuse(
                     const fused_idx = index_map.items[idx_usize];
                     break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
                 },
+                // Stage 4: variable + destructuring opcodes. Legacy's fuse
+                // passes these operands through with the same layout as
+                // shown at `src/query/src/compiler.zig:7392` (index) and
+                // `:7432-7433` (none). No IP remapping is needed because
+                // none of these opcodes carry an instruction pointer.
+                .capture_variable, .load_variable, .pop_variable => .{ .index = r.operand.index },
+                .save_input, .restore_input, .backtrack => .{ .none = {} },
                 else => .{ .none = {} },
             },
         };
