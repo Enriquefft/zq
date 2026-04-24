@@ -310,6 +310,20 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| query_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(query_tests).step);
 
+    // BUG-005 defect 2 regression: prove compile-error paths are leak-free
+    // under a loud `.safety = true` GPA. Shares imports with query_tests.
+    const compile_leak_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compile_leak_matrix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compile_leak_matrix_mod.addImport("query", query_module);
+    compile_leak_matrix_mod.addImport("regex", regex_module);
+
+    const compile_leak_matrix_tests = b.addTest(.{ .root_module = compile_leak_matrix_mod });
+    if (shim_build_step) |step| compile_leak_matrix_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(compile_leak_matrix_tests).step);
+
     const output_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/output_test.zig"),
         .target = target,
