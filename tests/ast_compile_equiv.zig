@@ -1,4 +1,4 @@
-//! AST-walk compile equivalence harness (Phase 2 Stage 0/1).
+//! AST-walk compile equivalence harness (Phase 2 Stage 0/1/2/3/4/5).
 //!
 //! Invocation: `zig build ast-compile-equiv`.
 //!
@@ -286,7 +286,7 @@ fn dumpBoth(
     }
 }
 
-test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4" {
+test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5" {
     const alloc = std.testing.allocator;
 
     var stderr_buf: [4096]u8 = undefined;
@@ -296,11 +296,13 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4" {
     const total_supported = fixtures.stage1_supported.len +
         fixtures.stage2_supported.len +
         fixtures.stage3_supported.len +
-        fixtures.stage4_supported.len;
+        fixtures.stage4_supported.len +
+        fixtures.stage5_supported.len;
     const total_unsupported = fixtures.stage1_unsupported.len +
         fixtures.stage2_unsupported.len +
         fixtures.stage3_unsupported.len +
-        fixtures.stage4_unsupported.len;
+        fixtures.stage4_unsupported.len +
+        fixtures.stage5_unsupported.len;
     try out.print(
         "ast-compile-equiv: {d} supported + {d} unsupported fixtures\n",
         .{ total_supported, total_unsupported },
@@ -341,6 +343,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4" {
         }
     }
 
+    for (fixtures.stage5_supported) |filter| {
+        const outcome = try runSupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
     for (fixtures.stage1_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
@@ -366,6 +376,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4" {
     }
 
     for (fixtures.stage4_unsupported) |filter| {
+        const outcome = try runUnsupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
+    for (fixtures.stage5_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
             .pass => passed += 1,

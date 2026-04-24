@@ -1,13 +1,14 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5).
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
 //! This file is the future replacement for that compiler; for now it covers only
-//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–4:
+//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–5:
 //!   - `.literal` (int, float, string, bool, null)
 //!   - `.identity` (bare `.`)
 //!   - `.recurse` (`..` operator → `call_builtin(recurse)`)
-//!   - `.unary_neg` over a numeric literal (bare negative literals)
+//!   - `.unary_neg` — all operand shapes (literals via Stage 1, non-literals
+//!     via Stage 5)
 //!   - `.field_access` — `.foo`
 //!   - `.index_access` — `.[n]`
 //!   - `.iterate` — `.[]`
@@ -19,10 +20,14 @@
 //!   - `.variable_ref` — `$name`
 //!   - `.as_pattern` — `. as $x | body`, array/object destructuring
 //!   - `.destruct_alt` — `. as PAT1 ?// PAT2 | body`
+//!   - `.arithmetic` — `+`, `-`, `*`, `/`, `%`
+//!   - `.comparison` — `<`, `<=`, `>`, `>=`, `==`, `!=`
+//!   - `.and_expr`, `.or_expr` — `A and B`, `A or B`
+//!   - `.alternative` — `A // B`, chained
 //!
 //! Every other node kind returns `error.AstCompilerStageIncomplete`. This is NOT
 //! a workaround — it is the scaffold boundary, to be removed as later stages
-//! (5–13) extend coverage. See the plan doc for the full stage breakdown.
+//! (6–13) extend coverage. See the plan doc for the full stage breakdown.
 //!
 //! Production code is unaffected. The legacy compiler at
 //! `src/query/src/compiler.zig` remains the definitional compiler until Stage 13
@@ -272,15 +277,24 @@ const Walker = struct {
             },
 
             .unary_neg => |u| {
-                // Stage 1 supports ONLY `unary_neg` wrapping a literal — the
-                // bare-negative-literal case (e.g. `-1`, `-0.5`). The legacy
-                // compiler at compiler.zig:5834 emits:
-                //     push_<num>(N) [src_offset = literal_offset]
-                //     negate        [src_offset = literal_offset]
-                // because `ctx.last_tok_offset` after recursing through
-                // `parsePrimary` sits on the numeric literal. The operand's
-                // `span.start` is that same literal offset, so we reuse it
-                // for byte-identical emission.
+                // Stage 1 covered `unary_neg` wrapping a numeric literal — the
+                // bare-negative-literal case (e.g. `-1`, `-0.5`). Stage 5
+                // extends this to any non-literal operand (e.g. `-.x`, `-.[0]`,
+                // `- .items[0]`).
+                //
+                // Legacy `parseUnary` at `src/query/src/compiler.zig:2859-2871`:
+                //   1. Consume `-`             last_tok_offset = `-`.offset
+                //   2. Recurse parseUnary(op)  emits operand bytecode; last
+                //                              becomes the operand's final
+                //                              consumed-token offset.
+                //   3. emit .negate            src_offset = that final offset
+                //
+                // For the literal case the operand's span.start IS that final
+                // offset (single-token literal). For non-literal operands the
+                // walker stamps `.negate` with `w.last_emit_offset`, which
+                // equals the legacy `last_tok_offset` at the `.negate` emit
+                // site (every emit inside the operand updates last_emit_offset
+                // to match the legacy's `last_tok_offset` policy).
                 switch (u.operand.kind) {
                     .literal => |lit| switch (lit) {
                         .int => |n| {
@@ -291,9 +305,159 @@ const Walker = struct {
                             try w.emit(.push_float, .{ .float = f }, u.operand.span.start);
                             try w.emit(.negate, .{ .none = {} }, u.operand.span.start);
                         },
-                        else => return error.AstCompilerStageIncomplete,
+                        else => {
+                            // Non-literal operand (e.g. `-.x`). Walk the
+                            // operand, then stamp .negate with the walker's
+                            // last_emit_offset (matches legacy's
+                            // last_tok_offset after operand compilation).
+                            try w.walk(u.operand);
+                            try w.emit(.negate, .{ .none = {} }, w.last_emit_offset);
+                        },
                     },
-                    else => return error.AstCompilerStageIncomplete,
+                    else => {
+                        try w.walk(u.operand);
+                        try w.emit(.negate, .{ .none = {} }, w.last_emit_offset);
+                    },
+                }
+            },
+
+            // ── Stage 5: arithmetic, comparison, logical, alternative ──
+
+            .arithmetic => |a| {
+                // Stage 5 — `A op B` where op ∈ { +, -, *, /, % }.
+                // Legacy `parseAdditive` / `parseMultiplicative`:
+                //   - walk left; walk right; emit binop.
+                //   - src_offset of binop = last_tok_offset after walking
+                //     right = offset of the right operand's final consumed
+                //     token. We mirror via `w.last_emit_offset`.
+                //
+                // Generator-on-right (e.g. `. * (1,2)`) is handled by the
+                // VM's `Forkpoint.saved_stack` machinery; the compiler just
+                // emits the binop normally.
+                try w.walk(a.left);
+                try w.walk(a.right);
+                const op: Instruction.Op = switch (a.op) {
+                    .add => .add,
+                    .sub => .sub,
+                    .mul => .mul,
+                    .div => .div,
+                    .mod => .mod,
+                };
+                try w.emit(op, .{ .none = {} }, w.last_emit_offset);
+            },
+
+            .comparison => |c| {
+                // Stage 5 — `A op B` where op ∈ { <, <=, >, >=, ==, != }.
+                // Legacy `parseComparison`: walk left, walk right, emit op.
+                try w.walk(c.left);
+                try w.walk(c.right);
+                const op: Instruction.Op = switch (c.op) {
+                    .eq => .eq,
+                    .ne => .ne,
+                    .lt => .lt,
+                    .le => .le,
+                    .gt => .gt,
+                    .ge => .ge,
+                };
+                try w.emit(op, .{ .none = {} }, w.last_emit_offset);
+            },
+
+            .and_expr => |b| {
+                // Stage 5 — `A and B`. Legacy `parseAnd`: walk left, walk
+                // right, emit .and_op. Short-circuit is handled at the VM
+                // level (the opcode itself takes two booleans; jq's `and`
+                // short-circuits by the VM's evaluation order because both
+                // sides are already pushed — the actual jq semantics are
+                // encoded at the VM, not via compile-time jumps).
+                //
+                // Note: legacy chains `a and b and c` as
+                // `arithmetic(arithmetic(a, b), c)` — left-leaning — and the
+                // AST matches.
+                try w.walk(b.left);
+                try w.walk(b.right);
+                try w.emit(.and_op, .{ .none = {} }, w.last_emit_offset);
+            },
+
+            .or_expr => |b| {
+                // Stage 5 — `A or B`. See `.and_expr` notes.
+                try w.walk(b.left);
+                try w.walk(b.right);
+                try w.emit(.or_op, .{ .none = {} }, w.last_emit_offset);
+            },
+
+            .alternative => {
+                // Stage 5 — `A // B [// C ...]` emission.
+                //
+                // Legacy `parseAlternative` at
+                // `src/query/src/compiler.zig:2578-2617` records
+                // `chain_start` = raw.len BEFORE compiling the first left.
+                // For each subsequent `//`:
+                //   1. insertRawInstr(chain_start, fork_alt(0))
+                //      — splices fork_alt BEFORE the entire left subtree.
+                //   2. emit pipe, push_current, jump_if_false(0),
+                //          pop_try, push_current, jump(0), backtrack.
+                //   3. patch fork_alt operand → right_ip (= raw.len after
+                //      backtrack).
+                //   4. parseLogical(right).
+                //   5. patch the jump from step 2 → end_ip (= raw.len after
+                //      right).
+                //
+                // Every emit inside the loop is stamped with
+                // `last_tok_offset`, which was updated to `//`.offset by
+                // `nextToken` consuming the `//` operator. AST `alternative`
+                // is left-leaning (`alternative(alternative(a, b), c)`), so
+                // flatten to a list and scan each `//` in sequence.
+                var ops_list: std.ArrayList(*const Node) = .{};
+                defer ops_list.deinit(w.alloc);
+                try flattenAlternativeOperands(w.alloc, &ops_list, node);
+
+                const chain_start: usize = w.raw.items.len;
+                try w.walk(ops_list.items[0]);
+
+                var prev_end: u32 = ops_list.items[0].span.end;
+                var i: usize = 1;
+                while (i < ops_list.items.len) : (i += 1) {
+                    const right = ops_list.items[i];
+                    const slash_off = scanDoubleSlash(w.src, prev_end) orelse prev_end;
+
+                    // Insert fork_alt at chain_start. src_offset = 0 (legacy
+                    // literal omits the field).
+                    try insertRawInstr(w, chain_start, .{
+                        .op = .fork_alt,
+                        .operand = .{ .index = 0 },
+                        .src_offset = 0,
+                    });
+
+                    // Emit middle block — every emit stamped with
+                    // `//`.offset (legacy's last_tok_offset after
+                    // nextToken).
+                    try w.emit(.pipe, .{ .none = {} }, slash_off);
+                    try w.emit(.push_current, .{ .none = {} }, slash_off);
+
+                    const jif_pos = w.raw.items.len;
+                    try w.emit(.jump_if_false, .{ .index = 0 }, slash_off);
+
+                    try w.emit(.pop_try, .{ .none = {} }, slash_off);
+                    try w.emit(.push_current, .{ .none = {} }, slash_off);
+
+                    const jump_end_pos = w.raw.items.len;
+                    try w.emit(.jump, .{ .index = 0 }, slash_off);
+
+                    // Patch jif → raw.len (backtrack position).
+                    w.raw.items[jif_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+                    try w.emit(.backtrack, .{ .none = {} }, slash_off);
+
+                    // right_ip = current raw.len. Patch fork_alt at
+                    // chain_start → right_ip.
+                    const right_ip: u32 = @intCast(w.raw.items.len);
+                    w.raw.items[chain_start].operand = .{ .index = @intCast(right_ip) };
+
+                    try w.walk(right);
+
+                    // Patch jump_end → raw.len (end of this alternative).
+                    w.raw.items[jump_end_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+                    prev_end = right.span.end;
                 }
             },
 
@@ -806,11 +970,6 @@ const Walker = struct {
 
             // ── Scaffold boundary: every other kind is a future stage. ──
             .func_def,
-            .alternative,
-            .or_expr,
-            .and_expr,
-            .comparison,
-            .arithmetic,
             .paren,
             .array_construct,
             .object_construct,
@@ -985,6 +1144,34 @@ fn flattenCommaOperands(
         },
         else => try out.append(alloc, node),
     }
+}
+
+/// Flatten a left-leaning `alternative(alternative(a, b), c)` chain into
+/// `[a, b, c]`. Matches the AST parser's accumulation order at
+/// `src/ast/parser.zig:198-209`.
+fn flattenAlternativeOperands(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(*const Node),
+    node: *const Node,
+) error{OutOfMemory}!void {
+    switch (node.kind) {
+        .alternative => |a| {
+            try flattenAlternativeOperands(alloc, out, a.left);
+            try out.append(alloc, a.right);
+        },
+        else => try out.append(alloc, node),
+    }
+}
+
+/// Scan forward from `start` skipping trivia and return the offset of the
+/// first byte of a `//` token, or null if the next non-trivia bytes are not
+/// `//`. Whitespace between `/` and `/` is NOT allowed by jq's lexer; the
+/// two bytes must be contiguous.
+fn scanDoubleSlash(src: []const u8, start: u32) ?u32 {
+    const off = skipTrivia(src, start);
+    if (@as(usize, off) + 1 >= src.len) return null;
+    if (src[off] != '/' or src[off + 1] != '/') return null;
+    return off;
 }
 
 fn base_segment_start(base: *const Node, w: *Walker) usize {
@@ -1502,6 +1689,30 @@ fn fuse(
                 // none of these opcodes carry an instruction pointer.
                 .capture_variable, .load_variable, .pop_variable => .{ .index = r.operand.index },
                 .save_input, .restore_input, .backtrack => .{ .none = {} },
+                // Stage 5: arithmetic, comparison, logical, negate — all
+                // take a none-operand (operands are on the value stack).
+                // Mirrors `src/query/src/compiler.zig:7408-7422`.
+                .add, .sub, .mul, .div, .mod => .{ .none = {} },
+                .eq, .ne, .lt, .le, .gt, .ge => .{ .none = {} },
+                .and_op, .or_op, .not => .{ .none = {} },
+                // Stage 5: jump_if_false carries a raw-IP operand that must
+                // be remapped through index_map (same treatment as .jump).
+                .jump_if_false => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                // Stage 5: fork_alt uses sentinel-0 semantics like fork_try,
+                // but also always fires on exhaustion. Mirror the legacy
+                // remap at `src/query/src/compiler.zig:7442-7446`.
+                .fork_alt => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const mapped: i64 = if (r.operand.index > 0)
+                        @intCast(index_map.items[idx_usize])
+                    else
+                        0;
+                    break :blk .{ .index = mapped };
+                },
                 else => .{ .none = {} },
             },
         };

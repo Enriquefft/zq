@@ -238,3 +238,97 @@ pub const stage4_supported: []const []const u8 = &.{
 pub const stage4_unsupported: []const []const u8 = &.{
     "$__loc__",
 };
+
+/// Supported in Stage 5 — arithmetic, comparison, logical, alternative (`//`),
+/// and non-literal `unary_neg`. Every entry must yield byte-identical
+/// `Instruction[]` + `source_map` across the legacy compiler and the AST
+/// walker. See `research/phase-2-ast-walk-plan.md` §4 Stage 5.
+///
+/// Fixtures are restricted to Stage 1/2/3/4 primaries + Stage 5 operators.
+/// Parens are Stage 6 and therefore avoided; chains use natural precedence
+/// (`* /` tighter than `+ -` tighter than `< > == …` tighter than `and`
+/// tighter than `or` tighter than `//`).
+pub const stage5_supported: []const []const u8 = &.{
+    // Arithmetic — single binops.
+    "1+2",
+    "5-3",
+    "4*6",
+    "10/2",
+    "7%3",
+
+    // Arithmetic — left-associative same-precedence chains.
+    "1+2+3",
+    "10-1-2",
+    "2*3*4",
+
+    // Arithmetic — mixed precedence.
+    "1+2*3",
+    "10-2*3",
+    "1*2+3*4",
+
+    // Arithmetic with path primaries.
+    ".a+1",
+    ".a+.b",
+    ".items[0] * 2",
+    ".x+.y-.z",
+
+    // Arithmetic with patterns.
+    "1 as $x | $x+2",
+    ". as [$a,$b] | $a+$b",
+    ". as [$a,$b,$c] | $a+$b+$c",
+
+    // Unary neg over non-literal primaries.
+    "-.x",
+    "-.[0]",
+    "- .items[0]",
+
+    // Comparison — simple.
+    "1 < 2",
+    "2 >= 2",
+    "1 == 1",
+    "1 != 2",
+    "\"a\" < \"b\"",
+
+    // Comparison with path primaries.
+    ".a < 10",
+    ".x == null",
+    ".items[0] > 0",
+
+    // Logical — simple.
+    "true and false",
+    "true or false",
+
+    // Logical — precedence: `and` tighter than `or`.
+    "true and true or false",
+    "false or true and true",
+
+    // Logical with comparisons.
+    ".a > 0 and .b > 0",
+    ".x == null or .y == null",
+    "1 < 2 and 2 < 3",
+
+    // Logical with patterns.
+    "1 as $x | $x > 0 and $x < 10",
+
+    // Alternative `//` — simple.
+    ". // 0",
+    ".missing // \"default\"",
+    ".a // .b",
+
+    // Alternative chains.
+    ".a // .b // .c",
+    ". // 1 // 2",
+
+    // Alternative with path primaries.
+    ".items[0] // -1",
+    ".data.value // null",
+
+    // Alternative precedence (`//` is loosest — lower than `+`).
+    ".a + 1 // 0",
+    ".a // 0 + 1",
+};
+
+/// Stage 5 fixtures that depend on a later stage. Currently none — every
+/// Stage 5 node kind is handled; nested interactions with later-stage nodes
+/// (parens, builtins) are filtered out of the fixture list above.
+pub const stage5_unsupported: []const []const u8 = &.{};

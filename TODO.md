@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–4 landed; 5–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–5 landed; 6–13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -18,13 +18,16 @@ Last verified: 2026-04-23.
    Phase 2 replaces the compile path with an AST walk so there is one
    canonical representation (see `CLAUDE.md` §3).
 
-   **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4.
+   **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5.
    Walker covers: literal/identity/recurse/unary_neg (Stage 1),
    field_access/index_access/iterate/slice/suffix chains with `?` (Stage 2),
    pipe/comma chains (Stage 3 — including the legacy FORK/JUMP chain
-   emission via `insertRawInstr`), and variables/`as`-patterns/destructuring/
+   emission via `insertRawInstr`), variables/`as`-patterns/destructuring/
    `?//` (Stage 4 — mirrors legacy's pattern emit sequence with
-   per-final-pattern-token src_offset stamping inside `?//` bodies).
+   per-final-pattern-token src_offset stamping inside `?//` bodies), and
+   arithmetic/comparison/logical/alternative `//` (Stage 5 — including the
+   legacy `parseAlternative` insertRawInstr+pipe/push_current/jif/pop_try/
+   push_current/jump/backtrack pattern for each `//` in a chain).
    The walker lives at `src/ast/compiler.zig`. The equivalence harness lives
    at `tests/ast_compile_equiv.zig` (+ `tests/ast_compile_equiv_fixtures.zig`)
    and runs via `zig build ast-compile-equiv`. Every other AST node kind
@@ -35,7 +38,6 @@ Last verified: 2026-04-23.
    risk register, and cutover strategy.
 
    **Remaining stages (per plan §4):**
-   - Stage 5: arithmetic, comparison, logical, alternative.
    - Stage 6: try/catch, if/elif/else, `path()`, parens.
    - Stage 7: object literals, array constructors, string interpolation,
      format strings.
