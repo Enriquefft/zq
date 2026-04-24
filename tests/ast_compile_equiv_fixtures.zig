@@ -332,3 +332,111 @@ pub const stage5_supported: []const []const u8 = &.{
 /// Stage 5 node kind is handled; nested interactions with later-stage nodes
 /// (parens, builtins) are filtered out of the fixture list above.
 pub const stage5_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 6 — try/catch, if/elif/else, `path()`, and parens.
+/// Every entry must yield byte-identical `Instruction[]` + `source_map`
+/// across the legacy compiler and the AST walker. See
+/// `research/phase-2-ast-walk-plan.md` §4 Stage 6.
+///
+/// Fixtures are restricted to Stage 1–5 primaries plus the Stage 6 nodes.
+/// Object/array constructors, string interpolation, builtins beyond `path()`,
+/// user functions, and update-assign remain Stage 7+.
+pub const stage6_supported: []const []const u8 = &.{
+    // ── try/catch — simple forms. ──────────────────────────────────
+    "try .a",
+    "try .a catch null",
+    "try .a catch \"err\"",
+    "try .",
+    "try 1",
+
+    // Catch-less with path navigation (error-swallowing).
+    ". | try .a | .",
+    "try .items[0]",
+    "try .a.b.c",
+
+    // With explicit handler expressions.
+    "try .a catch .b",
+    "try .a catch 0",
+
+    // Nested try/catch.
+    "try try .a catch .b",
+    "try try .a catch null catch .c",
+
+    // try with a pattern binding (Stage 4 intersection).
+    ". as $x | try $x.a catch null",
+
+    // try inside `//` chains — `//` is Stage 5; verify the emission is
+    // unchanged when `try` produces the left-hand value.
+    "try .a // 0",
+
+    // ── if/elif/else/end — simple forms. ───────────────────────────
+    "if true then 1 else 2 end",
+    "if false then 1 else 2 end",
+    "if .a then \"yes\" else \"no\" end",
+    "if . then 1 else 0 end",
+
+    // No else — legacy emits `.identity` at end.offset.
+    "if .a then 1 end",
+    "if true then 1 end",
+
+    // Single elif.
+    "if .a then 1 elif .b then 2 else 3 end",
+    "if .a then 1 elif .b then 2 end",
+
+    // Multiple elif chains.
+    "if .a then 1 elif .b then 2 elif .c then 3 else 4 end",
+    "if .a then 1 elif .b then 2 elif .c then 3 end",
+
+    // Short-circuit logic in condition (Stage 5 intersection).
+    "if .a and .b then 1 else 0 end",
+    "if .a or .b then 1 else 0 end",
+    "if .a == .b then 1 else 2 end",
+
+    // ── parens — grouping for precedence. ──────────────────────────
+    "(1+2)*3",
+    "(.a + .b) * 2",
+    "1 + (2 * 3)",
+    "(1, 2, 3) | .",
+    ".x | (.a, .b)",
+
+    // Nested parens around simple primary.
+    "((1))",
+    "(((.a)))",
+    "(.)",
+
+    // Parens forcing explicit `//` grouping (Stage 5 intersection).
+    "(try .a) // 0",
+    "(.a // .b) + 1",
+
+    // ── path() — pure AST arg forms. ───────────────────────────────
+    "path(.)",
+    "path(.a)",
+    "path(.a.b)",
+    "path(.a[0])",
+    "path(.[])",
+    "path(.foo)",
+    "path(.items[0])",
+
+    // path() with pipe inside.
+    "path(.a | .b)",
+
+    // path() with pattern binding (Stage 4 intersection).
+    ". as $x | path($x.a)",
+
+    // Nested path() — legacy compiles both layers; runtime rejects but
+    // compile-equivalence holds.
+    "path(path(.a))",
+};
+
+/// Stage 6 fixtures that depend on a later stage. Currently none — every
+/// Stage 6 node kind (try_catch, if_expr, paren, path()) is handled.
+/// Builtin paths inside `path()` (e.g. `path(getpath([...]))`) depend on
+/// builtin lowering (Stage 10/11) and are deferred.
+///
+/// Latent AST shape note: `path` is missing from `isBuiltinName` at
+/// `src/ast/parser.zig:1484-1503`, so `path(.a)` parses as a `func_call`
+/// node rather than `builtin_call`. The Stage 6 walker handles both
+/// node shapes so the existing AST behavior is preserved; if a later
+/// parser fix moves `path` into `isBuiltinName`, the `.builtin_call`
+/// branch already has the emission.
+pub const stage6_unsupported: []const []const u8 = &.{};

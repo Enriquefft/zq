@@ -1,9 +1,9 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6).
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
 //! This file is the future replacement for that compiler; for now it covers only
-//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–5:
+//! the scope documented in `research/phase-2-ast-walk-plan.md` §4 Stage 0–6:
 //!   - `.literal` (int, float, string, bool, null)
 //!   - `.identity` (bare `.`)
 //!   - `.recurse` (`..` operator → `call_builtin(recurse)`)
@@ -24,10 +24,14 @@
 //!   - `.comparison` — `<`, `<=`, `>`, `>=`, `==`, `!=`
 //!   - `.and_expr`, `.or_expr` — `A and B`, `A or B`
 //!   - `.alternative` — `A // B`, chained
+//!   - `.paren` — `(EXPR)` grouping (Stage 6, transparent)
+//!   - `.try_catch` — `try BODY [catch HANDLER]` (Stage 6)
+//!   - `.if_expr` — `if COND then THEN [elif COND then THEN]* [else ELSE] end` (Stage 6)
+//!   - `.builtin_call("path", [EXPR])` / `.func_call("path", [EXPR])` — Stage 6
 //!
 //! Every other node kind returns `error.AstCompilerStageIncomplete`. This is NOT
 //! a workaround — it is the scaffold boundary, to be removed as later stages
-//! (6–13) extend coverage. See the plan doc for the full stage breakdown.
+//! (7–13) extend coverage. See the plan doc for the full stage breakdown.
 //!
 //! Production code is unaffected. The legacy compiler at
 //! `src/query/src/compiler.zig` remains the definitional compiler until Stage 13
@@ -968,17 +972,149 @@ const Walker = struct {
                 return error.AstCompileError;
             },
 
+            // ── Stage 6: parens, try/catch, if/elif/else, path() ──────
+
+            .paren => |u| {
+                // Stage 6 — `(EXPR)` grouping. Transparent: the legacy
+                // `parsePrimaryInner` at `src/query/src/compiler.zig:6295-6301`
+                // consumes `(`, calls `parsePipe` on the inner expression, then
+                // consumes `)` and runs `parseSuffixes`. The `(` / `)` tokens
+                // do NOT emit bytecode of their own — only the inner expression
+                // contributes instructions.
+                //
+                // Legacy side-effect: consuming `)` updates
+                // `ctx.last_tok_offset = ).offset`. Any emit that fires AFTER
+                // the parens (e.g. a surrounding `parseAdditive`'s `add`, or
+                // the trailing implicit `yield_output`) picks up `).offset`.
+                // Mirror this by bumping `w.last_emit_offset` to `).offset`
+                // after the inner walk. `).offset = span.end - 1` because
+                // `paren.span.end` is `p.lex.pos` after the `)` consume (see
+                // `src/ast/parser.zig:441`).
+                //
+                // The AST wraps `(inner)` in `paren { operand = inner }` but
+                // does NOT eagerly merge suffixes — the parser at
+                // `src/ast/parser.zig:441` produces a bare `paren` node and
+                // the caller (parseSuffix) builds a suffix chain on top if
+                // trailing suffixes exist. In that case the AST is
+                // `suffix { base = paren{inner}, ops = [...] }` and `.paren`
+                // is walked as the base, with the suffix walker driving
+                // subsequent emits.
+                try w.walk(u.operand);
+                if (node.span.end > node.span.start) {
+                    w.last_emit_offset = node.span.end - 1;
+                }
+            },
+
+            .try_catch => |tc| {
+                // Stage 6 — `try BODY [catch HANDLER]`.
+                //
+                // Legacy `parseTryCatch` at
+                // `src/query/src/compiler.zig:6422-6452`:
+                //   1. emit fork_try(0)                    [stamp=try.offset]
+                //   2. parsePrimary(body)
+                //   3. if catch present:
+                //        consume catch kw                  [last=catch.offset]
+                //        emit pop_try                      [stamp=catch.offset]
+                //        emit jump(0)                      [stamp=catch.offset]
+                //        backpatch fork_try → handler_ip
+                //        parsePrimary(handler)
+                //        backpatch jump → raw.len
+                //      else:
+                //        emit pop_try                      [stamp=body's last]
+                //
+                // `try.offset` == `node.span.start`. The catch-keyword offset
+                // is scanned from `body.span.end` forward.
+                const try_off = node.span.start;
+                const fork_try_pos = w.raw.items.len;
+                try w.emit(.fork_try, .{ .index = 0 }, try_off);
+
+                try w.walk(tc.body);
+
+                if (tc.catch_body) |handler| {
+                    const catch_off = scanKeyword(w.src, tc.body.span.end, "catch");
+                    try w.emit(.pop_try, .{ .none = {} }, catch_off);
+
+                    const jump_pos = w.raw.items.len;
+                    try w.emit(.jump, .{ .index = 0 }, catch_off);
+
+                    const catch_ip: u32 = @intCast(w.raw.items.len);
+                    w.raw.items[fork_try_pos].operand = .{ .index = @intCast(catch_ip) };
+
+                    try w.walk(handler);
+
+                    w.raw.items[jump_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+                } else {
+                    try w.emit(.pop_try, .{ .none = {} }, w.last_emit_offset);
+                }
+            },
+
+            .if_expr => |ife| {
+                // Stage 6 — `if COND then THEN [elif COND then THEN]* [else ELSE] end`.
+                //
+                // Legacy `parseIfBody` at
+                // `src/query/src/compiler.zig:6467-6522` emits:
+                //   save_input           [stamp=if.offset (or elif.offset for nested)]
+                //   <COND>
+                //   jump_if_false(0)     [stamp=then.offset]
+                //   restore_input        [stamp=then.offset]
+                //   <THEN>
+                //   jump(0)              [stamp=last emit from THEN]
+                //   <backpatch jif>
+                //   restore_input        [stamp=last emit from THEN]
+                //   (elif → nested parseIfBody; else → <ELSE> + end consumed;
+                //    no-else → emit identity stamped end.offset)
+                //   <backpatch jump>
+                //
+                // For elif, legacy is RECURSIVE: after the outer's
+                // `restore_input` it consumes `elif`, then recursively calls
+                // `parseIfBody`. That inner call emits its own save_input
+                // stamped with `elif.offset`, and so on. The AST flattens
+                // elif_chains, so the walker must re-recurse to match.
+                try emitIfBody(
+                    w,
+                    node.span.start,
+                    ife.cond,
+                    ife.then_body,
+                    ife.elif_chains,
+                    ife.else_body,
+                );
+            },
+
+            .builtin_call => |bc| {
+                // Stage 6 handles ONLY `path(EXPR)` here. Every other builtin
+                // stays at AstCompilerStageIncomplete. The AST parser's
+                // `isBuiltinName` (at `src/ast/parser.zig:1484-1503`) does NOT
+                // include "path" — so `path(.a)` actually arrives as a
+                // `func_call` node (see `.func_call` branch below for the
+                // primary dispatch). This arm is kept for defensive coverage:
+                // if a future parser fix adds "path" to isBuiltinName, the
+                // walker already handles it.
+                if (std.mem.eql(u8, bc.name, "path") and bc.args.len == 1) {
+                    try emitPathCall(w, node.span, bc.args[0]);
+                    return;
+                }
+                return error.AstCompilerStageIncomplete;
+            },
+
+            .func_call => |fc| {
+                // Stage 6 handles ONLY `path(EXPR)` here. The AST routes
+                // `path(.a)` through the `func_call` branch because
+                // `isBuiltinName` omits "path" (known AST latent mismatch —
+                // see comment on `.builtin_call`). Every other func_call
+                // stays at Stage 9/10.
+                if (std.mem.eql(u8, fc.name, "path") and fc.args.len == 1) {
+                    try emitPathCall(w, node.span, fc.args[0]);
+                    return;
+                }
+                return error.AstCompilerStageIncomplete;
+            },
+
             // ── Scaffold boundary: every other kind is a future stage. ──
             .func_def,
-            .paren,
             .array_construct,
             .object_construct,
             .string_interp,
             .format_string,
-            .builtin_call,
-            .func_call,
-            .if_expr,
-            .try_catch,
             .reduce,
             .foreach,
             .label_expr,
@@ -1172,6 +1308,140 @@ fn scanDoubleSlash(src: []const u8, start: u32) ?u32 {
     if (@as(usize, off) + 1 >= src.len) return null;
     if (src[off] != '/' or src[off + 1] != '/') return null;
     return off;
+}
+
+// ── Stage 6 helpers: try/catch, if/elif/else, path() ────────────────────────
+
+/// Scan forward from `start`, skipping trivia, and return the offset of the
+/// first byte of the literal keyword `kw`. If the keyword is not found at
+/// the next non-trivia position, returns `start` as a defensive fallback —
+/// AST well-formedness guarantees the keyword is present for every callsite.
+fn scanKeyword(src: []const u8, start: u32, kw: []const u8) u32 {
+    const off = skipTrivia(src, start);
+    if (@as(usize, off) + kw.len > src.len) return off;
+    if (!std.mem.eql(u8, src[off..][0..kw.len], kw)) return off;
+    // Require the byte after to be a non-ident byte (so `catchf` doesn't
+    // count as `catch`).
+    const after: usize = @as(usize, off) + kw.len;
+    if (after < src.len and isIdentByte(src[after])) return off;
+    return off;
+}
+
+/// Recursive helper for `if_expr` emission. Mirrors the legacy
+/// `parseIfBody` control flow in `src/query/src/compiler.zig:6467-6522`,
+/// including the nested-recursion pattern used for `elif`.
+///
+/// Parameters:
+///   - `if_off`    — offset of the `if` or `elif` keyword that begins this
+///     level. Stamps the initial `save_input` emit.
+///   - `cond`      — condition AST node.
+///   - `then_body` — then-branch AST node.
+///   - `elif_chains` — the AST's flat list of `elif` branches at this level
+///     and below. When non-empty, the first elif is consumed at THIS level
+///     (recursive mirror of legacy).
+///   - `else_body` — optional else branch at the deepest level. `null` means
+///     no `else` — legacy emits `identity` at end.offset.
+fn emitIfBody(
+    w: *Walker,
+    if_off: u32,
+    cond: *const Node,
+    then_body: *const Node,
+    elif_chains: []const Node.ElifChain,
+    else_body: ?*const Node,
+) Walker.Error!void {
+    // save_input — legacy stamps with last_tok_offset, which is the `if`/
+    // `elif` keyword offset (set when parsePrimaryInner/parseIfBody consumed
+    // it). For the outer `if`, that's node.span.start. For recursed elif,
+    // that's the elif-kw offset the caller computed.
+    try w.emit(.save_input, .{ .none = {} }, if_off);
+
+    try w.walk(cond);
+
+    // `then` keyword offset — scanned from cond.span.end forward.
+    const then_off = scanKeyword(w.src, cond.span.end, "then");
+
+    const jif_pos = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, then_off);
+
+    try w.emit(.restore_input, .{ .none = {} }, then_off);
+
+    try w.walk(then_body);
+
+    const jmp_pos = w.raw.items.len;
+    // Legacy stamps this `.jump` with last_tok_offset after THEN compiled —
+    // i.e. the offset of the then-body's final consumed token. Mirror via
+    // w.last_emit_offset.
+    const after_then_off = w.last_emit_offset;
+    try w.emit(.jump, .{ .index = 0 }, after_then_off);
+
+    // Backpatch jif → raw.len (else-branch entry).
+    w.raw.items[jif_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    // restore_input before else-branch, same stamp as the jump above.
+    try w.emit(.restore_input, .{ .none = {} }, after_then_off);
+
+    if (elif_chains.len > 0) {
+        // Legacy consumes `elif` (last_tok_offset = elif.offset), then
+        // recurses into parseIfBody. Mirror by scanning for `elif` from
+        // then_body.span.end.
+        const elif_off = scanKeyword(w.src, then_body.span.end, "elif");
+        const head = elif_chains[0];
+        try emitIfBody(
+            w,
+            elif_off,
+            head.cond,
+            head.body,
+            elif_chains[1..],
+            else_body,
+        );
+    } else if (else_body) |eb| {
+        // Legacy: consume `else`, parsePipe(else-body), consume `end`.
+        // The `else` / `end` keywords don't stamp emits directly — the
+        // else-body's internal emits use their own offsets. But after
+        // `end` is consumed, legacy's `last_tok_offset = end.offset` — so
+        // any subsequent implicit emit (e.g. the trailing yield_output)
+        // picks up that offset. Mirror by bumping `last_emit_offset` to
+        // `end.offset` after the walk.
+        try w.walk(eb);
+        const end_off = scanKeyword(w.src, eb.span.end, "end");
+        w.last_emit_offset = end_off;
+    } else {
+        // No-else form: legacy emits `.identity` stamped with end.offset.
+        const end_off = scanKeyword(w.src, then_body.span.end, "end");
+        try w.emit(.identity, .{ .none = {} }, end_off);
+    }
+
+    // Backpatch jmp → raw.len (past entire else-block).
+    w.raw.items[jmp_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+}
+
+/// Emit `path(EXPR)` bytecode — legacy `compilePath` at
+/// `src/query/src/compiler.zig:4858-4871`:
+///   emit path_begin(0)          [stamp=(`.offset]
+///   <EXPR>
+///   emit path_end               [stamp=`)`.offset]
+///   backpatch path_begin → raw.len - 1   (== path_end's IP, pre-fuse)
+///
+/// `node_span` is the span of the full `path(EXPR)` call — start at `path`
+/// ident, end one-past `)`. `(` is scanned from `span.start + 4` (after the
+/// `path` keyword). `)` is at `span.end - 1`.
+fn emitPathCall(w: *Walker, node_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const path_kw_len: u32 = @intCast("path".len);
+    const after_kw = node_span.start + path_kw_len;
+    const lparen_off = scanForSkipWs(w.src, after_kw, '(') orelse after_kw;
+    const rparen_off = if (node_span.end > 0) node_span.end - 1 else node_span.start;
+
+    const begin_ip = w.raw.items.len;
+    try w.emit(.path_begin, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.path_end, .{ .none = {} }, rparen_off);
+
+    // path_begin's operand points at path_end's raw IP (raw.len - 1 at the
+    // moment path_end was emitted). This matches the legacy backpatch at
+    // `compiler.zig:4870`.
+    w.raw.items[begin_ip].operand = .{ .index = @intCast(w.raw.items.len - 1) };
 }
 
 fn base_segment_start(base: *const Node, w: *Walker) usize {
@@ -1713,6 +1983,15 @@ fn fuse(
                         0;
                     break :blk .{ .index = mapped };
                 },
+                // Stage 6: path_begin carries a raw-IP operand pointing at
+                // its paired path_end that must be remapped through
+                // index_map. Mirrors `src/query/src/compiler.zig:7469-7473`.
+                .path_begin => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .path_end => .{ .none = {} },
                 else => .{ .none = {} },
             },
         };
