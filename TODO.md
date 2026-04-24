@@ -18,10 +18,11 @@ Last verified: 2026-04-23.
    Phase 2 replaces the compile path with an AST walk so there is one
    canonical representation (see `CLAUDE.md` §3).
 
-   **Complete:** Stage 0 (scaffolding + equivalence harness) and Stage 1
-   (literal / identity / recurse / bare-negative-literal coverage). The
-   walker lives at `src/ast/compiler.zig`. The equivalence harness lives at
-   `tests/ast_compile_equiv.zig` (+ `tests/ast_compile_equiv_fixtures.zig`)
+   **Complete:** Stage 0 + Stage 1 + Stage 2.
+   Walker covers: literal/identity/recurse/unary_neg (Stage 1) and
+   field_access/index_access/iterate/slice/suffix chains with `?` (Stage 2).
+   The walker lives at `src/ast/compiler.zig`. The equivalence harness lives
+   at `tests/ast_compile_equiv.zig` (+ `tests/ast_compile_equiv_fixtures.zig`)
    and runs via `zig build ast-compile-equiv`. Every other AST node kind
    returns `error.AstCompilerStageIncomplete` — explicit scaffold boundary,
    not a workaround.
@@ -30,7 +31,6 @@ Last verified: 2026-04-23.
    risk register, and cutover strategy.
 
    **Remaining stages (per plan §4):**
-   - Stage 2: field/index/iterate/slice/suffix chain.
    - Stage 3: pipes and commas.
    - Stage 4: variables, `as`, destructuring, `?//`.
    - Stage 5: arithmetic, comparison, logical, alternative.
