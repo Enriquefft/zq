@@ -293,6 +293,10 @@ pub const SemanticModel = struct {
             .update_assign => |ua| {
                 self.walkNode(ua.rhs, scope_id);
             },
+            .assign_general => |ag| {
+                self.walkNode(ag.lhs, scope_id);
+                self.walkNode(ag.rhs, scope_id);
+            },
             .suffix => |suf| {
                 self.walkNode(suf.base, scope_id);
                 for (suf.ops) |op| {

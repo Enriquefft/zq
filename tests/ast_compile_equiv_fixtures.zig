@@ -521,3 +521,62 @@ pub const stage7_supported: []const []const u8 = &.{
 /// Stage 7 node kind (object_construct, array_construct, string_interp,
 /// format_string) is handled.
 pub const stage7_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 8 — update assignments. Every entry must yield
+/// byte-identical `Instruction[]` + `source_map` across the legacy compiler
+/// and the AST walker. See `research/phase-2-ast-walk-plan.md` §4 Stage 8.
+///
+/// Covers both the simple `.path.chain OP= rhs` fast path (AST `update_assign`)
+/// and the complex-LHS fallback (AST `assign_general`), for every assignment
+/// operator the jq grammar defines: `=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`,
+/// `//=`.
+pub const stage8_supported: []const []const u8 = &.{
+    // ── Simple `.path = rhs` ───────────────────────────────────────
+    ".a = 1",
+    ".a.b = 2",
+    ".a[0] = null",
+
+    // ── `|=` update with a Stage 5 RHS ─────────────────────────────
+    ".a |= . + 1",
+    ".a |= . * 2",
+    ".items |= . + [99]",
+    ".a |= if . > 0 then . else 0 end",
+
+    // ── Compound arithmetic updates ────────────────────────────────
+    ".a += 1",
+    ".a -= 1",
+    ".a *= 2",
+    ".a /= 2",
+    ".a %= 3",
+
+    // ── `//=` alternative-assignment ───────────────────────────────
+    ".a //= 0",
+    ".a //= \"default\"",
+
+    // ── Pattern LHS / RHS pipe (Stage 3/4 intersections) ───────────
+    ".a = .b | .c",
+    ". as $x | $x.a = 1",
+
+    // ── Complex LHS — comma/pipe/iterate routed to assign_general ──
+    "(.a, .b) = 1",
+    "(.a | .b) = 1",
+    ".a.b.c |= . + 1",
+    ".items[] |= . * 2",
+
+    // ── Generator RHS ──────────────────────────────────────────────
+    ".a = (1, 2)",
+    ".a |= (1, 2)",
+
+    // ── Extra complex-LHS coverage ─────────────────────────────────
+    "(.a, .b) |= . + 1",
+    ".items[] = 0",
+    "(.a // .b) = 1",
+};
+
+/// Stage 8 fixtures that depend on a later stage. Currently none — every
+/// Stage 8 assignment shape is handled by either `update_assign` (simple
+/// `.path` LHS) or `assign_general` (complex LHS). `.[] = 1` (bare
+/// iterate LHS) routes through `assign_general` because the AST's strict
+/// `peekIsUpdateAssign` returns false for the `]`-bare form; the walker
+/// emits the same `compilePathExprUpdate` bytecode.
+pub const stage8_unsupported: []const []const u8 = &.{};

@@ -69,6 +69,20 @@ pub const Node = struct {
 
         // ── Assignment ───────────────────────────────────────────────
         update_assign: UpdateAssign,
+        /// Assignment whose LHS is NOT a simple `.path.path[n]` chain.
+        /// Mirrors the legacy compiler's `compilePathExprUpdate` dispatch
+        /// (`src/query/src/compiler.zig:1951`) — the LHS is any path
+        /// expression (parens, comma, pipe, iteration, function call that
+        /// produces paths, ...) and the walker wraps it in
+        /// `path_begin`/`path_end` at emit time.
+        ///
+        /// The strict `.path` LHS stays on `update_assign` so the fast-path
+        /// `emitNavigation`/`emitUpdateChain` bytecode shape is preserved
+        /// byte-for-byte. Complex LHSs route through this node instead.
+        /// See `research/phase-2-ast-walk-plan.md` §2 row "Update-assign LHS
+        /// that isn't a simple `.path.path[n]` chain" and §4 Stage 8 for
+        /// the rationale (Option A — AST-side).
+        assign_general: AssignGeneral,
 
         // ── Suffix chain ─────────────────────────────────────────────
         suffix: Suffix,
@@ -258,6 +272,23 @@ pub const Node = struct {
         rhs: *Node,
 
         pub const AssignOp = enum { pipe_eq, eq, plus_eq, minus_eq, star_eq, slash_eq, percent_eq, double_slash_eq };
+    };
+
+    /// Assignment with an arbitrary LHS expression. Walker must re-walk the
+    /// LHS as a path expression under `path_begin`/`path_end` to produce the
+    /// path set, then apply the compound-update logic from
+    /// `compilePathExprUpdate`. Reuses `UpdateAssign.AssignOp` so both
+    /// assign nodes speak the same operator alphabet.
+    pub const AssignGeneral = struct {
+        lhs: *Node,
+        op: UpdateAssign.AssignOp,
+        rhs: *Node,
+        /// Byte offset of the first character of the assignment operator
+        /// token (`=`, `|=`, `+=`, ...). Preserved so the walker can stamp
+        /// the same `last_tok_offset` the legacy compiler used when it
+        /// consumed the operator inside `compilePathExprUpdate`. AST spans
+        /// otherwise cover lhs.start → rhs.end and lose the operator byte.
+        op_offset: u32,
     };
 
     pub const PathStep = union(enum) {

@@ -1273,13 +1273,30 @@ const Walker = struct {
                 }
             },
 
+            // ── Stage 8: update assignments ────────────────────────────
+
+            .update_assign => |ua| {
+                // Simple `.path.chain OP= rhs` fast path — the AST's strict
+                // `peekIsUpdateAssign` only produces `update_assign` when the
+                // LHS is a pure `.field1.field2[idx][...]` chain. Mirrors
+                // the legacy fast-path at
+                // `src/query/src/compiler.zig:1735-1906`.
+                try emitSimpleUpdateAssign(w, node.span, ua);
+            },
+
+            .assign_general => |ag| {
+                // Complex LHS — parens, comma, pipe, iteration, function call
+                // that produces paths. Mirrors legacy `compilePathExprUpdate`
+                // at `src/query/src/compiler.zig:1951-2035`.
+                try emitGeneralAssign(w, ag);
+            },
+
             // ── Scaffold boundary: every other kind is a future stage. ──
             .func_def,
             .reduce,
             .foreach,
             .label_expr,
             .break_expr,
-            .update_assign,
             => return error.AstCompilerStageIncomplete,
         }
     }
@@ -2420,6 +2437,894 @@ fn formatBuiltinId(name: []const u8) ?types.BuiltinId {
     return null;
 }
 
+// ── Stage 8 helpers: update assignments ─────────────────────────────────────
+
+/// Reproduce the legacy compiler's `ctx.last_tok_offset` at the moment
+/// `compilePathExprUpdate` starts emitting its first `push_current`. See
+/// the comment on `emitGeneralAssign` for the three route variants; this
+/// scanner walks the source from the LHS start the same way
+/// `parseUpdateAssign` does, stopping where the legacy fallback triggered.
+///
+/// Routes:
+///   - LHS first byte != '.': legacy peek(non-dot) → `compilePathExprUpdate`
+///     without consuming any token. last_tok stays at the assign op.
+///   - LHS first byte == '.': legacy consumed `.`, any number of `.ident`
+///     segments, and potentially a leading `[`. It bails to the general
+///     path on:
+///       * `[` followed by `]` (bare iterate).
+///       * `[` followed by an ident (computed key).
+///       * `[` followed by a number-like that tryParseIndexInt rejects
+///         (e.g. `[1,2]`). We conservatively trigger on any `[` that
+///         doesn't enclose a single integer or single string literal
+///         — matching legacy's behavior byte-for-byte.
+///     In every fallback branch, the `[` was the most recent `nextToken`,
+///     so the returned stamp is that `[`.offset.
+fn computeGeneralAssignInitialStamp(
+    src: []const u8,
+    lhs: *const Node,
+    op_offset: u32,
+) u32 {
+    // Route 1: non-dot leading byte → no token consumption pre-fallback.
+    const start = lhs.span.start;
+    if (start >= src.len or src[start] != '.') return op_offset;
+
+    // Route 2/3: simulate parseUpdateAssign token loop.
+    var i: u32 = start + 1; // past the `.`
+    while (i < src.len) {
+        i = skipTrivia(src, i);
+        if (i >= src.len) break;
+        const c = src[i];
+        if (isIdentByte(c) and !std.ascii.isDigit(c)) {
+            i = advancePastIdentBytes(src, i);
+            // Optional `.` separator.
+            const sep = skipTrivia(src, i);
+            if (sep < src.len and src[sep] == '.') i = sep + 1 else i = sep;
+            continue;
+        }
+        if (c == '[') {
+            const lbracket_off = i;
+            i += 1;
+            const inner = skipTrivia(src, i);
+            if (inner >= src.len) return lbracket_off;
+            const ic = src[inner];
+            if (ic == ']') {
+                // Bare `.[]` — legacy fallback at `[`.offset.
+                return lbracket_off;
+            }
+            if (ic == '"') {
+                // `.["str"]` — simple, continue.
+                const after_str = skipStringLiteral(src, inner);
+                const close = skipTrivia(src, after_str);
+                if (close < src.len and src[close] == ']') {
+                    i = close + 1;
+                    const sep = skipTrivia(src, i);
+                    if (sep < src.len and src[sep] == '.') i = sep + 1 else i = sep;
+                    continue;
+                }
+                return lbracket_off;
+            }
+            if (ic == '-' or std.ascii.isDigit(ic)) {
+                // Try to parse as single int.
+                var j: u32 = inner;
+                if (ic == '-') j += 1;
+                while (j < src.len and std.ascii.isDigit(src[j])) : (j += 1) {}
+                const after_int = skipTrivia(src, j);
+                if (after_int < src.len and src[after_int] == ']') {
+                    i = after_int + 1;
+                    const sep = skipTrivia(src, i);
+                    if (sep < src.len and src[sep] == '.') i = sep + 1 else i = sep;
+                    continue;
+                }
+                // Multi-index or slice — legacy fallback at `[`.offset.
+                return lbracket_off;
+            }
+            // Ident / expr — legacy fallback at `[`.offset.
+            return lbracket_off;
+        }
+        // Anything else ends the simple-path loop without fallback (e.g.
+        // the assignment operator itself). Legacy's stamp at that point
+        // is the assign op offset.
+        break;
+    }
+    return op_offset;
+}
+
+/// Locate the byte offset of an assignment operator starting from `start`.
+/// Scans past trivia and returns the first offset where one of `=`, `|=`,
+/// `+=`, `-=`, `*=`, `/=`, `%=`, `//=` begins. Used by the simple-LHS path
+/// which does not carry `op_offset` on the `update_assign` AST node (the
+/// path tokens are a `PathStep` slice that loses the operator position).
+fn scanAssignOpOffset(src: []const u8, start: u32) u32 {
+    var i: u32 = skipTrivia(src, start);
+    // Scan past the LHS path tokens. For the simple-path AST, the LHS is a
+    // sequence of `.field` / `.[n]` / `.[str]` / `.[]` steps; the first
+    // byte outside that grammar is the assignment operator's first byte.
+    // We walk `.ident`, `[…]` blocks, and `.` separators linearly until we
+    // hit one of the operator leading bytes.
+    while (i < src.len) {
+        const c = src[i];
+        switch (c) {
+            '=', '|', '+', '-', '*', '/', '%' => return i,
+            '.' => i += 1,
+            '[' => {
+                const close = scanBracketPairEndFrom(src, i);
+                i = close + 1;
+            },
+            else => {
+                if (isIdentByte(c)) {
+                    i = advancePastIdentBytes(src, i);
+                } else {
+                    i += 1;
+                }
+            },
+        }
+        i = skipTrivia(src, i);
+    }
+    return i;
+}
+
+/// Emit navigation instructions for a simple path (save_input +
+/// navigate_key/index for each step). Mirrors `emitNavigation` at
+/// `src/query/src/compiler.zig:1910-1918`. All emits are stamped with
+/// `stamp` (the walker's current `last_tok_offset` equivalent).
+fn emitSimpleNavigation(
+    w: *Walker,
+    steps: []const Node.PathStep,
+    stamp: u32,
+) error{OutOfMemory}!void {
+    for (steps) |step| {
+        try w.emit(.save_input, .{ .none = {} }, stamp);
+        switch (step) {
+            .key => |name| {
+                const ref = try internStr(&w.intern, w.alloc, name);
+                try w.emit(.navigate_key, .{ .str_ref = ref }, stamp);
+            },
+            .index => |idx| {
+                try w.emit(.navigate_index, .{ .index = idx }, stamp);
+            },
+            .iterate => {
+                // AST's simple `update_assign` path never includes `.iterate`
+                // — `peekIsUpdateAssign` (parser.zig:1256) returns FALSE when
+                // the path contains `.[]` because the post-`[` branch
+                // explicitly requires int/string/close; bare `]` takes a
+                // fallthrough that returns false. Defensive guard: any
+                // `.iterate` reaching here is a parser invariant violation.
+                unreachable;
+            },
+        }
+    }
+}
+
+/// Emit update instructions in reverse path order. Mirrors `emitUpdateChain`
+/// at `src/query/src/compiler.zig:1921-1931`.
+fn emitSimpleUpdateChain(
+    w: *Walker,
+    steps: []const Node.PathStep,
+    stamp: u32,
+) error{OutOfMemory}!void {
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        const step = steps[i];
+        switch (step) {
+            .key => |name| {
+                const ref = try internStr(&w.intern, w.alloc, name);
+                try w.emit(.update_key, .{ .str_ref = ref }, stamp);
+            },
+            .index => |idx| {
+                try w.emit(.update_index, .{ .index = idx }, stamp);
+            },
+            .iterate => unreachable,
+        }
+    }
+}
+
+/// Emit the simple `.path.chain OP= rhs` fast path. Mirrors
+/// `src/query/src/compiler.zig:1735-1906`.
+///
+/// Source-offset policy (legacy's `ctx.last_tok_offset` after each nextToken):
+///   - Consuming `.path...`: last_tok = path's final ident / `]` offset.
+///   - Consuming the assignment operator: last_tok = op_offset.
+///   - Emits during navigation / path setup: stamped with op_offset (for
+///     `|=` and compound ops, since no RHS walk has happened yet).
+///   - Emits after walking RHS: stamped with walker's `last_emit_offset`,
+///     which equals the RHS's final emit offset (matches legacy's
+///     last_tok_offset after parseAlternative returns).
+fn emitSimpleUpdateAssign(
+    w: *Walker,
+    node_span: ast.Span,
+    ua: Node.UpdateAssign,
+) Walker.Error!void {
+    const op_offset = scanAssignOpOffset(w.src, node_span.start);
+
+    switch (ua.op) {
+        .pipe_eq => {
+            // Navigate first, then RHS against navigated value, then update.
+            try emitSimpleNavigation(w, ua.path, op_offset);
+            try w.walk(ua.rhs);
+            try emitSimpleUpdateChain(w, ua.path, w.last_emit_offset);
+        },
+        .eq => {
+            // RHS evaluated against original input FIRST, then navigate.
+            try w.walk(ua.rhs);
+            const rhs_last = w.last_emit_offset;
+            try emitSimpleNavigation(w, ua.path, rhs_last);
+            try emitSimpleUpdateChain(w, ua.path, rhs_last);
+        },
+        .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq => {
+            // 1. Save original input into tmp var.
+            const tmp_var_id = w.next_var_id;
+            w.next_var_id += 1;
+            try w.emit(.push_current, .{ .none = {} }, op_offset);
+            try w.emit(.capture_variable, .{ .index = @intCast(tmp_var_id) }, op_offset);
+
+            // 2. Navigate to target.
+            try emitSimpleNavigation(w, ua.path, op_offset);
+
+            // 3. Push navigated value.
+            try w.emit(.push_current, .{ .none = {} }, op_offset);
+
+            // 4. Restore original for RHS.
+            try w.emit(.load_variable, .{ .index = @intCast(tmp_var_id) }, op_offset);
+            try w.emit(.pipe, .{ .none = {} }, op_offset);
+
+            // 5. Evaluate RHS.
+            try w.walk(ua.rhs);
+            const rhs_last = w.last_emit_offset;
+
+            // 6. Apply arithmetic — stamp = rhs_last (legacy emits arith_op
+            //    via ctx.emit which stamps last_tok_offset == RHS's last).
+            const arith_op: Instruction.Op = switch (ua.op) {
+                .plus_eq => .add,
+                .minus_eq => .sub,
+                .star_eq => .mul,
+                .slash_eq => .div,
+                .percent_eq => .mod,
+                else => unreachable,
+            };
+            try w.emit(arith_op, .{ .none = {} }, rhs_last);
+
+            // 7. Update chain.
+            try emitSimpleUpdateChain(w, ua.path, rhs_last);
+        },
+        .double_slash_eq => {
+            // `.path //= rhs` — keep truthy value, else replace.
+            const tmp_var_id = w.next_var_id;
+            w.next_var_id += 1;
+            try w.emit(.push_current, .{ .none = {} }, op_offset);
+            try w.emit(.capture_variable, .{ .index = @intCast(tmp_var_id) }, op_offset);
+
+            try emitSimpleNavigation(w, ua.path, op_offset);
+
+            const fork_alt_pos = w.raw.items.len;
+            try w.emit(.fork_alt, .{ .index = 0 }, op_offset);
+            try w.emit(.push_current, .{ .none = {} }, op_offset);
+
+            const jif_pos = w.raw.items.len;
+            try w.emit(.jump_if_false, .{ .index = 0 }, op_offset);
+            try w.emit(.pop_try, .{ .none = {} }, op_offset);
+            try w.emit(.push_current, .{ .none = {} }, op_offset);
+
+            const jump_end_pos = w.raw.items.len;
+            try w.emit(.jump, .{ .index = 0 }, op_offset);
+
+            // Falsy branch.
+            w.raw.items[jif_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+            try w.emit(.backtrack, .{ .none = {} }, op_offset);
+
+            // Right side.
+            const right_ip: u32 = @intCast(w.raw.items.len);
+            w.raw.items[fork_alt_pos].operand = .{ .index = @intCast(right_ip) };
+
+            try w.emit(.load_variable, .{ .index = @intCast(tmp_var_id) }, op_offset);
+            try w.emit(.pipe, .{ .none = {} }, op_offset);
+            try w.walk(ua.rhs);
+            const rhs_last = w.last_emit_offset;
+
+            w.raw.items[jump_end_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+            try emitSimpleUpdateChain(w, ua.path, rhs_last);
+        },
+    }
+}
+
+/// Captured snapshot of RHS raw instructions, including the base IP they
+/// were originally emitted at so that later re-emissions can rebase internal
+/// jump targets. Mirrors `CapturedRhs` at
+/// `src/query/src/compiler.zig:2432-2436`.
+const CapturedRhs = struct {
+    instrs: []RawInstr,
+    original_start: u32,
+};
+
+/// Rebase internal jump/fork IP operands in a captured RHS buffer by `offset`.
+/// Mirrors `rebaseExprBuf` at `src/query/src/compiler.zig:1256-1264`.
+fn rebaseExprBuf(buf: []RawInstr, offset: i64) void {
+    for (buf) |*r| {
+        if (r.op.hasIpOperand()) {
+            r.operand.index += offset;
+        } else if (r.op.hasSentinelIpOperand()) {
+            if (r.operand.index > 0) r.operand.index += offset;
+        }
+    }
+}
+
+/// Copy raw instructions in `[start, end)` into a heap buffer and truncate
+/// the walker's stream back to `start`. Caller must free the returned slice.
+/// Mirrors `captureAndTruncate` at `src/query/src/compiler.zig:2421-2427`.
+fn captureAndTruncate(
+    w: *Walker,
+    start: usize,
+    end: usize,
+) error{OutOfMemory}!CapturedRhs {
+    const slice = w.raw.items[start..end];
+    const buf = try w.alloc.alloc(RawInstr, slice.len);
+    @memcpy(buf, slice);
+    w.raw.items.len = start;
+    return .{ .instrs = buf, .original_start = @intCast(start) };
+}
+
+/// Append a rebased copy of the captured RHS at the walker's current tail.
+/// Mirrors `appendRebasedInstrsCopy` at
+/// `src/query/src/compiler.zig:2439-2447`. Also updates the walker's
+/// `last_emit_offset` to the final appended instruction's src_offset so
+/// subsequent `emit` calls default-stamp with the RHS's last token offset
+/// (legacy's `ctx.last_tok_offset` state after parseAlternative left it
+/// at the RHS's last consumed token; appending via appendSlice bypasses
+/// `emit` and therefore does not update the walker's tracker by itself).
+fn appendRebasedInstrsCopy(
+    w: *Walker,
+    captured: CapturedRhs,
+) error{OutOfMemory}!void {
+    const new_start: i64 = @intCast(w.raw.items.len);
+    const offset: i64 = new_start - @as(i64, @intCast(captured.original_start));
+    const copy = try w.alloc.alloc(RawInstr, captured.instrs.len);
+    defer w.alloc.free(copy);
+    @memcpy(copy, captured.instrs);
+    rebaseExprBuf(copy, offset);
+    try w.raw.appendSlice(w.alloc, copy);
+    if (copy.len > 0) {
+        w.last_emit_offset = copy[copy.len - 1].src_offset;
+    }
+}
+
+/// Emit `[]` (empty array literal). Mirrors `emitEmptyArray` at
+/// `src/query/src/compiler.zig:2411-2417`.
+fn emitEmptyArray(w: *Walker, stamp: u32) error{OutOfMemory}!void {
+    const start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, stamp);
+    const end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, stamp);
+    w.raw.items[start].operand = .{ .index = @intCast(end) };
+}
+
+/// Detect whether a captured RHS is exactly a single `call_builtin(empty)`.
+/// Mirrors `isEmptyBuiltinCall` at `src/query/src/compiler.zig:2039-2043`.
+fn isEmptyBuiltinCall(buf: []const RawInstr) bool {
+    return buf.len == 1 and
+        buf[0].op == .call_builtin and
+        buf[0].operand.index == @intFromEnum(types.BuiltinId.empty);
+}
+
+/// Emit `[path(LHS)]` — collects every path the LHS expression produces.
+/// Mirrors `emitPathCollection` at `src/query/src/compiler.zig:2049-2066`.
+/// The LHS is walked in path-expression mode (wrapped in path_begin/end).
+fn emitPathCollection(
+    w: *Walker,
+    lhs: *const Node,
+    stamp: u32,
+) Walker.Error!void {
+    // Legacy stamp sequence (mirrors `emitPathCollection` at
+    // `src/query/src/compiler.zig:2049-2066` with the `ctx.last_tok_offset`
+    // convention):
+    //   - array_collect_start / path_begin   → `assign_tok.offset`
+    //     (last_tok_offset at entry, which is the operator position because
+    //     `peekIsUpdateAssign` advanced through it without restoring).
+    //   - after parseAlternative(LHS)         → last_tok = LHS's final token
+    //     offset (e.g. the `)` offset for `(.a, .b)` LHS).
+    //   - path_end / yield_output / array_collect_end → that LHS-final
+    //     offset.
+    const ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, stamp);
+
+    const path_begin_ip = w.raw.items.len;
+    try w.emit(.path_begin, .{ .index = 0 }, stamp);
+
+    try w.walk(lhs);
+
+    // All post-LHS emits stamp with the final LHS emit offset, matching the
+    // legacy `ctx.last_tok_offset` state after `parseAlternative` returns.
+    const lhs_last = w.last_emit_offset;
+    try w.emit(.path_end, .{ .none = {} }, lhs_last);
+    w.raw.items[path_begin_ip].operand = .{ .index = @intCast(w.raw.items.len - 1) };
+
+    try w.emit(.yield_output, .{ .none = {} }, lhs_last);
+
+    const ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, lhs_last);
+    w.raw.items[ace_start].operand = .{ .index = @intCast(ace_end) };
+}
+
+/// Complex LHS / general path-expression update.
+/// Mirrors `compilePathExprUpdate` at `src/query/src/compiler.zig:1951-2035`.
+///
+/// All emits inside this helper stamp with `op_offset` because the legacy
+/// path-capture loop sets `ctx.last_tok_offset = assign_tok.offset` (see
+/// `src/query/src/compiler.zig:1977-1978`) before every bytecode-generating
+/// helper runs. `$orig/$paths` captures happen BEFORE the RHS walk, so they
+/// carry the assign-op offset; post-RHS emits inherit from RHS's last emit.
+fn emitGeneralAssign(w: *Walker, ag: Node.AssignGeneral) Walker.Error!void {
+    const op_offset = ag.op_offset;
+
+    // Reproduce legacy's `ctx.last_tok_offset` at the moment
+    // `compilePathExprUpdate` starts emitting. Legacy reaches that entry
+    // via one of three routes, each leaving last_tok_offset at a different
+    // value (see `parseUpdateAssign` at `src/query/src/compiler.zig:1735`):
+    //   1. Non-`.` LHS: `parseUpdateAssign` falls through on first peek
+    //      without consuming tokens. last_tok_offset stays at the assign
+    //      op (`peekIsUpdateAssign` set it before returning).
+    //   2. `.`-prefix LHS with a bare `.[]` or `.[ident]` fallback: legacy
+    //      consumed `.`, path idents, and the `[` before bailing. The `[`
+    //      was the most recent `nextToken`, so last_tok = `[`.offset.
+    //   3. `.`-prefix LHS with a multi-index `.[n,m]` fallback: same as
+    //      (2), `[` was last consumed.
+    // We reconstruct the value by scanning the source the same way. The
+    // AST's LHS subtree suffices to distinguish (1) from (2)/(3).
+    const initial_stamp = computeGeneralAssignInitialStamp(w.src, ag.lhs, op_offset);
+
+    const orig_var = w.next_var_id;
+    w.next_var_id += 1;
+    const paths_var = w.next_var_id;
+    w.next_var_id += 1;
+    const acc_var = w.next_var_id;
+    w.next_var_id += 1;
+    const dels_var = w.next_var_id;
+    w.next_var_id += 1;
+    const p_var = w.next_var_id;
+    w.next_var_id += 1;
+    const r_var = w.next_var_id;
+    w.next_var_id += 1;
+
+    // $orig = current input.
+    try w.emit(.push_current, .{ .none = {} }, initial_stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(orig_var) }, initial_stamp);
+
+    // $paths = [path(LHS)]. After `emitPathCollection`, the walker's
+    // `last_emit_offset` = LHS's final emit offset (legacy's
+    // `ctx.last_tok_offset` state after parseAlternative left it at the
+    // LHS's last consumed token). `capture_variable($paths)` stamps with
+    // that value — see legacy `src/query/src/compiler.zig:1974` which
+    // emits via `ctx.emit`, inheriting `ctx.last_tok_offset`.
+    try emitPathCollection(w, ag.lhs, initial_stamp);
+    try w.emit(
+        .capture_variable,
+        .{ .index = @intCast(paths_var) },
+        w.last_emit_offset,
+    );
+
+    // Capture RHS into a buffer so we can re-emit inside the reduce body.
+    // Legacy stamps assign_tok.offset on `ctx.last_tok_offset` right before
+    // parseAlternative (compiler.zig:1977); during the walk of RHS, emits
+    // follow RHS span offsets — the walker's `w.walk(rhs)` does the same.
+    const rhs_start = w.raw.items.len;
+    try w.walk(ag.rhs);
+    const rhs_end = w.raw.items.len;
+
+    // Special case: `|= empty` desugars to `delpaths($paths)` directly.
+    if (ag.op == .pipe_eq and isEmptyBuiltinCall(w.raw.items[rhs_start..rhs_end])) {
+        w.raw.items.len = rhs_start;
+        try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, op_offset);
+        try w.emit(.pipe, .{ .none = {} }, op_offset);
+        try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, op_offset);
+        try w.emit(
+            .call_builtin,
+            .{ .index = @intFromEnum(types.BuiltinId.delpaths) },
+            op_offset,
+        );
+        return;
+    }
+
+    const captured = try captureAndTruncate(w, rhs_start, rhs_end);
+    defer w.alloc.free(captured.instrs);
+
+    // At this point legacy's `ctx.last_tok_offset` == RHS's final token
+    // offset (parseAlternative walked through the RHS; captureAndTruncate
+    // only trims raw buffer, not last_tok). Every subsequent `ctx.emit`
+    // inside the per-op emitters stamps with that value. Mirror here by
+    // passing `w.last_emit_offset` (set by captureAndTruncate to the final
+    // appended RHS emit's src_offset — see `appendRebasedInstrsCopy` and
+    // the `emit` updates in `w.walk(ag.rhs)`).
+    //
+    // `w.walk(rhs)` above already set `w.last_emit_offset = RHS_last` for
+    // emitGeneralEqUpdate/etc. — captureAndTruncate does not clear it.
+    const post_rhs_stamp = w.last_emit_offset;
+
+    switch (ag.op) {
+        .pipe_eq => try emitGeneralPipeEqUpdate(
+            w,
+            post_rhs_stamp,
+            orig_var,
+            paths_var,
+            acc_var,
+            dels_var,
+            p_var,
+            r_var,
+            captured,
+        ),
+        .eq => try emitGeneralEqUpdate(
+            w,
+            post_rhs_stamp,
+            orig_var,
+            paths_var,
+            acc_var,
+            p_var,
+            captured,
+        ),
+        .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq => {
+            const arith_op: Instruction.Op = switch (ag.op) {
+                .plus_eq => .add,
+                .minus_eq => .sub,
+                .star_eq => .mul,
+                .slash_eq => .div,
+                .percent_eq => .mod,
+                else => unreachable,
+            };
+            try emitGeneralCompoundUpdate(
+                w,
+                post_rhs_stamp,
+                orig_var,
+                paths_var,
+                acc_var,
+                p_var,
+                arith_op,
+                captured,
+            );
+        },
+        .double_slash_eq => try emitGeneralAlternativeUpdate(
+            w,
+            post_rhs_stamp,
+            orig_var,
+            paths_var,
+            acc_var,
+            p_var,
+            captured,
+        ),
+    }
+}
+
+/// Emit the general `LHS |= f` update. Mirrors `emitGeneralPipeEqUpdate` at
+/// `src/query/src/compiler.zig:2106-2215`.
+fn emitGeneralPipeEqUpdate(
+    w: *Walker,
+    stamp: u32,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    dels_var: u32,
+    p_var: u32,
+    r_var: u32,
+    rhs: CapturedRhs,
+) Walker.Error!void {
+    // $acc = $orig
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, stamp);
+
+    // $dels = []
+    try emitEmptyArray(w, stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(dels_var) }, stamp);
+
+    // For each $p in $paths:
+    try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+
+    const inner_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, stamp);
+    try w.emit(.each, .{ .none = {} }, stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(p_var) }, stamp);
+
+    // Compute $r = [ ($acc | getpath($p)) | f ]
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.getpath) },
+        stamp,
+    );
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+
+    const r_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, stamp);
+    try appendRebasedInstrsCopy(w, rhs);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+    const r_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, stamp);
+    w.raw.items[r_ace_start].operand = .{ .index = @intCast(r_ace_end) };
+    try w.emit(.capture_variable, .{ .index = @intCast(r_var) }, stamp);
+
+    // if length($r) == 0 then add $p to $dels else $acc = setpath(...)
+    try w.emit(.load_variable, .{ .index = @intCast(r_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.length) },
+        stamp,
+    );
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.push_int, .{ .int = 0 }, stamp);
+    try w.emit(.eq, .{ .none = {} }, stamp);
+
+    const jif_pos = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, stamp);
+
+    // THEN: $dels = $dels + [$p]
+    try w.emit(.load_variable, .{ .index = @intCast(dels_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.push_current, .{ .none = {} }, stamp);
+
+    const p_arr_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, stamp);
+    try w.emit(.yield_output, .{ .none = {} }, stamp);
+    const p_arr_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, stamp);
+    w.raw.items[p_arr_start].operand = .{ .index = @intCast(p_arr_end) };
+    try w.emit(.add, .{ .none = {} }, stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(dels_var) }, stamp);
+
+    const jump_end_pos = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, stamp);
+
+    // ELSE: $acc = setpath($acc; $p; $r[0])
+    w.raw.items[jif_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.save_input, .{ .none = {} }, stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, stamp);
+    try w.emit(.restore_input, .{ .none = {} }, stamp);
+    try w.emit(.save_input, .{ .none = {} }, stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(r_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.load_index, .{ .index = 0 }, stamp);
+    try w.emit(.restore_input, .{ .none = {} }, stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.setpath) },
+        stamp,
+    );
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, stamp);
+
+    // END
+    w.raw.items[jump_end_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.backtrack, .{ .none = {} }, stamp);
+
+    const inner_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, stamp);
+    w.raw.items[inner_ace_start].operand = .{ .index = @intCast(inner_ace_end) };
+
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+
+    // Apply deletions: $acc | delpaths($dels)
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(dels_var) }, stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.delpaths) },
+        stamp,
+    );
+}
+
+/// Emit the general `LHS = v` update. Mirrors `emitGeneralEqUpdate` at
+/// `src/query/src/compiler.zig:2220-2270`.
+fn emitGeneralEqUpdate(
+    w: *Walker,
+    stamp: u32,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    rhs: CapturedRhs,
+) Walker.Error!void {
+    const value_var = w.next_var_id;
+    w.next_var_id += 1;
+
+    // $value = $orig | v
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try appendRebasedInstrsCopy(w, rhs);
+    try w.emit(.capture_variable, .{ .index = @intCast(value_var) }, w.last_emit_offset);
+
+    // $acc = $orig
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, w.last_emit_offset);
+
+    // For each $p in $paths: $acc = setpath($acc; $p; $value)
+    try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+
+    const after_rhs_stamp = w.last_emit_offset;
+
+    const inner_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, after_rhs_stamp);
+    try w.emit(.each, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(value_var) }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.setpath) },
+        after_rhs_stamp,
+    );
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+
+    try w.emit(.backtrack, .{ .none = {} }, after_rhs_stamp);
+
+    const inner_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, after_rhs_stamp);
+    w.raw.items[inner_ace_start].operand = .{ .index = @intCast(inner_ace_end) };
+
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+}
+
+/// Emit the general `LHS op= v` compound update. Mirrors
+/// `emitGeneralCompoundUpdate` at `src/query/src/compiler.zig:2276-2332`.
+fn emitGeneralCompoundUpdate(
+    w: *Walker,
+    stamp: u32,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    arith_op: Instruction.Op,
+    rhs: CapturedRhs,
+) Walker.Error!void {
+    const tmp_var = w.next_var_id;
+    w.next_var_id += 1;
+
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try appendRebasedInstrsCopy(w, rhs);
+    try w.emit(.capture_variable, .{ .index = @intCast(tmp_var) }, w.last_emit_offset);
+
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, w.last_emit_offset);
+
+    try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+
+    const after_rhs_stamp = w.last_emit_offset;
+
+    const inner_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, after_rhs_stamp);
+    try w.emit(.each, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.getpath) },
+        after_rhs_stamp,
+    );
+    try w.emit(.load_variable, .{ .index = @intCast(tmp_var) }, after_rhs_stamp);
+    try w.emit(arith_op, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.setpath) },
+        after_rhs_stamp,
+    );
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+
+    try w.emit(.backtrack, .{ .none = {} }, after_rhs_stamp);
+
+    const inner_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, after_rhs_stamp);
+    w.raw.items[inner_ace_start].operand = .{ .index = @intCast(inner_ace_end) };
+
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+}
+
+/// Emit the general `LHS //= v` alternative-assignment update. Mirrors
+/// `emitGeneralAlternativeUpdate` at
+/// `src/query/src/compiler.zig:2336-2408`.
+fn emitGeneralAlternativeUpdate(
+    w: *Walker,
+    stamp: u32,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    rhs: CapturedRhs,
+) Walker.Error!void {
+    const tmp_var = w.next_var_id;
+    w.next_var_id += 1;
+
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, stamp);
+    try w.emit(.pipe, .{ .none = {} }, stamp);
+    try appendRebasedInstrsCopy(w, rhs);
+    try w.emit(.capture_variable, .{ .index = @intCast(tmp_var) }, w.last_emit_offset);
+
+    try w.emit(.load_variable, .{ .index = @intCast(orig_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, w.last_emit_offset);
+
+    try w.emit(.load_variable, .{ .index = @intCast(paths_var) }, w.last_emit_offset);
+    try w.emit(.pipe, .{ .none = {} }, w.last_emit_offset);
+
+    const after_rhs_stamp = w.last_emit_offset;
+
+    const inner_ace_start = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, after_rhs_stamp);
+    try w.emit(.each, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.capture_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+
+    // current = getpath($acc; $p)
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.getpath) },
+        after_rhs_stamp,
+    );
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.push_current, .{ .none = {} }, after_rhs_stamp);
+
+    const jif_pos = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, after_rhs_stamp);
+
+    const jump_end_pos = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, after_rhs_stamp);
+
+    // ELSE: $acc = setpath($acc; $p; $tmp)
+    w.raw.items[jif_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(p_var) }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.save_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(tmp_var) }, after_rhs_stamp);
+    try w.emit(.restore_input, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(
+        .call_builtin,
+        .{ .index = @intFromEnum(types.BuiltinId.setpath) },
+        after_rhs_stamp,
+    );
+    try w.emit(.capture_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+
+    w.raw.items[jump_end_pos].operand = .{ .index = @intCast(w.raw.items.len) };
+
+    try w.emit(.backtrack, .{ .none = {} }, after_rhs_stamp);
+
+    const inner_ace_end: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, after_rhs_stamp);
+    w.raw.items[inner_ace_start].operand = .{ .index = @intCast(inner_ace_end) };
+
+    try w.emit(.pipe, .{ .none = {} }, after_rhs_stamp);
+    try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
+}
+
 // ── insertRawInstr ────────────────────────────────────────────────────────────
 
 /// Insert `instr` at position `pos`, shifting later instructions forward by
@@ -2632,6 +3537,13 @@ fn fuse(
                 // Stage 7: load_computed carries no operand. Legacy at
                 // `src/query/src/compiler.zig:7400`.
                 .load_computed => .{ .none = {} },
+                // Stage 8: update-assign path navigation/mutation opcodes.
+                // Legacy fuse: `src/query/src/compiler.zig:7449-7450`.
+                .navigate_key, .update_key => .{ .str_ref = .{
+                    .offset = r.operand.str_ref.offset,
+                    .len = r.operand.str_ref.len,
+                } },
+                .navigate_index, .update_index => .{ .index = r.operand.index },
                 else => .{ .none = {} },
             },
         };

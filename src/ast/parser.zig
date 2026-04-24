@@ -140,12 +140,15 @@ pub const Parser = struct {
     }
 
     fn parsePipe(p: *Parser) error{ParseFailed}!*Node {
-        // Check for update assignment
-        if (p.peekIsUpdateAssign()) {
-            return p.parseUpdateAssign();
-        }
-
-        var left = try p.parseComma();
+        // First operand: either a strict `.path OP= rhs` (fast path) or a
+        // regular comma expression. Matches legacy `parsePipe` at
+        // `src/query/src/compiler.zig:2449-2471` which calls
+        // `parseCommaOperand` for every operand — assignments bind at the
+        // comma-operand level so `.a = .b | .c` is `pipe(assign(.a, .b), .c)`.
+        var left: *Node = if (p.peekIsUpdateAssign())
+            try p.parseUpdateAssign()
+        else
+            try p.parseComma();
         while (true) {
             const tok = p.peek() orelse break;
             if (tok.tag != .pipe) break;
@@ -174,7 +177,7 @@ pub const Parser = struct {
     }
 
     fn parseComma(p: *Parser) error{ParseFailed}!*Node {
-        var left = try p.parseAlternative();
+        var left = try p.parseCommaOperand();
         while (true) {
             const tok = p.peek() orelse break;
             if (tok.tag != .comma) break;
@@ -188,11 +191,60 @@ pub const Parser = struct {
                 break;
             }
 
-            const right = p.parseAlternative() catch break;
+            const right = p.parseCommaOperand() catch break;
             const span = Span.from(left.span.start, right.span.end);
             left = p.createNode(.{ .comma = .{ .left = left, .right = right } }, span);
         }
         return left;
+    }
+
+    /// Parse one operand of a `,` expression. Mirrors the legacy compiler's
+    /// `parseCommaOperand` at `src/query/src/compiler.zig:2477`: assignment
+    /// operators (`=`, `|=`, `+=`, ...) bind at this precedence level. The
+    /// strict `.path` LHS fast path goes through `parseUpdateAssign`; any
+    /// other LHS shape falls through to `parseAlternative` and is wrapped in
+    /// an `assign_general` node if a trailing assignment operator remains.
+    ///
+    /// The legacy `peekIsUpdateAssign` (`:1691`) is depth-aware and accepts
+    /// any LHS whose first matching `=`/`|=`/... at depth 0 is an assignment
+    /// operator — including paren-grouped LHSs like `(.a, .b) = 1`. The AST
+    /// mirrors that over-acceptance via this two-step dispatch (strict
+    /// pattern first, fall-through wrap second) without a duplicate scanner.
+    fn parseCommaOperand(p: *Parser) error{ParseFailed}!*Node {
+        if (p.peekIsUpdateAssign()) {
+            return p.parseUpdateAssign();
+        }
+        const lhs = try p.parseAlternative();
+        return p.wrapAssignGeneralIfTrailing(lhs);
+    }
+
+    /// If the next token is an assignment operator, consume it, parse the
+    /// RHS at alternative precedence, and wrap `lhs` in `assign_general`.
+    /// Otherwise return `lhs` unchanged. Called both from
+    /// `parseCommaOperand` and `parseObjectFieldValue` so pipe/comma inside
+    /// an object value (BUG-005 shape) still recognizes a trailing assign.
+    fn wrapAssignGeneralIfTrailing(p: *Parser, lhs: *Node) error{ParseFailed}!*Node {
+        const tok = p.peek() orelse return lhs;
+        const op: Node.UpdateAssign.AssignOp = switch (tok.tag) {
+            .eq_assign => .eq,
+            .pipe_eq => .pipe_eq,
+            .plus_eq => .plus_eq,
+            .minus_eq => .minus_eq,
+            .star_eq => .star_eq,
+            .slash_eq => .slash_eq,
+            .percent_eq => .percent_eq,
+            .double_slash_eq => .double_slash_eq,
+            else => return lhs,
+        };
+        const op_offset = tok.offset;
+        _ = p.advance(); // consume assignment operator
+        const rhs = try p.parseAlternative();
+        return p.createNode(.{ .assign_general = .{
+            .lhs = lhs,
+            .op = op,
+            .rhs = rhs,
+            .op_offset = op_offset,
+        } }, Span.from(lhs.span.start, rhs.span.end));
     }
 
     fn parseAlternative(p: *Parser) error{ParseFailed}!*Node {
@@ -824,6 +876,10 @@ pub const Parser = struct {
         }
 
         var left = try p.parseAlternative();
+        // Trailing assignment on the first operand (before any `|`). Matches
+        // legacy `parseCommaOperand` behavior when the object value begins
+        // with a non-`.path` LHS like `{a: (.b, .c) = 1}`.
+        left = try p.wrapAssignGeneralIfTrailing(left);
         while (true) {
             const tok = p.peek() orelse break;
             if (tok.tag != .pipe) break;
@@ -840,10 +896,11 @@ pub const Parser = struct {
                 break;
             }
 
-            const right = p.parseAlternative() catch {
+            var right = p.parseAlternative() catch {
                 p.syncToNextStatement();
                 continue;
             };
+            right = try p.wrapAssignGeneralIfTrailing(right);
             const span = Span.from(left.span.start, right.span.end);
             left = p.createNode(.{ .pipe = .{ .left = left, .right = right } }, span);
         }
@@ -1279,11 +1336,12 @@ pub const Parser = struct {
                             const sep = p.lex.peek() catch return false;
                             if (sep.tag == .dot) _ = p.lex.next() catch return false;
                         },
-                        .rbracket => {
-                            _ = p.lex.next() catch return false;
-                            const sep = p.lex.peek() catch return false;
-                            if (sep.tag == .dot) _ = p.lex.next() catch return false;
-                        },
+                        // `.[]` iteration cannot be represented as a static
+                        // PathStep sequence — legacy's parseUpdateAssign
+                        // (compiler.zig:1801-1806) bails to compilePathExprUpdate
+                        // the moment it sees a bare `]`. We do the same here so
+                        // the walker's `assign_general` path handles it.
+                        .rbracket => return false,
                         else => return false,
                     }
                 },

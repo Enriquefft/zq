@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–7 landed; 8–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–8 landed; 9–13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -19,24 +19,27 @@ Last verified: 2026-04-23.
    canonical representation (see `CLAUDE.md` §3).
 
    **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5
-   + Stage 6 + Stage 7. Walker covers: literal/identity/recurse/unary_neg
-   (Stage 1), field_access/index_access/iterate/slice/suffix chains with `?`
-   (Stage 2), pipe/comma chains (Stage 3 — including the legacy FORK/JUMP
-   chain emission via `insertRawInstr`), variables/`as`-patterns/
-   destructuring/`?//` (Stage 4 — mirrors legacy's pattern emit sequence
-   with per-final-pattern-token src_offset stamping inside `?//` bodies),
-   arithmetic/comparison/logical/alternative `//` (Stage 5 — including the
-   legacy `parseAlternative` insertRawInstr+pipe/push_current/jif/pop_try/
-   push_current/jump/backtrack pattern for each `//` in a chain),
-   try/catch, if/elif/else/end, `path()`, and parens (Stage 6 — recursive
-   elif emission mirroring legacy `parseIfBody`, path_begin/path_end with
-   backpatched IP, `last_emit_offset` bumps at `)`/`end` to mirror legacy
-   `last_tok_offset` stamping), and object/array constructors, string
-   interpolation, format strings plus the `$__loc__` / `{__loc__}` marker
-   shorthands (Stage 7 — includes the `@name "literal"` no-interp special
-   case per plan §6.6, shorthand object fields via an AST parser fix that
-   synthesizes the implicit value node, and BUG-005 d1 pipe-in-object-value
-   coverage via the existing `.pipe` walker).
+   + Stage 6 + Stage 7 + Stage 8. Walker covers: literal/identity/recurse/
+   unary_neg (Stage 1), field_access/index_access/iterate/slice/suffix
+   chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including the
+   legacy FORK/JUMP chain emission via `insertRawInstr`),
+   variables/`as`-patterns/destructuring/`?//` (Stage 4 — mirrors legacy's
+   pattern emit sequence with per-final-pattern-token src_offset stamping
+   inside `?//` bodies), arithmetic/comparison/logical/alternative `//`
+   (Stage 5 — including the legacy `parseAlternative`
+   insertRawInstr+pipe/push_current/jif/pop_try/push_current/jump/backtrack
+   pattern for each `//` in a chain), try/catch, if/elif/else/end, `path()`,
+   and parens (Stage 6 — recursive elif emission mirroring legacy
+   `parseIfBody`, path_begin/path_end with backpatched IP,
+   `last_emit_offset` bumps at `)`/`end` to mirror legacy `last_tok_offset`
+   stamping), object/array constructors, string interpolation, format
+   strings plus the `$__loc__` / `{__loc__}` marker shorthands (Stage 7),
+   and update assignments (Stage 8 — both the strict `.path OP= rhs` fast
+   path via the AST's `update_assign` node and the complex-LHS path via a
+   new `assign_general` node covering `(.a, .b) = 1`, `.items[] |= f`,
+   `(.a | .b) = v` etc., with legacy byte-identical src_offset stamping
+   via a source-byte scanner that reproduces `parseUpdateAssign`'s
+   partial-consume-then-fallback behavior).
    The walker lives at `src/ast/compiler.zig`. The equivalence harness lives
    at `tests/ast_compile_equiv.zig` (+ `tests/ast_compile_equiv_fixtures.zig`)
    and runs via `zig build ast-compile-equiv`. Every other AST node kind
@@ -47,7 +50,6 @@ Last verified: 2026-04-23.
    risk register, and cutover strategy.
 
    **Remaining stages (per plan §4):**
-   - Stage 8: update assignments.
    - Stage 9: user-defined functions, filter args, recursion.
    - Stage 10: generators and reducing builtins.
    - Stage 11: regex builtins and string-ops remainder.

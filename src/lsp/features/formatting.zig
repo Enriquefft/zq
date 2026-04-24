@@ -338,6 +338,21 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
             buf.appendSlice(alloc, op_str) catch {};
             formatNode(ua.rhs, buf, alloc, indent);
         },
+        .assign_general => |ag| {
+            formatNode(ag.lhs, buf, alloc, indent);
+            const op_str: []const u8 = switch (ag.op) {
+                .pipe_eq => " |= ",
+                .eq => " = ",
+                .plus_eq => " += ",
+                .minus_eq => " -= ",
+                .star_eq => " *= ",
+                .slash_eq => " /= ",
+                .percent_eq => " %= ",
+                .double_slash_eq => " //= ",
+            };
+            buf.appendSlice(alloc, op_str) catch {};
+            formatNode(ag.rhs, buf, alloc, indent);
+        },
         .foreach => |fe| {
             buf.appendSlice(alloc, "foreach ") catch {};
             formatNode(fe.expr, buf, alloc, indent);
