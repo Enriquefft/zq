@@ -21,6 +21,8 @@ const std = @import("std");
 const legacy = @import("compiler_legacy");
 const walker = @import("compiler_ast");
 const types = @import("types");
+const prefilter_mod = @import("prefilter");
+const regex_mod = @import("regex");
 const fixtures = @import("ast_compile_equiv_fixtures.zig");
 
 const Instruction = types.Instruction;
@@ -87,14 +89,14 @@ fn diffCompiled(
 ) !bool {
     if (a_ins.len != b_ins.len) {
         try out.print(
-            "  MISMATCH filter=\"{s}\": instruction count differs legacy={d} walker={d}\n",
+            "  MISMATCH filter=\"{s}\" field=instructions: count differs legacy={d} walker={d}\n",
             .{ filter, a_ins.len, b_ins.len },
         );
         return false;
     }
     if (a_src.len != b_src.len) {
         try out.print(
-            "  MISMATCH filter=\"{s}\": source_map count differs legacy={d} walker={d}\n",
+            "  MISMATCH filter=\"{s}\" field=source_map: count differs legacy={d} walker={d}\n",
             .{ filter, a_src.len, b_src.len },
         );
         return false;
@@ -107,7 +109,7 @@ fn diffCompiled(
         if (as != bs) differs = true;
 
         if (differs) {
-            try out.print("  MISMATCH filter=\"{s}\" at index {d}:\n", .{ filter, i });
+            try out.print("  MISMATCH filter=\"{s}\" field=instructions at index {d}:\n", .{ filter, i });
             try out.writeAll("    legacy:\n");
             try dumpInstruction(out, "    ", i, ai, as, a_buf);
             try out.writeAll("    walker:\n");
@@ -116,6 +118,221 @@ fn diffCompiled(
         }
     }
 
+    return true;
+}
+
+/// Compare the function_table between the two compilers. Both currently inline
+/// all user definitions at compile time (length-0 tables), but the field is
+/// part of the public Compiled shape so the harness diffs it regardless.
+fn diffFunctionTable(
+    out: anytype,
+    filter: []const u8,
+    a: []const types.FunctionDef,
+    b: []const types.FunctionDef,
+) !bool {
+    if (a.len != b.len) {
+        try out.print(
+            "  MISMATCH filter=\"{s}\" field=function_table: length differs legacy={d} walker={d}\n",
+            .{ filter, a.len, b.len },
+        );
+        return false;
+    }
+    for (a, b, 0..) |ae, be, i| {
+        if (ae.body_ip != be.body_ip or ae.body_end != be.body_end or ae.param_count != be.param_count) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=function_table at index {d}: legacy(body_ip={d},body_end={d},param_count={d}) walker(body_ip={d},body_end={d},param_count={d})\n",
+                .{ filter, i, ae.body_ip, ae.body_end, ae.param_count, be.body_ip, be.body_end, be.param_count },
+            );
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Compare the `external_var_ids` slices. The harness passes no externals so
+/// both should be empty, but we compare contents for correctness if that
+/// changes.
+fn diffExternalVarIds(
+    out: anytype,
+    filter: []const u8,
+    a: []const u32,
+    b: []const u32,
+) !bool {
+    if (a.len != b.len) {
+        try out.print(
+            "  MISMATCH filter=\"{s}\" field=external_var_ids: length differs legacy={d} walker={d}\n",
+            .{ filter, a.len, b.len },
+        );
+        return false;
+    }
+    for (a, b, 0..) |av, bv, i| {
+        if (av != bv) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=external_var_ids at index {d}: legacy={d} walker={d}\n",
+                .{ filter, i, av, bv },
+            );
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Compare regex-pool size + interned-pattern contents. Offset ordering may
+/// differ if the two compilers insert patterns in a different order — we
+/// compare the unordered set of pattern keys, not their positions.
+fn diffRegexPool(
+    out: anytype,
+    filter: []const u8,
+    a: *const regex_mod.RegexPool,
+    b: *const regex_mod.RegexPool,
+) !bool {
+    if (a.len() != b.len()) {
+        try out.print(
+            "  MISMATCH filter=\"{s}\" field=regex_pool: size differs legacy={d} walker={d}\n",
+            .{ filter, a.len(), b.len() },
+        );
+        return false;
+    }
+    // Compare unordered key sets: every legacy key must appear in the walker
+    // pool's index map.
+    var it = a.index.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (b.index.get(key) == null) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=regex_pool: pattern \"{s}\" present in legacy but missing in walker\n",
+                .{ filter, key },
+            );
+            return false;
+        }
+    }
+    // Symmetric check in case lengths matched but keys differ.
+    it = b.index.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (a.index.get(key) == null) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=regex_pool: pattern \"{s}\" present in walker but missing in legacy\n",
+                .{ filter, key },
+            );
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Compare string_buf by content reachable through the instruction stream.
+/// We cannot diff the raw bytes — allocation order across the two compilers
+/// is not byte-identical (e.g. legacy interns function-body source bytes
+/// during body re-parse, walker doesn't). The `instructions` diff above
+/// already compares every str_ref by resolved string content via
+/// `operandsEqual`. As an additional check, ensure both string_buf byte
+/// slices are reachable (not null, not poisoned) by re-resolving every
+/// emitted str_ref and confirming it's in-bounds.
+fn diffStringBuf(
+    out: anytype,
+    filter: []const u8,
+    a_ins: []const Instruction,
+    a_buf: []const u8,
+    b_ins: []const Instruction,
+    b_buf: []const u8,
+) !bool {
+    for (a_ins, b_ins, 0..) |ai, bi, i| {
+        switch (ai.op) {
+            .push_string, .load_key, .load_path, .navigate_key, .update_key => {
+                const a_end = @as(u64, ai.operand.str_ref.offset) + @as(u64, ai.operand.str_ref.len);
+                const b_end = @as(u64, bi.operand.str_ref.offset) + @as(u64, bi.operand.str_ref.len);
+                if (a_end > a_buf.len) {
+                    try out.print(
+                        "  MISMATCH filter=\"{s}\" field=string_buf: legacy str_ref at instruction {d} out of bounds (end={d} buf_len={d})\n",
+                        .{ filter, i, a_end, a_buf.len },
+                    );
+                    return false;
+                }
+                if (b_end > b_buf.len) {
+                    try out.print(
+                        "  MISMATCH filter=\"{s}\" field=string_buf: walker str_ref at instruction {d} out of bounds (end={d} buf_len={d})\n",
+                        .{ filter, i, b_end, b_buf.len },
+                    );
+                    return false;
+                }
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Compare prefilter groups: length, per-group literal list, per-group flag.
+/// Order matters — both compilers harvest from the same idiom via the same
+/// matcher, so groups are produced in identical order.
+fn diffPrefilter(
+    out: anytype,
+    filter: []const u8,
+    a: ?prefilter_mod.PrefilterSet,
+    b: ?prefilter_mod.PrefilterSet,
+) !bool {
+    if ((a == null) != (b == null)) {
+        try out.print(
+            "  MISMATCH filter=\"{s}\" field=prefilter: presence differs legacy={} walker={}\n",
+            .{ filter, a != null, b != null },
+        );
+        return false;
+    }
+    if (a == null) return true;
+
+    const ag = a.?.groups;
+    const bg = b.?.groups;
+    if (ag.len != bg.len) {
+        try out.print(
+            "  MISMATCH filter=\"{s}\" field=prefilter_groups: length differs legacy={d} walker={d}\n",
+            .{ filter, ag.len, bg.len },
+        );
+        return false;
+    }
+    for (ag, bg, 0..) |ga, gb, gi| {
+        if (ga.all_required != gb.all_required) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=prefilter_groups at group {d}: all_required differs legacy={} walker={}\n",
+                .{ filter, gi, ga.all_required, gb.all_required },
+            );
+            return false;
+        }
+        if (ga.literals.len != gb.literals.len) {
+            try out.print(
+                "  MISMATCH filter=\"{s}\" field=prefilter_groups at group {d}: literal count differs legacy={d} walker={d}\n",
+                .{ filter, gi, ga.literals.len, gb.literals.len },
+            );
+            return false;
+        }
+        for (ga.literals, gb.literals, 0..) |la, lb, li| {
+            if (!std.mem.eql(u8, la, lb)) {
+                try out.print(
+                    "  MISMATCH filter=\"{s}\" field=prefilter_groups at group {d} literal {d}: legacy=\"{s}\" walker=\"{s}\"\n",
+                    .{ filter, gi, li, la, lb },
+                );
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Full-shape diff: runs every field comparison and returns true only when
+/// all pass. On failure the first field-level mismatch message is already
+/// printed by the sub-diff that returned false.
+fn diffCompiledFull(
+    out: anytype,
+    filter: []const u8,
+    a: legacy.Compiled,
+    b: walker.Compiled,
+) !bool {
+    if (!try diffCompiled(out, filter, a.instructions, a.source_map, a.string_buf, b.instructions, b.source_map, b.string_buf)) return false;
+    if (!try diffFunctionTable(out, filter, a.function_table, b.function_table)) return false;
+    if (!try diffExternalVarIds(out, filter, a.external_var_ids, b.external_var_ids)) return false;
+    if (!try diffRegexPool(out, filter, &a.regex_pool, &b.regex_pool)) return false;
+    if (!try diffStringBuf(out, filter, a.instructions, a.string_buf, b.instructions, b.string_buf)) return false;
+    if (!try diffPrefilter(out, filter, a.prefilter, b.prefilter)) return false;
     return true;
 }
 
@@ -194,16 +411,7 @@ fn runSupported(
             .ok => {
                 const a = legacy_result.ok;
                 const b = walker_result.ok;
-                const ok = try diffCompiled(
-                    out,
-                    filter,
-                    a.instructions,
-                    a.source_map,
-                    a.string_buf,
-                    b.instructions,
-                    b.source_map,
-                    b.string_buf,
-                );
+                const ok = try diffCompiledFull(out, filter, a, b);
                 if (verbose) try dumpBoth(out, filter, a, b);
                 return if (ok) .pass else .fail;
             },
@@ -286,7 +494,7 @@ fn dumpBoth(
     }
 }
 
-test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a + Stage 10b + Stage 10c + Stage 11" {
+test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a + Stage 10b + Stage 10c + Stage 11 + Stage 12" {
     const alloc = std.testing.allocator;
 
     var stderr_buf: [4096]u8 = undefined;
@@ -305,7 +513,8 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 
         fixtures.stage10a_supported.len +
         fixtures.stage10b_supported.len +
         fixtures.stage10c_supported.len +
-        fixtures.stage11_supported.len;
+        fixtures.stage11_supported.len +
+        fixtures.stage12_supported.len;
     const total_unsupported = fixtures.stage1_unsupported.len +
         fixtures.stage2_unsupported.len +
         fixtures.stage3_unsupported.len +
@@ -316,7 +525,8 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 
         fixtures.stage8_unsupported.len +
         fixtures.stage9_unsupported.len +
         fixtures.stage10c_unsupported.len +
-        fixtures.stage11_unsupported.len;
+        fixtures.stage11_unsupported.len +
+        fixtures.stage12_unsupported.len;
     try out.print(
         "ast-compile-equiv: {d} supported + {d} unsupported fixtures\n",
         .{ total_supported, total_unsupported },
@@ -429,6 +639,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 
         }
     }
 
+    for (fixtures.stage12_supported) |filter| {
+        const outcome = try runSupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
     for (fixtures.stage1_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
@@ -510,6 +728,14 @@ test "ast compile equivalence — Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 
     }
 
     for (fixtures.stage11_unsupported) |filter| {
+        const outcome = try runUnsupported(alloc, out, filter);
+        switch (outcome) {
+            .pass => passed += 1,
+            .fail => failed += 1,
+        }
+    }
+
+    for (fixtures.stage12_unsupported) |filter| {
         const outcome = try runUnsupported(alloc, out, filter);
         switch (outcome) {
             .pass => passed += 1,

@@ -4,7 +4,7 @@ const types = @import("types");
 const compiler = @import("src/compiler.zig");
 const vm = @import("src/vm.zig");
 const regex_mod = @import("regex");
-const prefilter_mod = @import("src/prefilter.zig");
+const prefilter_mod = @import("prefilter");
 
 pub const PrefilterSet = prefilter_mod.PrefilterSet;
 

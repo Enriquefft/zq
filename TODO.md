@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–11 complete; 12–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–12 complete; 13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -20,7 +20,7 @@ Last verified: 2026-04-23.
 
    **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5
    + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10 (10a + 10b + 10c)
-   + Stage 11.
+   + Stage 11 + Stage 12.
    Walker covers: literal/identity/
    recurse/unary_neg (Stage 1), field_access/index_access/iterate/slice/
    suffix chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including
@@ -114,6 +114,38 @@ Last verified: 2026-04-23.
      call pattern) / `isempty(f)` / `in(expr)` (generator-aware
      save_input/yield/restore envelope with chain_start splice).
 
+   **Stage 12 (landed — prefilter fold + full CompileResult shape
+   equivalence):**
+   - Prefilter-harvester refactor: the AST-idiom matcher moved from
+     `src/query/src/compiler.zig:1520-1660` into
+     `src/query/src/prefilter.zig:harvestFromAstRoot(alloc, root, out)`.
+     Legacy's `harvestPrefilterFromAst` is now a thin wrapper that parses
+     once and delegates — byte-equivalent to the prior inline body.
+   - Walker ownership: `src/ast/compiler.zig:compileWithExternals` calls
+     `prefilter_mod.harvestFromAstRoot` against the SAME AST it walked
+     for bytecode (no second `ast.parse` call) and transfers the
+     harvested groups into `Compiled.prefilter` via the same ownership
+     handoff legacy uses (`prefilter_groups_consumed` flag).
+   - `Compiled` shape parity: walker's `Compiled.prefilter` upgraded
+     from a `?void` scaffold stub to a real `?prefilter_mod.PrefilterSet`
+     that deinits on teardown. Every field of legacy's `Compiled`
+     (`instructions`, `function_table`, `string_buf`, `external_var_ids`,
+     `source_map`, `regex_pool`, `prefilter`) is now populated
+     identically.
+   - Harness extension: `tests/ast_compile_equiv.zig` diff extended
+     beyond `instructions` + `source_map` to cover `function_table`,
+     `external_var_ids`, `regex_pool` (size + interned pattern set),
+     `string_buf` (bounds check via instruction str_refs), and
+     `prefilter_groups` (length + per-group literal list + all_required
+     flag). Mismatches are reported as
+     `MISMATCH filter="..." field=<name> ...`.
+   - Build wiring: `prefilter.zig` promoted to a standalone build
+     module; both compiler_legacy_module and compiler_ast_module import
+     it by name so a single file-root services both compile paths.
+   - Fixtures: Stage 12 fixture bucket added exercising the
+     `select(<accessor> | test|scan("lit"[; "flags"]))` idiom
+     (6 filters including scan/flags/alternation). Harness: 540 passed,
+     0 failed.
+
    **Remaining stages (per plan §4):**
-   - Stage 12: prefilter integration (fold into single AST pass).
    - Stage 13: cutover — delete legacy compiler, swap in walker.

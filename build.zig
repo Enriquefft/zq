@@ -152,6 +152,18 @@ pub fn build(b: *std.Build) void {
     ast_module.addImport("error", error_module);
     ast_module.addImport("types", types_module);
 
+    // Prefilter harvester — defined early so every downstream module
+    // (query_module, compiler_legacy_module, compiler_ast_module) can import
+    // it by name and stay on a single module root. Phase 2 Stage 12 moved the
+    // AST-idiom matcher into this file so both compile paths share it.
+    const prefilter_module = b.createModule(.{
+        .root_source_file = b.path("src/query/src/prefilter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prefilter_module.addImport("regex", regex_module);
+    prefilter_module.addImport("ast", ast_module);
+
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
         .target = target,
@@ -164,6 +176,7 @@ pub fn build(b: *std.Build) void {
     // Prefilter harvest walks the AST from src/ast/. Single source of truth:
     // the same parser the LSP uses — no second source-byte scanner.
     query_module.addImport("ast", ast_module);
+    query_module.addImport("prefilter", prefilter_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding
@@ -485,6 +498,13 @@ pub fn build(b: *std.Build) void {
     compiler_legacy_module.addImport("lexer", lexer_module);
     compiler_legacy_module.addImport("regex", regex_module);
     compiler_legacy_module.addImport("ast", ast_module);
+    // Share the same prefilter module created at the top of this function so
+    // the ast-compile-equiv harness (which also loads the walker) doesn't
+    // double-root `src/query/src/prefilter.zig`. Before Stage 12 the legacy
+    // compiler pulled the file in via a relative `@import("prefilter.zig")`;
+    // now it imports by module name and both compilers share the single
+    // root. See `src/query/src/compiler.zig` and `src/ast/compiler.zig`.
+    compiler_legacy_module.addImport("prefilter", prefilter_module);
 
     // AST walker exposed as a sibling module. Parallel to the legacy
     // compiler. Stage 13 cutover collapses these into one.
@@ -497,6 +517,7 @@ pub fn build(b: *std.Build) void {
     compiler_ast_module.addImport("types", types_module);
     compiler_ast_module.addImport("error", error_module);
     compiler_ast_module.addImport("regex", regex_module);
+    compiler_ast_module.addImport("prefilter", prefilter_module);
 
     const ast_equiv_step = b.step("ast-compile-equiv", "Run AST-walk compile equivalence harness (Phase 2)");
     const ast_equiv_mod = b.createModule(.{
@@ -507,6 +528,8 @@ pub fn build(b: *std.Build) void {
     ast_equiv_mod.addImport("compiler_legacy", compiler_legacy_module);
     ast_equiv_mod.addImport("compiler_ast", compiler_ast_module);
     ast_equiv_mod.addImport("types", types_module);
+    ast_equiv_mod.addImport("prefilter", prefilter_module);
+    ast_equiv_mod.addImport("regex", regex_module);
     ast_equiv_mod.addImport("build_options", ast_equiv_options_module);
     const ast_equiv_tests = b.addTest(.{ .root_module = ast_equiv_mod });
     if (shim_build_step) |step| ast_equiv_tests.step.dependOn(&step.step);

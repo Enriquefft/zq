@@ -7,7 +7,7 @@ const Lexer = lx.Lexer;
 const Token = lx.Token;
 const regex_mod = @import("regex");
 const RegexPool = regex_mod.RegexPool;
-const prefilter_mod = @import("prefilter.zig");
+const prefilter_mod = @import("prefilter");
 const ast = @import("ast");
 
 // ── Public output type ────────────────────────────────────────────────────────
@@ -1522,141 +1522,16 @@ fn harvestPrefilterFromAst(ctx: *Ctx, alloc: std.mem.Allocator) error{OutOfMemor
 
     // Parse once. The AST parser never errors out — partial trees are fine;
     // an idiom match on a partial tree is still sound because we independently
-    // re-compile the literal through the real regex engine below.
+    // re-compile the literal through the real regex engine (inside the
+    // delegated harvester) below.
     var parsed = ast.parse(ctx.src, alloc);
     defer parsed.deinit();
 
-    // Top-level must be exactly `select(BODY)`. Any other shape → bail.
-    const root = parsed.root;
-    const sel = switch (root.kind) {
-        .builtin_call => |bc| bc,
-        else => return,
-    };
-    if (!std.mem.eql(u8, sel.name, "select")) return;
-    if (sel.args.len != 1) return;
-
-    // BODY must be a pipe whose left is a pure accessor and whose right is a
-    // builtin call to `test` or `scan` with 1-2 string literal args.
-    const body = sel.args[0];
-    const pipe = switch (body.kind) {
-        .pipe => |p| p,
-        else => return,
-    };
-    if (!isPureAccessorNode(pipe.left)) return;
-    const call = switch (pipe.right.kind) {
-        .builtin_call => |bc| bc,
-        else => return,
-    };
-    // Only `test` / `scan` are prefilter-safe. See the source-scan prose
-    // (now moved here) for the reasoning:
-    //   - match / capture raise a TypeError on no-match — skipping the
-    //     record would silently swallow the error.
-    //   - splits on no-match yields the original string (non-empty), so
-    //     `select(.x | splits("foo"))` outputs even without "foo".
-    //   - sub / gsub are mutators — `select(.x | sub(...))` doesn't filter
-    //     records at all.
-    if (!std.mem.eql(u8, call.name, "test") and !std.mem.eql(u8, call.name, "scan")) return;
-    if (call.args.len < 1 or call.args.len > 2) return;
-
-    // Pattern arg must be a direct string literal. Interpolation or pipe
-    // expressions as the pattern don't yield a statically-known literal.
-    const pattern_decoded = stringLiteralValue(call.args[0]) orelse return;
-
-    // Optional flags arg (same shape: plain string literal).
-    var flags_decoded: ?[]const u8 = null;
-    if (call.args.len == 2) {
-        flags_decoded = stringLiteralValue(call.args[1]) orelse return;
-    }
-
-    // Build the real pattern that the regex engine will see: optional
-    // `(?<flags>)` prefix, then the decoded literal. Pattern is ALREADY
-    // decoded because the AST stores decoded string literals.
-    var pattern_buf = std.ArrayList(u8){};
-    defer pattern_buf.deinit(alloc);
-    if (flags_decoded) |fl| {
-        var inline_buf: [8]u8 = undefined;
-        var inline_len: usize = 0;
-        for (fl) |ch| {
-            switch (ch) {
-                'i', 'x', 'm', 's' => {
-                    inline_buf[inline_len] = ch;
-                    inline_len += 1;
-                },
-                'g', 'n' => {}, // no pattern effect
-                else => return, // unknown → let the full compile path error
-            }
-        }
-        if (inline_len > 0) {
-            try pattern_buf.appendSlice(alloc, "(?");
-            try pattern_buf.appendSlice(alloc, inline_buf[0..inline_len]);
-            try pattern_buf.append(alloc, ')');
-        }
-    }
-    try pattern_buf.appendSlice(alloc, pattern_decoded);
-
-    var probe = regex_mod.Regex.compile(pattern_buf.items) catch return;
-    defer probe.deinit();
-    const maybe_group = prefilter_mod.groupFromRegex(alloc, &probe) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    const group = maybe_group orelse return;
-    try ctx.prefilter_groups.append(alloc, group);
-}
-
-/// True iff `n` is a pure path expression — a chain of field accesses,
-/// index accesses, iteration, slices, and optionals starting from identity
-/// or a field access, with no function calls, boolean combinators, variable
-/// refs, arithmetic, or alternatives.
-///
-/// Matches the same safe subset the old byte-scan `isSafeAccessor` accepted,
-/// now expressed as a direct AST-kind whitelist.
-fn isPureAccessorNode(n: *const ast.nodes.Node) bool {
-    return switch (n.kind) {
-        .identity => true,
-        .field_access => true,
-        .iterate => true,
-        .index_access => true,
-        .slice => true,
-        .recurse => true,
-        .optional => |u| isPureAccessorNode(u.operand),
-        .paren => |u| isPureAccessorNode(u.operand),
-        .pipe => |p| isPureAccessorNode(p.left) and isPureAccessorNode(p.right),
-        .suffix => |s| blk: {
-            // Base must itself be a pure accessor, and every suffix op must
-            // stay inside the accessor grammar.
-            if (!isPureAccessorNode(s.base)) break :blk false;
-            for (s.ops) |op| {
-                switch (op) {
-                    .field, .index, .iterate, .slice, .optional, .bracket_str => {},
-                    .bracket_expr => |inner| {
-                        // .[EXPR] is safe only if EXPR is itself a pure
-                        // accessor OR a literal (e.g. `.[2]` equivalents).
-                        // Bare literals — int/string — are trivially safe.
-                        switch (inner.kind) {
-                            .literal => {},
-                            else => if (!isPureAccessorNode(inner)) break :blk false,
-                        }
-                    },
-                }
-            }
-            break :blk true;
-        },
-        else => false,
-    };
-}
-
-/// If `n` is a plain string literal node, return its decoded bytes. All
-/// other shapes (interpolation, pipe, etc.) return null — a statically-known
-/// literal is required for a sound prefilter.
-fn stringLiteralValue(n: *const ast.nodes.Node) ?[]const u8 {
-    switch (n.kind) {
-        .literal => |l| switch (l) {
-            .string => |s| return s,
-            else => return null,
-        },
-        .paren => |u| return stringLiteralValue(u.operand),
-        else => return null,
-    }
+    // Phase 2 Stage 12: the idiom-matching logic lives in `prefilter_mod` so
+    // the AST-walker compiler can share it (it reaches harvest with an
+    // already-parsed AST). Byte-identical behaviour to the prior inline
+    // implementation — see `prefilter.zig:harvestFromAstRoot`.
+    try prefilter_mod.harvestFromAstRoot(alloc, parsed.root, &ctx.prefilter_groups);
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────

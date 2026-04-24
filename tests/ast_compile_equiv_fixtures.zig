@@ -1063,3 +1063,32 @@ pub const stage11_supported: []const []const u8 = &.{
 /// a hypothetical `_reject_equiv` bucket — deferred for now, documented
 /// here so the fixture enumeration captures the intent.
 pub const stage11_unsupported: []const []const u8 = &.{};
+
+/// Stage 12 — prefilter integration.
+/// These fixtures match the `select(<pure-accessor> | test|scan("lit"[; "flags"]))`
+/// idiom that triggers the sparser prefilter harvest. Since the legacy
+/// compiler and the AST walker now share `prefilter_mod.harvestFromAstRoot`,
+/// both paths must populate `CompileResult.ok.prefilter` with byte-identical
+/// literal groups; the harness's extended diff (`diffPrefilter`) verifies
+/// this. Fixtures that don't match the idiom still pass through every
+/// diff (including the prefilter diff, both nulls) — those live elsewhere.
+pub const stage12_supported: []const []const u8 = &.{
+    // Plain select + pure accessor + test literal.
+    ".msg | select(. | test(\"err\"))",
+    // Nested accessor in the pure-accessor position.
+    "select(.msg | test(\"warn\"))",
+    // Accessor with iteration as the pure-accessor subject.
+    "select(.items[] | test(\"hello\"))",
+    // select(... | scan("lit")) — same shape, scan flavor.
+    "select(.msg | scan(\"abc\"))",
+    // Two-arg variant with a flags literal.
+    "select(.msg | test(\"err\"; \"i\"))",
+    // Alternation pattern — walker and legacy must extract the OR group.
+    "select(.msg | test(\"foo|bar\"))",
+};
+
+/// Stage 12 has no `_unsupported` bucket — the walker already handled every
+/// shape up through Stage 11, so there are no novel rejections. Kept for
+/// harness-enumeration uniformity; harness iteration is conditional on
+/// decl presence, so leaving this at an empty slice is safe.
+pub const stage12_unsupported: []const []const u8 = &.{};

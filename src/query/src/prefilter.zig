@@ -58,6 +58,7 @@
 
 const std = @import("std");
 const regex_mod = @import("regex");
+const ast = @import("ast");
 
 pub const enabled: bool = regex_mod.enabled;
 
@@ -245,6 +246,164 @@ pub fn groupFromRegex(
         .literals = out,
         .all_required = effective_all_required,
     };
+}
+
+// ─── AST-backed harvester (Phase 2 Stage 12) ─────────────────────────────────
+//
+// Single source of truth for the prefilter shape match: walks an already-parsed
+// AST root and appends any harvestable `LiteralGroup`s onto the caller's list.
+//
+// Both the legacy token-walk compiler (`src/query/src/compiler.zig`) and the
+// AST walker (`src/ast/compiler.zig`) call `harvestFromAstRoot` — legacy after
+// a dedicated `ast.parse(src)`, walker with the AST it already parsed for
+// bytecode emission. The two call sites therefore observe byte-identical
+// prefilter output by construction: the harvest logic depends only on the AST
+// shape, not on the caller's state.
+//
+// Matches the exact idiom:
+//
+//     select( <pure-accessor> | <regex-builtin>("<literal>" [; "<flags>"]) )
+//
+// Anything else — boolean combinators, `//`, trailing pipes, `map(...)`,
+// arithmetic, function calls, variable refs — invalidates the
+// "no regex match ⇒ no select output" invariant the raw-byte prescreen relies
+// on and the harvester bails (safe default: no prefilter).
+
+/// Harvest prefilter literal groups from the given AST root into `out`.
+/// Appends zero or one `LiteralGroup` depending on whether the root matches the
+/// supported `select(... | test|scan("lit"[; "flags"]))` idiom. Never rejects
+/// on shape mismatch — absence of a group is the default.
+///
+/// Ownership: each appended group's literal bytes are freshly allocated from
+/// `alloc`; the caller (or the `PrefilterSet` that eventually consumes them)
+/// is responsible for freeing them via `LiteralGroup` convention on failure
+/// paths. The `ArrayList` storage itself is caller-owned.
+pub fn harvestFromAstRoot(
+    alloc: std.mem.Allocator,
+    root: *const ast.Node,
+    out: *std.ArrayList(LiteralGroup),
+) error{OutOfMemory}!void {
+    if (!enabled) return;
+
+    // Top-level must be exactly `select(BODY)`. Any other shape → bail.
+    const sel = switch (root.kind) {
+        .builtin_call => |bc| bc,
+        else => return,
+    };
+    if (!std.mem.eql(u8, sel.name, "select")) return;
+    if (sel.args.len != 1) return;
+
+    // BODY must be a pipe whose left is a pure accessor and whose right is a
+    // builtin call to `test` or `scan` with 1-2 string literal args.
+    const body = sel.args[0];
+    const pipe = switch (body.kind) {
+        .pipe => |p| p,
+        else => return,
+    };
+    if (!isPureAccessorNode(pipe.left)) return;
+    const call = switch (pipe.right.kind) {
+        .builtin_call => |bc| bc,
+        else => return,
+    };
+    // Only `test` / `scan` are prefilter-safe:
+    //   - match / capture raise a TypeError on no-match — skipping the
+    //     record would silently swallow the error.
+    //   - splits on no-match yields the original string (non-empty), so
+    //     `select(.x | splits("foo"))` outputs even without "foo".
+    //   - sub / gsub are mutators — `select(.x | sub(...))` doesn't filter
+    //     records at all.
+    if (!std.mem.eql(u8, call.name, "test") and !std.mem.eql(u8, call.name, "scan")) return;
+    if (call.args.len < 1 or call.args.len > 2) return;
+
+    // Pattern arg must be a direct string literal. Interpolation or pipe
+    // expressions as the pattern don't yield a statically-known literal.
+    const pattern_decoded = stringLiteralValue(call.args[0]) orelse return;
+
+    // Optional flags arg (same shape: plain string literal).
+    var flags_decoded: ?[]const u8 = null;
+    if (call.args.len == 2) {
+        flags_decoded = stringLiteralValue(call.args[1]) orelse return;
+    }
+
+    // Build the real pattern that the regex engine will see: optional
+    // `(?<flags>)` prefix, then the decoded literal. Pattern is ALREADY
+    // decoded because the AST stores decoded string literals.
+    var pattern_buf = std.ArrayList(u8){};
+    defer pattern_buf.deinit(alloc);
+    if (flags_decoded) |fl| {
+        var inline_buf: [8]u8 = undefined;
+        var inline_len: usize = 0;
+        for (fl) |ch| {
+            switch (ch) {
+                'i', 'x', 'm', 's' => {
+                    inline_buf[inline_len] = ch;
+                    inline_len += 1;
+                },
+                'g', 'n' => {}, // no pattern effect
+                else => return, // unknown → let the full compile path error
+            }
+        }
+        if (inline_len > 0) {
+            try pattern_buf.appendSlice(alloc, "(?");
+            try pattern_buf.appendSlice(alloc, inline_buf[0..inline_len]);
+            try pattern_buf.append(alloc, ')');
+        }
+    }
+    try pattern_buf.appendSlice(alloc, pattern_decoded);
+
+    var probe = regex_mod.Regex.compile(pattern_buf.items) catch return;
+    defer probe.deinit();
+    const maybe_group = try groupFromRegex(alloc, &probe);
+    const group = maybe_group orelse return;
+    try out.append(alloc, group);
+}
+
+/// True iff `n` is a pure path expression — a chain of field accesses,
+/// index accesses, iteration, slices, and optionals starting from identity
+/// or a field access, with no function calls, boolean combinators, variable
+/// refs, arithmetic, or alternatives.
+fn isPureAccessorNode(n: *const ast.Node) bool {
+    return switch (n.kind) {
+        .identity => true,
+        .field_access => true,
+        .iterate => true,
+        .index_access => true,
+        .slice => true,
+        .recurse => true,
+        .optional => |u| isPureAccessorNode(u.operand),
+        .paren => |u| isPureAccessorNode(u.operand),
+        .pipe => |p| isPureAccessorNode(p.left) and isPureAccessorNode(p.right),
+        .suffix => |s| blk: {
+            if (!isPureAccessorNode(s.base)) break :blk false;
+            for (s.ops) |op| {
+                switch (op) {
+                    .field, .index, .iterate, .slice, .optional, .bracket_str => {},
+                    .bracket_expr => |inner| {
+                        switch (inner.kind) {
+                            .literal => {},
+                            else => if (!isPureAccessorNode(inner)) break :blk false,
+                        }
+                    },
+                }
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// If `n` is a plain string literal node, return its decoded bytes. All
+/// other shapes (interpolation, pipe, etc.) return null — a statically-known
+/// literal is required for a sound prefilter.
+fn stringLiteralValue(n: *const ast.Node) ?[]const u8 {
+    switch (n.kind) {
+        .literal => |l| switch (l) {
+            .string => |s| return s,
+            else => return null,
+        },
+        .paren => |u| return stringLiteralValue(u.operand),
+        else => return null,
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

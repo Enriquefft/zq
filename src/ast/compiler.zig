@@ -85,6 +85,7 @@ const ast = @import("ast");
 const types = @import("types");
 const err_mod = @import("error");
 const regex_mod = @import("regex");
+const prefilter_mod = @import("prefilter");
 const Instruction = types.Instruction;
 const Node = ast.Node;
 const ParseResult = ast.ParseResult;
@@ -100,7 +101,13 @@ pub const Compiled = struct {
     external_var_ids: []u32,
     source_map: []u32,
     regex_pool: regex_mod.RegexPool,
-    prefilter: ?void, // Stage 1/2 never populates prefilter; keep field for layout parity.
+    /// Sparser raw-byte prefilter — populated at compile time when the source
+    /// matches the `select(PATH | regex_builtin("lit"))` idiom. `null`
+    /// otherwise. Shape-equivalent to `src/query/src/compiler.zig:Compiled`'s
+    /// `prefilter` field; the legacy compiler and the AST walker share
+    /// `prefilter_mod.harvestFromAstRoot` so the two paths produce identical
+    /// group lists by construction.
+    prefilter: ?prefilter_mod.PrefilterSet,
 
     pub fn deinit(c: *Compiled, alloc: std.mem.Allocator) void {
         alloc.free(c.instructions);
@@ -108,7 +115,7 @@ pub const Compiled = struct {
         alloc.free(c.source_map);
         alloc.free(c.external_var_ids);
         c.regex_pool.deinit();
-        _ = c.prefilter;
+        if (c.prefilter) |*p| p.deinit();
     }
 };
 
@@ -200,12 +207,31 @@ pub fn compileWithExternals(
     defer if (!intern_consumed) walker.intern.deinit(alloc);
     var regex_pool_consumed = false;
     defer if (!regex_pool_consumed) walker.regex_pool.deinit();
+    // Stage 12 — prefilter harvest. Share the AST parse with bytecode emission
+    // (no second `ast.parse` call). Ownership matches legacy's
+    // `prefilter_groups_consumed` pattern at `compiler.zig:1354-1361`: on
+    // success, the groups are moved into `Compiled.prefilter`; on any error
+    // path, the `defer` below frees every group's literal bytes.
+    var prefilter_groups: std.ArrayList(prefilter_mod.LiteralGroup) = .{};
+    var prefilter_groups_consumed = false;
+    defer if (!prefilter_groups_consumed) {
+        for (prefilter_groups.items) |g| {
+            for (g.literals) |l| alloc.free(l);
+            alloc.free(g.literals);
+        }
+        prefilter_groups.deinit(alloc);
+    };
 
     walker.walk(parsed.root) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.AstCompilerStageIncomplete => return error.AstCompilerStageIncomplete,
         error.AstCompileError => return .{ .err = walker.compile_err.? },
     };
+
+    // Stage 12 — harvest prefilter literals from the SAME AST we walked.
+    // Delegated to `prefilter_mod.harvestFromAstRoot` so the legacy compiler
+    // and the walker share one idiom matcher (single source of truth).
+    try prefilter_mod.harvestFromAstRoot(alloc, parsed.root, &prefilter_groups);
 
     // Append implicit yield_output if not already present (mirrors legacy at
     // `compiler.zig:1449-1453`).
@@ -227,6 +253,30 @@ pub fn compileWithExternals(
     compiled.regex_pool.deinit();
     compiled.regex_pool = walker.regex_pool;
     regex_pool_consumed = true;
+
+    // Transfer prefilter literal groups into a PrefilterSet that owns them.
+    // Mirrors legacy's ownership transfer at
+    // `src/query/src/compiler.zig:1470-1490`: allocate a fresh group array,
+    // copy the group pointers (NOT the bytes, so the literal-byte ownership
+    // moves directly), then flip `prefilter_groups_consumed` so the defer
+    // above doesn't double-free.
+    if (prefilter_groups.items.len > 0) {
+        const moved_groups = alloc.alloc(prefilter_mod.LiteralGroup, prefilter_groups.items.len) catch {
+            // OOM on the move: fall back to no prefilter rather than failing
+            // the whole compile. Matches legacy's behavior.
+            compiled.prefilter = null;
+            return .{ .ok = compiled };
+        };
+        @memcpy(moved_groups, prefilter_groups.items);
+        compiled.prefilter = prefilter_mod.PrefilterSet{
+            .allocator = alloc,
+            .groups = moved_groups,
+        };
+        prefilter_groups.clearAndFree(alloc);
+        prefilter_groups_consumed = true;
+    } else {
+        compiled.prefilter = null;
+    }
     return .{ .ok = compiled };
 }
 
@@ -7326,6 +7376,9 @@ fn fuse(
         .external_var_ids = external_var_ids,
         .source_map = source_map,
         .regex_pool = regex_mod.RegexPool.init(alloc),
+        // Placeholder — caller overwrites with the real prefilter set (or
+        // null) after transferring ownership from the walker's harvest list.
+        // Matches legacy's fuse at `src/query/src/compiler.zig:7509`.
         .prefilter = null,
     };
 }
@@ -7477,4 +7530,30 @@ test "walker: .foo.bar fuses to load_path" {
     const ins = result.ok.instructions;
     try std.testing.expectEqual(@as(usize, 2), ins.len);
     try std.testing.expectEqual(Instruction.Op.load_path, ins[0].op);
+}
+
+test "walker Stage 12: select(.msg | test(\"lit\")) populates prefilter" {
+    if (!regex_mod.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var result = try compile(alloc, "select(.msg | test(\"err\"))", null);
+    defer switch (result) {
+        .ok => |*c| @constCast(c).deinit(alloc),
+        .err => {},
+    };
+    try std.testing.expect(result == .ok);
+    const pf = result.ok.prefilter orelse return error.TestExpectedPrefilter;
+    try std.testing.expect(pf.groups.len >= 1);
+    try std.testing.expect(pf.groups[0].literals.len >= 1);
+    try std.testing.expectEqualStrings("err", pf.groups[0].literals[0]);
+}
+
+test "walker Stage 12: non-idiom filter leaves prefilter null" {
+    const alloc = std.testing.allocator;
+    var result = try compile(alloc, ".foo", null);
+    defer switch (result) {
+        .ok => |*c| @constCast(c).deinit(alloc),
+        .err => {},
+    };
+    try std.testing.expect(result == .ok);
+    try std.testing.expect(result.ok.prefilter == null);
 }
