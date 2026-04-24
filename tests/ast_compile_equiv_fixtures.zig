@@ -758,23 +758,80 @@ pub const stage10a_supported: []const []const u8 = &.{
     ". as $x | select($x > 0)",
 };
 
-/// Stage 10a fixtures that require later-stage coverage. The AST walker
-/// currently returns `AstCompilerStageIncomplete` for these; Stage 10b/10c
-/// will move them into `stage10a_supported`.
-pub const stage10a_unsupported: []const []const u8 = &.{
-    // `reduce` / `foreach` — EXPR-after-INIT reorder, Stage 10b.
-    "reduce .[] as $x (0; . + $x)",
-    "foreach .[] as $x (0; . + $x; .)",
-    // `label` / `break` — label-frame emission, Stage 10b.
-    "label $out | 1",
-    // `range` (1/2/3-arg) — parseArgToArray + Cartesian product, Stage 10b.
+/// Supported in Stage 10b — reduce, foreach, label/break, range (1/2/3-arg),
+/// limit, skip, nth. Every entry must yield byte-identical `Instruction[]`
+/// + `source_map` across the legacy compiler and the AST walker.
+///
+/// Stage 10b covers the Stage-10 builtins that require EXPR-after-INIT
+/// reorder (`reduce`, `foreach`), label-frame emission (`label`/`break`),
+/// or multi-arg Cartesian-product collection via `parseArgToArray` (`range`,
+/// `limit`, `skip`, `nth`). Stage 10c will cover `del` / `pick` / `INDEX` /
+/// `IN` / `JOIN`.
+pub const stage10b_supported: []const []const u8 = &.{
+    // ── reduce ─────────────────────────────────────────────────────
+    "[1,2,3] | reduce .[] as $x (0; . + $x)",
+    "reduce range(5) as $i (0; . + $i)",
+    "reduce .items[] as $it ([]; . + [$it.name])",
+    "reduce .[] as $x (1; . * $x)",
+    "reduce .[] as $x (\"\"; . + $x)",
+
+    // ── foreach ────────────────────────────────────────────────────
+    "[1,2,3] | foreach .[] as $x (0; . + $x; .)",
+    "foreach range(3) as $i ([]; . + [$i]; .)",
+    "foreach .[] as $x (0; . + $x)",
+    "[foreach range(3) as $i (0; . + $i; [., $i])]",
+
+    // ── label / break ──────────────────────────────────────────────
+    "label $out | range(10) | if . > 3 then ., break $out else . end",
+    "[label $x | 1, 2, break $x, 3]",
+    "label $e | 1",
+    "label $x | range(5) | if . == 3 then break $x else . end",
+
+    // ── range ──────────────────────────────────────────────────────
     "range(5)",
+    "[range(5)]",
     "range(1; 4)",
+    "[range(1; 4)]",
     "range(0; 10; 2)",
-    // `limit` / `skip` / `nth` — parseArgToArray with hidden var, Stage 10b.
+    "[range(0; 10; 2)]",
+    "range(0; .n)",
+    "range(.lo; .hi)",
+    "range(3)",
+    "[range(10; 0; -1)]",
+
+    // ── limit ──────────────────────────────────────────────────────
     "limit(3; range(10))",
-    "skip(2; range(5))",
+    "[limit(2; .[])]",
+    "limit(0; range(5))",
+    "limit(5; range(3))",
+    "limit(1; range(100))",
+
+    // ── skip ───────────────────────────────────────────────────────
+    "[skip(2; range(5))]",
+    "[skip(0; range(3))]",
+    "[skip(5; range(3))]",
+    "[skip(1; range(10))]",
+
+    // ── nth ────────────────────────────────────────────────────────
+    "nth(0; .[])",
     "nth(2; range(10))",
+    "nth(4; range(3))",
+    "[nth(1; .items[])]",
+    "nth(0; range(5))",
+
+    // ── Stage-10b intersections with earlier stages ───────────────
+    "reduce [1,2] as $x (0; . as $acc | $acc + $x)",
+    "[foreach range(3) as $i (0; . + $i; [., $i])]",
+    "label $out | reduce .[] as $x (0; if $x > 10 then break $out else . + $x end)",
+    "def sum(f): reduce f as $x (0; . + $x); sum(.[])",
+    "[range(3)] | map(reduce range(.) as $i (0; . + $i))",
+    "limit(3; range(10)) | . + 1",
+};
+
+/// Stage 10c fixtures that remain outside the walker. Legacy accepts; the
+/// walker currently returns `AstCompilerStageIncomplete`. Stage 10c will
+/// land `del` / `pick` / `INDEX` / `IN` / `JOIN`.
+pub const stage10c_unsupported: []const []const u8 = &.{
     // `del` / `pick` — path arg + delpaths, Stage 10c.
     "del(.a)",
     "pick(.a)",
