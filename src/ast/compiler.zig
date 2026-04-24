@@ -1,4 +1,27 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9 + Stage 10a).
+//!
+//! Stage 10 is split into multiple partials because the total scope (reduce /
+//! foreach / label / break + 11+ generator/reducing builtins) is too large to
+//! land byte-identically in a single commit. Stage 10a — landed here — covers
+//! the builtin subset whose emission is a straight `( arg )` descent with no
+//! EXPR-after-INIT reorder and no variable-id bookkeeping beyond what Stage
+//! 4/9 already provide:
+//!
+//!   - `select(f)` — predicate filter (save_input + cond + jif/restore/jump/backtrack)
+//!   - `map(f)` — collect `[.[] | f]` via array_collect_start/each/arg/yield/end
+//!   - `map_values(f)` — filter-arg builtin (`map_values_` opcode)
+//!   - `walk(f)` — walk_start/arg/walk_end bracketed recursion
+//!   - `while(cond; update)` — loop_top/save/cond/jif/restore/yield/update/pipe/jump
+//!   - `until(cond; update)` — loop_top/save/cond/jif/restore/jump_done/restore/update/pipe/jump
+//!   - `repeat(f)` — loop_top/yield/f/pipe/jump (infinite; bounded by label/first/limit)
+//!   - `any`/`all` — 0-arg (call_builtin), 1-arg (`[.[] | f]` desugar), 2-arg (generator;cond)
+//!   - `add(f)` — save_input + collect + pipe + call_builtin(add) + restore_input
+//!   - `first(f)` — limit(1;f) fast path: push_int(1) + limit_start/arg/yield
+//!   - `last(f)` — collect + pipe + load_index(-1)
+//!
+//! Stage 10b/10c will land reduce/foreach/label/break/range/limit/skip/nth/
+//! del/pick/INDEX/IN/JOIN once the tricky offset/var_id/reorder semantics are
+//! ported with byte-identical emission verified against the harness.
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
@@ -1241,6 +1264,12 @@ const Walker = struct {
                         return;
                     }
                 }
+
+                // ── Stage 10a: generator / reducing builtins ──────────
+                // Each helper expects the builtin name already verified and
+                // handles its own arg walk + source-byte offset scanning.
+                if (try dispatchStage10aBuiltin(w, bc, node.span)) return;
+
                 return error.AstCompilerStageIncomplete;
             },
 
@@ -4123,6 +4152,529 @@ fn emitFunctionBody(
     }
 }
 
+// ── Stage 10a: generator / reducing builtins ───────────────────────────────
+//
+// Legacy reference: `src/query/src/compiler.zig:5909-6051` dispatch table plus
+// `compileSelect` / `compileMap` / `compileMapValues` / `compileWalk` /
+// `compileWhile` / `compileUntil` / `compileRepeat` / `compileAnyAll` /
+// `compileAddExpr` / `compileFirst` / `compileLast` / `compileFilterArgBuiltin`.
+//
+// Source-offset policy (all helpers below mirror it exactly):
+//   - `lparen_off` — offset of the `(` between the builtin name and its first
+//     arg. Legacy stamps `ctx.last_tok_offset` with this value after the
+//     `nextToken` that consumes `(`; every emit BEFORE the arg walk picks up
+//     `lparen_off`.
+//   - Arg walk — `w.walk(arg)` stamps with the arg's own node offsets and
+//     updates `w.last_emit_offset` to the arg's final emitted instruction's
+//     src_offset (mirrors legacy's last_tok after `parsePipe`).
+//   - `rparen_off` — offset of the closing `)` (= `node.span.end - 1`). Legacy
+//     consumes `)` via `nextToken`, updating `last_tok_offset = rparen.offset`;
+//     every emit AFTER the arg walk (that is not itself from a nested walk)
+//     picks up `rparen_off`.
+//   - `semi_off` — offset of a `;` separator between semicolon-split args.
+//     Scanned via `scanForSkipWs(w.src, prev_arg.span.end, ';')`.
+//
+// For builtins whose first emit fires AFTER `lparen` consume and before the
+// arg walk, stamp with `lparen_off`. For emits AFTER the arg walk that don't
+// depend on mid-consume state, stamp with `w.last_emit_offset` (arg's final
+// token, matches legacy's last_tok_offset just before the `)` consume) OR
+// with `rparen_off` (for emits AFTER the `)` consume).
+//
+// All helpers return `true` if they handled the call, `false` if the walker
+// should fall through to the AstCompilerStageIncomplete default. Stage 10a
+// covers a subset of the 26 Stage-10 builtins; names outside this subset
+// return `false` so later stages (10b/10c) slot in cleanly.
+
+/// Dispatch a builtin_call node to the matching Stage 10a helper. Returns
+/// true on handled (walker emits the builtin's bytecode); false if no match
+/// (caller falls through to AstCompilerStageIncomplete). Each helper stamps
+/// src_offsets byte-identically with the legacy compiler.
+fn dispatchStage10aBuiltin(
+    w: *Walker,
+    bc: Node.BuiltinCall,
+    call_span: ast.Span,
+) Walker.Error!bool {
+    // Uniform requirement: every Stage 10a builtin requires parens. Args length
+    // distinguishes arity variants handled by each helper.
+    if (std.mem.eql(u8, bc.name, "select") and bc.args.len == 1) {
+        try emitSelect(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "map") and bc.args.len == 1) {
+        try emitMap(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "map_values") and bc.args.len == 1) {
+        try emitMapValues(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "walk") and bc.args.len == 1) {
+        try emitWalk(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "while") and bc.args.len == 2) {
+        try emitWhileUntil(w, call_span, bc.args[0], bc.args[1], .kw_while);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "until") and bc.args.len == 2) {
+        try emitWhileUntil(w, call_span, bc.args[0], bc.args[1], .kw_until);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "repeat") and bc.args.len == 1) {
+        try emitRepeat(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "any")) {
+        if (bc.args.len == 1) {
+            try emitAnyAll(w, call_span, bc.args[0], null, .any);
+            return true;
+        }
+        if (bc.args.len == 2) {
+            try emitAnyAll(w, call_span, bc.args[0], bc.args[1], .any);
+            return true;
+        }
+    }
+    if (std.mem.eql(u8, bc.name, "all")) {
+        if (bc.args.len == 1) {
+            try emitAnyAll(w, call_span, bc.args[0], null, .all);
+            return true;
+        }
+        if (bc.args.len == 2) {
+            try emitAnyAll(w, call_span, bc.args[0], bc.args[1], .all);
+            return true;
+        }
+    }
+    if (std.mem.eql(u8, bc.name, "add") and bc.args.len == 1) {
+        try emitAddExpr(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "first") and bc.args.len == 1) {
+        try emitFirstExpr(w, call_span, bc.args[0]);
+        return true;
+    }
+    if (std.mem.eql(u8, bc.name, "last") and bc.args.len == 1) {
+        try emitLastExpr(w, call_span, bc.args[0]);
+        return true;
+    }
+    return false;
+}
+
+const WhileKind = enum { kw_while, kw_until };
+const AnyAllKind = enum { any, all };
+
+/// Locate the offset of the `(` token that opens a builtin call. The AST
+/// records `call_span.start = name_tok.offset`; we advance past the name
+/// ident bytes and skip trivia to find the `(`.
+fn scanBuiltinLparen(src: []const u8, call_span: ast.Span) u32 {
+    var i: u32 = call_span.start;
+    while (i < src.len and isIdentByte(src[i])) : (i += 1) {}
+    const lp = scanForSkipWs(src, i, '(') orelse i;
+    return lp;
+}
+
+/// `rparen_off` for a builtin call — the AST's span ends one-past the closing
+/// `)` (see parser.zig:596 — `const end = p.lex.pos` after `rparen` consume).
+fn builtinRparenOff(call_span: ast.Span) u32 {
+    return if (call_span.end > call_span.start) call_span.end - 1 else call_span.start;
+}
+
+/// Emit `select(f)`. Legacy reference: `compileSelect` at
+/// `src/query/src/compiler.zig:3501-3535`. Bytecode:
+///   save_input                   [stamp=lparen]
+///   <f>                          [arg walk]
+///   jump_if_false -> skip        [stamp=rparen]
+///   restore_input                [stamp=rparen]
+///   jump -> done                 [stamp=rparen]
+///   skip:
+///   restore_input                [stamp=rparen]
+///   backtrack                    [stamp=rparen]
+///   done:
+fn emitSelect(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+    try w.walk(arg);
+
+    const jif_pos = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, rparen_off);
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+
+    const jmp_pos = w.raw.items.len;
+    try w.emit(.jump, .{ .index = 0 }, rparen_off);
+
+    // skip:
+    const skip_ip: u32 = @intCast(w.raw.items.len);
+    w.raw.items[jif_pos].operand = .{ .index = @intCast(skip_ip) };
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+    try w.emit(.backtrack, .{ .none = {} }, rparen_off);
+
+    // done:
+    const done_ip: u32 = @intCast(w.raw.items.len);
+    w.raw.items[jmp_pos].operand = .{ .index = @intCast(done_ip) };
+}
+
+/// Emit `map(f)`. Legacy reference: `compileMap` at
+/// `src/query/src/compiler.zig:3463-3488`. Bytecode:
+///   array_collect_start(end)     [stamp=lparen]
+///   each                         [stamp=lparen]
+///   <f>                          [arg walk]
+///   yield_output                 [stamp=arg's last]
+///   array_collect_end            [stamp=rparen]
+///   (backpatch start operand → end's raw IP)
+fn emitMap(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+    try w.emit(.each, .{ .none = {} }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+}
+
+/// Emit `map_values(f)` — legacy routes to `compileFilterArgBuiltin` with
+/// `bid = map_values_`. See `compileMapValues` at
+/// `src/query/src/compiler.zig:4029-4031` and the generic helper at
+/// `:4597-4626`. Bytecode:
+///   save_input                       [stamp=lparen]
+///   array_collect_start(end)         [stamp=lparen]
+///   each                             [stamp=lparen]
+///   <f>                              [arg walk]
+///   yield_output                     [stamp=arg's last]
+///   array_collect_end                [stamp=rparen]
+///   call_builtin(map_values_)        [stamp=rparen]
+fn emitMapValues(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    try emitFilterArgBuiltin(w, call_span, arg, .map_values_);
+}
+
+/// Generic filter-arg builtin emission. Used directly for `map_values` in
+/// Stage 10a; `sort_by` / `group_by` / `min_by` / `max_by` / `unique_by` all
+/// share the same shape and can land in a later stage by dispatching here.
+fn emitFilterArgBuiltin(
+    w: *Walker,
+    call_span: ast.Span,
+    arg: *const Node,
+    bid: types.BuiltinId,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+    try w.emit(.each, .{ .none = {} }, lparen_off);
+
+    try w.walk(arg);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+}
+
+/// Emit `walk(f)`. Legacy reference: `compileWalk` at
+/// `src/query/src/compiler.zig:4976-4994`. Bytecode:
+///   walk_start(exit_ip)          [stamp=lparen]
+///   <f>                          [arg walk]
+///   walk_end                     [stamp=rparen]
+///   (backpatch walk_start.exit → raw.len after walk_end)
+fn emitWalk(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const walk_ip: u32 = @intCast(w.raw.items.len);
+    try w.emit(.walk_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.walk_end, .{ .none = {} }, rparen_off);
+    w.raw.items[walk_ip].operand = .{ .index = @intCast(w.raw.items.len) };
+}
+
+/// Emit `while(cond; update)` or `until(cond; update)`. Legacy references:
+/// `compileWhile` (`:3553-3601`), `compileUntil` (`:3620-3673`). Both share
+/// structure; kind-specific differences are the branch layout.
+///
+/// `while` bytecode:
+///   loop_top:
+///     save_input                  [stamp=lparen]
+///     <cond>                      [arg walk]
+///     jump_if_false -> loop_exit  [stamp=semi]
+///     restore_input               [stamp=semi]
+///     yield_output                [stamp=semi]
+///     <update>                    [arg walk]
+///     pipe                        [stamp=rparen]
+///     jump -> loop_top            [stamp=rparen]
+///   loop_exit:
+///     restore_input               [stamp=rparen]
+///     backtrack                   [stamp=rparen]
+///
+/// `until` bytecode:
+///   loop_top:
+///     save_input                  [stamp=lparen]
+///     <cond>                      [arg walk]
+///     jump_if_false -> loop_body  [stamp=semi]
+///     restore_input               [stamp=semi]
+///     jump -> loop_done           [stamp=semi]
+///   loop_body:
+///     restore_input               [stamp=semi]
+///     <update>                    [arg walk]
+///     pipe                        [stamp=rparen]
+///     jump -> loop_top            [stamp=rparen]
+///   loop_done:
+///     push_current                [stamp=rparen]
+fn emitWhileUntil(
+    w: *Walker,
+    call_span: ast.Span,
+    cond: *const Node,
+    update: *const Node,
+    kind: WhileKind,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+    const semi_off = scanForSkipWs(w.src, cond.span.end, ';') orelse cond.span.end;
+
+    const loop_top: u32 = @intCast(w.raw.items.len);
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+
+    try w.walk(cond);
+
+    const jif_pos = w.raw.items.len;
+    try w.emit(.jump_if_false, .{ .index = 0 }, semi_off);
+
+    switch (kind) {
+        .kw_while => {
+            // True path: restore + output + update + pipe + jump loop_top.
+            try w.emit(.restore_input, .{ .none = {} }, semi_off);
+            try w.emit(.yield_output, .{ .none = {} }, semi_off);
+
+            try w.walk(update);
+
+            try w.emit(.pipe, .{ .none = {} }, rparen_off);
+            try w.emit(.jump, .{ .index = @intCast(loop_top) }, rparen_off);
+
+            // loop_exit:
+            const loop_exit: u32 = @intCast(w.raw.items.len);
+            w.raw.items[jif_pos].operand = .{ .index = @intCast(loop_exit) };
+
+            try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+            try w.emit(.backtrack, .{ .none = {} }, rparen_off);
+        },
+        .kw_until => {
+            // True path: condition met — restore and jump to done.
+            try w.emit(.restore_input, .{ .none = {} }, semi_off);
+
+            const jmp_done_pos = w.raw.items.len;
+            try w.emit(.jump, .{ .index = 0 }, semi_off);
+
+            // loop_body:
+            const loop_body: u32 = @intCast(w.raw.items.len);
+            w.raw.items[jif_pos].operand = .{ .index = @intCast(loop_body) };
+
+            try w.emit(.restore_input, .{ .none = {} }, semi_off);
+            try w.walk(update);
+
+            try w.emit(.pipe, .{ .none = {} }, rparen_off);
+            try w.emit(.jump, .{ .index = @intCast(loop_top) }, rparen_off);
+
+            // loop_done:
+            const loop_done: u32 = @intCast(w.raw.items.len);
+            w.raw.items[jmp_done_pos].operand = .{ .index = @intCast(loop_done) };
+
+            try w.emit(.push_current, .{ .none = {} }, rparen_off);
+        },
+    }
+}
+
+/// Emit `repeat(f)`. Legacy reference: `compileRepeat` at
+/// `src/query/src/compiler.zig:3684-3705`. Bytecode:
+///   loop_top:
+///     yield_output                [stamp=lparen]
+///     <f>                         [arg walk]
+///     pipe                        [stamp=rparen]
+///     jump -> loop_top            [stamp=rparen]
+/// Infinite loop — bounded by caller (`limit`, `first`, `label`/`break`).
+fn emitRepeat(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const loop_top: u32 = @intCast(w.raw.items.len);
+    try w.emit(.yield_output, .{ .none = {} }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.jump, .{ .index = @intCast(loop_top) }, rparen_off);
+}
+
+/// Emit `any(f)` / `all(f)` / `any(gen; cond)` / `all(gen; cond)`. Legacy
+/// reference: `compileAnyAll` at `src/query/src/compiler.zig:4667-4708`.
+///
+/// 1-arg bytecode:
+///   array_collect_start(end)     [stamp=lparen]
+///   each                         [INSERTED at start+1, stamp=0 default]
+///   <f>                          [arg walk]
+///   yield_output                 [stamp=arg's last]
+///   array_collect_end            [stamp=rparen]
+///   pipe                         [stamp=rparen]
+///   call_builtin(any|all)        [stamp=rparen]
+///
+/// Legacy uses `insertRawInstr(start_pos + 1, each)` AFTER the arg walk, so
+/// the inserted `each`'s src_offset = 0 (RawInstr literal default). All
+/// jump/fork IPs inside the arg that pointed past `start_pos+1` get bumped
+/// by +1 — this is the key reason for the `insertRawInstr` approach.
+///
+/// 2-arg bytecode:
+///   array_collect_start(end)     [stamp=lparen]
+///   <gen>                        [arg walk]
+///   pipe                         [stamp=semi]
+///   <cond>                       [arg walk]
+///   yield_output                 [stamp=cond's last]
+///   array_collect_end            [stamp=rparen]
+///   pipe                         [stamp=rparen]
+///   call_builtin(any|all)        [stamp=rparen]
+fn emitAnyAll(
+    w: *Walker,
+    call_span: ast.Span,
+    first: *const Node,
+    maybe_second: ?*const Node,
+    kind: AnyAllKind,
+) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(first);
+
+    if (maybe_second) |second| {
+        const semi_off = scanForSkipWs(w.src, first.span.end, ';') orelse first.span.end;
+        try w.emit(.pipe, .{ .none = {} }, semi_off);
+        try w.walk(second);
+    } else {
+        // 1-arg form — insert `each` AFTER the arg walk at start_pos+1.
+        // Legacy's `insertRawInstr` emits with src_offset=0 (default).
+        try insertRawInstr(w, start_pos + 1, .{
+            .op = .each,
+            .operand = .{ .none = {} },
+            .src_offset = 0,
+        });
+    }
+
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    const bid: types.BuiltinId = switch (kind) {
+        .any => .any,
+        .all => .all,
+    };
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(bid) }, rparen_off);
+}
+
+/// Emit `add(f)` — parens form that collects a generator into an array then
+/// calls the zero-arg `add` builtin. Legacy reference: `compileAddExpr` at
+/// `src/query/src/compiler.zig:4718-4754`. Bytecode:
+///   save_input                   [stamp=lparen]
+///   array_collect_start(end)     [stamp=lparen]
+///   <f>                          [arg walk]
+///   yield_output                 [stamp=arg's last]
+///   array_collect_end            [stamp=rparen]
+///   pipe                         [stamp=rparen]
+///   call_builtin(add)            [stamp=rparen]
+///   restore_input                [stamp=rparen]
+fn emitAddExpr(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.save_input, .{ .none = {} }, lparen_off);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.call_builtin, .{ .index = @intFromEnum(types.BuiltinId.add) }, rparen_off);
+    try w.emit(.restore_input, .{ .none = {} }, rparen_off);
+}
+
+/// Emit `first(f)`. Legacy reference: `compileFirst` at
+/// `src/query/src/compiler.zig:4758-4780`. Desugars to `limit(1; f)` using
+/// the streaming `limit_start` opcode. Bytecode:
+///   push_int(1)                  [stamp=lparen]
+///   limit_start(exit_ip)         [stamp=lparen]
+///   <f>                          [arg walk]
+///   yield_output                 [stamp=rparen]
+///   (backpatch limit_start.exit → raw.len after yield)
+///
+/// Stamp note: legacy's `ctx.nextToken()` consumes the closing `)` BEFORE
+/// the final `emit(yield_output, …)`, so `yield_output.src_offset =
+/// rparen.offset`. The walker matches by stamping `rparen_off` explicitly
+/// rather than falling through to `w.last_emit_offset` (which would be the
+/// arg's last token offset — wrong by the legacy's exact emission order).
+fn emitFirstExpr(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    try w.emit(.push_int, .{ .int = 1 }, lparen_off);
+
+    const limit_ip: u32 = @intCast(w.raw.items.len);
+    try w.emit(.limit_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+
+    try w.emit(.yield_output, .{ .none = {} }, rparen_off);
+
+    w.raw.items[limit_ip].operand = .{ .index = @intCast(w.raw.items.len) };
+}
+
+/// Emit `last(f)`. Legacy reference: `compileLast` at
+/// `src/query/src/compiler.zig:4783-4804`. Collects `[f]` into an array then
+/// loads index -1. Bytecode:
+///   array_collect_start(end)     [stamp=lparen]
+///   <f>                          [arg walk]
+///   yield_output                 [stamp=arg's last]
+///   array_collect_end            [stamp=rparen]
+///   pipe                         [stamp=rparen]
+///   load_index(-1)               [stamp=rparen]
+fn emitLastExpr(w: *Walker, call_span: ast.Span, arg: *const Node) Walker.Error!void {
+    const lparen_off = scanBuiltinLparen(w.src, call_span);
+    const rparen_off = builtinRparenOff(call_span);
+
+    const start_pos = w.raw.items.len;
+    try w.emit(.array_collect_start, .{ .index = 0 }, lparen_off);
+
+    try w.walk(arg);
+    try w.emit(.yield_output, .{ .none = {} }, w.last_emit_offset);
+
+    const end_pos: u32 = @intCast(w.raw.items.len);
+    try w.emit(.array_collect_end, .{ .none = {} }, rparen_off);
+    w.raw.items[start_pos].operand = .{ .index = @intCast(end_pos) };
+
+    try w.emit(.pipe, .{ .none = {} }, rparen_off);
+    try w.emit(.load_index, .{ .index = -1 }, rparen_off);
+}
+
 // ── insertRawInstr ────────────────────────────────────────────────────────────
 
 /// Insert `instr` at position `pos`, shifting later instructions forward by
@@ -4354,7 +4906,25 @@ fn fuse(
                 // Stage 9: call_filter_arg / def_function / pop_variable
                 // carry index operands (param index / var id) — pass through.
                 .call_filter_arg, .def_function => .{ .index = r.operand.index },
-                else => .{ .none = {} },
+                // Stage 10a: generator/reducing builtin opcodes. Each `_start`
+                // opcode carries a raw-IP exit operand pointing at the end of
+                // its scope that must be remapped through `index_map`. Mirrors
+                // legacy's fuse at `src/query/src/compiler.zig:7462-7480`.
+                .limit_start, .walk_start, .skip_start, .nth_start => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .limit_end, .walk_end, .skip_end => .{ .none = {} },
+                // Stage 10a: label_begin carries an exit_ip (remapped) like
+                // limit_start. label_end / break_op carry no operand. Mirrors
+                // legacy's fuse at `:7454-7460`.
+                .label_begin => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .label_end, .break_op => .{ .none = {} },
             },
         };
     }

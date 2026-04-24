@@ -58,7 +58,26 @@ Last verified: 2026-04-23.
    risk register, and cutover strategy.
 
    **Remaining stages (per plan §4):**
-   - Stage 10: generators and reducing builtins.
+   - Stage 10 — SPLIT into 10a / 10b / 10c for bite-sized byte-equivalence
+     verification. The full Stage 10 builtin surface (~26 entries) carries
+     enough per-builtin emission quirks (EXPR-after-INIT reorder in reduce /
+     foreach, hidden var-id allocation in lock-step with legacy, label-frame
+     plumbing, Cartesian-product argument collection, path-expression
+     embedding in del/pick) that landing it in one commit would pile
+     divergences faster than the harness could surface them.
+     - Stage 10a (landed): `select`, `map`, `map_values`, `walk`, `while`,
+       `until`, `repeat`, `any` / `all` (0/1/2-arg), `add(f)`, `first(f)`,
+       `last(f)`. Straight `( arg )` descent with no reorder / no hidden
+       vars. Dispatch lives in `dispatchStage10aBuiltin` at
+       `src/ast/compiler.zig`; per-builtin emitters follow.
+     - Stage 10b (pending): `reduce`, `foreach`, `label`/`break`, `range`
+       (1/2/3-arg), `limit`, `skip`, `nth`. These need `rebaseExprBuf` —
+       already ported to the walker at Stage 8 for `assign_general` — plus
+       `parseArgToArray` equivalents for collecting generator args into
+       arrays, plus label-frame emission for `label`/`break`.
+     - Stage 10c (pending): `del`, `pick`, `INDEX`, `IN`, `JOIN`. These
+       each desugar to a larger reduce/setpath pattern and depend on
+       Stage 10b's reduce machinery landing first.
    - Stage 11: regex builtins and string-ops remainder.
    - Stage 12: prefilter integration (fold into single AST pass).
    - Stage 13: cutover — delete legacy compiler, swap in walker.

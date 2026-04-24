@@ -669,3 +669,120 @@ pub const stage9_supported: []const []const u8 = &.{
 /// Stage 9 node kind (func_def, func_call, filter-arg substitution,
 /// recursion) is handled.
 pub const stage9_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 10a — generator/reducing builtins with a simple
+/// `(arg)` or `(arg; arg)` descent shape and no EXPR-after-INIT reorder:
+/// `select`, `map`, `map_values`, `walk`, `while`, `until`, `repeat`,
+/// `any`/`all` (0/1/2-arg), `add(f)`, `first(f)`, `last(f)`.
+///
+/// Stage 10b / 10c will extend coverage to `reduce`, `foreach`, `label`/
+/// `break`, `range`, `limit`, `skip`, `nth`, `del`, `pick`, `INDEX`, `IN`,
+/// `JOIN` — each of which requires additional semantics (EXPR-buffer
+/// reorder, multi-arg Cartesian product collection, hidden-variable
+/// allocation in lock-step with legacy, `?//`-style alternate emission,
+/// or label-frame/break-token plumbing).
+///
+/// Every entry must yield byte-identical `Instruction[]` + `source_map`
+/// across the legacy compiler and the AST walker.
+pub const stage10a_supported: []const []const u8 = &.{
+    // ── select(f) ──────────────────────────────────────────────────
+    "select(.a)",
+    "select(. > 2)",
+    "select(.active)",
+    "select(.a == null)",
+    "select(true)",
+    "[1,2,3,4,5] | map(select(. > 2))",
+
+    // ── map(f) ─────────────────────────────────────────────────────
+    "map(.)",
+    "map(. * 2)",
+    "map(.name)",
+    "map(.a + .b)",
+    "[1,2,3] | map(. + 1)",
+    ".items | map(.name)",
+
+    // ── map_values(f) — filter-arg builtin shape ───────────────────
+    "map_values(.)",
+    "map_values(. + 10)",
+    "map_values(. * 2)",
+
+    // ── walk(f) ────────────────────────────────────────────────────
+    "walk(.)",
+    "walk(. + 0)",
+    "[1, [2, 3]] | walk(.)",
+
+    // ── while(cond; update) ────────────────────────────────────────
+    "while(. < 100; . * 2)",
+    "1 | while(. < 10; . + 1)",
+    "while(. > 0; . - 1)",
+
+    // ── until(cond; update) ────────────────────────────────────────
+    "until(. >= 10; . + 1)",
+    "0 | until(. == 5; . + 1)",
+
+    // ── repeat(f) — emitted bytecode is an infinite loop; verified at
+    //    compile time only (no runtime bound in harness). ─────────
+    "repeat(. + 1)",
+    "repeat(.)",
+
+    // ── any / all — zero-arg (bare ident), 1-arg, 2-arg ────────────
+    "any",
+    "all",
+    "any(.a)",
+    "all(.a)",
+    "any(.active)",
+    "all(.valid == true)",
+    ".items | any(.active)",
+    "any(.items[]; .active)",
+    "all(.items[]; .valid)",
+
+    // ── add / add(f) ───────────────────────────────────────────────
+    "add",
+    "add(.)",
+    "add(.items[])",
+    "add(.a, .b)",
+
+    // ── first(f) / last(f) — parens form (bare first/last are Stage
+    //    1/2 already via field_access("first")/field_access("last")).
+    "first(.)",
+    "last(.)",
+    "first(.items[])",
+    "last(.items[])",
+
+    // ── Intersection with earlier stages ──────────────────────────
+    "map(select(. > 0))",
+    ".items[] | select(.a == .b)",
+    "{a: map(. + 1)}",
+    "[map(.)]",
+    "def f: map(. + 1); f",
+    ". as $x | select($x > 0)",
+};
+
+/// Stage 10a fixtures that require later-stage coverage. The AST walker
+/// currently returns `AstCompilerStageIncomplete` for these; Stage 10b/10c
+/// will move them into `stage10a_supported`.
+pub const stage10a_unsupported: []const []const u8 = &.{
+    // `reduce` / `foreach` — EXPR-after-INIT reorder, Stage 10b.
+    "reduce .[] as $x (0; . + $x)",
+    "foreach .[] as $x (0; . + $x; .)",
+    // `label` / `break` — label-frame emission, Stage 10b.
+    "label $out | 1",
+    // `range` (1/2/3-arg) — parseArgToArray + Cartesian product, Stage 10b.
+    "range(5)",
+    "range(1; 4)",
+    "range(0; 10; 2)",
+    // `limit` / `skip` / `nth` — parseArgToArray with hidden var, Stage 10b.
+    "limit(3; range(10))",
+    "skip(2; range(5))",
+    "nth(2; range(10))",
+    // `del` / `pick` — path arg + delpaths, Stage 10c.
+    "del(.a)",
+    "pick(.a)",
+    // `INDEX` / `IN` / `JOIN` — reduce desugar, Stage 10c.
+    // NOTE: legacy's `compileINDEX` requires a 2-arg form; `INDEX(.id)` is
+    // actually a compile error in legacy too, so the harness contract
+    // ("unsupported = legacy accepts, walker rejects") would fail. Using a
+    // 2-arg form instead so the fixture has legacy parity.
+    "INDEX([{id:1}][]; .id)",
+    "IN(1, 2, 3)",
+};
