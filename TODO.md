@@ -8,7 +8,7 @@ Last verified: 2026-04-23.
 
 ## Active
 
-1. **AST-walk compile pipeline (Phase 2) — Stages 0–8 landed; 9–13 remaining.**
+1. **AST-walk compile pipeline (Phase 2) — Stages 0–9 landed; 10–13 remaining.**
    The AST parser in `src/ast/` is the source of truth for the LSP
    (`src/lsp/`) and, since commit `f01eeed`, for the compiler's prefilter
    harvester (`harvestPrefilterFromAst` at
@@ -19,10 +19,10 @@ Last verified: 2026-04-23.
    canonical representation (see `CLAUDE.md` §3).
 
    **Complete:** Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5
-   + Stage 6 + Stage 7 + Stage 8. Walker covers: literal/identity/recurse/
-   unary_neg (Stage 1), field_access/index_access/iterate/slice/suffix
-   chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including the
-   legacy FORK/JUMP chain emission via `insertRawInstr`),
+   + Stage 6 + Stage 7 + Stage 8 + Stage 9. Walker covers: literal/identity/
+   recurse/unary_neg (Stage 1), field_access/index_access/iterate/slice/
+   suffix chains with `?` (Stage 2), pipe/comma chains (Stage 3 — including
+   the legacy FORK/JUMP chain emission via `insertRawInstr`),
    variables/`as`-patterns/destructuring/`?//` (Stage 4 — mirrors legacy's
    pattern emit sequence with per-final-pattern-token src_offset stamping
    inside `?//` bodies), arithmetic/comparison/logical/alternative `//`
@@ -39,7 +39,15 @@ Last verified: 2026-04-23.
    new `assign_general` node covering `(.a, .b) = 1`, `.items[] |= f`,
    `(.a | .b) = v` etc., with legacy byte-identical src_offset stamping
    via a source-byte scanner that reproduces `parseUpdateAssign`'s
-   partial-consume-then-fallback behavior).
+   partial-consume-then-fallback behavior), and user-defined functions
+   with value/filter params, recursion detection + `call_function` IP
+   patching, inner-def lexical scoping, and filter-arg AST subtree
+   substitution (Stage 9 — replaces legacy's source-range re-parse with
+   AST subtree re-walk; scanning_body mode keeps `next_var_id` in
+   lock-step with legacy during func_def body-scan pass; zero-arg
+   builtin dispatch via `zeroArgBuiltinId` routes `length`/`keys`/etc.
+   to `call_builtin` with the same shadowing-is-inert semantics as
+   legacy).
    The walker lives at `src/ast/compiler.zig`. The equivalence harness lives
    at `tests/ast_compile_equiv.zig` (+ `tests/ast_compile_equiv_fixtures.zig`)
    and runs via `zig build ast-compile-equiv`. Every other AST node kind
@@ -50,7 +58,6 @@ Last verified: 2026-04-23.
    risk register, and cutover strategy.
 
    **Remaining stages (per plan §4):**
-   - Stage 9: user-defined functions, filter args, recursion.
    - Stage 10: generators and reducing builtins.
    - Stage 11: regex builtins and string-ops remainder.
    - Stage 12: prefilter integration (fold into single AST pass).

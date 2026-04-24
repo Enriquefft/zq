@@ -1,4 +1,4 @@
-//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7).
+//! AST-walk compile pipeline — Phase 2 (Stage 0 + Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6 + Stage 7 + Stage 8 + Stage 9).
 //!
 //! Goal: walk the `src/ast/parser.zig`-produced AST and emit bytecode byte-for-byte
 //! equivalent to the legacy token-driven compiler at `src/query/src/compiler.zig`.
@@ -146,10 +146,17 @@ pub fn compileWithExternals(
         .intern = .{},
         .scope_vars = .{},
         .scope_marks = .{},
+        .func_table = .{},
+        .filter_bindings = .{},
     };
     defer walker.raw.deinit(alloc);
     defer walker.scope_vars.deinit(alloc);
     defer walker.scope_marks.deinit(alloc);
+    defer {
+        for (walker.func_table.items) |entry| alloc.free(entry.params);
+        walker.func_table.deinit(alloc);
+    }
+    defer walker.filter_bindings.deinit(alloc);
     var intern_consumed = false;
     defer if (!intern_consumed) walker.intern.deinit(alloc);
 
@@ -201,12 +208,68 @@ const RawInstr = extern struct {
 /// Stage 4 — variable scope entry. A name→id mapping added whenever an
 /// `as` pattern declares a new variable. Legacy's `VariableScope` at
 /// `src/query/src/compiler.zig:186` is a linked list of per-function-body
-/// scopes; Stage 4's walker has no user functions (Stage 9), so a single
-/// flat list of entries with shadow-by-update semantics (see
-/// `declareVariable` at `compiler.zig:312`) is sufficient.
+/// scopes; the walker uses a flat list with scope marks to track push/pop
+/// boundaries. Stage 9 added function-body scopes (push on func_def,
+/// pop after walking rest / at end of expansion).
 const VarEntry = struct {
     name: []const u8,
     id: u32,
+};
+
+// ── Stage 9 — user-function support ─────────────────────────────────────────
+
+/// One parameter of a user-defined function. `parse_var_id` mirrors legacy's
+/// `ParamInfo.var_id` for value params (`$name`) — allocated in
+/// `parseFunctionDef` BEFORE body parsing. Filter params (`name`) don't need
+/// a var_id; their `parse_var_id` is unused. `body_scope_var_id` is the
+/// additional id legacy's body-scope `declareVariable` allocates for every
+/// param (value or filter) at `src/query/src/compiler.zig:6695-6702`; we
+/// record it to keep `next_var_id` in lock-step with legacy's counter.
+const FuncParam = struct {
+    name: []const u8,
+    is_filter: bool,
+    parse_var_id: u32,
+    body_scope_var_id: u32,
+};
+
+/// A registered user-defined function. `body_node` is the AST subtree of the
+/// function body; the walker recompiles it per-call (non-recursive) or once
+/// in the recursive trampoline (recursive).
+const FuncEntry = struct {
+    name: []const u8,
+    params: []FuncParam,
+    body_node: *const Node,
+    is_recursive: bool,
+    /// For recursive functions: raw-instr offset where the body was emitted.
+    /// 0 means not yet emitted. Set on first call-site expansion; subsequent
+    /// expansions reuse it. Mirrors legacy's `recursive_body_ip`.
+    recursive_body_ip: u32,
+    /// Lexical scope snapshot: length of `func_table` at registration time.
+    /// During body re-emission, entries in `[func_table_snapshot, outer_len)`
+    /// are hidden from lookups, enforcing jq's lexical scoping.
+    func_table_snapshot: usize,
+
+    fn paramCount(self: *const FuncEntry) u8 {
+        return @intCast(self.params.len);
+    }
+};
+
+/// Active binding from a filter-parameter name to the caller's AST argument
+/// subtree. When the body walker hits a `field_access`/`func_call` whose
+/// name matches an active binding, it emits the binding's AST subtree in
+/// place (with the CALLER's scope/binding state restored per legacy's
+/// `reParseBodyWithBindings` at `src/query/src/compiler.zig:1125`).
+const FilterBinding = struct {
+    name: []const u8,
+    arg_node: *const Node,
+    /// Length of the filter_bindings stack at the moment this binding was
+    /// PUSHED — i.e. the stack position of the NEXT binding pushed at or
+    /// above it. When the walker re-emits this binding's arg subtree, it
+    /// temporarily truncates the stack to this index so a filter-arg whose
+    /// value is another filter-arg name (pass-through) doesn't resolve to
+    /// itself. Mirrors legacy's `ctx.filter_arg_bindings.items.len = bk`
+    /// trick at `src/query/src/compiler.zig:6216`.
+    hide_from_index: usize,
 };
 
 const Walker = struct {
@@ -242,6 +305,35 @@ const Walker = struct {
     /// Stage 4 shapes but populated as groundwork for Stage 9). Pushed on
     /// `pushScope`, popped on `popScope`.
     scope_marks: std.ArrayList(usize),
+
+    // ── Stage 9 — user-function state ─────────────────────────────────────
+    /// Registered user-defined functions. Append-only during func_def
+    /// processing; entries may be temporarily hidden via `func_hidden_*`
+    /// during recursive/lexically-scoped body re-emission.
+    func_table: std.ArrayList(FuncEntry),
+    /// Active filter-arg bindings. Pushed when a non-recursive function is
+    /// expanded with filter args; popped after the body emits. Nested calls
+    /// stack their bindings on top.
+    filter_bindings: std.ArrayList(FilterBinding),
+    /// Lexical-scoping hidden range — functions in `[start, end)` are
+    /// skipped by `lookupUserFunc` during body re-emission. Matches legacy's
+    /// `func_hidden_start/_end` at `src/query/src/compiler.zig:107-108`.
+    func_hidden_start: ?usize = null,
+    func_hidden_end: ?usize = null,
+    /// Index of the function currently being emitted in its recursive-body
+    /// trampoline. Self-refs emit `call_function(recursive_body_ip)` instead
+    /// of re-entering `expandFunctionCall` (which would infinite-loop).
+    /// Matches legacy's `expanding_recursive_func` at
+    /// `src/query/src/compiler.zig:100`.
+    expanding_recursive_func: ?usize = null,
+    /// When true, the walker is in "scan-only" mode: inside a function-def
+    /// body-scan pass that advances `next_var_id` to match legacy's
+    /// counter without actually committing state. Function calls emitted
+    /// during the scan are NOT expanded (they emit `load_key` placeholders
+    /// that get discarded when the caller truncates the raw buffer), and
+    /// `recursive_body_ip` is NOT mutated. Mirrors legacy's
+    /// `scanning_body` at `src/query/src/compiler.zig:95`.
+    scanning_body: bool = false,
 
     const Error = error{ OutOfMemory, AstCompilerStageIncomplete, AstCompileError };
 
@@ -474,12 +566,20 @@ const Walker = struct {
             // ── Stage 2: field access / index access / iterate / slice ──
 
             .field_access => |fa| {
-                // `.foo` (bare) — emit load_key(foo). Legacy stamps src_offset
-                // with the offset of the `foo` ident token. For `.["k"]` the
-                // legacy path stamps `]`.offset (parseBracket consumes `]`
-                // via nextToken, setting last_tok_offset before the emit).
-                // We discriminate by inspecting the source byte after the
-                // leading `.` to pick the correct stamp location.
+                // Stage 9 — if the field_access is a BARE ident (span doesn't
+                // start with `.`) and it matches an active filter-arg binding
+                // OR a registered zero-arg user function OR the currently-
+                // expanding recursive function, dispatch to the user-function
+                // path instead of emitting load_key. This mirrors legacy's
+                // ident-dispatch at `src/query/src/compiler.zig:6200-6250`.
+                //
+                // A leading `.` means this is `.name` (legit field access), so
+                // the user-func check is skipped.
+                const starts_with_dot = node.span.start < w.src.len and
+                    w.src[node.span.start] == '.';
+                if (!starts_with_dot) {
+                    if (try tryDispatchBareIdent(w, fa.name, node.span)) return;
+                }
                 const ref = try internStr(&w.intern, w.alloc, fa.name);
                 const src_off = stampFieldAccessOrBracket(w.src, node.span, fa.name);
                 try w.emit(.load_key, .{ .str_ref = ref }, src_off);
@@ -1123,6 +1223,28 @@ const Walker = struct {
                         return;
                     }
                 }
+
+                // Stage 9 — zero-arg builtin dispatch. The AST parser emits
+                // `builtin_call(name, [])` for bare identifiers that match
+                // `isZeroArgBuiltin` (e.g. `length`, `keys`). Legacy's
+                // `zeroArgBuiltinId` at `src/query/src/compiler.zig:2874`
+                // emits `call_builtin(bid)` stamped at `last_tok_offset` =
+                // ident offset (= node.span.start for a bare-ident call).
+                //
+                // User-defined functions that SHADOW a zero-arg builtin do
+                // NOT win: legacy at `src/query/src/compiler.zig:5896-5906`
+                // checks `zeroArgBuiltinId` BEFORE user-function lookup for
+                // bare idents. We match.
+                if (bc.args.len == 0) {
+                    if (zeroArgBuiltinId(bc.name)) |bid| {
+                        try w.emit(
+                            .call_builtin,
+                            .{ .index = @intFromEnum(bid) },
+                            node.span.start,
+                        );
+                        return;
+                    }
+                }
                 return error.AstCompilerStageIncomplete;
             },
 
@@ -1134,6 +1256,28 @@ const Walker = struct {
                 // stays at Stage 9/10.
                 if (std.mem.eql(u8, fc.name, "path") and fc.args.len == 1) {
                     try emitPathCall(w, node.span, fc.args[0]);
+                    return;
+                }
+
+                // Stage 9 — user-defined function call with arguments.
+                // During scanning_body, legacy emits a placeholder load_key
+                // (the instrs are discarded by the caller). We mirror by
+                // walking the args for var_id burn simulation and emitting
+                // a cheap placeholder that gets truncated.
+                const arity: u8 = @intCast(fc.args.len);
+                if (w.scanning_body) {
+                    if (lookupUserFunc(w, fc.name, arity) != null) {
+                        // Walk args so any var_id burns inside them
+                        // (e.g. `as` patterns) update next_var_id.
+                        for (fc.args) |arg| try w.walk(arg);
+                        const ref = try internStr(&w.intern, w.alloc, fc.name);
+                        try w.emit(.load_key, .{ .str_ref = ref }, node.span.start);
+                        return;
+                    }
+                    return error.AstCompilerStageIncomplete;
+                }
+                if (lookupUserFunc(w, fc.name, arity)) |idx| {
+                    try expandFunctionCall(w, idx, fc.args, node.span);
                     return;
                 }
                 return error.AstCompilerStageIncomplete;
@@ -1291,8 +1435,11 @@ const Walker = struct {
                 try emitGeneralAssign(w, ag);
             },
 
+            // ── Stage 9: user functions, filter args, recursion ─────────
+
+            .func_def => |fd| try emitFuncDef(w, fd),
+
             // ── Scaffold boundary: every other kind is a future stage. ──
-            .func_def,
             .reduce,
             .foreach,
             .label_expr,
@@ -3325,6 +3472,671 @@ fn emitGeneralAlternativeUpdate(
     try w.emit(.load_variable, .{ .index = @intCast(acc_var) }, after_rhs_stamp);
 }
 
+// ── Stage 9 helpers: user functions, filter args, recursion ────────────────
+
+/// Map a bare-ident name to a zero-arg BuiltinId. Mirrors legacy's
+/// `zeroArgBuiltinId` at `src/query/src/compiler.zig:2874`. Returns null if
+/// the name isn't a recognized zero-arg builtin.
+fn zeroArgBuiltinId(name: []const u8) ?types.BuiltinId {
+    if (std.mem.eql(u8, name, "length")) return .length;
+    if (std.mem.eql(u8, name, "keys")) return .keys;
+    if (std.mem.eql(u8, name, "keys_unsorted")) return .keys_unsorted;
+    if (std.mem.eql(u8, name, "values")) return .values;
+    if (std.mem.eql(u8, name, "type")) return .type_;
+    if (std.mem.eql(u8, name, "empty")) return .empty;
+    if (std.mem.eql(u8, name, "tostring")) return .tostring;
+    if (std.mem.eql(u8, name, "tonumber")) return .tonumber;
+    if (std.mem.eql(u8, name, "error")) return .error_;
+    if (std.mem.eql(u8, name, "add")) return .add;
+    if (std.mem.eql(u8, name, "sort")) return .sort;
+    if (std.mem.eql(u8, name, "reverse")) return .reverse;
+    if (std.mem.eql(u8, name, "flatten")) return .flatten;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "to_entries")) return .to_entries;
+    if (std.mem.eql(u8, name, "from_entries")) return .from_entries;
+    if (std.mem.eql(u8, name, "any")) return .any;
+    if (std.mem.eql(u8, name, "all")) return .all;
+    if (std.mem.eql(u8, name, "unique")) return .unique;
+    if (std.mem.eql(u8, name, "paths")) return .paths;
+    if (std.mem.eql(u8, name, "leaf_paths")) return .leaf_paths;
+    if (std.mem.eql(u8, name, "recurse")) return .recurse;
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+    if (std.mem.eql(u8, name, "floor")) return .floor_;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil_;
+    if (std.mem.eql(u8, name, "round")) return .round_;
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt_;
+    if (std.mem.eql(u8, name, "fabs")) return .fabs_;
+    if (std.mem.eql(u8, name, "nan")) return .nan_;
+    if (std.mem.eql(u8, name, "infinite")) return .infinite_;
+    if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_;
+    if (std.mem.eql(u8, name, "isnan")) return .isnan_;
+    if (std.mem.eql(u8, name, "isnormal")) return .isnormal_;
+    if (std.mem.eql(u8, name, "exp")) return .exp_;
+    if (std.mem.eql(u8, name, "exp2")) return .exp2_;
+    if (std.mem.eql(u8, name, "exp10")) return .exp10_;
+    if (std.mem.eql(u8, name, "log")) return .log_;
+    if (std.mem.eql(u8, name, "log2")) return .log2_;
+    if (std.mem.eql(u8, name, "log10")) return .log10_;
+    if (std.mem.eql(u8, name, "cbrt")) return .cbrt_;
+    if (std.mem.eql(u8, name, "sin")) return .sin_;
+    if (std.mem.eql(u8, name, "cos")) return .cos_;
+    if (std.mem.eql(u8, name, "tan")) return .tan_;
+    if (std.mem.eql(u8, name, "asin")) return .asin_;
+    if (std.mem.eql(u8, name, "acos")) return .acos_;
+    if (std.mem.eql(u8, name, "atan")) return .atan_;
+    if (std.mem.eql(u8, name, "rint")) return .rint_;
+    if (std.mem.eql(u8, name, "nearbyint")) return .nearbyint_;
+    if (std.mem.eql(u8, name, "trunc")) return .trunc_;
+    if (std.mem.eql(u8, name, "ascii_downcase")) return .ascii_downcase;
+    if (std.mem.eql(u8, name, "ascii_upcase")) return .ascii_upcase;
+    if (std.mem.eql(u8, name, "ascii")) return .ascii_;
+    if (std.mem.eql(u8, name, "explode")) return .explode_;
+    if (std.mem.eql(u8, name, "implode")) return .implode_;
+    if (std.mem.eql(u8, name, "tojson")) return .tojson;
+    if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
+    if (std.mem.eql(u8, name, "transpose")) return .transpose_;
+    return null;
+}
+
+/// Look up a user-defined function by name and arity. Respects the
+/// `func_hidden_*` range for lexical scoping during body re-emission.
+/// Searches backward so the latest (innermost/shadowing) def wins. Mirrors
+/// legacy's `lookupFunction` at `src/query/src/compiler.zig:1018`.
+fn lookupUserFunc(w: *Walker, name: []const u8, arity: u8) ?usize {
+    var i = w.func_table.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (w.func_hidden_start) |start| {
+            if (w.func_hidden_end) |end| {
+                if (i >= start and i < end) continue;
+            }
+        }
+        const entry = &w.func_table.items[i];
+        if (entry.paramCount() == arity and std.mem.eql(u8, entry.name, name)) {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Handle bare-ident lookup in the walker: filter bindings first, then
+/// recursive self-call (if we're emitting a recursive body), then user
+/// function (zero-arg) lookup. Returns true if the walker dispatched the
+/// emission; false if the caller should fall through to load_key.
+fn tryDispatchBareIdent(
+    w: *Walker,
+    name: []const u8,
+    span: ast.Span,
+) Walker.Error!bool {
+    // During the initial body-scan pass (`scanning_body=true`), skip
+    // user-function expansion. This matches legacy's `scanning_body`
+    // guard at `src/query/src/compiler.zig:6230` which only dispatches
+    // user-func calls when NOT scanning. The body-scan emits a
+    // `load_key` placeholder (our caller's default) whose raw-buffer
+    // entries are discarded when the scan returns.
+    if (w.scanning_body) return false;
+
+    // Filter-arg binding (innermost first) — the body references a filter
+    // parameter by name, so re-emit the caller's arg AST subtree. Legacy
+    // mirror: `src/query/src/compiler.zig:6200-6227`.
+    var bk = w.filter_bindings.items.len;
+    while (bk > 0) {
+        bk -= 1;
+        const binding = &w.filter_bindings.items[bk];
+        if (std.mem.eql(u8, binding.name, name)) {
+            try expandFilterArg(w, binding.*);
+            return true;
+        }
+    }
+
+    // Recursive self-call: the walker is currently emitting a function's
+    // recursive body, and the body references the function itself. Emit
+    // `call_function(recursive_body_ip)` directly (no re-expansion). Legacy
+    // mirror: `src/query/src/compiler.zig:6234-6241`.
+    if (w.expanding_recursive_func) |expanding_idx| {
+        const exp = &w.func_table.items[expanding_idx];
+        if (exp.paramCount() == 0 and std.mem.eql(u8, exp.name, name)) {
+            try w.emit(
+                .call_function,
+                .{ .index = @intCast(exp.recursive_body_ip) },
+                span.start,
+            );
+            return true;
+        }
+    }
+
+    // Zero-arg user function lookup.
+    if (lookupUserFunc(w, name, 0)) |idx| {
+        try expandFunctionCall(w, idx, &.{}, span);
+        return true;
+    }
+
+    return false;
+}
+
+/// Expand a filter-arg binding: re-walk the caller's AST subtree with the
+/// filter_bindings stack temporarily truncated to `binding.hide_from_index`.
+/// This prevents a pass-through binding (`g: f; ...`) from recursing into
+/// itself. Mirrors legacy's source-range re-parse at
+/// `src/query/src/compiler.zig:6211-6226`, but replaces source re-parse
+/// with AST subtree re-walk.
+fn expandFilterArg(w: *Walker, binding: FilterBinding) Walker.Error!void {
+    const saved_len = w.filter_bindings.items.len;
+    w.filter_bindings.items.len = binding.hide_from_index;
+    defer w.filter_bindings.items.len = saved_len;
+    try w.walk(binding.arg_node);
+}
+
+/// Detect whether a function's AST body references the function itself (by
+/// name, zero-arg). Mirrors the effect of legacy's `is_recursive` detection
+/// at `src/query/src/compiler.zig:6753-6778` which scans the processed body
+/// for `load_key(name)` matches. For the AST walker, a self-reference shows
+/// up as a `field_access`/`func_call` whose `name` matches, plus the
+/// function must not be shadowed by an inner `def` of the same name+arity.
+///
+/// Only arity-0 recursion is detected: legacy's is_recursive flag is only
+/// set for arity 0 (see `compiler.zig:6757`). Higher-arity recursion is
+/// handled by normal expansion (which, thanks to `expanding_recursive_func`,
+/// emits call_function instead of re-expanding).
+fn detectRecursion(
+    name: []const u8,
+    body: *const Node,
+    arity: u8,
+) bool {
+    if (arity != 0) return false;
+    return astContainsSelfRef(body, name, false);
+}
+
+/// Recursively scan an AST subtree for a zero-arg self-reference by name.
+/// Skips the body of inner `def` nodes that SHADOW the target name, so an
+/// inner `def foo: ...; foo` doesn't falsely flag an outer `def foo` as
+/// recursive when the outer's body only contains calls to the inner shadow.
+/// `inside_shadow` tracks whether the current subtree is under a shadowing
+/// def and therefore can't contribute a self-ref.
+fn astContainsSelfRef(node: *const Node, name: []const u8, inside_shadow: bool) bool {
+    switch (node.kind) {
+        .field_access => |fa| {
+            if (inside_shadow) return false;
+            return std.mem.eql(u8, fa.name, name);
+        },
+        .func_call => |fc| {
+            // Zero-arg user-func calls: `f` with no args — matches recursion.
+            // Non-zero-arg calls are higher-arity; ignore per legacy.
+            if (!inside_shadow and fc.args.len == 0 and std.mem.eql(u8, fc.name, name)) {
+                return true;
+            }
+            for (fc.args) |arg| {
+                if (astContainsSelfRef(arg, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .builtin_call => |bc| {
+            for (bc.args) |arg| {
+                if (astContainsSelfRef(arg, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .func_def => |fd| {
+            // Inner def — if its name shadows the target AND same arity (0),
+            // the inner body CANNOT reference the target. The inner's rest
+            // continues normally but with `inside_shadow` set ONLY for the
+            // inner's body.
+            const shadows = std.mem.eql(u8, fd.name, name) and fd.params.len == 0;
+            const body_shadow = inside_shadow or shadows;
+            if (astContainsSelfRef(fd.body, name, body_shadow)) return true;
+            return astContainsSelfRef(fd.rest, name, inside_shadow);
+        },
+        .pipe => |p| {
+            return astContainsSelfRef(p.left, name, inside_shadow) or
+                astContainsSelfRef(p.right, name, inside_shadow);
+        },
+        .comma => |c| {
+            return astContainsSelfRef(c.left, name, inside_shadow) or
+                astContainsSelfRef(c.right, name, inside_shadow);
+        },
+        .arithmetic => |a| {
+            return astContainsSelfRef(a.left, name, inside_shadow) or
+                astContainsSelfRef(a.right, name, inside_shadow);
+        },
+        .comparison => |c| {
+            return astContainsSelfRef(c.left, name, inside_shadow) or
+                astContainsSelfRef(c.right, name, inside_shadow);
+        },
+        .and_expr, .or_expr, .alternative => |b| {
+            return astContainsSelfRef(b.left, name, inside_shadow) or
+                astContainsSelfRef(b.right, name, inside_shadow);
+        },
+        .unary_neg, .paren, .optional => |u| {
+            return astContainsSelfRef(u.operand, name, inside_shadow);
+        },
+        .as_pattern => |ap| {
+            return astContainsSelfRef(ap.expr, name, inside_shadow) or
+                astContainsSelfRef(ap.body, name, inside_shadow);
+        },
+        .destruct_alt => |da| {
+            return astContainsSelfRef(da.expr, name, inside_shadow) or
+                astContainsSelfRef(da.body, name, inside_shadow);
+        },
+        .if_expr => |ife| {
+            if (astContainsSelfRef(ife.cond, name, inside_shadow)) return true;
+            if (astContainsSelfRef(ife.then_body, name, inside_shadow)) return true;
+            for (ife.elif_chains) |ec| {
+                if (astContainsSelfRef(ec.cond, name, inside_shadow)) return true;
+                if (astContainsSelfRef(ec.body, name, inside_shadow)) return true;
+            }
+            if (ife.else_body) |eb| {
+                if (astContainsSelfRef(eb, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .try_catch => |tc| {
+            if (astContainsSelfRef(tc.body, name, inside_shadow)) return true;
+            if (tc.catch_body) |cb| {
+                if (astContainsSelfRef(cb, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .suffix => |sfx| {
+            if (astContainsSelfRef(sfx.base, name, inside_shadow)) return true;
+            for (sfx.ops) |op| switch (op) {
+                .bracket_expr => |expr| {
+                    if (astContainsSelfRef(expr, name, inside_shadow)) return true;
+                },
+                else => {},
+            };
+            return false;
+        },
+        .array_construct => |ac| {
+            if (ac.expr) |e| return astContainsSelfRef(e, name, inside_shadow);
+            return false;
+        },
+        .object_construct => |oc| {
+            for (oc.fields) |field| {
+                switch (field.key) {
+                    .expr => |kn| {
+                        if (astContainsSelfRef(kn, name, inside_shadow)) return true;
+                    },
+                    else => {},
+                }
+                if (astContainsSelfRef(field.value, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .string_interp => |si| {
+            for (si.parts) |p| switch (p) {
+                .expr => |e| {
+                    if (astContainsSelfRef(e, name, inside_shadow)) return true;
+                },
+                else => {},
+            };
+            return false;
+        },
+        .format_string => |fs| {
+            for (fs.parts) |p| switch (p) {
+                .expr => |e| {
+                    if (astContainsSelfRef(e, name, inside_shadow)) return true;
+                },
+                else => {},
+            };
+            return false;
+        },
+        .update_assign => |ua| {
+            return astContainsSelfRef(ua.rhs, name, inside_shadow);
+        },
+        .assign_general => |ag| {
+            return astContainsSelfRef(ag.lhs, name, inside_shadow) or
+                astContainsSelfRef(ag.rhs, name, inside_shadow);
+        },
+        .reduce => |r| {
+            return astContainsSelfRef(r.expr, name, inside_shadow) or
+                astContainsSelfRef(r.init, name, inside_shadow) or
+                astContainsSelfRef(r.update, name, inside_shadow);
+        },
+        .foreach => |fe| {
+            if (astContainsSelfRef(fe.expr, name, inside_shadow)) return true;
+            if (astContainsSelfRef(fe.init, name, inside_shadow)) return true;
+            if (astContainsSelfRef(fe.update, name, inside_shadow)) return true;
+            if (fe.extract) |ex| {
+                if (astContainsSelfRef(ex, name, inside_shadow)) return true;
+            }
+            return false;
+        },
+        .label_expr => |le| {
+            return astContainsSelfRef(le.body, name, inside_shadow);
+        },
+        .identity,
+        .recurse,
+        .iterate,
+        .slice,
+        .literal,
+        .variable_ref,
+        .index_access,
+        .break_expr,
+        .error_node,
+        => return false,
+    }
+}
+
+/// Emit a `func_def` node: register the function entry and walk the
+/// continuation. Mirrors legacy `parseFunctionDef` at
+/// `src/query/src/compiler.zig:6614`, but operates on AST instead of tokens.
+fn emitFuncDef(w: *Walker, fd: Node.FuncDef) Walker.Error!void {
+    // Allocate parse-time var_ids for value params in source order.
+    // Legacy: `src/query/src/compiler.zig:6642-6648`. Filter params don't
+    // get a parse-time id.
+    var params = try w.alloc.alloc(FuncParam, fd.params.len);
+    errdefer w.alloc.free(params);
+    for (fd.params, 0..) |p, i| {
+        const parse_id: u32 = if (p.is_filter) 0 else blk: {
+            const id = w.next_var_id;
+            w.next_var_id += 1;
+            break :blk id;
+        };
+        params[i] = .{
+            .name = p.name,
+            .is_filter = p.is_filter,
+            .parse_var_id = parse_id,
+            .body_scope_var_id = 0, // filled below
+        };
+    }
+
+    // Enter a body scope. For every param (filter OR value), legacy's
+    // body-scope loop at `src/query/src/compiler.zig:6695-6702` calls
+    // `declareVariable` — burning one var_id per param. Value params
+    // also emit `load_variable(body_scope_var_id)` in the BODY during
+    // legacy's initial scan; filter params stay as load_key and are
+    // post-processed to call_filter_arg. We record body_scope_var_id so
+    // the walker's next_var_id counter matches legacy's, though the AST
+    // walker's non-recursive path doesn't emit load_variable with this id
+    // (the call-site path uses the fresh capture var_id instead).
+    try pushScope(w);
+    for (params) |*p| {
+        const id = w.next_var_id;
+        w.next_var_id += 1;
+        p.body_scope_var_id = id;
+        try w.scope_vars.append(w.alloc, .{ .name = p.name, .id = id });
+    }
+
+    // Record the registration's func_table snapshot BEFORE walking the
+    // body. Legacy: `src/query/src/compiler.zig:6705`.
+    const func_table_snapshot = w.func_table.items.len;
+
+    // Register the function entry NOW, before walking its rest, so that
+    // inner calls (recursive or otherwise) during `rest` can look it up.
+    // For the body scan (recursion detection), we check the AST structure —
+    // no emission happens yet.
+    const is_recursive = detectRecursion(fd.name, fd.body, @intCast(fd.params.len));
+
+    try w.func_table.append(w.alloc, .{
+        .name = fd.name,
+        .params = params,
+        .body_node = fd.body,
+        .is_recursive = is_recursive,
+        .recursive_body_ip = 0,
+        .func_table_snapshot = func_table_snapshot,
+    });
+
+    // Simulate legacy's body-scan pass: legacy parses the body into a
+    // throwaway raw buffer, which advances `next_var_id` for every `as`
+    // pattern / nested def / compound assignment encountered. To keep
+    // the walker's var_id counter in lock-step we walk the body here
+    // in `scanning_body` mode — user-func expansions are skipped (they
+    // emit placeholder `load_key` that gets discarded), but var_id
+    // allocations proceed normally.
+    const body_raw_start = w.raw.items.len;
+    const saved_scanning = w.scanning_body;
+    w.scanning_body = true;
+    w.walk(fd.body) catch |e| {
+        w.scanning_body = saved_scanning;
+        w.raw.items.len = body_raw_start;
+        // Clean up any inner defs that the scan registered.
+        while (w.func_table.items.len > func_table_snapshot + 1) {
+            const removed = w.func_table.pop() orelse unreachable;
+            w.alloc.free(removed.params);
+        }
+        return e;
+    };
+    w.scanning_body = saved_scanning;
+    w.raw.items.len = body_raw_start;
+
+    // Remove any inner defs registered during the scan — they're scoped
+    // to the body and re-registered on each expansion. Legacy mirror:
+    // `src/query/src/compiler.zig:6783-6786`.
+    while (w.func_table.items.len > func_table_snapshot + 1) {
+        const removed = w.func_table.pop() orelse unreachable;
+        w.alloc.free(removed.params);
+    }
+
+    // Pop the body scope: we registered the function but we DON'T emit the
+    // body here. The body is walked per-call in `expandFunctionCall`.
+    popScope(w);
+
+    // Walk the continuation (code after the `;`). The new function is
+    // visible during this walk. Per-def nested-scoping of inner defs is
+    // handled when the outer def is expanded (see expandFunctionCall).
+    try w.walk(fd.rest);
+}
+
+/// Push a new variable scope — records the current scope_vars length so
+/// `popScope` can restore to it. Mirrors legacy's `pushScope` at
+/// `src/query/src/compiler.zig:290`.
+fn pushScope(w: *Walker) error{OutOfMemory}!void {
+    try w.scope_marks.append(w.alloc, w.scope_vars.items.len);
+}
+
+/// Pop the most recent variable scope. Truncates `scope_vars` to the mark
+/// set by the matching `pushScope`. `next_var_id` is NOT rolled back —
+/// legacy leaks var_ids the same way. Mirrors `popScope` at
+/// `src/query/src/compiler.zig:301`.
+fn popScope(w: *Walker) void {
+    const mark = w.scope_marks.pop() orelse unreachable;
+    w.scope_vars.items.len = mark;
+}
+
+/// Expand a user-function call at the walker's current tail. Mirrors
+/// legacy's `expandFunctionCall` at `src/query/src/compiler.zig:1066`.
+///
+/// `args` are the caller's AST argument subtrees. `call_span` is the span
+/// of the full call (used for src_offset stamps that derive from legacy's
+/// `last_tok_offset` at various emission points).
+fn expandFunctionCall(
+    w: *Walker,
+    func_idx: usize,
+    args: []const *Node,
+    call_span: ast.Span,
+) Walker.Error!void {
+    const entry = &w.func_table.items[func_idx];
+
+    // For byte-identical bytecode with legacy, we need to determine the
+    // `ctx.last_tok_offset` at each emission point. Legacy consumes the
+    // closing `)` of the call (or nothing if zero-arg), landing at:
+    //   - `(`.offset for zero-arg (legacy doesn't emit `(` stamp here; but
+    //     zero-arg calls in legacy reach expandFunctionCall after the ident
+    //     was consumed, so last_tok = ident.offset).
+    //   - `)`.offset for N-arg (last nextToken consumed `)`).
+    // For call_span.end: 1-past the `)`. So `)`.offset = call_span.end - 1
+    // when the call has parens. Zero-arg: no parens → ident.offset =
+    // call_span.end - name.len (but for field_access calls, span ends
+    // at one-past ident).
+    const has_parens = args.len > 0 or callHasParens(w.src, call_span);
+    const close_off: u32 = if (has_parens) call_span.end - 1 else call_span.start;
+
+    // ── Emit value-arg bytecode + capture_variable per value arg. ─────
+    // Count value args in definition order (NOT call order). For each
+    // value param: evaluate the arg subtree, alloc new_var_id, emit
+    // capture_variable. Filter args are recorded as bindings below.
+    //
+    // Variable holding each value-param's call-site id, indexed by param
+    // index.
+    var call_var_ids = try w.alloc.alloc(u32, entry.params.len);
+    defer w.alloc.free(call_var_ids);
+    for (call_var_ids) |*id| id.* = 0;
+
+    for (entry.params, 0..) |p, i| {
+        if (p.is_filter) continue;
+        if (i >= args.len) continue;
+
+        // Walk the arg AST — emits the arg bytecode into w.raw.
+        try w.walk(args[i]);
+
+        // Allocate fresh var_id, emit capture. Legacy stamps capture with
+        // `ctx.last_tok_offset` = `)`.offset of the call (set when
+        // parseCallExpr consumed `)`).
+        const new_id = w.next_var_id;
+        w.next_var_id += 1;
+        call_var_ids[i] = new_id;
+        try w.emit(.capture_variable, .{ .index = @intCast(new_id) }, close_off);
+    }
+
+    // ── Emit body. ────────────────────────────────────────────────────
+    if (entry.is_recursive) {
+        if (entry.recursive_body_ip == 0) {
+            // First expansion: emit jump-over-body, the body, return_function,
+            // patch jump, then call_function.
+            const jump_pos = w.raw.items.len;
+            try w.emit(.jump, .{ .index = 0 }, call_span.start);
+
+            const body_start: u32 = @intCast(w.raw.items.len);
+            entry.recursive_body_ip = body_start;
+
+            const saved_expanding = w.expanding_recursive_func;
+            w.expanding_recursive_func = func_idx;
+            defer w.expanding_recursive_func = saved_expanding;
+
+            try emitFunctionBody(w, func_idx, args, call_var_ids);
+
+            // return_function — stamped with last emit (end of body).
+            try w.emit(.return_function, .{ .none = {} }, w.last_emit_offset);
+
+            const body_end: u32 = @intCast(w.raw.items.len);
+            // Patch the jump to skip over the body.
+            w.raw.items[jump_pos].operand = .{ .index = @intCast(body_end) };
+
+            // Invoke the body. Legacy stamps `call_function` with
+            // `ctx.last_tok_offset` — after the body's `return_function`
+            // emission, that equals the body's final token offset. Mirror
+            // via w.last_emit_offset.
+            try w.emit(.call_function, .{ .index = @intCast(body_start) }, w.last_emit_offset);
+        } else {
+            // Subsequent expansion — just emit call_function.
+            try w.emit(
+                .call_function,
+                .{ .index = @intCast(entry.recursive_body_ip) },
+                call_span.start,
+            );
+        }
+    } else {
+        try emitFunctionBody(w, func_idx, args, call_var_ids);
+    }
+
+    // ── Emit pop_variable for each value arg. ─────────────────────────
+    // Stamp with last_emit_offset (legacy stamps `ctx.last_tok_offset`
+    // which, after body expansion, is the body's final token).
+    for (entry.params, 0..) |p, i| {
+        if (p.is_filter) continue;
+        if (i >= args.len) continue;
+        try w.emit(
+            .pop_variable,
+            .{ .index = @intCast(call_var_ids[i]) },
+            w.last_emit_offset,
+        );
+    }
+}
+
+/// Detect whether the call's source range includes a `(...)` — zero-arg
+/// user-func calls land here via `field_access`, so `has_parens` is false.
+/// Arity ≥ 1 calls arrive via `func_call` and have parens. We detect by
+/// scanning forward from call_span.start past the ident to see if the
+/// next non-trivia byte is `(`.
+fn callHasParens(src: []const u8, call_span: ast.Span) bool {
+    var i: u32 = call_span.start;
+    // Skip ident bytes.
+    while (i < src.len and isIdentByte(src[i])) : (i += 1) {}
+    i = skipTrivia(src, i);
+    return i < src.len and src[i] == '(';
+}
+
+/// Emit a function's body with the caller's filter-arg bindings active and
+/// the per-call value-arg var_ids substituted. Pushes a body scope,
+/// redeclares each value-param (allocating a throwaway var_id to keep
+/// `next_var_id` in lock-step with legacy) and rewrites the scope entry to
+/// the caller's `call_var_ids[i]`, then walks the body AST.
+fn emitFunctionBody(
+    w: *Walker,
+    func_idx: usize,
+    args: []const *Node,
+    call_var_ids: []const u32,
+) Walker.Error!void {
+    const entry = &w.func_table.items[func_idx];
+
+    // Save & set hidden range for lexical scoping. Legacy's
+    // `reParseBodyWithBindings` at `src/query/src/compiler.zig:1171-1176`
+    // hides functions defined AFTER this function but before the current
+    // re-parse. Stage 9 tracks the snapshot and current length; if the
+    // snapshot is less than the current length (i.e. there ARE newer
+    // functions that should be hidden), set the hidden range.
+    const saved_hidden_start = w.func_hidden_start;
+    const saved_hidden_end = w.func_hidden_end;
+    const table_len = w.func_table.items.len;
+    if (entry.func_table_snapshot < table_len) {
+        w.func_hidden_start = entry.func_table_snapshot;
+        w.func_hidden_end = table_len;
+    }
+    defer {
+        w.func_hidden_start = saved_hidden_start;
+        w.func_hidden_end = saved_hidden_end;
+    }
+
+    // Push filter-arg bindings for every filter param. Use the caller's
+    // arg AST subtree directly — no source re-parse needed.
+    const bindings_start = w.filter_bindings.items.len;
+    for (entry.params, 0..) |p, i| {
+        if (!p.is_filter) continue;
+        if (i >= args.len) continue;
+        try w.filter_bindings.append(w.alloc, .{
+            .name = p.name,
+            .arg_node = args[i],
+            // The hide index: filter_bindings length at the moment this
+            // binding was pushed. When the binding is expanded, the walker
+            // truncates to this index so the arg's own references to
+            // earlier bindings (like a pass-through `g: f` call) don't
+            // infinite-loop. Mirrors legacy's `bk` truncation at
+            // `compiler.zig:6216`.
+            .hide_from_index = w.filter_bindings.items.len,
+        });
+    }
+    defer w.filter_bindings.items.len = bindings_start;
+
+    // Push body scope + declare value params to match legacy's var_id burn.
+    try pushScope(w);
+    defer popScope(w);
+
+    for (entry.params, 0..) |p, i| {
+        if (p.is_filter) continue;
+        // Allocate a throwaway var_id (next_var_id++) — this matches
+        // legacy's `declareVariable` at `compiler.zig:1149` which burns
+        // an id and then rewrites the entry to the call-site id. The
+        // body's lookupVariable for this param name resolves to
+        // call_var_ids[i], but the counter still advanced.
+        _ = w.next_var_id;
+        w.next_var_id += 1;
+        const call_id = if (i < call_var_ids.len) call_var_ids[i] else 0;
+        try w.scope_vars.append(w.alloc, .{ .name = p.name, .id = call_id });
+    }
+
+    // Walk the body AST. Emissions go to w.raw in sequence.
+    try w.walk(entry.body_node);
+
+    // Remove any inner defs registered during the body walk — they're
+    // scoped to this expansion only. Legacy mirror:
+    // `src/query/src/compiler.zig:1188-1192`.
+    while (w.func_table.items.len > table_len) {
+        const removed = w.func_table.pop() orelse unreachable;
+        w.alloc.free(removed.params);
+    }
+}
+
 // ── insertRawInstr ────────────────────────────────────────────────────────────
 
 /// Insert `instr` at position `pos`, shifting later instructions forward by
@@ -3544,6 +4356,18 @@ fn fuse(
                     .len = r.operand.str_ref.len,
                 } },
                 .navigate_index, .update_index => .{ .index = r.operand.index },
+                // Stage 9: call_function carries a raw-IP operand that must
+                // be remapped through index_map. Mirrors legacy's fuse at
+                // `src/query/src/compiler.zig:7394-7398`.
+                .call_function => blk: {
+                    const idx_usize: usize = @intCast(r.operand.index);
+                    const fused_idx = index_map.items[idx_usize];
+                    break :blk .{ .index = @as(i64, @intCast(fused_idx)) };
+                },
+                .return_function => .{ .none = {} },
+                // Stage 9: call_filter_arg / def_function / pop_variable
+                // carry index operands (param index / var id) — pass through.
+                .call_filter_arg, .def_function => .{ .index = r.operand.index },
                 else => .{ .none = {} },
             },
         };

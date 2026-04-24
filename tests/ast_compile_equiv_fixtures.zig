@@ -580,3 +580,92 @@ pub const stage8_supported: []const []const u8 = &.{
 /// `peekIsUpdateAssign` returns false for the `]`-bare form; the walker
 /// emits the same `compilePathExprUpdate` bytecode.
 pub const stage8_unsupported: []const []const u8 = &.{};
+
+/// Supported in Stage 9 — user-defined functions, filter args, recursion.
+/// Every entry must yield byte-identical `Instruction[]` + `source_map`
+/// across the legacy compiler and the AST walker. See
+/// `research/phase-2-ast-walk-plan.md` §4 Stage 9.
+///
+/// Fixtures use ONLY non-builtin function names. `add`, `length`, `first`,
+/// `last`, etc. are routed through AST's `isBuiltinName`/`isZeroArgBuiltin`
+/// and emit `call_builtin`, NOT a user-func call — legacy does the same.
+/// The Stage 9 walker handles zero-arg builtin dispatch for parity.
+pub const stage9_supported: []const []const u8 = &.{
+    // ── Zero-arg user function — literal body. ─────────────────────
+    "def f: 1; f",
+    "def f: .; f",
+    "def f: . + 1; f",
+    "def doubled: . * 2; doubled",
+    "def myfn: null; myfn",
+    "def myfn: \"hi\"; myfn",
+
+    // ── Zero-arg builtin dispatch (user-def shadow is INERT). ──────
+    // Legacy emits call_builtin(length) even with a shadowing def —
+    // the AST parser's isZeroArgBuiltin wins. Walker mirrors.
+    "def length: \"custom\"; length",
+
+    // ── One value arg. ─────────────────────────────────────────────
+    "def myclip(max): if . > max then max else . end; .a | myclip(100)",
+    "def myfn(x): . + 1; myfn(2)",
+
+    // ── Multiple value args. ───────────────────────────────────────
+    "def myf3(lo; hi; step): lo, lo+step, lo+step*2; myf3(0; 10; 2)",
+
+    // ── Filter args. ───────────────────────────────────────────────
+    "def twice(f): f | f; 5 | twice(. + 1)",
+    "def apply(f): f; 1 | apply(. * 10)",
+    "def mypair(f; g): [f, g]; .x | mypair(.a; .b)",
+    "def apply_add(f; x): f + x; 1 | apply_add(. * 2; 3)",
+
+    // ── Recursion. ─────────────────────────────────────────────────
+    "def fact: if . <= 1 then 1 else . * (. - 1 | fact) end; 5 | fact",
+    "def sum_to: if . <= 0 then 0 else . + (. - 1 | sum_to) end; 10 | sum_to",
+
+    // ── Inner def hiding / shadowing. ──────────────────────────────
+    "def f: def g: 2; g; f",
+    "def f: def g: 1; g + g; f",
+
+    // ── $var params. ───────────────────────────────────────────────
+    "def myfn($x): $x + 1; myfn(5)",
+    "def myfn($x; $y): $x * $y; myfn(3; 4)",
+
+    // ── Nested user functions. ─────────────────────────────────────
+    "def outer: def inner(x): x * 2; inner(5); outer",
+    "def wrap: def helper: 10; helper + 1; wrap",
+
+    // ── Mixed filter + value args. ─────────────────────────────────
+    "def combine(f; $n): f + $n; combine(. * 2; 3)",
+
+    // ── Filter-arg pass-through. ───────────────────────────────────
+    "def f(g): g; def h(g): f(g); h(. + 1)",
+
+    // ── Filter args with patterns (Stage 4 intersection). ──────────
+    "def myf(f): . as $x | f; 5 | myf(. * 2)",
+
+    // ── Body using builtins + user func. ───────────────────────────
+    "def neg_myfn: . * -1; neg_myfn",
+
+    // ── Simple pipe continuation after def. ────────────────────────
+    "1 | def myfn: . + 1; myfn",
+    ". | def myfn: .a; myfn",
+
+    // ── User function inside array construct. ──────────────────────
+    "def myfn: 1; [myfn, myfn]",
+
+    // ── User function inside object construct. ─────────────────────
+    "def myfn: 1; {a: myfn}",
+
+    // ── Zero-arg user function in pipe chain. ──────────────────────
+    "def myfn: . + 1; 1 | myfn | myfn",
+
+    // ── User function returning identity-like body. ────────────────
+    "def ident: .; ident | ident",
+
+    // ── Zero-arg user function with try inside body. ───────────────
+    "def safe: try .a catch null; safe",
+};
+
+/// Stage 9 fixtures that depend on a later stage. Currently none — every
+/// Stage 9 node kind (func_def, func_call, filter-arg substitution,
+/// recursion) is handled.
+pub const stage9_unsupported: []const []const u8 = &.{};
