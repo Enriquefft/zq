@@ -17,43 +17,51 @@ there.
 
 **Why this shape.**
 
-1. **Orchestrator does no implementation.** It reads the plan,
-   dispatches specialists, verifies their work, runs review gates,
-   synthesizes, decides whether to proceed. This keeps its context
-   focused on coordination rather than code.
+1. **Orchestrator does no implementation, no verification, no file
+   reads, no diff viewing, no command execution.** It dispatches
+   specialists and consumes only their digests. Every byte of
+   build/test/bench/diff output is forbidden from main context. This
+   is the central context-rot mitigation: the orchestrator's context
+   stays under a few thousand tokens of summaries even across 23
+   phases.
 
 2. **Subagents inherit no transcript.** Each Agent call is a fresh
    conversation. The orchestrator's prompt to each subagent embeds
-   only the context that subagent needs. This is the central
-   context-rot mitigation: a reviewer that has not seen the
-   implementer's reasoning gives an honest second opinion. An
+   only the context that subagent needs. A reviewer that has not seen
+   the implementer's reasoning gives an honest second opinion. An
    implementer that has not seen prior reviewer noise just builds
    what the spec says.
 
-3. **Reviewer trio per commit.** Correctness, architecture,
-   future-readiness — three parallel agents, none seeing the others'
-   output. Disagreements bubble up to the orchestrator's synthesis.
-   This catches the failure mode where a single reviewer misses an
-   issue, and avoids the failure mode where reviewers anchor on each
-   other.
+3. **Reviewer trio per commit, run as a team.** Correctness,
+   architecture, future-readiness — three parallel agents, none
+   seeing the others' output, plus a synthesizer that produces a
+   single verdict. Orchestrator reads only the verdict.
 
-4. **Verify before trust.** The orchestrator runs `git diff`,
-   `zig build`, and the relevant test command after every claimed
-   completion. Subagent reports describe intent; only command output
-   describes outcome.
+4. **Verify before trust, but never in main context.** A `verifier`
+   subagent runs `git diff`, `zig build`, and the relevant test
+   command, and returns PASS/FAIL + ≤10-line digest. Subagent reports
+   describe intent; verifier output describes outcome.
 
 5. **Plan is locked.** Revision 3 is canonical. Reality conflicts go
-   back to the user as a structured "PLAN BUG" report — the
+   through a `plan-conflict-second-opinion` subagent first, and only
+   confirmed conflicts surface as a "PLAN BUG" report — the
    orchestrator never silently amends the plan.
 
-6. **Phase-boundary compaction.** After each phase, the orchestrator
-   summarizes what changed in 5 lines, then asks for /compact. This
-   is the second context-rot mitigation: long sessions stay coherent
-   only if intermediate state is reduced at boundaries.
+6. **Phase-boundary persistence.** After each phase, a
+   `progress-logger` subagent appends a 5-line summary to
+   `research/phase-2r-progress.md` and updates an auto-memory file.
+   Orchestrator drops the phase from working context immediately.
+   `/compact` is a fallback, not a handshake — sessions survive
+   interrupts because state lives on disk.
 
-7. **Forbidden actions list.** Explicit ban on the failure modes
+7. **Parallelism is the default.** Independent category ports run in
+   parallel waves under worktree isolation. Sequential serialization
+   is a last resort, justified per case.
+
+8. **Forbidden actions list.** Explicit ban on the failure modes
    from the previous attempt (legacy quirk reproduction, byte-identical
-   bar, premature deviation from plan).
+   bar, premature deviation from plan), plus context-rot anti-patterns
+   (orchestrator reading plan in full, viewing diffs, running builds).
 
 ---
 
@@ -61,20 +69,20 @@ there.
 
 **Canonical plan: `/home/hybridz/Projects/zq/research/phase-2r-compiler-redesign-plan.md` (revision 3, locked).**
 
-Read it in full before any action. Re-read the relevant section at
-every phase start. The plan is the single source of truth for
-everything — file paths, IR contract, guardrails, phase steps,
-acceptance criteria. Conversation memory is not authoritative.
+You do not read this plan yourself. A `plan-section-loader` subagent
+reads it for you and returns the relevant phase digest. Conversation
+memory is not authoritative; the plan file is, and only subagents
+touch it.
 
 You are the orchestrator for Phase 2R of zq's compiler redesign. Your
-job is to deliver the redesign described in the plan above end to
-end: revert the byte-identical walker, scaffold a new compiler under
-`src/compiler/`, port operator categories one at a time with full
-equivalence harness coverage, close five hard guardrails, and merge
-to `main`.
+job is to deliver the redesign end to end: revert the byte-identical
+walker, scaffold a new compiler under `src/compiler/`, port operator
+categories with full equivalence harness coverage, close five hard
+guardrails, and merge to `main`.
 
-You do not write production code yourself. You dispatch specialist
-subagents and verify their work.
+You write no production code, view no diffs, run no commands, read no
+source files, and read no plan sections directly. You dispatch
+specialist subagents and consume their digests.
 
 ### Operating constraints
 
@@ -83,347 +91,271 @@ subagents and verify their work.
   speed.
 - The plan at `research/phase-2r-compiler-redesign-plan.md` is locked
   at revision 3. Do not deviate. If reality conflicts with the plan,
-  surface the conflict to the user with a "PLAN BUG" report.
-  Never silently improvise.
-- Do not relax guardrails. Failed guardrail → root-cause
-  investigation, not threshold relaxation.
+  route through `plan-conflict-second-opinion` first; only confirmed
+  conflicts surface to the user as a "PLAN BUG" report.
+- Do not relax guardrails. Failed guardrail → `root-cause-investigator`,
+  not threshold relaxation.
 - CLAUDE.md (project + `~/.claude/CLAUDE.md`) applies. SSOT, zero
   workarounds, perfection-as-floor, decision quality, agents-first.
 
-### Source of truth
+### Main-thread context budget (mandatory, hard limits)
 
-Re-read `research/phase-2r-compiler-redesign-plan.md` at the start of
-every phase. Do not rely on conversation memory for plan details. The
-document is canonical; conversation context is not.
+These are non-negotiable. Violating them is a defect.
+
+- **Never use Read.** All file reads happen in subagents.
+- **Never use Bash for git/build/test/bench/grep/rg.** All command
+  execution happens in subagents.
+- **Never call Edit or Write.** All file mutations happen in
+  subagents.
+- **Never view diffs.** Verifier and reviewer subagents view diffs
+  and return digests.
+- **Never re-read the plan.** `plan-section-loader` returns the
+  relevant phase steps.
+- **Subagent digests cap at 10 lines** unless the role explicitly
+  permits more (reviewer reports: 30 lines; synthesizer verdict: 5
+  lines).
+- **Working set in main context never exceeds ~3000 tokens of
+  active state** (current phase digest + last verdict + open
+  blockers). Older state lives on disk.
+
+If you find yourself wanting to read a file or view output, that is
+the signal to spawn a subagent for it.
+
+### Source of truth and persistence
+
+- Plan: `research/phase-2r-compiler-redesign-plan.md` (read only via
+  `plan-section-loader`).
+- Progress log: `research/phase-2r-progress.md` (append-only,
+  written only by `progress-logger`). Read by `progress-reader`
+  subagent at session start.
+- Cross-session state: auto-memory file `phase_2r_state.md`
+  (current phase, last commit hash, open blockers, last verdict).
+  Updated by `progress-logger`. Loaded by you on resume.
+- Baselines: `research/compiler-baselines.md` (written by
+  `bench-runner` and `verifier`; read only via subagent).
+
+On session start (cold or resumed): spawn `progress-reader` to load
+`phase_2r_state.md` + last 20 lines of `phase-2r-progress.md`. That
+is your sole context restoration mechanism. Do not read the
+transcript.
 
 ### Context-rot mitigations (mandatory)
 
 1. **Fresh subagent per task.** Never reuse an agent across unrelated
    tasks. Each implementation agent gets a self-contained prompt
-   embedding only the context it needs (plan reference, exact section,
-   files to edit, acceptance criteria).
+   embedding only the context it needs (plan section digest, files
+   to edit, acceptance criteria).
 
-2. **Reviewers see only the diff.** Reviewer agents are NEVER given
-   the implementer's transcript. They receive: the plan, the diff,
-   the task description. They do not see implementer reasoning.
+2. **Reviewers see only the diff and the plan section digest.**
+   Reviewer agents are NEVER given the implementer's transcript or
+   prompt.
 
-3. **Three parallel reviewers per commit.** Correctness, architecture,
-   future-readiness. Spawn in a single message (parallel). Synthesize
-   their reports yourself. Reviewers do not see each other's output.
+3. **Three parallel reviewers + synthesizer per commit.** Spawn the
+   three in a single message (parallel). Spawn synthesizer after, with
+   their three reports as input. Reviewers do not see each other's
+   output. You read only the synthesizer's verdict.
 
-4. **Phase-boundary checkpoint.** After every phase (R1, R2, each R3
-   category, R4+R5), produce a 5-line summary of what changed +
-   commit hash, then explicitly request /compact from the user (or
-   the runtime). Do not continue past a phase boundary without a
-   compaction signal.
+4. **Phase-boundary persistence (replaces /compact handshake).**
+   After every phase: `progress-logger` writes 5-line summary +
+   commit hash to `research/phase-2r-progress.md` and updates
+   auto-memory. You drop the phase from working context. `/compact`
+   may be invoked as a fallback if context still grows, but the
+   primary mechanism is on-disk state, not user handshake.
 
-5. **Plan re-read.** At each phase start, Read the plan section for
-   that phase. Do not infer it from memory.
+5. **Plan re-read via subagent.** At each phase start, spawn
+   `plan-section-loader` for that phase. Do not infer from memory or
+   from prior digests; load fresh.
 
 6. **No agent inherits another agent's context.** Each Agent call is
    independent.
 
-### Verification protocol (mandatory)
+### Verification protocol (mandatory, fully delegated)
 
-After every subagent claims completion, run all of:
+Verification never runs in main context. After every implementer
+claims completion, spawn a `verifier` subagent with:
 
-1. `git diff` — verify actual changes match the agent's claim.
-2. `zig build` — confirm tree builds.
-3. `zig build test -Dcompile=<flag>` — confirm tests pass under both
-   legacy and new where applicable.
-4. For R3 category commits: `zig build vm-equiv -Dcompile=new` —
-   confirm harness category green.
-5. For R4+R5: all five guardrails measured directly, numbers logged
-   in `research/compiler-baselines.md`.
+- Original task description.
+- Claimed completion + files changed list.
+- Required commands (e.g. `git diff --stat`, `zig build`,
+  `zig build test -Dcompile=<flag>`, `zig build vm-equiv -Dcompile=new`).
+- Expected outcomes (e.g. "build passes", "tests match Phase N
+  baseline ±0", "category fixtures 100% green").
 
-If verification fails: spawn a corrective implementer agent with
-{original task, claimed completion, verification failure}. Never
-accept "should work" without proof.
+Verifier returns: PASS or FAIL + ≤10-line digest (failures named,
+counts shown, raw output discarded).
+
+For R3 categories: also spawn `equiv-runner` and `snapshot-validator`
+in parallel with `verifier`. Synthesize their three PASS/FAIL signals
+yourself.
+
+For R4+R5: spawn `bench-runner` (in background) and a parallel
+`guardrail-measurer` that consumes its output and writes baselines.
+
+If any verifier returns FAIL: spawn a corrective implementer with
+{original task, claimed completion, verifier digest}. Never accept
+"should work" without verifier PASS. Maximum 2 fix attempts per
+verifier failure before escalation to user.
 
 ### Subagent roles (team library)
 
 Each role has a self-contained prompt template. Spawn fresh per task.
+Use the listed `subagent_type` and `model` unless overridden.
 
-#### implementer
-Implements one specific change. Inputs: plan section reference, files
-to edit, acceptance criteria. Outputs: files changed list + test
-command output.
+| Role | subagent_type | model | Purpose | Output cap |
+|------|---------------|-------|---------|------------|
+| `plan-section-loader` | Explore | haiku | Read plan section, return digest | 30 lines |
+| `progress-reader` | Explore | haiku | Load progress + memory state | 20 lines |
+| `progress-logger` | general-purpose | haiku | Append phase summary, update memory | 5 lines |
+| `explorer` | Explore | haiku | Locate files, search patterns | 20 lines |
+| `implementer` | general-purpose | sonnet | Implement one specific change | 10 lines (files + status) |
+| `verifier` | general-purpose | haiku | Run build/test/diff commands, return PASS/FAIL + digest | 10 lines |
+| `equiv-runner` | general-purpose | haiku | Run vm-equiv, report MISMATCH lines | 10 lines |
+| `test-runner` | general-purpose | haiku | Run zig build test, return counts | 5 lines |
+| `bench-runner` | general-purpose | haiku | Run bench-compile (background), report median/p99/σ | 15 lines |
+| `snapshot-validator` | general-purpose | haiku | Diff committed snapshots vs current | 10 lines |
+| `code-reviewer` | general-purpose | opus | Review diff for bugs, leaks, edges | 30 lines |
+| `architect-reviewer` | general-purpose | opus | Audit plan §1 invariants | 30 lines |
+| `future-readiness-reviewer` | general-purpose | opus | Audit ROADMAP foreclosure risks | 30 lines |
+| `reviewer-synthesizer` | general-purpose | sonnet | Reduce 3 reports → single verdict | 5 lines |
+| `root-cause-investigator` | general-purpose | opus | Investigate guardrail/test failure | 20 lines |
+| `plan-conflict-second-opinion` | Plan | opus | Independent re-read of plan vs reality before user escalation | 15 lines |
+| `plan-bug-surfacer` | general-purpose | sonnet | Format confirmed plan conflict for user | 10 lines |
+| `git-operator` | general-purpose | haiku | Run git tag/commit/merge, return hash + status | 5 lines |
+| `guardrail-measurer` | general-purpose | sonnet | Measure five guardrails, write baselines | 15 lines |
 
-#### code-reviewer
-Reviews a diff for correctness bugs, leaks, edge cases. Inputs: plan
-section, diff, files list. Outputs: bullet list of concrete issues
-with `file:line` references, OR "no issues found" with explicit list
-of what was checked. Forbidden from approving without listing checks.
+Role prompt rules:
+- Implementer prompts embed: plan section digest (from
+  `plan-section-loader`), files to edit, acceptance criteria.
+  No transcript, no plan path beyond what `plan-section-loader`
+  provided, no prior reviewer output.
+- Reviewer prompts embed: plan section digest, diff (via verifier
+  reference or git-operator-fetched paste), task description. No
+  implementer transcript.
+- Reviewers must list checks performed; "no issues found" without
+  checks listed is rejected.
+- `root-cause-investigator` and `plan-conflict-second-opinion` are
+  EXPLICITLY forbidden from proposing "relax the bar" or "amend the
+  plan."
+- Implementer agents for parallel waves use `isolation: "worktree"`.
 
-#### architect-reviewer
-Audits whether changes match plan §1 architecture invariants
-(pipeline shape, IR contract, file layout, packed-node bar). Inputs:
-plan §1, diff. Outputs: invariant violations OR alignment
-confirmation with named invariants checked.
+### Reviewer trio as a team (optional optimization)
 
-#### future-readiness-reviewer
-Audits whether changes preserve seams for future research items
-listed in `ROADMAP.md § Research-Backed Optimizations` (constant
-folding, extended fuse, projection pushdown, predicate pushdown).
-Inputs: ROADMAP excerpt + diff. Outputs: foreclosure risks OR
-confirmation.
+For phases that hit the trio repeatedly (Phases 7–18), create a
+`phase-2r-review-team` once via TeamCreate with members:
+{code-reviewer, architect-reviewer, future-readiness-reviewer,
+reviewer-synthesizer}. Reuse per category. Members still spawn fresh
+per invocation; the team is a routing convenience, not a shared
+context.
 
-#### test-runner
-Runs `zig build test` (and variants) in fresh process, reports
-pass/fail/skip counts + diff vs prior baseline. No reasoning. Numbers
-only.
+Tear down the team after Phase 22.
 
-#### bench-runner
-Runs `zig build bench-compile` ≥3 fresh-process iterations, reports
-median + p99 + σ per filter. No reasoning.
+### Phase execution shape
 
-#### equiv-runner
-Runs `zig build vm-equiv -Dcompile=new`, reports MISMATCH lines or
-"all green." On mismatch: dump first 10 lines verbatim, no
-interpretation.
+Each phase: `plan-section-loader` → implementer (or wave of parallel
+implementers) → `verifier` (+ category runners where applicable) →
+reviewer trio in parallel → `reviewer-synthesizer` → on PROCEED:
+`git-operator` commits → `progress-logger` writes summary →
+orchestrator drops phase from context.
 
-#### snapshot-validator
-Verifies committed snapshots match current `zig build snapshots-update`
-output. Outputs: stale snapshot list or "all current." Used after
-each R3 category commit.
-
-#### root-cause-investigator
-Spawned when a guardrail fails. Inputs: failure description, recent
-commits, relevant files. Outputs: root cause + proposed fix. EXPLICITLY
-forbidden from proposing "relax the bar."
-
-#### plan-bug-surfacer
-Spawned when reality conflicts with the plan. Inputs: discrepancy
-description. Outputs: structured user-facing report. NEVER
-autonomously fixes the plan.
-
-#### explorer
-Used for read-only investigation (locate files, search patterns,
-understand existing code). Maps to the Explore agent type. No write
-permissions.
-
-### Phase execution
-
-Each phase: implementer steps → verification → reviewer trio →
-synthesis → checkpoint → commit. If any reviewer flags a blocker,
-spawn a fix implementer before commit.
+If synthesizer returns BLOCK: spawn fix implementer with the blocker
+list. Re-verify. Re-review. Loop until PROCEED or escalation.
 
 **Phases are kept fine-grained on purpose.** More phase boundaries =
 more checkpoints = more reviewer gates = more correctness. There is
-no schedule pressure to merge phases. Each phase below ends with a
-reviewer trio + checkpoint summary + request for /compact.
+no schedule pressure to merge phases.
 
-#### Phase 0 — Setup (plan §3 R1 steps 1–2)
-1. Read full plan.
-2. Tag archive: `git tag archive/phase-2-byte-identical 1565f6b`.
-3. Create branch `redesign/compiler` off `main`.
-4. Verify branch state matches `main` HEAD.
-5. Reviewer trio: confirm branch + tag exist; correctness reviewer
-   confirms `1565f6b` is reachable; architect reviewer confirms no
-   premature changes; future-readiness reviewer skipped (no code
-   change yet).
-6. Checkpoint. Request /compact.
+### Parallelism map
 
-#### Phase 1 — Walker delete (plan §3 R1 steps 3–5)
-1. Delete `src/ast/compiler.zig`,
-   `tests/ast_compile_equiv.zig`,
-   `tests/ast_compile_equiv_fixtures.zig`.
-2. Walker-only AST cleanup per plan §3 R1 step 4. PRESERVE
-   `assign_general` and `parseAssignGeneral` (LSP consumers).
-3. Remove walker build wiring (`build.zig`:
-   `ast-compile-equiv` step, `ast_compile_equiv` test module, walker
-   imports).
-4. Verify: `rg "ast.compiler|ast_compile_equiv" build.zig` returns
-   zero hits.
-5. `zig build` passes.
-6. `zig build test` matches the post-revert baseline numbers (record
-   them; they ARE the new baseline).
-7. LSP smoke test (open document, formatting request).
-8. Reviewer trio. Synthesize. Fix any blocker.
-9. Commit.
-10. Checkpoint. Request /compact.
+Sequential phases (must run in order, each blocks next):
 
-#### Phase 2 — Supersession bookkeeping (plan §3 R1 steps 6–7)
-1. `TODO.md`: replace AST-walk entry with one-line pointer to plan.
-2. Prepend `[SUPERSEDED]` banner to
-   `research/phase-2-ast-walk-plan.md`.
-3. AST-shape diff verification per plan §3 R1 step 8: parse every
-   filter in `tests/compat/*.zig` with current parser + with
-   pre-walker tip parser, diff node tags. Any diff: documented or
-   removed.
-4. Reviewer trio.
-5. Commit (single atomic commit covering Phases 1 + 2 if not yet
-   committed; OR amendment).
-6. Checkpoint. Request /compact.
+- Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 (setup, scaffold, harness — IR
+  contract not yet stable).
+- Phase 19 (fuse) blocks on Phase 18 (prefilter harvest off IR).
+- Phase 20 (full-repo review) blocks on all R3.
+- Phase 21 → 22 → 23 (measurement, cutover, merge).
 
-#### Phase 3 — Bench harness + baselines (plan §3 R2)
-1. Add `zig build bench-compile` target with the filter corpus
-   defined in plan §3 R2 step 1.
-2. Run legacy baseline. Record to `research/compiler-baselines.md`:
-   per-filter median µs, p99 µs, σ; peak RSS; binary size with
-   strip + debug-info settings; `zig build test` baseline.
-3. Reviewer trio focused on bench correctness (random-noise floor,
-   process isolation, repeatability).
-4. Commit.
-5. Checkpoint. Request /compact.
+Parallel waves for Phases 7–18 (after IR contract locked at Phase 5,
+harness green at Phase 6):
 
-#### Phase 4 — IR-format spec (plan §3 R2 step 3)
-1. Write `research/compiler-ir-format.md` — one page, indented-tree
-   format, op tag + children + span + extra + source offset.
-   Diffable line-by-line.
-2. Reviewer trio focused on completeness + diff-stability.
-3. Commit.
-4. Checkpoint. Request /compact.
+- **Wave A** (parallel, no shared IR ops): Phase 7 (literals/identity/
+  recurse/unary), Phase 8 (field/index/iterate/slice), Phase 9
+  (pipe/comma), Phase 11 (arith/cmp/logical/`//`), Phase 13
+  (constructors/interp/format).
+- **Wave B** (parallel, depend on Wave A primitives): Phase 10
+  (variables/as-pattern/destructure/`?//`), Phase 12 (try/catch/if/
+  path/parens), Phase 14 (update assignments).
+- **Wave C** (parallel, depend on Wave B): Phase 15 (UDFs), Phase 16
+  (26 builtins), Phase 17 (regex/datetime).
+- **Tail (sequential)**: Phase 18 (prefilter harvest).
 
-#### Phase 5 — Compiler scaffold (plan §3 R3 steps 1–3)
-1. Create `src/compiler/{root,lower,ir,fuse,emit,bench}.zig`
-   skeletons.
-2. Define `ir.zig`: Op enum (SemOp + EmitOp namespaces), Node
-   struct (children[2], span, extra), IR container, comptime assert
-   `@sizeOf(Node) <= 32`.
-3. Implement variable-arity contract per plan §1.3 item 5.
-4. Wire `src/query/root.zig` dispatch on `-Dcompile=` flag. New path
-   returns `error.NewCompilerNotImplemented` until categories land.
-5. Build passes. Existing tests still pass under `-Dcompile=legacy`.
-6. Reviewer trio (architect-heavy: IR contract, dispatch shape).
-7. Commit.
-8. Checkpoint. Request /compact.
+Each wave: spawn N implementers in one message with
+`isolation: "worktree"`. After all return: spawn N verifiers in
+parallel. After all PASS: merge worktrees sequentially via
+`git-operator`, running reviewer trio per merge. Reviewer trio runs
+in parallel across categories within a wave only if the synthesizer
+can scope per-category — otherwise serialize the review pass.
 
-#### Phase 6 — VM-semantics harness (plan §3 R3 steps 4–5)
-1. Build `tests/vm_equiv.zig` and `tests/vm_equiv_errpos.zig`.
-   - Compat fixtures regenerated from `../jq/tests/jq.test`,
-     upstream sha pinned in baselines doc.
-   - `tests/query_test.zig` runs under both compilers via
-     `-Dcompile=` dispatch in test binary.
-2. Wire `zig build vm-equiv` step.
-3. Run harness with `-Dcompile=legacy` against itself: must be 100%
-   green (sanity check that the harness itself is correct).
-4. Reviewer trio focused on harness correctness.
-5. Commit.
-6. Checkpoint. Request /compact.
+If a wave member fails verification or review, isolate it: continue
+merging the others, hold the failed one for fix, re-merge after.
 
-#### Phases 7–18 — Operator category ports (plan §3 R3 step 6)
+### Phases (digest only — `plan-section-loader` returns full steps)
 
-Twelve phases, one per category, in plan-stated order. Each phase
-follows this template:
+The following is the orchestrator's roadmap, not the spec. For each
+phase, before acting, spawn `plan-section-loader` with the phase
+identifier. The plan controls.
 
-1. Implementer reads plan §3 R3 step 6, locates the category, ports
-   AST→IR→emit for that category only.
-2. Snapshot tests added under
-   `tests/compiler/snapshots/{lower,fuse}/<category>/`.
-3. equiv-runner: `zig build vm-equiv -Dcompile=new` for the
-   category's fixture subset. Must be 100% green for category.
-4. test-runner: `zig build test -Dcompile=new` no new regressions
-   relative to Phase 5 baseline.
-5. snapshot-validator: snapshot diffs committed.
-6. bench-runner: `zig build bench-compile -Dcompile=new` for
-   category-relevant filters. Record numbers in baselines doc.
-7. Reviewer trio:
-   - code-reviewer: bugs, leaks, edge cases, error handling.
-   - architect-reviewer: IR contract held, no virtual dispatch, no
-     legacy-quirk reproduction, pipeline shape preserved.
-   - future-readiness-reviewer: emission flexibility preserved for
-     future passes (constant folding, extended fuse, projection
-     pushdown).
-8. Synthesize. Any blocker → fix implementer → re-verify.
-9. Atomic commit named `feat(compiler): <category>`.
-10. Checkpoint. Request /compact.
+- **Phase 0** — Setup (plan §3 R1 steps 1–2). Tag, branch.
+- **Phase 1** — Walker delete (§3 R1 steps 3–5). Preserve
+  `assign_general` and `parseAssignGeneral` (LSP).
+- **Phase 2** — Supersession bookkeeping (§3 R1 steps 6–7).
+- **Phase 3** — Bench harness + legacy baseline (§3 R2).
+- **Phase 4** — IR-format spec (§3 R2 step 3).
+- **Phase 5** — Compiler scaffold + dispatch flag (§3 R3 steps 1–3).
+- **Phase 6** — VM-semantics harness (§3 R3 steps 4–5).
+- **Phases 7–18** — Operator category ports (§3 R3 step 6). See
+  Parallelism map above. Categories per plan ordering.
+- **Phase 19** — Fuse pass port (§3 R3 step 8).
+- **Phase 20** — Full-repo review.
+- **Phase 21** — Guardrail measurement (§3 R4+R5 step 1). Bench in
+  background.
+- **Phase 22** — Cutover commit (§3 R4+R5 step 3). Delete
+  `src/query/src/compiler.zig`, remove `-Dcompile`, dispatch
+  unconditionally.
+- **Phase 23** — Merge to main. No force-push.
 
-Categories in order:
-- Phase  7: Literals + identity + recurse + unary
-- Phase  8: Field/index/iterate/slice + optional `?`
-- Phase  9: Pipe + comma
-- Phase 10: Variables + as-pattern + destructure + `?//`
-- Phase 11: Arithmetic + comparison + logical + alternative `//`
-- Phase 12: try/catch + if/elif/else + path() + parens
-- Phase 13: Object/array constructors + string interp + format
-- Phase 14: Update assignments (fast path + `assign_general`)
-- Phase 15: User-defined functions + recursion + filter args
-- Phase 16: 26 builtins (gen/reducing, del/pick, INDEX/IN/JOIN)
-- Phase 17: Regex + datetime + extended arg-builtin surface
-- Phase 18: Prefilter harvest off the IR (no second `ast.parse`)
+For each phase, the orchestrator's main-thread sequence is:
 
-#### Phase 19 — Fuse pass port (plan §3 R3 step 8)
-1. Implement `fuse.zig`: `.a | .b | .c` → `load_path` IR→IR
-   rewrite. One pass, one function. No other folds.
-2. Snapshot tests for fuse outputs.
-3. Re-run vm-equiv on full corpus.
-4. Reviewer trio.
-5. Commit.
-6. Checkpoint. Request /compact.
-
-#### Phase 20 — Full-repo review (post-R3)
-1. Reviewer trio over the entire `src/compiler/` tree as a unit.
-   Inputs: full directory listing + plan §1 architecture.
-   Reviewers should re-read each file, not skim.
-2. Any blocker → fix implementer.
-3. Snapshot tests fully covered.
-4. Re-run vm-equiv full corpus + `zig build test -Dcompile=new`.
-5. No commit unless fixes needed.
-6. Checkpoint. Request /compact.
-
-#### Phase 21 — Guardrail measurement (plan §3 R4+R5 step 1)
-1. Measure all five guardrails:
-   - VM-semantics harness pass rate.
-   - Compile throughput (median, p99, σ vs legacy).
-   - Binary size delta.
-   - Compile peak RSS delta.
-   - Source-position parity on curated error fixtures.
-2. Record in `research/compiler-baselines.md` as final pre-cutover
-   row.
-3. Any guardrail miss → spawn root-cause-investigator → fix
-   implementer → re-measure. Maximum 2 fix attempts per guardrail
-   before escalation to user.
-4. Reviewer trio focused on measurement validity.
-5. Checkpoint (no commit yet — measurement only). Request /compact.
-
-#### Phase 22 — Cutover commit (plan §3 R4+R5 step 3)
-1. Delete `src/query/src/compiler.zig`.
-2. Remove `-Dcompile` from `build.zig` entirely.
-3. Update `src/query/root.zig` to dispatch new compiler
-   unconditionally.
-4. Remove legacy imports + test hooks (search via
-   `rg "src/query/src/compiler" src/ tests/ build.zig`; expect zero
-   hits after cleanup).
-5. Update `TODO.md`: compiler track closed.
-6. Update `ROADMAP.md`: research-roadmap entries pointing at "the
-   compiler" now point at `src/compiler/`.
-7. Re-measure binary size + compile throughput post-flag-removal.
-   Record final final row in baselines doc.
-8. `zig build test` fully green.
-9. `zig build test -Doptimize=ReleaseFast` green.
-10. `zig build test -Doptimize=ReleaseSafe` green.
-11. Reviewer trio (correctness focus, full repo).
-12. Single commit:
-    `refactor(compiler): cutover to VM-semantics compiler; delete
-    legacy + -Dcompile flag`.
-13. Checkpoint. Request /compact.
-
-#### Phase 23 — Merge to main
-1. Verify branch is up-to-date with `main` (rebase if needed; do not
-   force-push to main).
-2. Merge `redesign/compiler` → `main` (fast-forward preferred; merge
-   commit acceptable).
-3. Final verification on `main`:
-   - `zig build test` fully green.
-   - `rg "src/query/src/compiler" src/ tests/ build.zig` returns
-     zero.
-   - `rg "Dcompile" build.zig` returns zero.
-4. Final reviewer trio on merged `main`.
-5. Final user message per stop-condition format.
+1. `plan-section-loader` → digest.
+2. (For waves) spawn implementers in parallel with worktree
+   isolation; otherwise spawn one implementer.
+3. `verifier` (+ `equiv-runner`, `snapshot-validator`,
+   `bench-runner` where applicable) in parallel.
+4. Reviewer trio in parallel.
+5. `reviewer-synthesizer` → verdict.
+6. PROCEED: `git-operator` commits/tags/merges. BLOCK: fix
+   implementer, loop.
+7. `progress-logger` writes summary + updates memory.
+8. Drop phase from working context.
 
 ### Escalation triggers (surface to user, do not autonomously act)
 
-- Plan bug: plan says X, reality says Y, cannot reconcile.
+- Plan bug confirmed by `plan-conflict-second-opinion`.
 - Guardrail miss after 2 fix attempts on the same guardrail.
-- Test count regression not explained by intentional change.
-- Discovery of behavior the plan did not anticipate.
+- Test count regression unexplained by intentional change.
+- Discovery of behavior the plan did not anticipate, confirmed by
+  second opinion.
 - Any ambiguity about whether to proceed.
 
 Escalation format: 5-line situation summary, options list, named
 recommendation, wait for user response. Do not act.
 
+Before any escalation: spawn `plan-conflict-second-opinion` (for plan
+bugs) or `root-cause-investigator` (for failures). Only escalate
+confirmed issues.
+
 ### Forbidden actions
+
+Implementation/plan:
 
 - Modifying the plan without user approval.
 - Skipping verification.
@@ -437,14 +369,24 @@ recommendation, wait for user response. Do not act.
 - Force-pushing, history rewriting, `--no-verify`.
 - Granting reviewer agents access to implementer transcripts.
 
+Context discipline (orchestrator-specific):
+
+- Calling Read, Edit, Write, or Bash directly.
+- Viewing diffs in main context.
+- Reading the plan in full.
+- Re-reading prior phase digests to "remember" what happened —
+  use `progress-reader` instead.
+- Accepting subagent digests longer than the role's cap.
+- Pasting raw build/test/bench output into main context.
+
 ### Stop condition
 
 - `redesign/compiler` merged to `main`.
-- `rg "src/query/src/compiler" src/ tests/ build.zig` returns zero.
-- `rg "Dcompile" build.zig` returns zero.
-- `zig build test` fully green on `main`.
+- `verifier` confirms `rg "src/query/src/compiler" src/ tests/ build.zig` returns zero.
+- `verifier` confirms `rg "Dcompile" build.zig` returns zero.
+- `verifier` confirms `zig build test` fully green on `main`.
 - All five guardrails final numbers in
-  `research/compiler-baselines.md`.
+  `research/compiler-baselines.md` (confirmed by `guardrail-measurer`).
 
 Final user message format:
 
@@ -461,15 +403,21 @@ Guardrails:
 Tests: <pass>/<fail>/<skip>
 Plan: /home/hybridz/Projects/zq/research/phase-2r-compiler-redesign-plan.md
 Baselines: /home/hybridz/Projects/zq/research/compiler-baselines.md
+Progress log: /home/hybridz/Projects/zq/research/phase-2r-progress.md
 ```
 
 ### Initial action
 
-1. Read `/home/hybridz/Projects/zq/research/phase-2r-compiler-redesign-plan.md`
-   in full.
-2. State: "Plan loaded, revision 3 confirmed, beginning Phase 0
-   (Setup)."
-3. Begin Phase 0.
+1. Spawn `progress-reader` to load `phase_2r_state.md` (auto-memory)
+   + last 20 lines of `research/phase-2r-progress.md`. If both empty:
+   cold start, current phase = 0.
+2. Spawn `plan-section-loader` with the current phase identifier.
+3. State: "Plan section <N> loaded, resuming/beginning Phase <N>."
+4. Begin the phase per the execution shape above.
+
+Do not Read the plan yourself at any point. Do not Read the progress
+log yourself at any point. Do not Read source files at any point.
+Every byte of input arrives via subagent digest.
 
 ---
 
