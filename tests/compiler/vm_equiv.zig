@@ -46,7 +46,6 @@ const FIXTURES = [_]Fixture{
     .{ .name = "nested", .filter = ".foo.bar", .input = "{\"foo\":{\"bar\":2}}", .expected_output = "2" },
     .{ .name = "pipe", .filter = ".foo | .bar", .input = "{\"foo\":{\"bar\":3}}", .expected_output = "3" },
     .{ .name = "index", .filter = ".[0]", .input = "[10,20]", .expected_output = "10" },
-    // Cat-2 dedicated fixtures (Phase 8)
     .{ .name = "iterate_top", .filter = ".[]", .input = "[1,2,3]", .expected_output = "1\n2\n3" },
     .{ .name = "field_iterate", .filter = ".foo[]", .input = "{\"foo\":[10,20]}", .expected_output = "10\n20" },
     .{ .name = "slice_top", .filter = ".[1:3]", .input = "[10,20,30,40]", .expected_output = "[20,30]" },
