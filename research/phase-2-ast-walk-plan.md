@@ -1,3 +1,5 @@
+> **[SUPERSEDED]** This plan pursued byte-identical legacy semantics. It is superseded by `research/phase-2r-compiler-redesign-plan.md` (rev 3, locked). Kept for historical reference only.
+
 # Phase 2 — AST-walk Compile Pipeline
 
 Goal: replace the recursive-descent-on-tokens compile path in `src/query/src/compiler.zig` with an AST walker in a new `src/ast/compiler.zig`. The AST produced by `src/ast/parser.zig` becomes the canonical representation of a zq filter. The bytecode (`RawInstr` stream and then fused `Instruction` stream) produced by the new path must be byte-for-byte equal to the current path for every in-tree fixture, after which the old path is deleted in one commit.
