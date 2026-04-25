@@ -1,0 +1,4 @@
+# source: sub("o"; "X")
+# SemOp
+call_builtin("sub", re_0 "/o/") @0..13
+  load_const("X") @9..12

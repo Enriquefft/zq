@@ -23,6 +23,8 @@ const std = @import("std");
 const ast = @import("ast");
 const err_mod = @import("error");
 const ir = @import("ir.zig");
+const regex_mod = @import("regex");
+const types_mod = @import("types");
 
 const Node = ast.Node;
 const Span = ast.Span;
@@ -78,6 +80,21 @@ pub const Lowerer = struct {
     /// Cat-4 only declares vars in `as`-patterns; user-function param
     /// vars (cat-9) and label vars (cat-12) reuse the same counter.
     next_var_id: u32 = 0,
+    /// Allocator for the regex pool (cat-11). Must outlive the IR
+    /// arena because the pool transfers into the final `Compiled`.
+    /// `compile()` wires this to the same allocator that owns
+    /// `Compiled`. Snapshot/regen tools wire it to their test
+    /// allocator and call `deinitRegexPool()` after the dumper runs.
+    pool_alloc: ?std.mem.Allocator = null,
+    /// Filter-compile-time regex interner. Lazily initialized on the
+    /// first `internRegex` call. Owned by `pool_alloc` (not the IR
+    /// arena), so it survives `arena.deinit()` and transfers to
+    /// `Compiled`.
+    regex_pool: ?regex_mod.RegexPool = null,
+    /// Source offset of the last regex pattern interned. Used to
+    /// attach a useful caret to a `RegexCompileError` diagnostic.
+    last_regex_pattern_offset: u32 = 0,
+    last_regex_pattern_len: u32 = 0,
 
     /// Append a node and return its index. Plan §1.3 row 3 — children
     /// are u32 indices, never pointers.
@@ -138,6 +155,63 @@ pub const Lowerer = struct {
     fn lookupVar(self: *Lowerer, name: []const u8) ?u32 {
         return self.var_table.get(name);
     }
+
+    /// Intern a regex pattern and return its pool index. Lazily
+    /// initializes `regex_pool` on first call. Compile errors
+    /// surface as `error.RegexCompileError`; the caller (cat-11
+    /// lowering) maps them to `LowerDiagnostic` with
+    /// `last_regex_pattern_*` offsets so the top-level compile loop
+    /// attaches a useful caret. Mirrors legacy
+    /// `Ctx.regex_pool.intern` at
+    /// `src/query/src/compiler.zig:3128`.
+    pub fn internRegex(self: *Lowerer, pattern: []const u8) RegexInternError!u32 {
+        const alloc = self.pool_alloc orelse return error.RegexNotCompiled;
+        if (self.regex_pool == null) self.regex_pool = regex_mod.RegexPool.init(alloc);
+        return self.regex_pool.?.intern(pattern) catch |e| switch (e) {
+            regex_mod.Error.RegexCompileFailed => error.RegexCompileError,
+            regex_mod.Error.RegexNotCompiled => error.RegexNotCompiled,
+            regex_mod.Error.RegexInternalError => error.RegexCompileError,
+            regex_mod.Error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    /// Take ownership of the regex pool. Returns the populated pool
+    /// (or an empty one) and clears the field so `deinitRegexPool` is
+    /// a no-op afterwards. Used by `compile()` to transfer the pool
+    /// into the final `Compiled` struct.
+    pub fn takeRegexPool(self: *Lowerer) regex_mod.RegexPool {
+        if (self.regex_pool) |p| {
+            self.regex_pool = null;
+            return p;
+        }
+        // No regex builtin was lowered. Return an empty pool keyed
+        // to the caller's allocator so `Compiled.deinit` is
+        // symmetric. If pool_alloc was never wired, fall back to the
+        // page allocator — the empty pool's deinit walks zero
+        // entries so any allocator works.
+        const alloc = self.pool_alloc orelse std.heap.page_allocator;
+        return regex_mod.RegexPool.init(alloc);
+    }
+
+    /// Free the regex pool if it was lazily initialized but not
+    /// taken. Idempotent — safe to call on an already-taken or
+    /// never-allocated Lowerer. The snapshot test and regen tool
+    /// rely on this to clean up after lowering without an explicit
+    /// transfer.
+    pub fn deinitRegexPool(self: *Lowerer) void {
+        if (self.regex_pool) |*p| {
+            p.deinit();
+            self.regex_pool = null;
+        }
+    }
+};
+
+/// Errors surfaced by `internRegex`. Mirrors the legacy compiler's
+/// regex-compile error path at `src/query/src/compiler.zig:3128-3133`.
+pub const RegexInternError = error{
+    OutOfMemory,
+    RegexCompileError,
+    RegexNotCompiled,
 };
 
 // Public entry: callers construct a `Lowerer` and invoke `lowerNode`
@@ -1000,6 +1074,17 @@ pub const BuiltinClass = enum {
     math2,
     /// 3-arg math builtin (`fma`).
     math3,
+    /// 1-arg regex builtin (`test`, `match`, `capture`, `scan`,
+    /// `splits`). May absorb an optional 2nd literal flag string at
+    /// the AST surface — flags are decoded at lower time, so the IR
+    /// sees a literal-pattern collapsed shape (span_len = 0) or a
+    /// dynamic-pattern shape (span_len = 1) plus a packed
+    /// `(pool_idx, n_flag)` payload.
+    regex1,
+    /// 2-arg regex builtin (`sub`, `gsub`). May absorb an optional
+    /// 3rd literal flag string. The replacement arg always lowers
+    /// to a child IR node.
+    regex2,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1014,6 +1099,14 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 0 and std.mem.eql(u8, name, "not")) return .not;
     if (arity == 1 and std.mem.eql(u8, name, "path")) return .path;
 
+    // Regex builtins (cat-11). Dispatch by name alone, regardless of
+    // arity. Lowering may produce span_len ∈ {0, 1, 2} depending on
+    // literal/dynamic pattern + 1-arg/2-arg form, so a uniform arity
+    // check would mis-route. The synthesized internal name `match__g`
+    // (from `match("pat";"g")`) is treated as regex1 too.
+    if (isRegex1BuiltinName(name)) return .regex1;
+    if (isRegex2BuiltinName(name)) return .regex2;
+
     if (arity == 0) {
         if (isZeroArgBuiltin(name)) return .zero_arg;
         return .not_implemented;
@@ -1023,6 +1116,27 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 2 and isMath2Builtin(name)) return .math2;
     if (arity == 3 and isMath3Builtin(name)) return .math3;
     return .not_implemented;
+}
+
+/// Recognize 1-arg regex builtin names (cat-11). The internal
+/// generator variant `match__g` is recognized as well so the IR's
+/// synthesized name from `match("pat";"g")` flows through the same
+/// dispatch.
+pub fn isRegex1BuiltinName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "test") or
+        std.mem.eql(u8, name, "match") or
+        std.mem.eql(u8, name, "match__g") or
+        std.mem.eql(u8, name, "capture") or
+        std.mem.eql(u8, name, "scan") or
+        std.mem.eql(u8, name, "splits");
+}
+
+/// Recognize 2-arg regex builtin names (`sub`, `gsub`). The 3-arg
+/// form `sub(pat;repl;"g")` lowers to `gsub_` at compile time —
+/// single source of truth, one bid per distinct VM behavior.
+pub fn isRegex2BuiltinName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "sub") or
+        std.mem.eql(u8, name, "gsub");
 }
 
 /// Names accepted as zero-arg builtin calls. Mirrors legacy
@@ -1239,8 +1353,300 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
+        .regex1 => return lowerRegexBuiltin1(ctx, bc, src_start, src_len),
+        .regex2 => return lowerRegexBuiltin2(ctx, bc, src_start, src_len),
         .not_implemented => return error.NewCompilerNotImplemented,
     }
+}
+
+// ── Regex builtin lowering (cat-11) ──────────────────────────────────────────
+//
+// Single source of truth for regex pattern interning + flag decoding.
+// Mirrors legacy `compileRegexBuiltin1` and `compileRegexBuiltin2` at
+// `src/query/src/compiler.zig:3059-3147` and `:3742-3864`.
+//
+// Pattern classification (literal vs dynamic) drives two emission shapes:
+//
+// 1. Literal pattern (string-literal arg). The decoded pattern bytes
+//    (with optional inline `(?<flags>)` prefix derived from a literal
+//    flag string) are interned into the lowerer's `regex_pool`; the
+//    resulting `u32` index is packed into `extra_data` slots 2..3 along
+//    with the `n_flag` bit. The IR's variadic span carries only the
+//    auxiliary args (replacement for `sub`/`gsub`); the regex pattern
+//    itself does NOT reach the value stack — emit's `regex1`/`regex2`
+//    bytecode pattern reads the pool index from the operand directly.
+//
+// 2. Dynamic pattern (any non-literal expression). The pattern is
+//    lowered as a regular IR child and pushed onto the value stack at
+//    runtime; `regex_pool_idx == REGEX_POOL_DYNAMIC` tells the VM to
+//    consult its per-iterator `LruCache` instead of the compile-time
+//    pool. Cat-11 only supports literal flags (3-arg sub/gsub flag
+//    arg); dynamic flag strings surface as `RegexCompileError`.
+//
+// 3-arg regex builtins (`sub(pat;repl;"g")`, `match("pat";"g")`)
+// dispatch to the global-mode internal variants `gsub_` / `match_g_`
+// at lower time — single source of truth, one bid per distinct VM
+// behavior. The IR carries the substituted name (`match__g`); emit's
+// `nameToBuiltinId` recognizes the synthesized name and routes to
+// `.match_g_`.
+
+/// Lower a 1-arg regex builtin (`test`, `match`, `capture`, `scan`,
+/// `splits`). AST shape: `BuiltinCall { args = [pat] }` or
+/// `BuiltinCall { args = [pat, flag_string_lit] }` for the 2-arg
+/// flag form. The optional flag string is absorbed at lower time;
+/// non-literal flag strings surface as `RegexCompileError` (matches
+/// legacy strictness — runtime-built flags are out of scope).
+fn lowerRegexBuiltin1(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    if (bc.args.len < 1 or bc.args.len > 2) return error.NewCompilerNotImplemented;
+
+    var flag_body: ?[]const u8 = null;
+    if (bc.args.len == 2) {
+        flag_body = extractStringLiteral(bc.args[1]) orelse {
+            return regexLiteralFlagError(ctx, bc.args[1]);
+        };
+    }
+
+    return lowerRegexBuiltinCommon(
+        ctx,
+        bc.name,
+        bc.args[0],
+        flag_body,
+        &.{}, // 1-arg form has no replacement arg
+        src_start,
+        src_len,
+    );
+}
+
+/// Lower a 2- or 3-arg regex builtin (`sub`, `gsub`). The replacement
+/// arg always lowers to a child IR node; the regex pattern follows
+/// the same literal/dynamic dichotomy as 1-arg builtins.
+fn lowerRegexBuiltin2(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    if (bc.args.len < 2 or bc.args.len > 3) return error.NewCompilerNotImplemented;
+
+    var flag_body: ?[]const u8 = null;
+    if (bc.args.len == 3) {
+        flag_body = extractStringLiteral(bc.args[2]) orelse {
+            return regexLiteralFlagError(ctx, bc.args[2]);
+        };
+    }
+
+    // Replacement arg: reject comma-arg generators (cat-10's
+    // territory). The replacement is lowered as a regular value-arg
+    // child — emit brackets it with save_input/restore_input around
+    // the pattern push.
+    if (bc.args[1].kind == .comma) return error.NewCompilerNotImplemented;
+    const repl_idx = try lowerNode(ctx, bc.args[1]);
+
+    return lowerRegexBuiltinCommon(
+        ctx,
+        bc.name,
+        bc.args[0],
+        flag_body,
+        &.{repl_idx},
+        src_start,
+        src_len,
+    );
+}
+
+/// Surface a `RegexCompileError` LowerDiagnostic anchored at `node`'s
+/// span. Used when the optional flag arg of a 2-arg regex builtin or
+/// the 3rd arg of `sub`/`gsub` is not a string literal — same
+/// rejection as legacy at `src/query/src/compiler.zig:3824`.
+fn regexLiteralFlagError(ctx: *Lowerer, node: *const Node) LowerError {
+    ctx.last_regex_pattern_offset = node.span.start;
+    ctx.last_regex_pattern_len = if (node.span.end >= node.span.start)
+        node.span.end - node.span.start
+    else
+        0;
+    ctx.compile_err = .{
+        .kind = .regex_compile_error,
+        .offset = ctx.last_regex_pattern_offset,
+        .len = ctx.last_regex_pattern_len,
+    };
+    return error.LowerDiagnostic;
+}
+
+/// Shared lowering for 1- and 2-arg regex builtins. Interns the
+/// pattern (with optional inline flag prefix) into the regex pool,
+/// applies the `match_g_` / `gsub_` dispatch substitution if `g` is
+/// set, and writes a 4-slot `extra_data` payload `(name_off, name_len,
+/// pool_idx, n_flag)`. Emit's `regex1`/`regex2` cases read these
+/// slots; the variadic span carries only the auxiliary args
+/// (replacement for sub/gsub) plus an optional dynamic-pattern arg.
+fn lowerRegexBuiltinCommon(
+    ctx: *Lowerer,
+    src_name: []const u8,
+    pat_node: *const Node,
+    flag_body: ?[]const u8,
+    extra_args: []const u32,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    var has_g = false;
+    var has_n = false;
+    var inline_buf: [8]u8 = undefined;
+    var inline_flags: []const u8 = &.{};
+
+    if (flag_body) |fb| {
+        const decoded = decodeRegexFlags(fb, &inline_buf) catch {
+            return regexLiteralFlagError(ctx, pat_node);
+        };
+        inline_flags = decoded.inline_flags;
+        has_g = decoded.has_g;
+        has_n = decoded.has_n;
+    }
+
+    // Substitute name when the `g` flag selects an internal variant:
+    //   match("pat";"g")  → name "match__g" → emit BuiltinId.match_g_
+    //   sub(pat;repl;"g") → name "gsub"     → emit BuiltinId.gsub_
+    //   gsub(...; "g")    → name "gsub"     → unchanged (already global)
+    // Single source of truth: one bid per distinct VM behavior.
+    var effective_name = src_name;
+    if (has_g) {
+        if (std.mem.eql(u8, src_name, "match")) effective_name = "match__g";
+        if (std.mem.eql(u8, src_name, "sub")) effective_name = "gsub";
+    }
+
+    // Pattern classification: literal → intern into pool; dynamic →
+    // route to legacy. The dynamic path requires the legacy
+    // input-preservation semantics around `as`-bindings (see
+    // `as_pattern` cat-4 lowering — the new pipeline pipes expr's
+    // result, which would surface a different value-stack regime
+    // than legacy expects). Cat-11 owns the literal-pattern fast
+    // path only; dynamic patterns fall back so the splits/scan/
+    // match($var) idioms preserve VM-equivalence with legacy
+    // through the production dispatcher.
+    const pat_literal = extractStringLiteral(pat_node);
+    if (pat_literal == null) return error.NewCompilerNotImplemented;
+    var pool_idx: u32 = types_mod.REGEX_POOL_DYNAMIC;
+    if (pat_literal) |lit| {
+        // Build the final key: optional `(?<flags>)` prefix + decoded
+        // pattern bytes. Mirrors legacy `compileRegexBuiltin1FastLiteral`
+        // and `compileRegexBuiltin2`'s 3-arg form key construction.
+        const alloc = ctx.arena.allocator();
+        var key_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer key_buf.deinit(alloc);
+        if (inline_flags.len > 0) {
+            try key_buf.appendSlice(alloc, "(?");
+            try key_buf.appendSlice(alloc, inline_flags);
+            try key_buf.append(alloc, ')');
+        }
+        try key_buf.appendSlice(alloc, lit);
+
+        ctx.last_regex_pattern_offset = pat_node.span.start;
+        ctx.last_regex_pattern_len = if (pat_node.span.end >= pat_node.span.start)
+            pat_node.span.end - pat_node.span.start
+        else
+            0;
+
+        pool_idx = ctx.internRegex(key_buf.items) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RegexCompileError, error.RegexNotCompiled => {
+                ctx.compile_err = .{
+                    .kind = if (e == error.RegexNotCompiled) .regex_not_compiled else .regex_compile_error,
+                    .offset = ctx.last_regex_pattern_offset,
+                    .len = ctx.last_regex_pattern_len,
+                };
+                return error.LowerDiagnostic;
+            },
+        };
+    }
+
+    // Build the variadic span. For dynamic patterns the pattern arg
+    // reaches the value stack; for literal patterns the regex pool
+    // index supplies the regex and only `extra_args` (replacement, if
+    // any) participate.
+    const alloc = ctx.arena.allocator();
+    var span_buf: std.ArrayListUnmanaged(u32) = .{};
+    defer span_buf.deinit(alloc);
+
+    if (pool_idx == types_mod.REGEX_POOL_DYNAMIC) {
+        if (pat_node.kind == .comma) return error.NewCompilerNotImplemented;
+        const pat_idx = try lowerNode(ctx, pat_node);
+        try span_buf.append(alloc, pat_idx);
+    }
+    try span_buf.appendSlice(alloc, extra_args);
+
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.appendSlice(alloc, span_buf.items);
+    const span_len: u32 = @intCast(span_buf.items.len);
+
+    // 4-slot payload: `internString` writes (name_off, name_len);
+    // append (pool_idx, n_flag).
+    const extra_idx = try ctx.internString(effective_name);
+    try ctx.out.extra_data.append(alloc, pool_idx);
+    try ctx.out.extra_data.append(alloc, if (has_n) @as(u32, 1) else 0);
+
+    return ctx.pushNode(.{
+        .op = .call_builtin,
+        .span_start = span_start,
+        .span_len = span_len,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Decoded regex flag string. `inline_flags` is the subset that maps
+/// to a `(?<flags>)` inline group prepended to the pattern; `has_g`
+/// and `has_n` are surfaced separately because they affect bid/operand
+/// selection (not the pattern bytes).
+const RegexFlagDecode = struct {
+    inline_flags: []const u8,
+    has_g: bool,
+    has_n: bool,
+};
+
+/// Decode a regex flag string into the legacy flag-prefix tuple.
+/// Recognized flag letters (`i`, `x`, `m`, `s`) → `inline_flags`;
+/// `g` → `has_g`; `n` → `has_n`. Unknown letters →
+/// `error.RegexCompileError`. Mirrors `emitFlagPrefix` at
+/// `src/query/src/compiler.zig:3179`.
+fn decodeRegexFlags(flag_body: []const u8, scratch: []u8) error{RegexCompileError}!RegexFlagDecode {
+    var inline_len: usize = 0;
+    var has_g = false;
+    var has_n = false;
+    for (flag_body) |ch| {
+        switch (ch) {
+            'i', 'x', 'm', 's' => {
+                if (inline_len >= scratch.len) return error.RegexCompileError;
+                scratch[inline_len] = ch;
+                inline_len += 1;
+            },
+            'g' => has_g = true,
+            'n' => has_n = true,
+            else => return error.RegexCompileError,
+        }
+    }
+    return .{
+        .inline_flags = scratch[0..inline_len],
+        .has_g = has_g,
+        .has_n = has_n,
+    };
+}
+
+/// Extract a string-literal value from an AST node, or null if the
+/// node isn't a `.literal { .string = … }`. Used for regex-pattern
+/// and flag-arg detection. The returned slice aliases the parser's
+/// arena — caller must not mutate it.
+fn extractStringLiteral(node: *const Node) ?[]const u8 {
+    return switch (node.kind) {
+        .literal => |lit| switch (lit) {
+            .string => |s| s,
+            else => null,
+        },
+        else => null,
+    };
 }
 
 /// Map AST `AssignOp` → `UpdateOpKind` (excluding `general`, which is a

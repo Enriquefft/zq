@@ -1,0 +1,3 @@
+# source: test("^foo")
+# SemOp
+call_builtin("test", re_0 "/^foo/") @0..12

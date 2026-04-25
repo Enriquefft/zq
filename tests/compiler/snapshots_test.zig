@@ -102,6 +102,16 @@ const FIXTURES = [_]Fixture{
     .{ .name = "builtin_pow", .expected = @embedFile("snapshots/lower/builtin_pow.txt") },
     .{ .name = "builtin_setpath", .expected = @embedFile("snapshots/lower/builtin_setpath.txt") },
     .{ .name = "builtin_fma", .expected = @embedFile("snapshots/lower/builtin_fma.txt") },
+    // ── Cat-11 regex / datetime / arg-builtin snapshots ───────────
+    .{ .name = "regex_test_lit", .expected = @embedFile("snapshots/lower/regex_test_lit.txt") },
+    .{ .name = "regex_match_g", .expected = @embedFile("snapshots/lower/regex_match_g.txt") },
+    .{ .name = "regex_capture", .expected = @embedFile("snapshots/lower/regex_capture.txt") },
+    .{ .name = "regex_sub_lit", .expected = @embedFile("snapshots/lower/regex_sub_lit.txt") },
+    .{ .name = "regex_gsub_g_subst", .expected = @embedFile("snapshots/lower/regex_gsub_g_subst.txt") },
+    .{ .name = "datetime_now", .expected = @embedFile("snapshots/lower/datetime_now.txt") },
+    .{ .name = "datetime_strftime", .expected = @embedFile("snapshots/lower/datetime_strftime.txt") },
+    .{ .name = "argbuiltin_split", .expected = @embedFile("snapshots/lower/argbuiltin_split.txt") },
+    .{ .name = "argbuiltin_pow", .expected = @embedFile("snapshots/lower/argbuiltin_pow.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive
@@ -132,7 +142,9 @@ test "snapshot fixtures: lower" {
             .src = filter,
             .out = compiler.IR.init(&arena),
             .opts = .{},
+            .pool_alloc = alloc,
         };
+        defer lowerer.deinitRegexPool();
         _ = try compiler.lowerNode(&lowerer, parse_result.root);
 
         var actual_buf: std.ArrayList(u8) = .{};

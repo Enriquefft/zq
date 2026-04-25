@@ -576,12 +576,27 @@ fn dumpAst(
                 return;
             }
             // Generic builtin call: rendered as `call_builtin("name")`.
+            // For regex builtins with a literal pattern arg, also
+            // render the pool ref annotation per spec §6 "Regex pool
+            // refs": `call_builtin("name", re_0 "/<pat>/<flags>")`.
+            // The pool index is rendered as `re_0` because the
+            // dumper has no access to the lowerer's interned
+            // index — snapshot stability comes from the
+            // human-readable pattern + flag suffix.
             try writer.writeAll("call_builtin(");
             try writeStringLit(writer, bc.name);
+            if (isRegexBuiltinByName(bc.name)) {
+                try writeRegexPoolRef(writer, &bc);
+            }
             try writer.writeAll(")");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            for (bc.args) |arg| {
+            // For regex builtins, skip the args absorbed into the
+            // pool ref (literal pattern + literal flags); render the
+            // rest as ordinary children. Non-regex builtins render
+            // every arg.
+            for (bc.args, 0..) |arg, i| {
+                if (isRegexBuiltinByName(bc.name) and shouldSkipRegexArg(&bc, i)) continue;
                 try dumpAst(ir_obj, arg, depth + 1, writer);
             }
         },
@@ -1134,4 +1149,111 @@ fn writeStringLit(writer: anytype, s: []const u8) !void {
         }
     }
     try writer.writeByte('"');
+}
+
+// ── Regex-aware dumper helpers (cat-11) ─────────────────────────────────────
+
+/// Recognize regex builtin names for dump-time pool-ref rendering.
+/// Mirrors `lower.isRegex1BuiltinName` / `isRegex2BuiltinName` — kept
+/// inline because the dumper is pure and shouldn't depend on
+/// `lower.zig`. The internal `match__g` variant is included so a
+/// `match("pat";"g")` source still routes through the regex render
+/// path even after lowering substitutes the bid name.
+fn isRegexBuiltinByName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "test") or
+        std.mem.eql(u8, name, "match") or
+        std.mem.eql(u8, name, "match__g") or
+        std.mem.eql(u8, name, "capture") or
+        std.mem.eql(u8, name, "scan") or
+        std.mem.eql(u8, name, "splits") or
+        std.mem.eql(u8, name, "sub") or
+        std.mem.eql(u8, name, "gsub");
+}
+
+/// Decide whether the dumper should skip arg index `i` of a regex
+/// `builtin_call` because the arg is absorbed into the inline pool
+/// ref rendering. Pattern arg (idx 0) is skipped when literal; flag
+/// arg (idx 1 for 1-arg builtins, idx 2 for sub/gsub) is skipped
+/// when literal.
+fn shouldSkipRegexArg(bc: *const ast.Node.BuiltinCall, i: usize) bool {
+    if (bc.args.len == 0) return false;
+    const is_2arg = std.mem.eql(u8, bc.name, "sub") or std.mem.eql(u8, bc.name, "gsub");
+    const flag_arg_idx: usize = if (is_2arg) 2 else 1;
+    if (i == 0) {
+        // Skip pattern arg if it's a literal string.
+        if (bc.args[0].kind == .literal) {
+            switch (bc.args[0].kind.literal) {
+                .string => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+    if (i == flag_arg_idx and bc.args.len > flag_arg_idx) {
+        // Skip the flag arg if it's a literal string.
+        if (bc.args[i].kind == .literal) {
+            switch (bc.args[i].kind.literal) {
+                .string => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+/// Render an inline `, re_<idx> "/<pattern>/<flags>"` pool ref for
+/// regex builtins whose pattern arg is a string literal. When the
+/// pattern is dynamic (a non-literal expression), nothing is rendered
+/// — the pattern lowers to a regular IR child instead, and the dump
+/// shows it as such. Pool index renders as `re_0` because the
+/// dumper has no access to the lowerer's interned index; snapshot
+/// stability comes from the human-readable pattern + flag suffix per
+/// spec §6 worked example.
+fn writeRegexPoolRef(writer: anytype, bc: *const ast.Node.BuiltinCall) !void {
+    if (bc.args.len == 0) return;
+    const pat_lit = switch (bc.args[0].kind) {
+        .literal => |lit| switch (lit) {
+            .string => |s| s,
+            else => return,
+        },
+        else => return,
+    };
+
+    // Detect a literal flag string at args[1] for 1-arg regex
+    // builtins (test/match/...) or args[2] for 2-arg (sub/gsub).
+    var flag_body: []const u8 = "";
+    const is_2arg = std.mem.eql(u8, bc.name, "sub") or std.mem.eql(u8, bc.name, "gsub");
+    const flag_arg_idx: usize = if (is_2arg) 2 else 1;
+    if (bc.args.len > flag_arg_idx and bc.args[flag_arg_idx].kind == .literal) {
+        switch (bc.args[flag_arg_idx].kind.literal) {
+            .string => |s| flag_body = s,
+            else => {},
+        }
+    }
+
+    try writer.writeAll(", re_0 \"/");
+    // Pattern body: emit raw bytes with JSON-style escapes applied
+    // (per spec §6 "Regex pool refs" example).
+    for (pat_lit) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11, 12, 14...31 => try writer.print("\\u{X:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeAll("/");
+    // Strip the `g` flag — `match__g` already encodes that signal in
+    // the renamed bid; rendering `g` here would confuse the snapshot
+    // reader. Other flags (i/x/m/s/n) flow through verbatim.
+    for (flag_body) |c| {
+        switch (c) {
+            'g' => continue,
+            'i', 'x', 'm', 's', 'n' => try writer.writeByte(c),
+            else => {},
+        }
+    }
+    try writer.writeAll("\"");
 }

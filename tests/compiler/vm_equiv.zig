@@ -256,6 +256,40 @@ const FIXTURES = [_]Fixture{
 
     // ── Category 10 — builtins (3-arg math) ───────────────────────
     .{ .name = "builtin_fma", .filter = "fma(2; 3; 4)", .input = "null", .expected_output = "10" },
+
+    // ── Category 11 — regex builtins (literal pattern fast path) ──
+    // Each fixture exercises one regex bid through a string-literal
+    // pattern so the pool is populated at lower time. The new
+    // compiler reads the pool index from the operand; the legacy
+    // compiler did the same — VM-equivalence holds.
+    .{ .name = "regex_test_t", .filter = "test(\"^[a-z]+$\")", .input = "\"foobar\"", .expected_output = "true" },
+    .{ .name = "regex_test_f", .filter = "test(\"^[0-9]+$\")", .input = "\"foobar\"", .expected_output = "false" },
+    .{ .name = "regex_test_flag_i", .filter = "test(\"FOO\"; \"i\")", .input = "\"foobar\"", .expected_output = "true" },
+    .{ .name = "regex_match_obj", .filter = "match(\"o+\") | .offset", .input = "\"foobar\"", .expected_output = "1" },
+    .{ .name = "regex_match_g_count", .filter = "[match(\"o\"; \"g\")] | length", .input = "\"foobar\"", .expected_output = "2" },
+    .{ .name = "regex_capture", .filter = "capture(\"(?<n>[a-z]+)\")|.n", .input = "\"abc\"", .expected_output = "\"abc\"" },
+    .{ .name = "regex_scan", .filter = "[scan(\"[a-z]+\")]", .input = "\"a1b2c\"", .expected_output = "[\"a\",\"b\",\"c\"]" },
+    .{ .name = "regex_splits", .filter = "[splits(\"[0-9]+\")]", .input = "\"a1b22c\"", .expected_output = "[\"a\",\"b\",\"c\"]" },
+    .{ .name = "regex_sub", .filter = "sub(\"o\"; \"X\")", .input = "\"foobar\"", .expected_output = "\"fXobar\"" },
+    .{ .name = "regex_gsub", .filter = "gsub(\"o\"; \"X\")", .input = "\"foobar\"", .expected_output = "\"fXXbar\"" },
+    .{ .name = "regex_sub_g_dispatches_gsub", .filter = "sub(\"o\"; \"X\"; \"g\")", .input = "\"foobar\"", .expected_output = "\"fXXbar\"" },
+
+    // ── Category 11 — datetime builtins ──────────────────────────
+    // Datetime values vary by clock; pick deterministic cases:
+    //   - `gmtime` of a fixed timestamp → fixed broken-down array
+    //   - `mktime | gmtime` round-trip → identity
+    //   - `todate` of a fixed timestamp → fixed ISO string
+    .{ .name = "datetime_gmtime_zero", .filter = "0 | gmtime", .input = "null", .expected_output = "[1970,0,1,0,0,0,4,0]" },
+    .{ .name = "datetime_mktime_round_trip", .filter = "[1970,0,1,0,0,0,4,0] | mktime", .input = "null", .expected_output = "0" },
+    .{ .name = "datetime_todate_zero", .filter = "0 | todate", .input = "null", .expected_output = "\"1970-01-01T00:00:00Z\"" },
+    .{ .name = "datetime_fromdate_zero", .filter = "\"1970-01-01T00:00:00Z\" | fromdate", .input = "null", .expected_output = "0" },
+    .{ .name = "datetime_strftime_iso", .filter = "0 | gmtime | strftime(\"%Y-%m-%d\")", .input = "null", .expected_output = "\"1970-01-01\"" },
+
+    // ── Category 11 — extended arg-builtin surface ───────────────
+    // Bare-name forms reaching AST as `field_access` (not in the
+    // narrow `isZeroArgBuiltin` list — see `src/ast/parser.zig:1601`).
+    .{ .name = "builtin_utf8bytelength_bare", .filter = "utf8bytelength", .input = "\"abc\"", .expected_output = "3" },
+    .{ .name = "builtin_trim_bare", .filter = "trim", .input = "\"  hi  \"", .expected_output = "\"hi\"" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

@@ -67,6 +67,7 @@ const Emitter = struct {
 pub fn emit(
     ir_obj: ir.IR,
     external_var_count: usize,
+    regex_pool: regex_mod.RegexPool,
     allocator: std.mem.Allocator,
 ) EmitError!ctypes.Compiled {
     var instructions: std.ArrayListUnmanaged(types_mod.Instruction) = .{};
@@ -128,7 +129,7 @@ pub fn emit(
         .string_buf = buf_slice,
         .external_var_ids = ext_var_ids,
         .source_map = src_map_slice,
-        .regex_pool = regex_mod.RegexPool.init(allocator),
+        .regex_pool = regex_pool,
         .prefilter = null,
     };
 }
@@ -1787,6 +1788,61 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // (it routes them to dedicated SemOps), so emit unreachable —
         // hitting them indicates an upstream classifier drift.
         .not, .path => unreachable,
+        // ── Regex builtins (cat-11) ─────────────────────────────────
+        // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
+        // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
+        // n_flag)` into the `call_builtin` operand via the legacy SSOT
+        // helper so the VM bytecode shape is unchanged (BUG-006).
+        .regex1 => {
+            const pool_idx: u32 = slots[node.extra + 2];
+            const n_flag: bool = slots[node.extra + 3] != 0;
+            // Dynamic patterns push the pattern arg onto the value
+            // stack before the call; literal patterns rely on the
+            // pool index in the operand and have no value-stack arg.
+            if (pool_idx == types_mod.REGEX_POOL_DYNAMIC and node.span_len >= 1) {
+                const pat_idx = em.ir_obj.extra_children.items[node.span_start];
+                try emitNode(em, pat_idx);
+            }
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = types_mod.packRegexBuiltinOperandFlags(bid, pool_idx, n_flag) },
+                node,
+            );
+        },
+        .regex2 => {
+            const pool_idx: u32 = slots[node.extra + 2];
+            const n_flag: bool = slots[node.extra + 3] != 0;
+            const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            if (pool_idx == types_mod.REGEX_POOL_DYNAMIC) {
+                // Dynamic pattern: span = [pat, repl]. Mirrors legacy
+                // `compileRegexBuiltin2` slow path:
+                //   save_input ; <pat> ; restore_input ;
+                //   save_input ; <repl> ; restore_input ; call_builtin
+                std.debug.assert(args.len == 2);
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, args[0]);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, args[1]);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            } else {
+                // Literal pattern: span = [repl] only. The pool index
+                // supplies the regex; the pattern push is replaced by
+                // an empty save/restore pair so the input-stack
+                // bracketing matches legacy's fast-path shape exactly.
+                std.debug.assert(args.len == 1);
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, args[0]);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            }
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = types_mod.packRegexBuiltinOperandFlags(bid, pool_idx, n_flag) },
+                node,
+            );
+        },
         .not_implemented => return error.NewCompilerNotImplemented,
     }
 }
@@ -1797,6 +1853,21 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
 /// (name, arity) tuple disambiguates overloaded names (e.g. `flatten`
 /// has both 0-arg and 1-arg forms mapping to different ids).
 fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
+    // Regex builtins (cat-11) — dispatch by name alone, regardless
+    // of IR arity. Lowering may produce span_len ∈ {0, 1, 2}
+    // depending on literal/dynamic pattern + 1-arg/2-arg form, so a
+    // uniform arity check would mis-route. The synthesized
+    // `match__g` name (from `match("pat";"g")`) maps to the internal
+    // generator-mode bid `match_g_`.
+    if (std.mem.eql(u8, name, "test")) return .test_;
+    if (std.mem.eql(u8, name, "match")) return .match_;
+    if (std.mem.eql(u8, name, "match__g")) return .match_g_;
+    if (std.mem.eql(u8, name, "capture")) return .capture_;
+    if (std.mem.eql(u8, name, "scan")) return .scan_;
+    if (std.mem.eql(u8, name, "splits")) return .splits_;
+    if (std.mem.eql(u8, name, "sub")) return .sub_;
+    if (std.mem.eql(u8, name, "gsub")) return .gsub_;
+
     if (arity == 0) {
         if (std.mem.eql(u8, name, "length")) return .length;
         if (std.mem.eql(u8, name, "keys")) return .keys;

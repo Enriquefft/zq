@@ -65,7 +65,9 @@ pub fn main() !void {
             .src = filter_owned,
             .out = compiler.IR.init(&arena),
             .opts = .{},
+            .pool_alloc = alloc,
         };
+        defer lowerer.deinitRegexPool();
         _ = compiler.lowerNode(&lowerer, parse_result.root) catch |e| {
             try w.print("SKIP {s}: lower error `{s}` in `{s}`\n", .{ entry.name, @errorName(e), filter_owned });
             continue;
