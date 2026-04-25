@@ -339,6 +339,22 @@ fn dumpAst(
             try writer.writeAll("\n");
             try dumpAst(ir_obj, un.operand, depth + 1, writer);
         },
+        .pipe => |bp| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("pipe");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bp.left, depth + 1, writer);
+            try dumpAst(ir_obj, bp.right, depth + 1, writer);
+        },
+        .comma => |bc| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("comma");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bc.left, depth + 1, writer);
+            try dumpAst(ir_obj, bc.right, depth + 1, writer);
+        },
         .suffix => |sf| try dumpSuffix(ir_obj, &sf, node.span, depth, writer),
         .builtin_call => |bc| {
             try writeIndent(writer, depth);

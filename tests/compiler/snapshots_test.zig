@@ -39,6 +39,10 @@ const FIXTURES = [_]Fixture{
     .{ .name = "iterate", .expected = @embedFile("snapshots/lower/iterate.txt") },
     .{ .name = "slice", .expected = @embedFile("snapshots/lower/slice.txt") },
     .{ .name = "try_optional", .expected = @embedFile("snapshots/lower/try_optional.txt") },
+    .{ .name = "pipe_simple", .expected = @embedFile("snapshots/lower/pipe_simple.txt") },
+    .{ .name = "pipe_chain", .expected = @embedFile("snapshots/lower/pipe_chain.txt") },
+    .{ .name = "comma_simple", .expected = @embedFile("snapshots/lower/comma_simple.txt") },
+    .{ .name = "comma_pipe_mixed", .expected = @embedFile("snapshots/lower/comma_pipe_mixed.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

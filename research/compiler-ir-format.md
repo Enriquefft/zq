@@ -169,7 +169,7 @@ offsets (start inclusive, end exclusive), counting from byte 0 of the filter str
 
 **Span coverage rules:**
 - For leaf nodes the span covers the source token range exactly, including any leading
-  `.` for `field` nodes (e.g., `.foo` → `@0..4`, not `@1..4`).
+  `.` for `load_field` nodes (e.g., `.foo` → `@0..4`, not `@1..4`).
 - For composite nodes the span covers the entire source range governed by the node,
   from the first byte of the first child to one past the last byte of the last child.
 

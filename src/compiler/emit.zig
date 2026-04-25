@@ -217,6 +217,24 @@ fn emitNode(
             try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
         },
 
+        // Comma: emit a fork bracketing the left arm with a jump-end so
+        // backtracking from the left's last yield resumes at the right
+        // arm's entry. Mirrors legacy `parseComma` (compiler.zig:2379):
+        // fork target = right_start; jump target = end. Backpatch both
+        // after the corresponding subtree has been emitted.
+        .comma => {
+            const fork_pos: usize = instructions.items.len;
+            try push(instructions, source_map, .fork, .{ .index = 0 }, node, allocator);
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            const jump_pos: usize = instructions.items.len;
+            try push(instructions, source_map, .jump, .{ .index = 0 }, node, allocator);
+            const right_start: u32 = @intCast(instructions.items.len);
+            instructions.items[fork_pos].operand = .{ .index = right_start };
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            const end_ip: u32 = @intCast(instructions.items.len);
+            instructions.items[jump_pos].operand = .{ .index = end_ip };
+        },
+
         // Try wrap: record the start IP, emit the inner expression,
         // insert `fork_try` at the recorded start, then append
         // `pop_try`. Mirrors the legacy `?`-segment-wrap

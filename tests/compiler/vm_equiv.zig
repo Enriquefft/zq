@@ -63,6 +63,10 @@ const FIXTURES = [_]Fixture{
     .{ .name = "udf_semi", .filter = "def f(a;b): a + b; f(.x;.y)", .input = "{\"x\":2,\"y\":3}", .expected_output = "5" },
     .{ .name = "regex_lit", .filter = "test(\"^[a-z]+$\")", .input = "\"foobar\"", .expected_output = "true" },
     .{ .name = "reduce", .filter = "reduce range(10) as $i (0; . + $i)", .input = "null", .expected_output = "45" },
+
+    .{ .name = "pipe_chain", .filter = ".a | .b | .c", .input = "{\"a\":{\"b\":{\"c\":7}}}", .expected_output = "7" },
+    .{ .name = "comma_simple", .filter = ".a, .b", .input = "{\"a\":1,\"b\":2}", .expected_output = "1\n2" },
+    .{ .name = "comma_chain", .filter = ".a, .b, .c", .input = "{\"a\":1,\"b\":2,\"c\":3}", .expected_output = "1\n2\n3" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

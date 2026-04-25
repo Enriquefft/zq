@@ -275,6 +275,30 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             });
         },
 
+        // ── Pipe `lhs | rhs` (category 3) ───────────────────────────
+        .pipe => |bp| {
+            const left = try lowerNode(ctx, bp.left);
+            const right = try lowerNode(ctx, bp.right);
+            return ctx.pushNode(.{
+                .op = .pipe,
+                .children = .{ left, right },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Comma `lhs , rhs` (category 3) ──────────────────────────
+        .comma => |bc| {
+            const left = try lowerNode(ctx, bc.left);
+            const right = try lowerNode(ctx, bc.right);
+            return ctx.pushNode(.{
+                .op = .comma,
+                .children = .{ left, right },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Suffix chain (category 2) ───────────────────────────────
         // Each non-`optional` SuffixOp produces a new pipe layer
         // wrapping (accumulated_chain, new_op_node). Each `optional`
