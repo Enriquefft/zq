@@ -127,7 +127,7 @@ fn emitNode(
             }
         },
 
-        .identity => try push(instructions, source_map, .identity, .{ .none = {} }, node, allocator),
+        .identity => try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator),
 
         .recurse => try push(
             instructions,
@@ -376,8 +376,217 @@ fn emitNode(
             instructions.items[jump_end_pos].operand = .{ .index = @intCast(instructions.items.len) };
         },
 
+        // ── Category 7 ──────────────────────────────────────────────
+        // Object literal `{...}`. Variadic span carries (key, value)
+        // pairs interleaved (k0, v0, k1, v1, ...). Emit
+        // `object_construct_start` once, lower each pair followed by
+        // `object_key`, then close with `object_construct_end`.
+        // Matches legacy `parseObjectLiteral`
+        // (`src/query/src/compiler.zig:6702`).
+        .obj_ctor => {
+            try push(instructions, source_map, .object_construct_start, .{ .none = {} }, node, allocator);
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            // Pairs are (k, v); span_len is always even (lowering invariant).
+            std.debug.assert(span.len % 2 == 0);
+            var pi: usize = 0;
+            while (pi < span.len) : (pi += 2) {
+                try emitNode(instructions, source_map, ir_obj, span[pi], allocator);
+                try emitNode(instructions, source_map, ir_obj, span[pi + 1], allocator);
+                try push(instructions, source_map, .object_key, .{ .none = {} }, node, allocator);
+            }
+            try push(instructions, source_map, .object_construct_end, .{ .none = {} }, node, allocator);
+        },
+
+        // Array literal `[...]`. Emits the `array_collect_start ... end`
+        // pair around per-element `save_input / <elem> / yield_output /
+        // restore_input` ladders. The start instruction's operand
+        // receives the IP of the matching `array_collect_end` after
+        // backpatching. Matches legacy `parseArrayConstruct`
+        // (`src/query/src/compiler.zig:6410`).
+        .arr_ctor => {
+            const start_pos = instructions.items.len;
+            try push(instructions, source_map, .array_collect_start, .{ .index = 0 }, node, allocator);
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span) |elem_idx| {
+                try push(instructions, source_map, .save_input, .{ .none = {} }, node, allocator);
+                try emitNode(instructions, source_map, ir_obj, elem_idx, allocator);
+                try push(instructions, source_map, .yield_output, .{ .none = {} }, node, allocator);
+                try push(instructions, source_map, .restore_input, .{ .none = {} }, node, allocator);
+            }
+            const end_pos: u32 = @intCast(instructions.items.len);
+            try push(instructions, source_map, .array_collect_end, .{ .none = {} }, node, allocator);
+            instructions.items[start_pos].operand = .{ .index = end_pos };
+        },
+
+        // String interpolation `"... \(expr) ..."`. The parts span is
+        // `[lit0, expr0, lit1, expr1, ...]` (ladder always starts with a
+        // literal — parser invariant). Emit a leading `push_string` for
+        // `lit0`, then for each expr/lit-tail pair: `save_input ; <expr>
+        // ; pipe ; call_builtin tostring ; add ; restore_input ;
+        // push_string lit ; add`. Mirrors legacy
+        // `compileStringInterpolation`
+        // (`src/query/src/compiler.zig:5604`).
+        .interp => {
+            try emitInterpLadder(instructions, source_map, ir_obj, node, null, allocator);
+        },
+
+        // Format application `@fmt "..."`. Three legacy shapes:
+        //   1. `@fmt "lit\(expr)..."` → interp ladder with format
+        //                                builtin applied per expr part.
+        //   2. `@fmt "literal"`       → bare `push_string` (no format).
+        //   3. `@fmt` standalone     → call_builtin(format) on current.
+        // Cat-7 owns shapes 1 and 2 (both arrive as `format_string`
+        // AST). Shape 3 is `builtin_call` — cat-10's responsibility.
+        .format => {
+            const slots = ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            const fmt_name = ir_obj.string_buf.items[offset .. offset + len];
+            // `fmt_name` carries a leading '@' (parser
+            // `internFormatName`); legacy `formatBuiltinId` matches on
+            // the unprefixed name.
+            const bare = if (fmt_name.len > 0 and fmt_name[0] == '@') fmt_name[1..] else fmt_name;
+            const bid = formatBuiltinId(bare) orelse return error.NewCompilerNotImplemented;
+
+            // Shape 2: single literal part, no exprs → bare push_string.
+            // Detect by inspecting the children: every part must be a
+            // synthesized `load_const(string)` and there must be
+            // exactly one such part.
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            if (span.len == 1) {
+                const child = ir_obj.nodes.items[span[0]];
+                if (child.op == .load_const) {
+                    const value = ir.loadConstValue(&ir_obj, child);
+                    if (value == .string) {
+                        const c_slots = ir_obj.extra_data.items;
+                        const c_off: u32 = c_slots[child.extra + 1];
+                        const c_len: u32 = c_slots[child.extra + 2];
+                        try push(
+                            instructions,
+                            source_map,
+                            .push_string,
+                            .{ .str_ref = .{ .offset = c_off, .len = c_len } },
+                            node,
+                            allocator,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            try emitInterpLadder(instructions, source_map, ir_obj, node, bid, allocator);
+        },
+
         else => return error.NewCompilerNotImplemented,
     }
+}
+
+/// Emit the `compileStringInterpolation` ladder for an `interp` or
+/// `format` node. The parts span starts with a literal, alternates
+/// literal/expr after, but the parser always guarantees a literal as
+/// the first part (the tokenizer surfaces interpolations as
+/// `string_part` mid-tokens, never leading-expr). When `format_bid`
+/// is supplied (only for `format` nodes), each expr part funnels
+/// through `call_builtin(format_bid)` before `tostring`.
+fn emitInterpLadder(
+    instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
+    source_map: *std.ArrayListUnmanaged(u32),
+    ir_obj: ir.IR,
+    node: ir.Node,
+    format_bid: ?types_mod.BuiltinId,
+    allocator: std.mem.Allocator,
+) EmitError!void {
+    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    // First part is a literal — push it directly. Empty literal still
+    // pushes the empty string so the trailing `add`s have a base.
+    const first_idx = span[0];
+    const first_node = ir_obj.nodes.items[first_idx];
+    std.debug.assert(first_node.op == .load_const);
+    const first_slots = ir_obj.extra_data.items;
+    const first_off: u32 = first_slots[first_node.extra + 1];
+    const first_len: u32 = first_slots[first_node.extra + 2];
+    try push(
+        instructions,
+        source_map,
+        .push_string,
+        .{ .str_ref = .{ .offset = first_off, .len = first_len } },
+        node,
+        allocator,
+    );
+
+    var i: usize = 1;
+    while (i < span.len) : (i += 1) {
+        const child_idx = span[i];
+        const child = ir_obj.nodes.items[child_idx];
+        // Literal segment → push + add.
+        if (child.op == .load_const) blk: {
+            const value = ir.loadConstValue(&ir_obj, child);
+            if (value != .string) break :blk; // not a literal segment — fall through
+            const c_slots = ir_obj.extra_data.items;
+            const c_off: u32 = c_slots[child.extra + 1];
+            const c_len: u32 = c_slots[child.extra + 2];
+            // Match legacy behavior: empty literal segments are
+            // skipped (no push_string + add) so the bytecode shape
+            // stays identical (`compileStringInterpolation` line
+            // 5650/5660 guards on `tail_raw.len > 0`).
+            if (c_len > 0) {
+                try push(
+                    instructions,
+                    source_map,
+                    .push_string,
+                    .{ .str_ref = .{ .offset = c_off, .len = c_len } },
+                    node,
+                    allocator,
+                );
+                try push(instructions, source_map, .add, .{ .none = {} }, node, allocator);
+            }
+            continue;
+        }
+
+        // Expr segment → save_input ; <expr> ; pipe ; [format_bid? ;
+        // pipe ;] tostring ; add ; restore_input.
+        try push(instructions, source_map, .save_input, .{ .none = {} }, node, allocator);
+        try emitNode(instructions, source_map, ir_obj, child_idx, allocator);
+        try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+        if (format_bid) |bid| {
+            try push(
+                instructions,
+                source_map,
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+                allocator,
+            );
+            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+        }
+        try push(
+            instructions,
+            source_map,
+            .call_builtin,
+            .{ .index = @intFromEnum(types_mod.BuiltinId.tostring) },
+            node,
+            allocator,
+        );
+        try push(instructions, source_map, .add, .{ .none = {} }, node, allocator);
+        try push(instructions, source_map, .restore_input, .{ .none = {} }, node, allocator);
+    }
+}
+
+/// Map a format name (without the leading `@`) to the matching
+/// `BuiltinId`. Single source of truth — cat-7 emit dispatches here
+/// instead of duplicating the legacy `formatBuiltinId` table.
+fn formatBuiltinId(name: []const u8) ?types_mod.BuiltinId {
+    if (std.mem.eql(u8, name, "text")) return .format_text;
+    if (std.mem.eql(u8, name, "json")) return .format_json;
+    if (std.mem.eql(u8, name, "csv")) return .format_csv;
+    if (std.mem.eql(u8, name, "tsv")) return .format_tsv;
+    if (std.mem.eql(u8, name, "html")) return .format_html;
+    if (std.mem.eql(u8, name, "uri")) return .format_uri;
+    if (std.mem.eql(u8, name, "urid")) return .format_urid;
+    if (std.mem.eql(u8, name, "sh")) return .format_sh;
+    if (std.mem.eql(u8, name, "base64")) return .format_base64;
+    if (std.mem.eql(u8, name, "base64d")) return .format_base64d;
+    return null;
 }
 
 fn push(

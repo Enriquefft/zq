@@ -460,12 +460,130 @@ fn dumpAst(
                 try dumpAst(ir_obj, arg, depth + 1, writer);
             }
         },
+        .object_construct => |oc| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("obj_ctor");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            // Render every (key, value) pair as two indented children.
+            // Ident/string keys mirror `synthLoadConstString` — the IR
+            // synthesizes a `load_const(string)` for them; the dump
+            // shows the same shape as a real string literal so the
+            // text format remains uniform across key shapes.
+            for (oc.fields) |fld| {
+                try dumpObjectKey(ir_obj, &fld, depth + 1, writer);
+                try dumpAst(ir_obj, fld.value, depth + 1, writer);
+            }
+        },
+        .array_construct => |ac| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("arr_ctor");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            if (ac.expr) |inner| {
+                // Flatten comma chains so the dump matches the IR's
+                // variadic span exactly (lowering pre-flattens for the
+                // same reason — see `collectArrayElems`).
+                try dumpArrayElems(ir_obj, inner, depth + 1, writer);
+            }
+        },
+        .string_interp => |si| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("interp");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpStringParts(ir_obj, si.parts, node.span, depth + 1, writer);
+        },
+        .format_string => |fs| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("format(");
+            try writeStringLit(writer, fs.format);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpStringParts(ir_obj, fs.parts, node.span, depth + 1, writer);
+        },
         else => {
             try writeIndent(writer, depth);
             try writer.print("# unimplemented({s})", .{@tagName(node.kind)});
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
         },
+    }
+}
+
+/// Render an object-key payload (ident / string / expr) as a
+/// `load_const(string)` node for the synthesized literal cases or
+/// recurse into the AST for `expr` keys. Matches `lowerObjectKey`'s
+/// synthesis so the text dump and the IR shape stay byte-identical.
+fn dumpObjectKey(
+    ir_obj: *const IR,
+    fld: *const ast.Node.ObjectField,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    switch (fld.key) {
+        .ident => |name| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_const(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+            try writeSpan(writer, fld.span);
+            try writer.writeAll("\n");
+        },
+        .string => |raw_content| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_const(");
+            try writeStringLit(writer, raw_content);
+            try writer.writeAll(")");
+            try writeSpan(writer, fld.span);
+            try writer.writeAll("\n");
+        },
+        .expr => |expr| try dumpAst(ir_obj, expr, depth, writer),
+    }
+}
+
+/// Recursive walk of the array-construct inner expression, flattening
+/// comma chains into element nodes for the dump. Keeps the IR
+/// dumper's child sequence aligned with `collectArrayElems` in
+/// `lower.zig` — every leaf appears once, in source order.
+fn dumpArrayElems(
+    ir_obj: *const IR,
+    node: *const ast.Node,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    if (node.kind == .comma) {
+        const c = node.kind.comma;
+        try dumpArrayElems(ir_obj, c.left, depth, writer);
+        try dumpArrayElems(ir_obj, c.right, depth, writer);
+        return;
+    }
+    try dumpAst(ir_obj, node, depth, writer);
+}
+
+/// Render an interp/format parts list — literals as `load_const`
+/// nodes, exprs via the recursive AST walker. Mirrors
+/// `lowerStringParts` so dump shape == IR shape.
+fn dumpStringParts(
+    ir_obj: *const IR,
+    parts: []const ast.Node.StringPart,
+    parent_span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    for (parts) |part| {
+        switch (part) {
+            .literal => |s| {
+                try writeIndent(writer, depth);
+                try writer.writeAll("load_const(");
+                try writeStringLit(writer, s);
+                try writer.writeAll(")");
+                try writeSpan(writer, parent_span);
+                try writer.writeAll("\n");
+            },
+            .expr => |expr| try dumpAst(ir_obj, expr, depth, writer),
+        }
     }
 }
 

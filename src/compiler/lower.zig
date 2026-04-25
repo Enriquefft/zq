@@ -1,8 +1,9 @@
 //! AST → IR lowering — Phase 2R / R3.
 //!
-//! Categories landed: 1 (literals, identity, recurse, unary) and 2
-//! (field/index/iterate/slice + postfix `?`, including Suffix chains).
-//! AST shapes outside these categories return
+//! Categories landed: 1 (literals, identity, recurse, unary), 2
+//! (field/index/iterate/slice + postfix `?`, including Suffix chains),
+//! and 7 (object/array constructors, string interpolation, @format
+//! application). AST shapes outside these categories return
 //! `error.NewCompilerNotImplemented` (caught by the harness as
 //! SKIP-NotImplemented at vm-equiv time; the dispatcher falls back
 //! to legacy at runtime).
@@ -489,6 +490,111 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             return error.NewCompilerNotImplemented;
         },
 
+        // ── Object constructor `{...}` (category 7) ──────────────────
+        // Each AST `ObjectField` is lowered to a (key_idx, value_idx)
+        // pair and recorded back-to-back in the variadic span. Key
+        // shapes:
+        //   `.ident` / `.string` → synthesized `load_const(string)` IR
+        //                          node (legacy `push_string`).
+        //   `.expr`              → lowered expression node (legacy
+        //                          `parseLogical` result).
+        // Shorthand `{a}` → ident key + value=`load_field("a")`. The
+        // dynamic-shorthand `{(expr)}` (no colon) shape — legacy's
+        // `save_input/load_computed` dance — is intentionally deferred:
+        // the AST parser preserves the same `expr` pointer in both key
+        // and value, which would re-execute the expression. Defer to
+        // legacy via NotImplemented (per parser comment in
+        // `src/ast/parser.zig:846-851`).
+        .object_construct => |oc| {
+            const alloc = ctx.arena.allocator();
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            for (oc.fields) |fld| {
+                const key_idx = try lowerObjectKey(ctx, &fld);
+                const value_idx = try lowerObjectFieldValue(ctx, &fld);
+                try ctx.out.extra_children.append(alloc, key_idx);
+                try ctx.out.extra_children.append(alloc, value_idx);
+            }
+            const span_len: u32 = @intCast(2 * oc.fields.len);
+            return ctx.pushNode(.{
+                .op = .obj_ctor,
+                .span_start = span_start,
+                .span_len = span_len,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Array constructor `[...]` (category 7) ───────────────────
+        // The inner expression is a single AST node; comma chains are
+        // flattened into element children so each element becomes one
+        // child of `arr_ctor`. Empty `[]` has zero children. Generators
+        // (`[range(3)]`, `[.[]]`) appear as a single child whose own
+        // backtracking semantics drive the `yield_output` ladder.
+        .array_construct => |ac| {
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            var span_len: u32 = 0;
+            if (ac.expr) |inner| {
+                // Flatten the comma chain. Comma is left-associative in
+                // the AST (`comma(comma(a, b), c)`), so we recursively
+                // collect every leaf in source order.
+                try collectArrayElems(ctx, inner, &span_len);
+            }
+            return ctx.pushNode(.{
+                .op = .arr_ctor,
+                .span_start = span_start,
+                .span_len = span_len,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── String interpolation `"... \(expr) ..."` (category 7) ────
+        // Each `StringPart` becomes a child node:
+        //   `.literal` → synthesized `load_const(string)` IR node.
+        //   `.expr`    → lowered expression node.
+        // Emit ladders the children into the legacy `push_string` /
+        // `save_input` / tostring / `add` / `restore_input` pattern.
+        // `format` is the same shape with a non-zero format-spec id.
+        .string_interp => |si| {
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try lowerStringParts(ctx, si.parts);
+            const span_len: u32 = @intCast(si.parts.len);
+            return ctx.pushNode(.{
+                .op = .interp,
+                .span_start = span_start,
+                .span_len = span_len,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Format application `@fmt "..."` (category 7) ─────────────
+        // The `format` field of the AST node is the format name with a
+        // leading `@` (e.g. `"@base64"`); lowering interns the name in
+        // `string_buf` and stamps `(offset, len)` into a fresh
+        // `extra_data` entry. Emit decodes the name back to a
+        // `BuiltinId` (matching legacy `formatBuiltinId`).
+        //
+        // Special case: a single literal part with NO interpolations
+        // emits as a bare `push_string` (legacy
+        // `src/query/src/compiler.zig:6219-6225`). The IR records this
+        // as `format(span_len=1, child=load_const(...))` and emit
+        // detects the shape.
+        .format_string => |fs| {
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try lowerStringParts(ctx, fs.parts);
+            const span_len: u32 = @intCast(fs.parts.len);
+            const extra_idx = try ctx.internString(fs.format);
+            return ctx.pushNode(.{
+                .op = .format,
+                .span_start = span_start,
+                .span_len = span_len,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
     }
@@ -594,6 +700,174 @@ fn wrapRightmostInTry(ctx: *Lowerer, cur: u32, span: ast.Span) error{OutOfMemory
         .src_start = sp.start,
         .src_len = sp.len,
     });
+}
+
+/// Lower an `ObjectField.value` honoring the parser's shorthand
+/// synthesis. For `{a}` / `{a, b}` / `{"a"}` shorthand the parser emits
+/// a `field_access` value whose span starts at the key (no leading
+/// `.` in the source bytes). The general `field_access` arm in
+/// `lowerNode` rejects that shape (the leading-`.` guard filters
+/// zero-arg builtins like `utf8bytelength`), so we synthesize
+/// `load_field` directly here. Detection: synthesized shorthand
+/// `field_access` has `value.span.start == fld.span.start`; a real
+/// `key: value` field has the value span starting after the colon.
+fn lowerObjectFieldValue(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerError!u32 {
+    if (fld.value.kind == .field_access and fld.value.span.start == fld.span.start) {
+        const fa = fld.value.kind.field_access;
+        const vsp = fld.value.span;
+        const vsp_len: u32 = if (vsp.end >= vsp.start) vsp.end - vsp.start else 0;
+        const extra_idx = try ctx.internString(fa.name);
+        return ctx.pushNode(.{
+            .op = .load_field,
+            .extra = extra_idx,
+            .src_start = vsp.start,
+            .src_len = vsp_len,
+        });
+    }
+    return lowerNode(ctx, fld.value);
+}
+
+/// Lower an `ObjectField.key` into a fresh IR node. Ident and string
+/// keys synthesize a `load_const(string)` literal; expr keys recurse
+/// through `lowerNode`. Mirrors legacy's `parseObjectKey`
+/// (`src/query/src/compiler.zig:6788`): ident keys take the raw token
+/// bytes; string keys decode JSON escapes; `(expr)` keys evaluate the
+/// expression and leave the result on the value stack.
+fn lowerObjectKey(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerError!u32 {
+    const alloc = ctx.arena.allocator();
+    const sp = .{ .start = fld.span.start, .len = if (fld.span.end >= fld.span.start) fld.span.end - fld.span.start else 0 };
+    switch (fld.key) {
+        .ident => |name| {
+            // Ident keys are the raw token bytes — no escape decoding
+            // (legacy `internStr`, `src/query/src/compiler.zig:6823`).
+            return synthLoadConstString(ctx, name, sp.start, sp.len);
+        },
+        .string => |raw_content| {
+            // The AST parser stripped the surrounding quotes but did
+            // NOT decode JSON escapes for string keys (parser line 921;
+            // contrast `decodeString` for value-position string lits).
+            // Match legacy `internDecodedStr` by decoding here.
+            const decoded = try decodeJsonString(alloc, raw_content);
+            return synthLoadConstString(ctx, decoded, sp.start, sp.len);
+        },
+        .expr => |expr| return lowerNode(ctx, expr),
+    }
+}
+
+/// Synthesize a `load_const(string)` IR node owning `bytes` in the
+/// per-IR `string_buf`. Used by object-key lowering and interp/format
+/// part lowering so emit can dispatch on `node.op == .load_const` to
+/// distinguish literal segments from expression segments.
+fn synthLoadConstString(
+    ctx: *Lowerer,
+    bytes: []const u8,
+    src_start: u32,
+    src_len: u32,
+) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.string));
+    const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+    try ctx.out.string_buf.appendSlice(alloc, bytes);
+    try ctx.out.extra_data.append(alloc, offset);
+    try ctx.out.extra_data.append(alloc, @intCast(bytes.len));
+    return ctx.pushNode(.{
+        .op = .load_const,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Recursive walk of the array-construct inner expression, flattening
+/// comma chains into element children. Each element appends to
+/// `extra_children` and bumps `span_len`. Non-comma nodes recurse via
+/// `lowerNode` and contribute exactly one child.
+fn collectArrayElems(
+    ctx: *Lowerer,
+    node: *const ast.Node,
+    span_len: *u32,
+) LowerError!void {
+    if (node.kind == .comma) {
+        const c = node.kind.comma;
+        try collectArrayElems(ctx, c.left, span_len);
+        try collectArrayElems(ctx, c.right, span_len);
+        return;
+    }
+    const alloc = ctx.arena.allocator();
+    const child_idx = try lowerNode(ctx, node);
+    try ctx.out.extra_children.append(alloc, child_idx);
+    span_len.* += 1;
+}
+
+/// Lower an `interp` / `format` parts list into the variadic span.
+/// Literal parts synthesize a `load_const(string)` node; expr parts
+/// recurse via `lowerNode`. Each part contributes one child.
+fn lowerStringParts(ctx: *Lowerer, parts: []const ast.Node.StringPart) LowerError!void {
+    const alloc = ctx.arena.allocator();
+    for (parts) |part| {
+        const child_idx: u32 = switch (part) {
+            .literal => |s| try synthLoadConstString(ctx, s, 0, 0),
+            .expr => |expr| try lowerNode(ctx, expr),
+        };
+        try ctx.out.extra_children.append(alloc, child_idx);
+    }
+}
+
+/// Decode a JSON-style string body (without surrounding quotes) into a
+/// fresh arena-allocated buffer. Mirrors `src/ast/parser.zig:1525`'s
+/// `decodeString`. Used by object-key lowering — string keys reach the
+/// AST without escape decoding (parser inconsistency: value-position
+/// string literals decode but key-position string literals do not),
+/// and legacy keys decode via `internDecodedStr`. Restoring decode
+/// parity here keeps VM equivalence.
+fn decodeJsonString(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    errdefer buf.deinit(alloc);
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '\\') {
+            try buf.append(alloc, raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= raw.len) break;
+        switch (raw[i]) {
+            '\\' => try buf.append(alloc, '\\'),
+            '"' => try buf.append(alloc, '"'),
+            '/' => try buf.append(alloc, '/'),
+            'n' => try buf.append(alloc, '\n'),
+            'r' => try buf.append(alloc, '\r'),
+            't' => try buf.append(alloc, '\t'),
+            'b' => try buf.append(alloc, 0x08),
+            'f' => try buf.append(alloc, 0x0C),
+            'u' => {
+                i += 1;
+                if (i + 4 > raw.len) break;
+                const hi = std.fmt.parseInt(u21, raw[i..][0..4], 16) catch break;
+                i += 4;
+                var codepoint: u21 = hi;
+                if (hi >= 0xD800 and hi <= 0xDBFF) {
+                    if (i + 6 <= raw.len and raw[i] == '\\' and raw[i + 1] == 'u') {
+                        const lo = std.fmt.parseInt(u21, raw[i + 2 ..][0..4], 16) catch break;
+                        if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                            codepoint = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    }
+                }
+                var utf8_buf: [4]u8 = undefined;
+                const utf8_len = std.unicode.utf8Encode(@intCast(codepoint), &utf8_buf) catch break;
+                try buf.appendSlice(alloc, utf8_buf[0..utf8_len]);
+                continue;
+            },
+            else => try buf.append(alloc, raw[i]),
+        }
+        i += 1;
+    }
+    return buf.toOwnedSlice(alloc);
 }
 
 /// Validate a string-literal body (without surrounding quotes) for the

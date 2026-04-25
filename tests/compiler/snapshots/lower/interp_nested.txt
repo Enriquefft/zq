@@ -1,0 +1,8 @@
+# source: "a\(.x)b\(.y)c"
+# SemOp
+interp @1..15
+  load_const("a") @1..15
+  load_field("x") @4..6
+  load_const("b") @1..15
+  load_field("y") @10..12
+  load_const("c") @1..15

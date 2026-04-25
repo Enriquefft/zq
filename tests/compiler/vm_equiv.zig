@@ -86,6 +86,27 @@ const FIXTURES = [_]Fixture{
     .{ .name = "alt_false_lhs", .filter = "false // 7", .input = "null", .expected_output = "7" },
     .{ .name = "alt_truthy_lhs", .filter = "1 // 5", .input = "null", .expected_output = "1" },
 
+    // ── Category 7 — object constructor ───────────────────────────
+    .{ .name = "obj_static", .filter = "{a: 1, b: 2}", .input = "null", .expected_output = "{\"a\":1,\"b\":2}" },
+    .{ .name = "obj_field_value", .filter = "{x: .a, y: .b}", .input = "{\"a\":10,\"b\":20}", .expected_output = "{\"x\":10,\"y\":20}" },
+    .{ .name = "obj_shorthand_pair", .filter = "{a, b}", .input = "{\"a\":1,\"b\":2,\"c\":9}", .expected_output = "{\"a\":1,\"b\":2}" },
+    .{ .name = "obj_string_key", .filter = "{\"k\": .v}", .input = "{\"v\":42}", .expected_output = "{\"k\":42}" },
+    .{ .name = "obj_computed_key", .filter = "{(.k): .v}", .input = "{\"k\":\"name\",\"v\":\"x\"}", .expected_output = "{\"name\":\"x\"}" },
+
+    // ── Category 7 — array constructor ────────────────────────────
+    .{ .name = "arr_static", .filter = "[1, 2, 3]", .input = "null", .expected_output = "[1,2,3]" },
+    .{ .name = "arr_empty", .filter = "[]", .input = "null", .expected_output = "[]" },
+    .{ .name = "arr_field", .filter = "[.a, .b]", .input = "{\"a\":1,\"b\":2}", .expected_output = "[1,2]" },
+    .{ .name = "arr_iterate", .filter = "[.[]]", .input = "[1,2,3]", .expected_output = "[1,2,3]" },
+
+    // ── Category 7 — string interpolation ─────────────────────────
+    .{ .name = "interp_basic", .filter = "\"hello \\(.name)\"", .input = "{\"name\":\"world\"}", .expected_output = "\"hello world\"" },
+    .{ .name = "interp_arith", .filter = "\"x=\\(1+2)\"", .input = "null", .expected_output = "\"x=3\"" },
+
+    // ── Category 7 — format application ───────────────────────────
+    .{ .name = "format_base64_lit", .filter = "@base64 \"hi\"", .input = "null", .expected_output = "\"hi\"" },
+    .{ .name = "format_base64_interp", .filter = "@base64 \"\\(.)\"", .input = "\"hi\"", .expected_output = "\"aGk=\"" },
+
     .{ .name = "select", .filter = "select(.id > 100)", .input = "{\"id\":150}", .expected_output = "{\"id\":150}" },
     .{ .name = "map", .filter = "map(.id) | add", .input = "[{\"id\":1},{\"id\":2}]", .expected_output = "3" },
     .{ .name = "udf_simple", .filter = "def f: . + 1; f", .input = "10", .expected_output = "11" },

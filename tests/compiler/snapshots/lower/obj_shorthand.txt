@@ -1,0 +1,7 @@
+# source: {a, b}
+# SemOp
+obj_ctor @0..6
+  load_const("a") @1..2
+  load_field("a") @1..2
+  load_const("b") @3..5
+  load_field("b") @3..5

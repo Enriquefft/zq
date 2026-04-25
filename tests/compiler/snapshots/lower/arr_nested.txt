@@ -1,0 +1,9 @@
+# source: [[1, 2], [3, 4]]
+# SemOp
+arr_ctor @0..16
+  arr_ctor @1..7
+    load_const(1) @2..3
+    load_const(2) @5..6
+  arr_ctor @9..15
+    load_const(3) @10..11
+    load_const(4) @13..14

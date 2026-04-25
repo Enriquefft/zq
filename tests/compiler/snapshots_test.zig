@@ -57,6 +57,15 @@ const FIXTURES = [_]Fixture{
     .{ .name = "logical_or", .expected = @embedFile("snapshots/lower/logical_or.txt") },
     .{ .name = "alt_basic", .expected = @embedFile("snapshots/lower/alt_basic.txt") },
     .{ .name = "alt_chain", .expected = @embedFile("snapshots/lower/alt_chain.txt") },
+    .{ .name = "obj_static_keys", .expected = @embedFile("snapshots/lower/obj_static_keys.txt") },
+    .{ .name = "obj_computed_keys", .expected = @embedFile("snapshots/lower/obj_computed_keys.txt") },
+    .{ .name = "obj_shorthand", .expected = @embedFile("snapshots/lower/obj_shorthand.txt") },
+    .{ .name = "arr_simple", .expected = @embedFile("snapshots/lower/arr_simple.txt") },
+    .{ .name = "arr_nested", .expected = @embedFile("snapshots/lower/arr_nested.txt") },
+    .{ .name = "interp_basic", .expected = @embedFile("snapshots/lower/interp_basic.txt") },
+    .{ .name = "interp_nested", .expected = @embedFile("snapshots/lower/interp_nested.txt") },
+    .{ .name = "format_at_base64", .expected = @embedFile("snapshots/lower/format_at_base64.txt") },
+    .{ .name = "format_at_csv_tail", .expected = @embedFile("snapshots/lower/format_at_csv_tail.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive
