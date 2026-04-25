@@ -537,6 +537,81 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_compile_run.addArgs(args);
     bench_compile_step.dependOn(&bench_compile_run.step);
 
+    // ── vm-equiv (NOT in test_step) ───────────────────────────────────────
+    // VM-equivalence harness for Phase 2R Cluster A R3 (scaffold).
+    // Compiles each fixture via legacy AND new backends; Phase 6 SKIPs all
+    // because the new backend returns `NewCompilerNotImplemented`. Cluster B
+    // retrofits VM-execution + output-stream diff. Always built against
+    // -Dcompile=legacy by default (the harness calls compileLegacy directly,
+    // bypassing the dispatcher, so it works under any -Dcompile= setting).
+    // Invocation: `zig build vm-equiv`.
+    const vm_equiv_step = b.step("vm-equiv", "VM-equivalence harness (legacy vs new)");
+    const vm_equiv_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/vm_equiv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Reaches the legacy backend via `query.CompiledQuery.compileLegacy`.
+    // The new-backend dispatch will route through `compiler.compile()` once
+    // Cluster B resolves the build-runner duplicate-import issue (importing
+    // `compiler` directly here currently duplicates the module in the test
+    // binary's dep graph). See header comment in
+    // `tests/compiler/vm_equiv.zig`.
+    vm_equiv_mod.addImport("query", query_module);
+    const vm_equiv_exe = b.addExecutable(.{
+        .name = "zq-vm-equiv",
+        .root_module = vm_equiv_mod,
+    });
+    if (shim_build_step) |step| vm_equiv_exe.step.dependOn(&step.step);
+    const vm_equiv_run = b.addRunArtifact(vm_equiv_exe);
+    if (b.args) |args| vm_equiv_run.addArgs(args);
+    vm_equiv_step.dependOn(&vm_equiv_run.step);
+
+    // ── vm-equiv-errpos (NOT in test_step) ────────────────────────────────
+    // Source-position parity guardrail (plan §1.4 row 5). Curated list of
+    // compile-error fixtures; legacy and new must agree on `kind/offset/len`.
+    // Phase 6 SKIPs all (new returns NotImplemented). Invocation:
+    // `zig build vm-equiv-errpos`.
+    const vm_equiv_errpos_step = b.step("vm-equiv-errpos", "Compile-error source-position parity harness");
+    const vm_equiv_errpos_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/vm_equiv_errpos.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Same dep-graph constraint as `vm-equiv` above.
+    vm_equiv_errpos_mod.addImport("query", query_module);
+    const vm_equiv_errpos_exe = b.addExecutable(.{
+        .name = "zq-vm-equiv-errpos",
+        .root_module = vm_equiv_errpos_mod,
+    });
+    if (shim_build_step) |step| vm_equiv_errpos_exe.step.dependOn(&step.step);
+    const vm_equiv_errpos_run = b.addRunArtifact(vm_equiv_errpos_exe);
+    vm_equiv_errpos_run.stdio = .inherit;
+    if (b.args) |args| vm_equiv_errpos_run.addArgs(args);
+    vm_equiv_errpos_step.dependOn(&vm_equiv_errpos_run.step);
+
+    // ── vm-equiv-probe (NOT in test_step) ─────────────────────────────────
+    // Throwaway helper used while authoring the errpos fixture list. Prints
+    // the legacy compiler's exact `kind/offset/len` for each candidate
+    // filter so they can be transcribed into `tests/compiler/vm_equiv_errpos.zig`.
+    // Removed once Cluster B+ stabilizes the corpus.
+    const vm_equiv_probe_step = b.step("vm-equiv-probe", "Probe legacy compile-error positions for vm-equiv-errpos");
+    const vm_equiv_probe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/vm_equiv_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_equiv_probe_mod.addImport("query", query_module);
+    const vm_equiv_probe_exe = b.addExecutable(.{
+        .name = "zq-vm-equiv-probe",
+        .root_module = vm_equiv_probe_mod,
+    });
+    if (shim_build_step) |step| vm_equiv_probe_exe.step.dependOn(&step.step);
+    const vm_equiv_probe_run = b.addRunArtifact(vm_equiv_probe_exe);
+    vm_equiv_probe_run.stdio = .inherit;
+    if (b.args) |args| vm_equiv_probe_run.addArgs(args);
+    vm_equiv_probe_step.dependOn(&vm_equiv_probe_run.step);
+
     // ── Microbench (NOT in test_step) ─────────────────────────────────────
     // Per-stage latency harness — Phase 0 of the research roadmap. Drives
     // production modules (parser/query/output) directly and emits NDJSON

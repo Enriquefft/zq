@@ -101,7 +101,11 @@ pub const CompiledQuery = struct {
 
     /// Production compile path — extracted so the dispatcher above stays
     /// trivial. Body is the original (legacy) implementation.
-    fn compileLegacy(
+    ///
+    /// Always invokes the legacy compiler regardless of `-Dcompile=` setting;
+    /// used by `tests/compiler/vm_equiv.zig` for dual-dispatch (legacy + new)
+    /// so the harness can compare both backends in a single binary.
+    pub fn compileLegacy(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,
