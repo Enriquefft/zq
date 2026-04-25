@@ -405,3 +405,60 @@ Next orchestrator: phase-2r-orchestrator-B.md, start Phase 7.
 1. Spec residue line 172 fix
 2. Naming policy continuity for cat-3 (operators/arith) — confirm row 5 names before lowering
 3. Snapshot fixtures must include cat-3 forms; build on snapshots-update tooling
+
+
+## Wave A (Phases 9 + 11 + 13) close-out — 2026-04-25
+
+Wave A executed via 3 parallel implementer subagents in worktree isolation. All 3
+agents hit the org's monthly usage limit mid-execution; main thread recovered the
+uncommitted progress, applied gap fixes, and merged sequentially.
+
+### Recovery + gap-fix sequence
+- Phase 9 (cat-3 pipe+comma): worktree changes were complete and clean (vm-equiv
+  green, snapshots stable, spec residue line 172 fixed). Committed as-is.
+- Phase 11 (cat-5 arith/cmp/logical/alt): worktree changes were complete and
+  clean (vm-equiv 45 match, snapshots stable). Rebased onto Phase 9 (FIXTURES
+  list conflict — both arms kept). Committed.
+- Phase 13 (cat-7 obj/arr/interp/format): worktree had 3 gaps:
+  1. `obj_shorthand` snapshot SKIPped — `{a, b}` shorthand parser synthesizes
+     `field_access` value with span starting at the key (no leading `.`),
+     which the cat-2 lowering rejects. Fix: add `lowerObjectFieldValue` helper
+     that detects shorthand by `value.span.start == fld.span.start` and
+     synthesizes `load_field` directly, bypassing the dot-prefix guard.
+  2. No vm-equiv fixtures added (snapshots-only). Fix: 14 new cat-7 fixtures
+     covering obj_static, obj_field_value, obj_shorthand_pair, obj_string_key,
+     obj_computed_key, arr_static, arr_empty, arr_field, arr_iterate,
+     interp_basic, interp_arith, format_base64_lit, format_base64_interp.
+  3. Mismatch on `format_base64_interp` (`@base64 "\(.)"` with input `"hi"`):
+     new compiler emitted `""` instead of `"aGk="`. Root cause: `.identity`
+     emit was a no-op opcode but inside the interp ladder the value must reach
+     the value stack so the pipe+format sequence operates on the expr result.
+     Legacy `parsePrimary .dot` line 6162 emits `push_current` for bare `.`.
+     Fix: emit.zig:130 `.identity → push_current`. Affects cat-1 emission
+     globally; verified all prior fixtures still pass (the existing identity
+     fixture passes because `yield_output` reads from VS first then current).
+
+### Final shape
+- Stack: `dbee7ae → 6a12f39 (Phase 9) → 38c778f (Phase 11) → 6f970a8 (Phase 13)`
+- vm-equiv: 62 match / 0 mismatch / 6 skipped (was 28/0/7 at Phase 8 close)
+  Skipped: select, map, udf_simple, udf_semi, regex_lit, reduce
+- Snapshots: 43 stable (regenerated: 0; unchanged: 43)
+- Trunk full test suite: still 111 pre-existing failures (unrelated to the
+  redesign — same baseline since Phase 7).
+
+### New deferred items (carried forward to Wave B)
+1. `compiled_consumed` defer dead code in `src/compiler/root.zig` — still
+   unaddressed (rolled forward from Phase 7→8→Wave A).
+2. Snapshot coverage gap (chain forms, open-right slice) — rolled forward.
+3. vm-equiv missing slice_open_right + escape-rejection — rolled forward.
+4. `.["foo"]` AST escape decode (pre-existing) — separate tracking.
+5. `decodeJsonString` in lower.zig is duplicated logic with parser's
+   `decodeString` — SSOT cleanup candidate (re-export from parser?).
+6. `formatBuiltinId` in emit.zig is duplicated with legacy's same-name
+   helper — SSOT cleanup candidate (re-export from `src/types.zig`?).
+
+### Wave B entry prereqs
+1. Naming policy continuity for cat-4/6/8 (assignment/destructure, control flow,
+   functions/UDF) — confirm row 5 names before lowering.
+2. Snapshot fixtures must include cat-4/6/8 forms.
+3. Wave B implementer brief: cat-4 (Phase 10), cat-6 (Phase 12), cat-8 (Phase 14).
