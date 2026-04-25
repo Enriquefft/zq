@@ -254,17 +254,63 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             em.instructions.items[jump_pos].operand = .{ .index = end_ip };
         },
 
-        // Try wrap: record the start IP, emit the inner expression,
-        // insert `fork_try` at the recorded start, then append
-        // `pop_try`. Mirrors the legacy `?`-segment-wrap
-        // (`insertRawInstr(segment_start, fork_try)` + emit `pop_try`).
-        // The catch IP stays 0 — postfix `?` swallows errors silently.
+        // Try wrap: two shapes drive emission.
+        //   span_len == 0 → handler-absent: postfix `?` / `try expr`.
+        //                  Layout: `fork_try 0 ; <body> ; pop_try`. The
+        //                  catch IP stays 0 — error is swallowed
+        //                  silently. Mirrors legacy
+        //                  `?`-segment-wrap.
+        //   span_len == 2 → handler-present: `try expr catch handler`.
+        //                  Layout: `fork_try L_catch ; <body> ; pop_try
+        //                  ; jump L_end ; L_catch: <handler> ; L_end:`.
+        //                  Mirrors legacy `parseTryCatch`
+        //                  (`src/query/src/compiler.zig:6297`).
+        // The shape distinction is encoded via `span_len` rather than
+        // a separate `extra` flag — both children fit in the
+        // variable-arity span when present, and the no-handler form
+        // continues to use `children[0]` for cache-friendliness.
         .try_ => {
-            const start: usize = em.instructions.items.len;
-            try emitNode(em, node.children[0]);
-            try em.instructions.insert(em.allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
-            try em.source_map.insert(em.allocator, start, node.src_start);
-            try em.pushInstr(.pop_try, .{ .none = {} }, node);
+            if (node.span_len == 0) {
+                // No-handler form (`try expr` or `expr?`):
+                //   `fork_try L_after ; <body> ; pop_try ; L_after:`
+                // Errors on the body are swallowed silently (legacy
+                // `?`-segment-wrap shape).
+                const start: usize = em.instructions.items.len;
+                try emitNode(em, node.children[0]);
+                try em.instructions.insert(em.allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
+                try em.source_map.insert(em.allocator, start, node.src_start);
+                try em.pushInstr(.pop_try, .{ .none = {} }, node);
+            } else {
+                // Handler form (`try expr catch handler`):
+                //   `fork_try L_catch ; <body> ; pop_try ; jump L_end ;
+                //    L_catch: <handler> ; L_end:`.
+                std.debug.assert(node.span_len == 2);
+                const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+                const body_idx = span[0];
+                const handler_idx = span[1];
+
+                // fork_try with placeholder catch IP (backpatched once
+                // the body completes and the handler's first IP is
+                // known).
+                const fork_pos: usize = em.instructions.items.len;
+                try em.pushInstr(.fork_try, .{ .index = 0 }, node);
+
+                // Body — yields normally on success.
+                try emitNode(em, body_idx);
+
+                // Success path: drop try-handler then jump past handler.
+                try em.pushInstr(.pop_try, .{ .none = {} }, node);
+                const jump_pos: usize = em.instructions.items.len;
+                try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+                // Handler entry: backpatch fork_try to here.
+                const catch_ip: u32 = @intCast(em.instructions.items.len);
+                em.instructions.items[fork_pos].operand = .{ .index = catch_ip };
+                try emitNode(em, handler_idx);
+
+                // End: backpatch the jump past the handler.
+                em.instructions.items[jump_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+            }
         },
 
         // ── Category 5 ──────────────────────────────────────────────
@@ -484,6 +530,67 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const slots = em.ir_obj.extra_data.items;
             const kind: ir.UpdateOpKind = @enumFromInt(slots[node.extra]);
             try emitUpdateAssign(em, node, kind);
+        },
+
+        // ── Category 6 — control flow ───────────────────────────────
+        // if cond then A else B end. Variadic span carries exactly
+        // three children: [cond, then_body, else_body]. elif chains
+        // already nested the additional branches at lowering time
+        // (`lowerIfElseChain`), so emit only ever sees a 3-child node.
+        // Layout mirrors legacy `parseIfBody`
+        // (`src/query/src/compiler.zig:6342`):
+        //   save_input
+        //   <cond>
+        //   jump_if_false L_else
+        //   restore_input
+        //   <then>
+        //   jump L_end
+        //   L_else:
+        //   restore_input
+        //   <else>
+        //   L_end:
+        .if_ => {
+            std.debug.assert(node.span_len == 3);
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            const cond_idx = span[0];
+            const then_idx = span[1];
+            const else_idx = span[2];
+
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, cond_idx);
+
+            // jump_if_false → start of the else branch (backpatched once
+            // the then-arm and its trailing `jump` are emitted).
+            const jif_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+
+            // Then-arm: restore the saved input, emit the body, then
+            // unconditionally jump past the else-arm.
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try emitNode(em, then_idx);
+            const jmp_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+            // Else-arm entry — backpatch jif and emit.
+            em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try emitNode(em, else_idx);
+
+            // End: backpatch the post-then jump.
+            em.instructions.items[jmp_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+        },
+
+        // path(expr): emit `path_begin <body> path_end`. The
+        // `path_begin` operand is the IP of the `path_end` instruction
+        // (the VM uses it to bound the path frame's effective range —
+        // legacy `compilePath`, `src/query/src/compiler.zig:4733`).
+        .path_begin => {
+            const begin_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.path_begin, .{ .index = 0 }, node);
+            try emitNode(em, node.children[0]);
+            const end_pos: u32 = @intCast(em.instructions.items.len);
+            try em.pushInstr(.path_end, .{ .none = {} }, node);
+            em.instructions.items[begin_pos].operand = .{ .index = end_pos };
         },
 
         else => return error.NewCompilerNotImplemented,

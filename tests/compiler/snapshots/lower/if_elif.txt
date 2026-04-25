@@ -1,0 +1,13 @@
+# source: if . == 1 then "a" elif . == 2 then "b" else "c" end
+# SemOp
+if @0..52
+  cmp(eq) @3..9
+    identity @3..4
+    load_const(1) @8..9
+  load_const("a") @15..18
+  if @0..52
+    cmp(eq) @24..30
+      identity @24..25
+      load_const(2) @29..30
+    load_const("b") @36..39
+    load_const("c") @45..48

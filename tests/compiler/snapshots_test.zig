@@ -75,6 +75,12 @@ const FIXTURES = [_]Fixture{
     .{ .name = "assign_alt", .expected = @embedFile("snapshots/lower/assign_alt.txt") },
     .{ .name = "assign_update", .expected = @embedFile("snapshots/lower/assign_update.txt") },
     .{ .name = "assign_general_iterate", .expected = @embedFile("snapshots/lower/assign_general_iterate.txt") },
+    .{ .name = "try_simple", .expected = @embedFile("snapshots/lower/try_simple.txt") },
+    .{ .name = "try_catch", .expected = @embedFile("snapshots/lower/try_catch.txt") },
+    .{ .name = "if_basic", .expected = @embedFile("snapshots/lower/if_basic.txt") },
+    .{ .name = "if_elif", .expected = @embedFile("snapshots/lower/if_elif.txt") },
+    .{ .name = "path_simple", .expected = @embedFile("snapshots/lower/path_simple.txt") },
+    .{ .name = "path_iterate", .expected = @embedFile("snapshots/lower/path_iterate.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

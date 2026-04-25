@@ -1,0 +1,6 @@
+# source: path(.a.b)
+# SemOp
+path_begin @0..10
+  pipe @5..9
+    load_field("a") @5..7
+    load_field("b") @5..9

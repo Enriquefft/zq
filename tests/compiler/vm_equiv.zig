@@ -130,6 +130,43 @@ const FIXTURES = [_]Fixture{
     .{ .name = "assign_update", .filter = ".a |= . + 1", .input = "{\"a\":5}", .expected_output = "{\"a\":6}" },
     // ── Category 8 — update assignments (general LHS) ─────────────
     .{ .name = "assign_general_iterate", .filter = ".a[] = 0", .input = "{\"a\":[1,2,3]}", .expected_output = "{\"a\":[0,0,0]}" },
+
+    // ── Category 6 — try / catch ──────────────────────────────────
+    // No-handler form: error swallowed silently (empty stream).
+    .{ .name = "try_success", .filter = "try .x", .input = "{\"x\":42}", .expected_output = "42" },
+    .{ .name = "try_swallow", .filter = "try .x", .input = "[1,2]", .expected_output = "" },
+    // catch-handler form: error binds to handler's input.
+    .{ .name = "try_catch_caught", .filter = "try .x catch \"missing\"", .input = "[1,2]", .expected_output = "\"missing\"" },
+    .{ .name = "try_catch_passthrough", .filter = "try .x catch \"missing\"", .input = "{\"x\":7}", .expected_output = "7" },
+
+    // ── Category 6 — if / elif / else ─────────────────────────────
+    .{ .name = "if_then_else_t", .filter = "if . > 3 then \"big\" else \"small\" end", .input = "5", .expected_output = "\"big\"" },
+    .{ .name = "if_then_else_f", .filter = "if . > 3 then \"big\" else \"small\" end", .input = "1", .expected_output = "\"small\"" },
+    .{ .name = "if_elif_else_top", .filter = "if . > 3 then \"big\" elif . == 0 then \"zero\" else \"small\" end", .input = "5", .expected_output = "\"big\"" },
+    .{ .name = "if_elif_else_mid", .filter = "if . > 3 then \"big\" elif . == 0 then \"zero\" else \"small\" end", .input = "0", .expected_output = "\"zero\"" },
+    .{ .name = "if_elif_else_low", .filter = "if . > 3 then \"big\" elif . == 0 then \"zero\" else \"small\" end", .input = "1", .expected_output = "\"small\"" },
+    // Implicit-else (no `else` clause): falsy condition passes input through.
+    .{ .name = "if_implicit_else", .filter = "if . > 3 then \"big\" end", .input = "1", .expected_output = "1" },
+
+    // ── Category 6 — if/try nested in arr/obj/interp (parity probe) ──
+    // These trigger the variadic-span append ordering: arr_ctor /
+    // obj_ctor / interp wrap an `if` whose own variadic span must be
+    // emitted before the outer span captures its start position.
+    .{ .name = "if_then_generator", .filter = "[if 1 then 3,4 else 5 end]", .input = "null", .expected_output = "[3,4]" },
+    .{ .name = "if_else_generator", .filter = "[if null then 3 else 5,6 end]", .input = "null", .expected_output = "[5,6]" },
+    .{ .name = "if_in_obj", .filter = "{x: if .a then \"y\" else \"n\" end}", .input = "{\"a\":1}", .expected_output = "{\"x\":\"y\"}" },
+    .{ .name = "if_in_interp", .filter = "\"x=\\(if 1 then 3 else 5 end)\"", .input = "null", .expected_output = "\"x=3\"" },
+
+    // ── Category 6 — path() builtin ───────────────────────────────
+    .{ .name = "path_simple", .filter = "path(.a.b)", .input = "null", .expected_output = "[\"a\",\"b\"]" },
+    .{ .name = "path_iterate", .filter = "path(.[])", .input = "[10,20,30]", .expected_output = "[0]\n[1]\n[2]" },
+    .{ .name = "path_index", .filter = "path(.[1])", .input = "[10,20,30]", .expected_output = "[1]" },
+
+    // ── Category 6 — paren passthrough ────────────────────────────
+    // Parens are AST-level grouping with no IR shape — verify the
+    // dispatcher sees no SKIP and the output matches legacy.
+    .{ .name = "paren_field", .filter = "(.x)", .input = "{\"x\":42}", .expected_output = "42" },
+    .{ .name = "paren_arith", .filter = "(. + 1) * 2", .input = "5", .expected_output = "12" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

@@ -480,6 +480,17 @@ fn dumpAst(
                 try writer.writeAll("\n");
                 return;
             }
+            // `path(expr)` lowers to a unary `path_begin` IR node — render
+            // the dump in the same shape so the text format mirrors the
+            // IR (cat-6, Phase 12). The dedicated `path_end` SemOp stays
+            // emit-only and never appears in the dump tree.
+            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "path")) {
+                try writer.writeAll("path_begin");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try dumpAst(ir_obj, bc.args[0], depth + 1, writer);
+                return;
+            }
             // Generic builtin call: rendered as `call_builtin("name")`.
             try writer.writeAll("call_builtin(");
             try writeStringLit(writer, bc.name);
@@ -561,6 +572,36 @@ fn dumpAst(
             try dumpAst(ir_obj, ag.lhs, depth + 1, writer);
             try dumpAst(ir_obj, ag.rhs, depth + 1, writer);
         },
+        // ── Parens `(expr)` (cat-6 — passthrough) ───────────────────
+        // The AST has a `paren` wrapper for source-position fidelity;
+        // lowering treats it as transparent (the inner IR is emitted
+        // directly). The dump mirrors that — recurse into the operand
+        // without emitting a wrapper node.
+        .paren => |un| try dumpAst(ir_obj, un.operand, depth, writer),
+        // ── Try / catch (cat-6) ─────────────────────────────────────
+        // Without a catch handler the dump emits `try` with a single
+        // child (the body); with a catch handler the second indented
+        // child is the handler. Mirrors the IR shape: handler-absent
+        // uses `children[0]`, handler-present uses the variable-arity
+        // span `[body, handler]` with `span_len == 2`.
+        .try_catch => |tc| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("try");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, tc.body, depth + 1, writer);
+            if (tc.catch_body) |handler| {
+                try dumpAst(ir_obj, handler, depth + 1, writer);
+            }
+        },
+        // ── if / elif / else (cat-6) ────────────────────────────────
+        // elif chains desugar to nested `if` IR nodes at lowering time
+        // (one big AST `if_expr` → nested `if(cond1, then1, if(cond2,
+        // then2, else))`). The dumper mirrors that: each elif slot
+        // produces a nested `if` child in the else position. Implicit
+        // else (no `else` clause) materializes as `identity` — matches
+        // legacy `parseIfBody` (`src/query/src/compiler.zig:6390`).
+        .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, depth, writer),
         else => {
             try writeIndent(writer, depth);
             try writer.print("# unimplemented({s})", .{@tagName(node.kind)});
@@ -811,6 +852,67 @@ fn writePathSteps(writer: anytype, steps: []const ast.Node.PathStep) !void {
         }
     }
     try writer.writeByte('"');
+}
+
+/// Render an `if cond then a [elif c then b]* [else c] end` form as a
+/// chain of nested `if` nodes. The first `if` always emits the original
+/// `cond`/`then_body`. The else position is either:
+///   - the next elif (recursively rendered as a nested `if`),
+///   - the explicit else_body, or
+///   - `identity` (synthesized — matches legacy implicit-else rule).
+/// The `chain_idx` parameter walks the elif list one element per
+/// recursion. Snapshot output therefore makes the elif desugar
+/// explicit (no `# elif` directive needed; the nested-if shape IS the
+/// dump).
+fn dumpIfExpr(
+    ir_obj: *const IR,
+    ifx: *const ast.Node.IfExpr,
+    span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    try writeIndent(writer, depth);
+    try writer.writeAll("if");
+    try writeSpan(writer, span);
+    try writer.writeAll("\n");
+    try dumpAst(ir_obj, ifx.cond, depth + 1, writer);
+    try dumpAst(ir_obj, ifx.then_body, depth + 1, writer);
+    try dumpIfElsePosition(ir_obj, ifx, 0, span, depth + 1, writer);
+}
+
+/// Render the else-arm of an if/elif/else chain. `chain_idx` is the
+/// index of the next elif slot to consume; when it equals
+/// `ifx.elif_chains.len` the else_body (or synthesized identity) is
+/// emitted instead. Each elif consumes one recursion layer, producing
+/// a nested `if` node — matching the lowering desugar.
+fn dumpIfElsePosition(
+    ir_obj: *const IR,
+    ifx: *const ast.Node.IfExpr,
+    chain_idx: usize,
+    span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    if (chain_idx < ifx.elif_chains.len) {
+        const elif = ifx.elif_chains[chain_idx];
+        try writeIndent(writer, depth);
+        try writer.writeAll("if");
+        try writeSpan(writer, span);
+        try writer.writeAll("\n");
+        try dumpAst(ir_obj, elif.cond, depth + 1, writer);
+        try dumpAst(ir_obj, elif.body, depth + 1, writer);
+        try dumpIfElsePosition(ir_obj, ifx, chain_idx + 1, span, depth + 1, writer);
+        return;
+    }
+    if (ifx.else_body) |eb| {
+        try dumpAst(ir_obj, eb, depth, writer);
+        return;
+    }
+    // Implicit else → identity. Mirrors legacy `parseIfBody` line 6390.
+    try writeIndent(writer, depth);
+    try writer.writeAll("identity");
+    try writeSpan(writer, span);
+    try writer.writeAll("\n");
 }
 
 /// JSON-style escape per spec §3 (`string_lit`). Bytes 0x00..0x1F other

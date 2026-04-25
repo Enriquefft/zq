@@ -441,6 +441,72 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             });
         },
 
+        // ── Parens `(expr)` (category 6) ────────────────────────────
+        // Transparent passthrough — the AST records `paren` for
+        // source-position fidelity (parens shift error spans), but the
+        // IR has no concept of grouping. Recurse into the operand and
+        // re-emit its IR shape unchanged.
+        .paren => |un| return lowerNode(ctx, un.operand),
+
+        // ── try BODY [catch HANDLER] (category 6) ──────────────────
+        // Catch-handler attachment design (option C — variable):
+        //   * No handler: `try_` unary, `children[0]` = body. Same shape
+        //     as cat-2's postfix `?` so emit can reuse the bracket
+        //     ladder verbatim.
+        //   * With handler: `try_` variable-arity span = [body, handler]
+        //     with `span_len == 2`. Emit dispatches on `span_len` to
+        //     produce the legacy `fork_try ; <body> ; pop_try ; jump
+        //     end ; <handler> ; end:` ladder.
+        // The `extra` slot stays unused — encoding the marker via
+        // `span_len` keeps the Node struct cache-friendly without an
+        // auxiliary discriminator (plan §1.3 row 5).
+        .try_catch => |tc| {
+            const body = try lowerNode(ctx, tc.body);
+            if (tc.catch_body) |handler_ast| {
+                const handler = try lowerNode(ctx, handler_ast);
+                const alloc = ctx.arena.allocator();
+                const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+                try ctx.out.extra_children.append(alloc, body);
+                try ctx.out.extra_children.append(alloc, handler);
+                return ctx.pushNode(.{
+                    .op = .try_,
+                    .span_start = span_start,
+                    .span_len = 2,
+                    .src_start = sp.start,
+                    .src_len = sp.len,
+                });
+            }
+            return ctx.pushNode(.{
+                .op = .try_,
+                .children = .{ body, 0 },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── if cond then A [elif c then B]* [else C] end (cat-6) ────
+        // elif chains desugar to nested `if` IR nodes at lowering time
+        // (the plan only names one IR `if_` op). The implicit-else
+        // case (no `else` clause) materializes as `identity` — matches
+        // legacy `parseIfBody` (`src/query/src/compiler.zig:6390`).
+        .if_expr => |ifx| {
+            const cond = try lowerNode(ctx, ifx.cond);
+            const then_body = try lowerNode(ctx, ifx.then_body);
+            const else_idx = try lowerIfElseChain(ctx, &ifx, 0, sp.start, sp.len);
+            const alloc = ctx.arena.allocator();
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.append(alloc, cond);
+            try ctx.out.extra_children.append(alloc, then_body);
+            try ctx.out.extra_children.append(alloc, else_idx);
+            return ctx.pushNode(.{
+                .op = .if_,
+                .span_start = span_start,
+                .span_len = 3,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Builtin call: `not` / `type` (category 1 zero-arg) ────
         // Most builtins are category 10, but `not` and `type` are the
         // only zero-arg builtins category 1 owns (per orchestrator
@@ -448,6 +514,22 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // category 10's responsibility. We accept here only the names
         // the brief lists.
         .builtin_call => |bc| {
+            // ── path(expr) (category 6) ─────────────────────────────
+            // Single-arg `path()` lowers to a unary `path_begin` IR
+            // node wrapping the body. Emit produces the legacy
+            // `path_begin <body> path_end` bytecode pair (the
+            // `path_end` SemOp stays in the enum but is not produced
+            // by lowering — it appears only in bytecode).
+            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "path")) {
+                const body = try lowerNode(ctx, bc.args[0]);
+                return ctx.pushNode(.{
+                    .op = .path_begin,
+                    .children = .{ body, 0 },
+                    .src_start = sp.start,
+                    .src_len = sp.len,
+                });
+            }
+
             if (bc.args.len == 0) {
                 // `not` is a logical op the brief explicitly assigns
                 // to category 1 (unary). The IR encodes it as the
@@ -506,6 +588,10 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // legacy via NotImplemented (per parser comment in
         // `src/ast/parser.zig:846-851`).
         .object_construct => |oc| {
+            // Two-phase lowering — see `array_construct` for the
+            // rationale. Lower every (key, value) pair first into a
+            // local buffer, then append to `extra_children` in one
+            // contiguous run so the variadic span stays adjacent.
             const alloc = ctx.arena.allocator();
             // Collect (key, value) pair indices in a local buffer first;
             // any nested obj/arr/interp lowering also writes to
@@ -914,8 +1000,8 @@ fn collectArrayElems(
         try collectArrayElems(ctx, c.right, out);
         return;
     }
-    const alloc = ctx.arena.allocator();
     const child_idx = try lowerNode(ctx, node);
+    const alloc = ctx.arena.allocator();
     try out.append(alloc, child_idx);
 }
 
@@ -991,6 +1077,56 @@ fn decodeJsonString(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory
         i += 1;
     }
     return buf.toOwnedSlice(alloc);
+}
+
+/// Synthesize the else-position node for an `if`-chain at lowering time.
+/// `chain_idx` is the next elif slot to consume. Returns the IR-array
+/// index of the lowered else-arm:
+///   * if there are remaining elif slots: build a nested `if_` node
+///     that consumes the next elif and recurses on chain_idx + 1.
+///   * else if `else_body` is set: lower it directly.
+///   * else: synthesize an `identity` node (matches legacy implicit-else
+///     `parseIfBody` line 6390 — `.` flowing the current input through).
+///
+/// `parent_start`/`parent_len` carry the outer if's source span so each
+/// nested `if_` inherits the same byte coverage — legacy emits the
+/// entire chain under one `if`'s IP range, keeping source-position
+/// parity trivial across the elif desugar.
+fn lowerIfElseChain(
+    ctx: *Lowerer,
+    ifx: *const ast.Node.IfExpr,
+    chain_idx: usize,
+    parent_start: u32,
+    parent_len: u32,
+) LowerError!u32 {
+    if (chain_idx < ifx.elif_chains.len) {
+        const elif = ifx.elif_chains[chain_idx];
+        const cond = try lowerNode(ctx, elif.cond);
+        const then_body = try lowerNode(ctx, elif.body);
+        const else_idx = try lowerIfElseChain(ctx, ifx, chain_idx + 1, parent_start, parent_len);
+        const alloc = ctx.arena.allocator();
+        const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+        try ctx.out.extra_children.append(alloc, cond);
+        try ctx.out.extra_children.append(alloc, then_body);
+        try ctx.out.extra_children.append(alloc, else_idx);
+        return ctx.pushNode(.{
+            .op = .if_,
+            .span_start = span_start,
+            .span_len = 3,
+            .src_start = parent_start,
+            .src_len = parent_len,
+        });
+    }
+    if (ifx.else_body) |eb| {
+        return lowerNode(ctx, eb);
+    }
+    // Implicit else → identity. Matches legacy `parseIfBody`
+    // (`src/query/src/compiler.zig:6390`).
+    return ctx.pushNode(.{
+        .op = .identity,
+        .src_start = parent_start,
+        .src_len = parent_len,
+    });
 }
 
 /// Validate a string-literal body (without surrounding quotes) for the

@@ -1,0 +1,4 @@
+# source: path(.[])
+# SemOp
+path_begin @0..9
+  iterate @5..8

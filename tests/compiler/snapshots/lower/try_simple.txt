@@ -1,0 +1,4 @@
+# source: try .x
+# SemOp
+try @0..6
+  load_field("x") @4..6

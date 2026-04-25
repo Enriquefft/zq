@@ -1,0 +1,6 @@
+# source: if . then "y" else "n" end
+# SemOp
+if @0..26
+  identity @3..4
+  load_const("y") @10..13
+  load_const("n") @19..22
