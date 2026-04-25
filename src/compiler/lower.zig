@@ -54,6 +54,71 @@ pub const LowerError = error{
     LowerDiagnostic,
 };
 
+/// User-function parameter (cat-9). Mirrors legacy `ParamInfo`
+/// (`src/query/src/compiler.zig:223`): `is_filter=true` for filter
+/// args (re-substituted at the call-site by re-lowering the caller's
+/// AST sub-tree); `is_filter=false` for value args (`$name` syntax —
+/// captured into a fresh var_id at the call site, body reads via
+/// `load_var`).
+pub const ParamInfo = struct {
+    name: []const u8,
+    is_filter: bool,
+    /// Allocated at registration time for value params. Filter params
+    /// don't carry a var_id (they re-lower the caller's AST).
+    var_id: u32,
+};
+
+/// Active filter-arg binding during user-function body re-walk
+/// (cat-9). The new compiler stores the AST sub-tree directly
+/// instead of the legacy compiler's source-byte range — we have a
+/// parsed AST in hand, so re-substitution is structural.
+///
+/// `bindings_floor_at_capture` records `filter_arg_bindings.items.len`
+/// at the time this binding was captured. When the binding is
+/// re-substituted, `filter_arg_bindings` is truncated back to that
+/// floor so the substituted AST sees only the bindings active at the
+/// caller's site (mirrors legacy's lex-pos snapshot at call-site —
+/// `src/query/src/compiler.zig:6090`). Without this floor, recursive
+/// filter-arg use (e.g. `def id(x): x; id(id(.))`) would loop.
+pub const FilterArgBinding = struct {
+    name: []const u8,
+    arg_ast: *const Node,
+    bindings_floor_at_capture: u32,
+};
+
+/// User-function table entry (cat-9). Owns the params + body AST
+/// pointer. Filter-arg substitution is structural: the body AST is
+/// re-walked at every call site with bindings active.
+///
+/// Recursion is detected eagerly via `is_recursive`; the body is
+/// pre-lowered into `body_ir_root` lazily on the first call site,
+/// with canonical var_ids visible. Subsequent self-calls emit
+/// `call_user(fn_id)`; emit translates that into legacy
+/// `call_function(body_ip)` and emits the body IR once.
+///
+/// `func_table_snapshot` records `function_table.items.len` at
+/// registration time so inner defs can be hidden during the parent's
+/// re-walk via the `func_hidden_*` lex-scoping pair (mirrors legacy
+/// `src/query/src/compiler.zig:1010`).
+pub const FunctionEntry = struct {
+    name: []const u8,
+    params: []const ParamInfo,
+    body: *const Node,
+    is_recursive: bool,
+    /// Pre-lowered body IR root for recursive functions. Sentinel
+    /// `BODY_IR_NOT_LOWERED` marks "body has not yet been lowered" —
+    /// the first `call_user` emit site triggers the lowering.
+    body_ir_root: u32,
+    func_table_snapshot: u32,
+};
+
+/// Sentinel for `FunctionEntry.body_ir_root` meaning "not yet
+/// lowered". Picked to be larger than any plausible IR-array index
+/// (the IR is bounded by per-arena allocation). When emit observes
+/// this value, it triggers the body lowering (recursive functions
+/// only).
+pub const BODY_IR_NOT_LOWERED: u32 = std.math.maxInt(u32);
+
 /// Recursive-descent lowering context. Owns nothing — the IR's arena
 /// owns every node, child span, extra-data scalar, and string-buf byte.
 pub const Lowerer = struct {
@@ -95,6 +160,33 @@ pub const Lowerer = struct {
     /// attach a useful caret to a `RegexCompileError` diagnostic.
     last_regex_pattern_offset: u32 = 0,
     last_regex_pattern_len: u32 = 0,
+
+    // ── Cat-9: user-defined functions + recursion + filter args ─────
+    /// User-function table. Indexed by `call_user.extra` (fn_id).
+    /// Populated at registration sites in `func_def` lowering. Inner
+    /// defs are scoped: registered while a parent body is being
+    /// re-walked, hidden after the body completes via the
+    /// `func_hidden_*` pair, popped after the parent's continuation
+    /// finishes lowering.
+    function_table: std.ArrayListUnmanaged(FunctionEntry) = .{},
+    /// Active filter-arg bindings during user-function body re-walk.
+    /// Pushed in `func_call` lowering (caller's AST sub-trees stashed
+    /// by name); popped after the body re-walk completes.
+    filter_arg_bindings: std.ArrayListUnmanaged(FilterArgBinding) = .{},
+    /// Stack of fn_ids whose bodies are currently being inlined. A
+    /// `func_call` whose target is on this stack is treated as a
+    /// recursive self-call — emit produces `call_user(fn_id)` IR
+    /// rather than re-recursing the body. Mirrors legacy
+    /// `expanding_recursive_func` (`src/query/src/compiler.zig:99`)
+    /// extended to a stack so mutual recursion (a def `f` whose body
+    /// calls `g`, whose body calls `f`) works without a textual scan.
+    expanding_stack: std.ArrayListUnmanaged(u32) = .{},
+    /// Lexical-scoping hidden range. Functions with `fn_id` in
+    /// `[func_hidden_start, func_hidden_end)` are skipped during
+    /// lookup. Mirrors legacy
+    /// `src/query/src/compiler.zig:107-108`.
+    func_hidden_start: ?u32 = null,
+    func_hidden_end: ?u32 = null,
 
     /// Append a node and return its index. Plan §1.3 row 3 — children
     /// are u32 indices, never pointers.
@@ -203,6 +295,38 @@ pub const Lowerer = struct {
             p.deinit();
             self.regex_pool = null;
         }
+    }
+
+    /// Look up a user-defined function by name + arity. Searches
+    /// backward so the latest registration wins (shadowing). Skips
+    /// the hidden range `[func_hidden_start, func_hidden_end)` so
+    /// re-walked function bodies see only the functions visible at
+    /// definition time. Mirrors legacy `lookupFunction`
+    /// (`src/query/src/compiler.zig:1018`).
+    fn lookupFunction(self: *Lowerer, name: []const u8, arity: u32) ?u32 {
+        var i: u32 = @intCast(self.function_table.items.len);
+        while (i > 0) {
+            i -= 1;
+            if (self.func_hidden_start) |start| if (self.func_hidden_end) |end| {
+                if (i >= start and i < end) continue;
+            };
+            const entry = self.function_table.items[i];
+            if (entry.params.len == arity and std.mem.eql(u8, entry.name, name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Returns true if `fn_id` is on the inline-expansion stack — the
+    /// call site is therefore inside the body of a function currently
+    /// being inlined, and a `call_user(fn_id)` IR node should be
+    /// emitted in lieu of recursing into the body again.
+    fn isExpanding(self: *const Lowerer, fn_id: u32) bool {
+        for (self.expanding_stack.items) |id| {
+            if (id == fn_id) return true;
+        }
+        return false;
     }
 };
 
@@ -320,17 +444,47 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // `mktime`, `arrays`, `strings`) reach the AST as `field_access`
         // because the AST parser uses a narrower zero-arg-builtin list
         // than the legacy compiler. A leading `.` in the source span is
-        // the structural marker that distinguishes a true field access
-        // from a bare-ident builtin reference; absent that, route through
-        // the cat-10 builtin classifier — the legacy compiler dispatches
-        // the same names through `zeroArgBuiltinId` at
-        // `src/query/src/compiler.zig:5771`.
+        // the structural marker that this is a true field access;
+        // absent that, the ident may be:
+        //   (a) a filter-arg binding (cat-9 — re-substitutes the
+        //       caller's AST sub-tree),
+        //   (b) a zero-arg user-defined function call (cat-9 —
+        //       inline-expand or recursive emit),
+        //   (c) a zero-arg builtin owned by cat-10 (route through the
+        //       builtin classifier — emits `call_builtin`),
+        //   (d) unknown ident — defer to legacy via NotImplemented.
+        //
+        // Cat-9 lookup MUST run before cat-10's builtin classifier so
+        // user defs shadow builtin names per legacy semantics.
         .field_access => |fa| {
             const is_dot_field = sp.start < ctx.src.len and ctx.src[sp.start] == '.';
             if (!is_dot_field) {
-                // Bare ident — try cat-10's classifier. If the name is a
-                // known zero-arg builtin, lower as a `call_builtin` leaf.
-                // Otherwise defer to legacy.
+                // ── Cat-9 — bare-ident resolution ─────────────────
+                // 1. Active filter-arg binding: re-walk the binding's
+                //    AST sub-tree under the floor of bindings active
+                //    at the binding's capture site (avoids infinite
+                //    recursion on `def id(x): x; id(id(.))`).
+                if (lookupFilterArgBinding(ctx, fa.name)) |binding_idx| {
+                    return reLowerFilterArg(ctx, binding_idx);
+                }
+                // 2. Zero-arg user-defined function call. If a
+                //    function with the same name and arity 0 is
+                //    visible AND it is currently being inline-expanded
+                //    (on `expanding_stack`), emit a self-reference
+                //    `call_user`. Otherwise inline-expand at the call
+                //    site. The recursion check bypasses the hidden
+                //    range so a function which hides itself during
+                //    inner-def expansion can still self-call.
+                if (lookupRecursiveSelf(ctx, fa.name, 0)) |fn_id| {
+                    return synthCallUser(ctx, fn_id, &.{}, sp.start, sp.len);
+                }
+                if (ctx.lookupFunction(fa.name, 0)) |fn_id| {
+                    return inlineUserCall(ctx, fn_id, &.{}, sp.start, sp.len);
+                }
+                // 3. Cat-10 zero-arg builtin classifier. The legacy
+                //    compiler dispatches the same names through
+                //    `zeroArgBuiltinId` at
+                //    `src/query/src/compiler.zig:5771`.
                 if (classifyBuiltin(fa.name, 0) == .zero_arg) {
                     const extra_idx_b = try ctx.internString(fa.name);
                     return ctx.pushNode(.{
@@ -340,6 +494,7 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                         .src_len = sp.len,
                     });
                 }
+                // Fall-through: unknown ident, defer to legacy.
                 return error.NewCompilerNotImplemented;
             }
             const extra_idx = try ctx.internString(fa.name);
@@ -647,14 +802,46 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // brief). Other zero-arg builtins (`length`, `keys`, ...) are
         // category 10's responsibility. We accept here only the names
         // the brief lists.
-        // ── Builtin call (cat-10 owns the wider alphabet; cat-1 + cat-6
-        // already own `not`/`type`/`path` and route through the same
-        // classifier). The classifier dispatches by (name, arity) to one
-        // of five call-shape buckets: 0-arg / 1-arg-value / 1-arg-filter
+        //
+        // Cat-9 priority: a user-defined function whose name happens
+        // to collide with a builtin name (e.g. `def add($x): ...; add(5)`)
+        // reaches the AST as `builtin_call` because the AST parser's
+        // `isBuiltinName` table doesn't know about runtime user defs.
+        // Dispatch to `lookupFunction` FIRST so the UDF wins; fall back
+        // to cat-10's `lowerBuiltinCall` classifier otherwise. Mirrors
+        // legacy `parsePrimaryInner`'s lookup order
+        // (`src/query/src/compiler.zig:5991`).
+        //
+        // Cat-10 owns the wider alphabet; cat-1 + cat-6 already own
+        // `not`/`type`/`path` and route through the same classifier.
+        // The classifier dispatches by (name, arity) to one of five
+        // call-shape buckets: 0-arg / 1-arg-value / 1-arg-filter
         // / 2-arg-math / 3-arg-math. Names outside the five buckets
         // surface `NewCompilerNotImplemented` for the harness to SKIP
         // (regex, generator-arg shapes, complex desugars).
-        .builtin_call => |bc| return lowerBuiltinCall(ctx, &bc, sp.start, sp.len),
+        .builtin_call => |bc| {
+            const arity: u32 = @intCast(bc.args.len);
+            // 1. User-defined function lookup first. Recursive self-call
+            //    (target on expanding_stack) emits `call_user`; otherwise
+            //    inline-expand. Mirrors the `func_call` arm below.
+            if (lookupRecursiveSelf(ctx, bc.name, arity)) |fn_id| {
+                var lowered_args: std.ArrayListUnmanaged(u32) = .{};
+                defer lowered_args.deinit(ctx.arena.allocator());
+                const entry_for_args = ctx.function_table.items[fn_id];
+                for (entry_for_args.params, 0..) |param, pi| {
+                    if (param.is_filter) continue;
+                    const arg_idx = try lowerNode(ctx, bc.args[pi]);
+                    try lowered_args.append(ctx.arena.allocator(), arg_idx);
+                }
+                return synthCallUser(ctx, fn_id, lowered_args.items, sp.start, sp.len);
+            }
+            if (ctx.lookupFunction(bc.name, arity)) |fn_id| {
+                return inlineUserCall(ctx, fn_id, bc.args, sp.start, sp.len);
+            }
+            // 2. Fall through to cat-10's builtin classifier (handles
+            //    `not`/`type`/`path` plus the wider alphabet).
+            return lowerBuiltinCall(ctx, &bc, sp.start, sp.len);
+        },
 
         // ── Object constructor `{...}` (category 7) ──────────────────
         // Each AST `ObjectField` is lowered to a (key_idx, value_idx)
@@ -1012,6 +1199,52 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                 .src_start = sp.start,
                 .src_len = sp.len,
             });
+        },
+
+        // ── User-defined function definition (cat-9) ────────────────
+        // `def name(params): body; rest`. The def itself produces NO
+        // IR node — it's purely a binding/scoping construct. The body
+        // AST pointer is registered for later re-walk (every call site
+        // re-lowers the body with bindings active); the `rest`
+        // continuation is what flows into the IR.
+        //
+        // Inner defs (registered while a body is re-walked) are popped
+        // from `function_table` and re-hidden via the `func_hidden_*`
+        // pair after the parent's `rest` finishes lowering, so call
+        // sites in sibling code don't see them (lexical scoping).
+        // Mirrors legacy's `parseFunctionDef` body handling at
+        // `src/query/src/compiler.zig:6489`.
+        .func_def => |fd| return lowerFuncDef(ctx, &fd, sp.start, sp.len),
+
+        // ── User-defined function call (cat-9) ──────────────────────
+        // `name(arg1; arg2; ...)`. Resolve by name + arity; for
+        // recursive self-references (target fn_id is on the
+        // inline-expansion stack) emit `call_user(fn_id)` IR — emit
+        // produces `call_function(body_ip)` against a body emitted
+        // once per recursive function. Otherwise re-walk the body AST
+        // inline with bindings active for the caller's value/filter
+        // args. Mirrors legacy's `expandFunctionCall` at
+        // `src/query/src/compiler.zig:1066`.
+        .func_call => |fc| {
+            const arity: u32 = @intCast(fc.args.len);
+            const fn_id = ctx.lookupFunction(fc.name, arity) orelse {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp.start,
+                    .len = 0,
+                };
+                return error.LowerDiagnostic;
+            };
+            // Self-recursive call inside inline expansion: emit
+            // `call_user(fn_id, value_args)` IR. Value args are lowered
+            // here (each call captures into the function's canonical
+            // var_ids at emit time); filter args are recorded as
+            // bindings against the caller's AST so the body's
+            // load_var/field_access references resolve through them.
+            if (ctx.isExpanding(fn_id)) {
+                return synthRecursiveCall(ctx, fn_id, fc.args, sp.start, sp.len);
+            }
+            return inlineUserCall(ctx, fn_id, fc.args, sp.start, sp.len);
         },
 
         // ── Other AST kinds: defer to later categories ─────────────
@@ -2210,4 +2443,506 @@ fn validateJsonEscapes(body: []const u8) bool {
         }
     }
     return true;
+}
+
+// ── Cat-9: user-defined functions + recursion + filter args ──────────────────
+
+/// Lower a `def name(params): body; rest` form. The def itself
+/// produces no IR node — only the `rest` continuation does. The body
+/// is registered with the entry; non-recursive call sites re-lower it
+/// inline (with bindings active), recursive call sites emit
+/// `call_user` IR that emit translates to `call_function(body_ip)`.
+fn lowerFuncDef(
+    ctx: *Lowerer,
+    fd: *const ast.Node.FuncDef,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    // Build the param table. Value params claim a fresh canonical
+    // var_id at registration time so the body, lowered once for
+    // recursive functions, can reference them via load_var. Filter
+    // params don't carry a var_id — they re-substitute the caller's
+    // AST sub-tree at call time.
+    var params: std.ArrayListUnmanaged(ParamInfo) = .{};
+    defer params.deinit(alloc);
+    for (fd.params) |p| {
+        if (p.is_filter) {
+            try params.append(alloc, .{
+                .name = p.name,
+                .is_filter = true,
+                .var_id = 0, // unused
+            });
+        } else {
+            const var_id = ctx.next_var_id;
+            ctx.next_var_id += 1;
+            try params.append(alloc, .{
+                .name = p.name,
+                .is_filter = false,
+                .var_id = var_id,
+            });
+        }
+    }
+
+    // Detect direct self-recursion via an AST scan. Mutual recursion
+    // (def f: g; def g: f) flips on at expansion time via
+    // `expanding_stack` regardless of this flag.
+    const is_recursive = bodyReferencesSelf(fd.body, fd.name, @intCast(fd.params.len));
+
+    // Snapshot the function-table length for inner-def lex scoping —
+    // any defs registered while THIS function's body is re-walked
+    // will live above this snapshot and get hidden when we re-enter
+    // the body (mirrors legacy's `func_table_snapshot` at compiler.zig:1010).
+    const func_table_snapshot: u32 = @intCast(ctx.function_table.items.len);
+
+    const params_owned = try alloc.dupe(ParamInfo, params.items);
+    try ctx.function_table.append(alloc, .{
+        .name = fd.name,
+        .params = params_owned,
+        .body = fd.body,
+        .is_recursive = is_recursive,
+        .body_ir_root = BODY_IR_NOT_LOWERED,
+        .func_table_snapshot = func_table_snapshot,
+    });
+
+    // Lower the continuation. The function entry stays in scope for
+    // the entirety of `rest` (legacy lex pos progresses past `;` and
+    // continues parsing the same input — the def's scope reaches the
+    // end of its enclosing scope).
+    return try lowerNode(ctx, fd.rest);
+}
+
+/// Inline-expand a non-recursive user-function call at the call site.
+/// Produces a single `call_user` IR node carrying the lowered value
+/// args + the per-call-site lowered body. Emit translates this into
+/// the legacy bytecode shape `<arg_0> ; capture_variable v_0 ; ... ;
+/// <body> ; pop_variable v_n ; ...`.
+///
+/// The body is re-lowered HERE with filter-arg bindings active; the
+/// body IR is fresh per call site (filter args are textually
+/// substituted, so different call sites produce different bodies).
+/// Filter args therefore have no IR representation — they're consumed
+/// during body re-walk.
+///
+/// IR layout for non-recursive call_user (`is_inline=true`):
+///   span = [value_arg_0, value_arg_1, ..., body_idx]
+///   span_len = num_value_args + 1
+///   extra_data = [fn_id, name_off, name_len, IS_INLINE_TRUE]
+///
+/// IR layout for recursive call_user (set by `synthCallUser`):
+///   span = [value_arg_0, value_arg_1, ...]
+///   span_len = num_value_args
+///   extra_data = [fn_id, name_off, name_len, IS_INLINE_FALSE]
+fn inlineUserCall(
+    ctx: *Lowerer,
+    fn_id: u32,
+    args: []const *Node,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    const alloc = ctx.arena.allocator();
+    const entry = ctx.function_table.items[fn_id];
+    const params = entry.params;
+    std.debug.assert(params.len == args.len);
+
+    // Phase 1 — lower value args at the OUTER scope so their
+    // references (vars, filter-arg bindings) resolve against the
+    // caller's site, not the callee's.
+    var value_arg_idxs: std.ArrayListUnmanaged(u32) = .{};
+    defer value_arg_idxs.deinit(alloc);
+    for (params, args) |param, arg_ast| {
+        if (param.is_filter) continue;
+        const arg_idx = try lowerNode(ctx, arg_ast);
+        try value_arg_idxs.append(alloc, arg_idx);
+    }
+
+    // Phase 2 — push filter-arg bindings + scope-hide-range. Save
+    // restore-points so the lowering state returns clean after the
+    // body re-walk.
+    const saved_bindings_len: u32 = @intCast(ctx.filter_arg_bindings.items.len);
+    const saved_hidden_start = ctx.func_hidden_start;
+    const saved_hidden_end = ctx.func_hidden_end;
+    const saved_var_table = ctx.var_table;
+
+    for (params, args) |param, arg_ast| {
+        if (!param.is_filter) continue;
+        try ctx.filter_arg_bindings.append(alloc, .{
+            .name = param.name,
+            .arg_ast = arg_ast,
+            .bindings_floor_at_capture = saved_bindings_len,
+        });
+    }
+
+    // Hide functions registered between this function's def time and
+    // the current snapshot — they're not lex-visible from the body.
+    const hidden_end: u32 = @intCast(ctx.function_table.items.len);
+    if (entry.func_table_snapshot < hidden_end) {
+        ctx.func_hidden_start = entry.func_table_snapshot;
+        ctx.func_hidden_end = hidden_end;
+    }
+
+    // Declare value-arg variables in a fresh var_table layer so they
+    // resolve to canonical var_ids during body re-walk.
+    var fresh_var_table: std.StringHashMapUnmanaged(u32) = .{};
+    var it = saved_var_table.iterator();
+    while (it.next()) |kv| {
+        try fresh_var_table.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    for (params) |param| {
+        if (param.is_filter) continue;
+        try fresh_var_table.put(alloc, param.name, param.var_id);
+    }
+    ctx.var_table = fresh_var_table;
+
+    // Push expanding stack so any self-ref inside body emits call_user.
+    try ctx.expanding_stack.append(alloc, fn_id);
+
+    const func_table_save: u32 = @intCast(ctx.function_table.items.len);
+
+    const body_idx = try lowerNode(ctx, entry.body);
+
+    // Record the lowered body IR root for recursive functions on the
+    // FIRST inline expansion (mutual / self recursion detected during
+    // body re-walk via `expanding_stack` flips `is_recursive`).
+    if (ctx.function_table.items[fn_id].is_recursive and
+        ctx.function_table.items[fn_id].body_ir_root == BODY_IR_NOT_LOWERED)
+    {
+        ctx.function_table.items[fn_id].body_ir_root = body_idx;
+    }
+
+    // Cleanup state.
+    while (ctx.function_table.items.len > func_table_save) {
+        _ = ctx.function_table.pop();
+    }
+    _ = ctx.expanding_stack.pop();
+    ctx.var_table.deinit(alloc);
+    ctx.var_table = saved_var_table;
+    ctx.func_hidden_start = saved_hidden_start;
+    ctx.func_hidden_end = saved_hidden_end;
+    ctx.filter_arg_bindings.items.len = saved_bindings_len;
+
+    // Phase 3 — synthesize a single call_user IR node with the body
+    // appended to the value-args span. Emit reads the IS_INLINE flag
+    // and renders the legacy `<arg>; capture_variable; ...; <body>;
+    // pop_variable; ...` ladder without intervening pipes — current
+    // is preserved for the body to consume the OUTER input.
+    return synthCallUserInline(ctx, fn_id, value_arg_idxs.items, body_idx, src_start, src_len);
+}
+
+/// Synthesize a non-recursive `call_user` IR node: span carries
+/// `[value_args..., body_idx]`, extra_data flags `is_inline=true`
+/// so emit uses the inline-expansion ladder rather than
+/// `call_function(body_ip)`. See `synthCallUser` for the recursive
+/// variant.
+fn synthCallUserInline(
+    ctx: *Lowerer,
+    fn_id: u32,
+    value_arg_idxs: []const u32,
+    body_idx: u32,
+    src_start: u32,
+    src_len: u32,
+) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const entry = ctx.function_table.items[fn_id];
+
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.appendSlice(alloc, value_arg_idxs);
+    try ctx.out.extra_children.append(alloc, body_idx);
+    const span_len: u32 = @intCast(value_arg_idxs.len + 1);
+
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, fn_id);
+    const name_offset: u32 = @intCast(ctx.out.string_buf.items.len);
+    try ctx.out.string_buf.appendSlice(alloc, entry.name);
+    try ctx.out.extra_data.append(alloc, name_offset);
+    try ctx.out.extra_data.append(alloc, @intCast(entry.name.len));
+    try ctx.out.extra_data.append(alloc, CALL_USER_INLINE);
+
+    return ctx.pushNode(.{
+        .op = .call_user,
+        .span_start = span_start,
+        .span_len = span_len,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Inline/recursive-call discriminant stored in the 4th slot of a
+/// `call_user` IR node's extra-data payload. Plan-§1.3-row-5 keeps
+/// the full enum namespace in `ir.zig`; we use plain u32 constants
+/// here because the discriminant has only two values and the SSOT
+/// stays trivially auditable.
+const CALL_USER_INLINE: u32 = 1;
+const CALL_USER_RECURSIVE: u32 = 0;
+
+/// Lower a self-recursive function call to `call_user(fn_id, value_args)`.
+/// Value args are lowered here (the call site's scope sees them) and
+/// recorded in the IR span; filter args are referenced inside the
+/// already-lowered recursive body via the `filter_arg_bindings` stack
+/// — when the body calls itself, the body's references to the
+/// recursive function's filter params still resolve through the
+/// bindings active at the inline-expansion call site (legacy's
+/// equivalent: filter-arg references in the body persist as
+/// `call_filter_arg` ops, which the recursive body's emit sees only
+/// at the top expansion's binding context).
+fn synthRecursiveCall(
+    ctx: *Lowerer,
+    fn_id: u32,
+    args: []const *Node,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    const alloc = ctx.arena.allocator();
+    const entry = ctx.function_table.items[fn_id];
+    std.debug.assert(entry.params.len == args.len);
+
+    // Lower value args at the call site. Filter args don't lower into
+    // IR here — they're substituted textually when the body's
+    // bare-ident refs match a binding name at body-walk time. Since
+    // the body of a recursive function is lowered once at the OUTER
+    // expansion of that function, filter arg substitution happens
+    // there and the recursive body has the substitutions baked in.
+    var value_arg_idxs: std.ArrayListUnmanaged(u32) = .{};
+    defer value_arg_idxs.deinit(alloc);
+    for (entry.params, args) |param, arg_ast| {
+        if (param.is_filter) continue;
+        const arg_idx = try lowerNode(ctx, arg_ast);
+        try value_arg_idxs.append(alloc, arg_idx);
+    }
+
+    return synthCallUser(ctx, fn_id, value_arg_idxs.items, src_start, src_len);
+}
+
+/// Synthesize a `call_user(fn_id, span=value_args)` IR node. The
+/// variable-arity span carries the lowered value-arg IR-node indices
+/// in source order; the `extra_data` payload encodes:
+///
+///   extra_data[extra + 0]   = fn_id (entry index — emit consults the
+///                              function-table slice passed in to read
+///                              body_ir_root + canonical var_ids)
+///   extra_data[extra + 1]   = name_offset (into IR string_buf)
+///   extra_data[extra + 2]   = name_len
+///
+/// Body lookup happens at emit time against the Lowerer's
+/// `function_table` snapshot, which is passed through to emit. This
+/// keeps the IR free of pointer-back-references and lets emit cache
+/// per-fn body_ip across multiple call_user sites.
+fn synthCallUser(
+    ctx: *Lowerer,
+    fn_id: u32,
+    value_arg_idxs: []const u32,
+    src_start: u32,
+    src_len: u32,
+) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    // Encountering a `call_user` at lower time means the target
+    // function IS recursive (directly via self-call detection on
+    // `expanding_stack`, or indirectly via mutual recursion). Mark
+    // it so emit asserts pass and the body-emission ladder fires.
+    // The `is_recursive` AST scan in `lowerFuncDef` is a cheap
+    // fast-path; this site is the canonical detector.
+    ctx.function_table.items[fn_id].is_recursive = true;
+    const entry = ctx.function_table.items[fn_id];
+
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.appendSlice(alloc, value_arg_idxs);
+    const span_len: u32 = @intCast(value_arg_idxs.len);
+
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, fn_id);
+    const name_offset: u32 = @intCast(ctx.out.string_buf.items.len);
+    try ctx.out.string_buf.appendSlice(alloc, entry.name);
+    try ctx.out.extra_data.append(alloc, name_offset);
+    try ctx.out.extra_data.append(alloc, @intCast(entry.name.len));
+    try ctx.out.extra_data.append(alloc, CALL_USER_RECURSIVE);
+
+    return ctx.pushNode(.{
+        .op = .call_user,
+        .span_start = span_start,
+        .span_len = span_len,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Synthesize a `destructure(as, name, var_id)` IR node — the same
+/// shape lowering produces for `expr as $name | ...`. Used to wire
+/// value-arg captures during inline expansion of user-function calls
+/// (cat-9). Mirrors the simple-as branch of `lowerPattern`.
+fn synthDestructureAs(
+    ctx: *Lowerer,
+    name: []const u8,
+    var_id: u32,
+    src_start: u32,
+    src_len: u32,
+) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.PatternKind.as));
+    const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+    try ctx.out.string_buf.appendSlice(alloc, name);
+    try ctx.out.extra_data.append(alloc, offset);
+    try ctx.out.extra_data.append(alloc, @intCast(name.len));
+    try ctx.out.extra_data.append(alloc, var_id);
+    return ctx.pushNode(.{
+        .op = .destructure,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Look up an active filter-arg binding by name. Searches backward so
+/// the innermost binding wins (lex-scope). Returns the binding index
+/// in `filter_arg_bindings` so callers can read both the AST and the
+/// `bindings_floor_at_capture` for re-substitution.
+fn lookupFilterArgBinding(ctx: *const Lowerer, name: []const u8) ?u32 {
+    var i: u32 = @intCast(ctx.filter_arg_bindings.items.len);
+    while (i > 0) {
+        i -= 1;
+        const binding = ctx.filter_arg_bindings.items[i];
+        if (std.mem.eql(u8, binding.name, name)) return i;
+    }
+    return null;
+}
+
+/// Re-lower the AST sub-tree captured for filter-arg `binding_idx`.
+/// The bindings stack is temporarily truncated to the binding's
+/// `bindings_floor_at_capture` so the substituted sub-tree sees only
+/// the bindings active at its capture site — preventing infinite
+/// recursion on `def id(x): x; id(id(.))`. Mirrors legacy
+/// `compiler.zig:6086-6101`.
+fn reLowerFilterArg(ctx: *Lowerer, binding_idx: u32) LowerError!u32 {
+    const binding = ctx.filter_arg_bindings.items[binding_idx];
+    const saved_len: u32 = @intCast(ctx.filter_arg_bindings.items.len);
+    ctx.filter_arg_bindings.items.len = binding.bindings_floor_at_capture;
+    const result = try lowerNode(ctx, binding.arg_ast);
+    ctx.filter_arg_bindings.items.len = saved_len;
+    return result;
+}
+
+/// Look up a function by name + arity that is currently being
+/// inline-expanded — i.e., on the `expanding_stack`. Bypasses the
+/// hidden range so a function which lex-hides itself during inner-def
+/// expansion can still self-call. Returns null if no such expanding
+/// function matches; the caller falls back to the regular
+/// `lookupFunction` (which respects hiding).
+fn lookupRecursiveSelf(ctx: *const Lowerer, name: []const u8, arity: u32) ?u32 {
+    var i: usize = ctx.expanding_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const fn_id = ctx.expanding_stack.items[i];
+        const entry = ctx.function_table.items[fn_id];
+        if (entry.params.len == arity and std.mem.eql(u8, entry.name, name)) {
+            return fn_id;
+        }
+    }
+    return null;
+}
+
+/// Walk an AST sub-tree looking for a self-reference matching
+/// `(name, arity)`. Inner `def` bodies are skipped — their refs are
+/// scoped to themselves. Used by `lowerFuncDef` to set
+/// `is_recursive` eagerly so emit can pre-allocate a body_ip slot
+/// for the recursive function's body (mirrors the post-pass scan in
+/// legacy `compiler.zig:6628`).
+fn bodyReferencesSelf(node: *const Node, name: []const u8, arity: u32) bool {
+    switch (node.kind) {
+        .func_call => |fc| {
+            if (std.mem.eql(u8, fc.name, name) and fc.args.len == arity) return true;
+            for (fc.args) |a| if (bodyReferencesSelf(a, name, arity)) return true;
+            return false;
+        },
+        .field_access => |fa| {
+            if (arity == 0 and std.mem.eql(u8, fa.name, name)) return true;
+            return false;
+        },
+        // Inner defs introduce a new scope — their bodies' refs to
+        // the SAME name address themselves (or the parent if the inner
+        // def shadows it the outer def — but legacy doesn't detect
+        // that here either). We descend only into `rest`, not body.
+        .func_def => |fd| return bodyReferencesSelf(fd.rest, name, arity),
+        .pipe => |bp| return bodyReferencesSelf(bp.left, name, arity) or bodyReferencesSelf(bp.right, name, arity),
+        .comma => |bc| return bodyReferencesSelf(bc.left, name, arity) or bodyReferencesSelf(bc.right, name, arity),
+        .arithmetic => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),
+        .comparison => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),
+        .and_expr => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),
+        .or_expr => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),
+        .alternative => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),
+        .unary_neg => |un| return bodyReferencesSelf(un.operand, name, arity),
+        .optional => |un| return bodyReferencesSelf(un.operand, name, arity),
+        .paren => |un| return bodyReferencesSelf(un.operand, name, arity),
+        .if_expr => |ifx| {
+            if (bodyReferencesSelf(ifx.cond, name, arity)) return true;
+            if (bodyReferencesSelf(ifx.then_body, name, arity)) return true;
+            for (ifx.elif_chains) |elif| {
+                if (bodyReferencesSelf(elif.cond, name, arity)) return true;
+                if (bodyReferencesSelf(elif.body, name, arity)) return true;
+            }
+            if (ifx.else_body) |eb| if (bodyReferencesSelf(eb, name, arity)) return true;
+            return false;
+        },
+        .try_catch => |tc| {
+            if (bodyReferencesSelf(tc.body, name, arity)) return true;
+            if (tc.catch_body) |cb| if (bodyReferencesSelf(cb, name, arity)) return true;
+            return false;
+        },
+        .as_pattern => |ap| return bodyReferencesSelf(ap.expr, name, arity) or bodyReferencesSelf(ap.body, name, arity),
+        .destruct_alt => |da| return bodyReferencesSelf(da.expr, name, arity) or bodyReferencesSelf(da.body, name, arity),
+        .reduce => |rd| return bodyReferencesSelf(rd.expr, name, arity) or bodyReferencesSelf(rd.init, name, arity) or bodyReferencesSelf(rd.update, name, arity),
+        .foreach => |fe| {
+            if (bodyReferencesSelf(fe.expr, name, arity)) return true;
+            if (bodyReferencesSelf(fe.init, name, arity)) return true;
+            if (bodyReferencesSelf(fe.update, name, arity)) return true;
+            if (fe.extract) |e| if (bodyReferencesSelf(e, name, arity)) return true;
+            return false;
+        },
+        .builtin_call => |bc| {
+            for (bc.args) |a| if (bodyReferencesSelf(a, name, arity)) return true;
+            return false;
+        },
+        .object_construct => |oc| {
+            for (oc.fields) |fld| {
+                switch (fld.key) {
+                    .ident, .string => {},
+                    .expr => |e| if (bodyReferencesSelf(e, name, arity)) return true,
+                }
+                if (bodyReferencesSelf(fld.value, name, arity)) return true;
+            }
+            return false;
+        },
+        .array_construct => |ac| {
+            if (ac.expr) |e| if (bodyReferencesSelf(e, name, arity)) return true;
+            return false;
+        },
+        .string_interp => |si| {
+            for (si.parts) |part| {
+                switch (part) {
+                    .literal => {},
+                    .expr => |e| if (bodyReferencesSelf(e, name, arity)) return true,
+                }
+            }
+            return false;
+        },
+        .format_string => |fs| {
+            for (fs.parts) |part| {
+                switch (part) {
+                    .literal => {},
+                    .expr => |e| if (bodyReferencesSelf(e, name, arity)) return true,
+                }
+            }
+            return false;
+        },
+        .suffix => |sf| {
+            return bodyReferencesSelf(sf.base, name, arity);
+        },
+        .update_assign => |ua| return bodyReferencesSelf(ua.rhs, name, arity),
+        .assign_general => |ag| return bodyReferencesSelf(ag.lhs, name, arity) or bodyReferencesSelf(ag.rhs, name, arity),
+        else => return false,
+    }
 }

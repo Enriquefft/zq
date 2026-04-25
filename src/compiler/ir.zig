@@ -317,39 +317,7 @@ pub fn dump(
 ) @TypeOf(writer).Error!void {
     try writer.print("# source: {s}\n", .{source});
     try writer.writeAll("# SemOp\n");
-    try dumpAstWithSrc(ir_obj, ast_root, source, 0, writer);
-}
-
-/// Top-level entry that detects bare-ident builtin references at the
-/// dump root. The recursive `dumpAst` doesn't see `source`, so the
-/// detection only fires at the AST root — that's enough for snapshot
-/// tests where every fixture starts with `# source: <name>`. Nested
-/// bare-ident builtins (e.g. inside an array constructor) still render
-/// through `dumpAst`'s `field_access` arm; their snapshot accuracy
-/// matters less than the IR structural fidelity, and lowering already
-/// routes them correctly through `classifyBuiltin`.
-fn dumpAstWithSrc(
-    ir_obj: *const IR,
-    node: *const ast.Node,
-    source: []const u8,
-    depth: usize,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    if (node.kind == .field_access) {
-        const fa = node.kind.field_access;
-        const sp_start = node.span.start;
-        const is_dot_field = sp_start < source.len and source[sp_start] == '.';
-        if (!is_dot_field and isCat10ZeroArgBuiltin(fa.name)) {
-            try writeIndent(writer, depth);
-            try writer.writeAll("call_builtin(");
-            try writeStringLit(writer, fa.name);
-            try writer.writeAll(")");
-            try writeSpan(writer, node.span);
-            try writer.writeAll("\n");
-            return;
-        }
-    }
-    return dumpAst(ir_obj, node, depth, writer);
+    try dumpAst(ir_obj, ast_root, source, 0, writer);
 }
 
 /// Cat-10 zero-arg builtin name predicate for the dumper. Mirrors the
@@ -357,7 +325,9 @@ fn dumpAstWithSrc(
 /// to these names render as `call_builtin("name")` to match the IR shape
 /// produced by `lowerBuiltinCall`. The AST parser's own zero-arg list
 /// (`src/ast/parser.zig:1601`) is narrower, so cat-10 picks up the
-/// remainder via `field_access` re-classification.
+/// remainder via `field_access` re-classification. Cat-9 disambiguates
+/// against this list — bare-ident `field_access` whose name does NOT
+/// match any cat-10 builtin renders as `call_user("name")`.
 fn isCat10ZeroArgBuiltin(name: []const u8) bool {
     return std.mem.eql(u8, name, "arrays") or
         std.mem.eql(u8, name, "objects") or
@@ -402,6 +372,7 @@ fn writeSpan(writer: anytype, span: ast.Span) !void {
 fn dumpAst(
     ir_obj: *const IR,
     node: *const ast.Node,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -445,10 +416,34 @@ fn dumpAst(
             try writer.writeAll("neg");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, un.operand, depth + 1, writer);
+            try dumpAst(ir_obj, un.operand, source, depth + 1, writer);
         },
         .field_access => |fa| {
             try writeIndent(writer, depth);
+            // Bare-ident `field_access` (no leading `.` in the source
+            // span) is the AST encoding for two distinct surfaces:
+            //   * Zero-arg builtins outside the AST parser's narrow
+            //     `isZeroArgBuiltin` list (cat-10, e.g. `arrays`,
+            //     `now`, `utf8bytelength`) — render as
+            //     `call_builtin("name")`.
+            //   * Zero-arg user-function calls (cat-9) — render as
+            //     `call_user("name")`.
+            // Disambiguate by name against `isCat10ZeroArgBuiltin`;
+            // the lowerer makes the same decision via
+            // `classifyBuiltin`, keeping snapshot output aligned.
+            const is_dot_field = node.span.start < source.len and source[node.span.start] == '.';
+            if (!is_dot_field) {
+                if (isCat10ZeroArgBuiltin(fa.name)) {
+                    try writer.writeAll("call_builtin(");
+                } else {
+                    try writer.writeAll("call_user(");
+                }
+                try writeStringLit(writer, fa.name);
+                try writer.writeAll(")");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                return;
+            }
             try writer.writeAll("load_field(");
             try writeStringLit(writer, fa.name);
             try writer.writeAll(")");
@@ -482,25 +477,25 @@ fn dumpAst(
             try writer.writeAll("try");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, un.operand, depth + 1, writer);
+            try dumpAst(ir_obj, un.operand, source, depth + 1, writer);
         },
         .pipe => |bp| {
             try writeIndent(writer, depth);
             try writer.writeAll("pipe");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bp.left, depth + 1, writer);
-            try dumpAst(ir_obj, bp.right, depth + 1, writer);
+            try dumpAst(ir_obj, bp.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bp.right, source, depth + 1, writer);
         },
         .comma => |bc| {
             try writeIndent(writer, depth);
             try writer.writeAll("comma");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bc.left, depth + 1, writer);
-            try dumpAst(ir_obj, bc.right, depth + 1, writer);
+            try dumpAst(ir_obj, bc.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bc.right, source, depth + 1, writer);
         },
-        .suffix => |sf| try dumpSuffix(ir_obj, &sf, node.span, depth, writer),
+        .suffix => |sf| try dumpSuffix(ir_obj, &sf, node.span, source, depth, writer),
         .arithmetic => |bn| {
             const op_name = switch (bn.op) {
                 .add => "add",
@@ -513,8 +508,8 @@ fn dumpAst(
             try writer.print("arith({s})", .{op_name});
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bn.left, depth + 1, writer);
-            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+            try dumpAst(ir_obj, bn.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, source, depth + 1, writer);
         },
         .comparison => |bn| {
             const op_name = switch (bn.op) {
@@ -529,32 +524,32 @@ fn dumpAst(
             try writer.print("cmp({s})", .{op_name});
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bn.left, depth + 1, writer);
-            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+            try dumpAst(ir_obj, bn.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, source, depth + 1, writer);
         },
         .and_expr => |bn| {
             try writeIndent(writer, depth);
             try writer.writeAll("logical(and)");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bn.left, depth + 1, writer);
-            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+            try dumpAst(ir_obj, bn.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, source, depth + 1, writer);
         },
         .or_expr => |bn| {
             try writeIndent(writer, depth);
             try writer.writeAll("logical(or)");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bn.left, depth + 1, writer);
-            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+            try dumpAst(ir_obj, bn.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, source, depth + 1, writer);
         },
         .alternative => |bn| {
             try writeIndent(writer, depth);
             try writer.writeAll("alt");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, bn.left, depth + 1, writer);
-            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+            try dumpAst(ir_obj, bn.left, source, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, source, depth + 1, writer);
         },
         .builtin_call => |bc| {
             try writeIndent(writer, depth);
@@ -572,7 +567,7 @@ fn dumpAst(
                 try writer.writeAll("path_begin");
                 try writeSpan(writer, node.span);
                 try writer.writeAll("\n");
-                try dumpAst(ir_obj, bc.args[0], depth + 1, writer);
+                try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
                 return;
             }
             // Generic builtin call: rendered as `call_builtin("name")`.
@@ -597,7 +592,7 @@ fn dumpAst(
             // every arg.
             for (bc.args, 0..) |arg, i| {
                 if (isRegexBuiltinByName(bc.name) and shouldSkipRegexArg(&bc, i)) continue;
-                try dumpAst(ir_obj, arg, depth + 1, writer);
+                try dumpAst(ir_obj, arg, source, depth + 1, writer);
             }
         },
         .object_construct => |oc| {
@@ -611,8 +606,24 @@ fn dumpAst(
             // shows the same shape as a real string literal so the
             // text format remains uniform across key shapes.
             for (oc.fields) |fld| {
-                try dumpObjectKey(ir_obj, &fld, depth + 1, writer);
-                try dumpAst(ir_obj, fld.value, depth + 1, writer);
+                try dumpObjectKey(ir_obj, &fld, source, depth + 1, writer);
+                // Shorthand object field — `{a}` / `{a, b}` — has a
+                // synthesized `field_access` value whose span starts
+                // at the key (no leading `.`). Render as `load_field`
+                // directly: the cat-9 bare-ident-as-`call_user`
+                // disambiguation in the generic `field_access` arm
+                // would otherwise mis-render shorthands as UDF calls.
+                if (fld.value.kind == .field_access and fld.value.span.start == fld.span.start) {
+                    const fa = fld.value.kind.field_access;
+                    try writeIndent(writer, depth + 1);
+                    try writer.writeAll("load_field(");
+                    try writeStringLit(writer, fa.name);
+                    try writer.writeAll(")");
+                    try writeSpan(writer, fld.value.span);
+                    try writer.writeAll("\n");
+                    continue;
+                }
+                try dumpAst(ir_obj, fld.value, source, depth + 1, writer);
             }
         },
         .array_construct => |ac| {
@@ -624,7 +635,7 @@ fn dumpAst(
                 // Flatten comma chains so the dump matches the IR's
                 // variadic span exactly (lowering pre-flattens for the
                 // same reason — see `collectArrayElems`).
-                try dumpArrayElems(ir_obj, inner, depth + 1, writer);
+                try dumpArrayElems(ir_obj, inner, source, depth + 1, writer);
             }
         },
         .string_interp => |si| {
@@ -632,7 +643,7 @@ fn dumpAst(
             try writer.writeAll("interp");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpStringParts(ir_obj, si.parts, node.span, depth + 1, writer);
+            try dumpStringParts(ir_obj, si.parts, node.span, source, depth + 1, writer);
         },
         .format_string => |fs| {
             try writeIndent(writer, depth);
@@ -641,7 +652,7 @@ fn dumpAst(
             try writer.writeAll(")");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpStringParts(ir_obj, fs.parts, node.span, depth + 1, writer);
+            try dumpStringParts(ir_obj, fs.parts, node.span, source, depth + 1, writer);
         },
         .update_assign => |ua| {
             // Fast-path AST shape: `.path1.path2[N] OP= rhs`. The path
@@ -656,7 +667,7 @@ fn dumpAst(
             try writer.writeAll(")");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, ua.rhs, depth + 1, writer);
+            try dumpAst(ir_obj, ua.rhs, source, depth + 1, writer);
         },
         .assign_general => |ag| {
             // General-LHS AST shape. The dump renders both LHS and
@@ -668,15 +679,15 @@ fn dumpAst(
             try writer.writeAll("])");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, ag.lhs, depth + 1, writer);
-            try dumpAst(ir_obj, ag.rhs, depth + 1, writer);
+            try dumpAst(ir_obj, ag.lhs, source, depth + 1, writer);
+            try dumpAst(ir_obj, ag.rhs, source, depth + 1, writer);
         },
         // ── Parens `(expr)` (cat-6 — passthrough) ───────────────────
         // The AST has a `paren` wrapper for source-position fidelity;
         // lowering treats it as transparent (the inner IR is emitted
         // directly). The dump mirrors that — recurse into the operand
         // without emitting a wrapper node.
-        .paren => |un| try dumpAst(ir_obj, un.operand, depth, writer),
+        .paren => |un| try dumpAst(ir_obj, un.operand, source, depth, writer),
         // ── Try / catch (cat-6) ─────────────────────────────────────
         // Without a catch handler the dump emits `try` with a single
         // child (the body); with a catch handler the second indented
@@ -688,9 +699,9 @@ fn dumpAst(
             try writer.writeAll("try");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, tc.body, depth + 1, writer);
+            try dumpAst(ir_obj, tc.body, source, depth + 1, writer);
             if (tc.catch_body) |handler| {
-                try dumpAst(ir_obj, handler, depth + 1, writer);
+                try dumpAst(ir_obj, handler, source, depth + 1, writer);
             }
         },
         // ── if / elif / else (cat-6) ────────────────────────────────
@@ -700,7 +711,7 @@ fn dumpAst(
         // produces a nested `if` child in the else position. Implicit
         // else (no `else` clause) materializes as `identity` — matches
         // legacy `parseIfBody` (`src/query/src/compiler.zig:6390`).
-        .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, depth, writer),
+        .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, source, depth, writer),
         // ── Variable load `$name` (category 4) ──────────────────────
         // Mirrors `lowerVariable` — the IR is a leaf `load_var` whose
         // payload echoes the variable name. Var-id resolution happens
@@ -724,13 +735,13 @@ fn dumpAst(
             try writer.writeAll("pipe");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, ap.expr, depth + 1, writer);
+            try dumpAst(ir_obj, ap.expr, source, depth + 1, writer);
             try writeIndent(writer, depth + 1);
             try writer.writeAll("pipe");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpPattern(ir_obj, ap.pattern, node.span, depth + 2, writer);
-            try dumpAst(ir_obj, ap.body, depth + 2, writer);
+            try dumpPattern(ir_obj, ap.pattern, node.span, source, depth + 2, writer);
+            try dumpAst(ir_obj, ap.body, source, depth + 2, writer);
         },
         // ── `expr as P1 ?// P2 ?// … | body` (category 4) ──────────
         // Lowering shape: `pipe(expr, pipe(destructure(alt_bind, …), body))`.
@@ -741,7 +752,7 @@ fn dumpAst(
             try writer.writeAll("pipe");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
-            try dumpAst(ir_obj, da.expr, depth + 1, writer);
+            try dumpAst(ir_obj, da.expr, source, depth + 1, writer);
             try writeIndent(writer, depth + 1);
             try writer.writeAll("pipe");
             try writeSpan(writer, node.span);
@@ -751,9 +762,35 @@ fn dumpAst(
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
             for (da.patterns) |alt_pat| {
-                try dumpPattern(ir_obj, alt_pat, node.span, depth + 3, writer);
+                try dumpPattern(ir_obj, alt_pat, node.span, source, depth + 3, writer);
             }
-            try dumpAst(ir_obj, da.body, depth + 2, writer);
+            try dumpAst(ir_obj, da.body, source, depth + 2, writer);
+        },
+        // ── User-defined function definition (cat-9) ────────────────
+        // The def itself produces no IR — only the `rest`
+        // continuation flows into the IR tree. The dump mirrors that:
+        // recurse into `rest` at the SAME depth, with no header for
+        // the def. Single-source-of-truth with `lowerFuncDef` in
+        // `lower.zig` (which also emits no IR for the def itself).
+        .func_def => |fd| try dumpAst(ir_obj, fd.rest, source, depth, writer),
+
+        // ── User-defined function call (cat-9) ──────────────────────
+        // Render as `call_user("name")` followed by the AST args at
+        // depth+1. This is the source-level shape — internally
+        // lowering may inline-expand the body or emit a recursive
+        // `call_user` IR node, but the dump captures the source
+        // intent. The function name is rendered as a string literal
+        // so the snapshot diff stays stable across name escaping.
+        .func_call => |fc| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("call_user(");
+            try writeStringLit(writer, fc.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            for (fc.args) |arg| {
+                try dumpAst(ir_obj, arg, source, depth + 1, writer);
+            }
         },
         else => {
             try writeIndent(writer, depth);
@@ -771,6 +808,7 @@ fn dumpAst(
 fn dumpObjectKey(
     ir_obj: *const IR,
     fld: *const ast.Node.ObjectField,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -791,7 +829,7 @@ fn dumpObjectKey(
             try writeSpan(writer, fld.span);
             try writer.writeAll("\n");
         },
-        .expr => |expr| try dumpAst(ir_obj, expr, depth, writer),
+        .expr => |expr| try dumpAst(ir_obj, expr, source, depth, writer),
     }
 }
 
@@ -802,16 +840,17 @@ fn dumpObjectKey(
 fn dumpArrayElems(
     ir_obj: *const IR,
     node: *const ast.Node,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
     if (node.kind == .comma) {
         const c = node.kind.comma;
-        try dumpArrayElems(ir_obj, c.left, depth, writer);
-        try dumpArrayElems(ir_obj, c.right, depth, writer);
+        try dumpArrayElems(ir_obj, c.left, source, depth, writer);
+        try dumpArrayElems(ir_obj, c.right, source, depth, writer);
         return;
     }
-    try dumpAst(ir_obj, node, depth, writer);
+    try dumpAst(ir_obj, node, source, depth, writer);
 }
 
 /// Render an interp/format parts list — literals as `load_const`
@@ -821,6 +860,7 @@ fn dumpStringParts(
     ir_obj: *const IR,
     parts: []const ast.Node.StringPart,
     parent_span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -834,7 +874,7 @@ fn dumpStringParts(
                 try writeSpan(writer, parent_span);
                 try writer.writeAll("\n");
             },
-            .expr => |expr| try dumpAst(ir_obj, expr, depth, writer),
+            .expr => |expr| try dumpAst(ir_obj, expr, source, depth, writer),
         }
     }
 }
@@ -856,10 +896,11 @@ fn dumpSuffix(
     ir_obj: *const IR,
     sf: *const ast.Node.Suffix,
     span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
-    try renderSuffixChain(ir_obj, sf, sf.ops.len, span, depth, writer);
+    try renderSuffixChain(ir_obj, sf, sf.ops.len, span, source, depth, writer);
 }
 
 /// Render the chain `sf.base + sf.ops[0 .. ops_len]`. The rightmost
@@ -872,6 +913,7 @@ fn renderSuffixChain(
     sf: *const ast.Node.Suffix,
     ops_len: usize,
     span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -893,7 +935,7 @@ fn renderSuffixChain(
             try writeSpan(writer, span);
             try writer.writeAll("\n");
         }
-        try dumpAst(ir_obj, sf.base, depth + try_wrap_count, writer);
+        try dumpAst(ir_obj, sf.base, source, depth + try_wrap_count, writer);
         return;
     }
 
@@ -907,9 +949,9 @@ fn renderSuffixChain(
     // Left subtree: recursive call with reduced ops_len. If
     // rh_end - 1 == 0 the left subtree is just the base.
     if (rh_end - 1 == 0) {
-        try dumpAst(ir_obj, sf.base, depth + 1, writer);
+        try dumpAst(ir_obj, sf.base, source, depth + 1, writer);
     } else {
-        try renderSuffixChain(ir_obj, sf, rh_end - 1, span, depth + 1, writer);
+        try renderSuffixChain(ir_obj, sf, rh_end - 1, span, source, depth + 1, writer);
     }
 
     // Right subtree: the rightmost non-optional op, wrapped in
@@ -1021,6 +1063,7 @@ fn dumpIfExpr(
     ir_obj: *const IR,
     ifx: *const ast.Node.IfExpr,
     span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -1028,9 +1071,9 @@ fn dumpIfExpr(
     try writer.writeAll("if");
     try writeSpan(writer, span);
     try writer.writeAll("\n");
-    try dumpAst(ir_obj, ifx.cond, depth + 1, writer);
-    try dumpAst(ir_obj, ifx.then_body, depth + 1, writer);
-    try dumpIfElsePosition(ir_obj, ifx, 0, span, depth + 1, writer);
+    try dumpAst(ir_obj, ifx.cond, source, depth + 1, writer);
+    try dumpAst(ir_obj, ifx.then_body, source, depth + 1, writer);
+    try dumpIfElsePosition(ir_obj, ifx, 0, span, source, depth + 1, writer);
 }
 
 /// Render the else-arm of an if/elif/else chain. `chain_idx` is the
@@ -1043,6 +1086,7 @@ fn dumpIfElsePosition(
     ifx: *const ast.Node.IfExpr,
     chain_idx: usize,
     span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -1052,13 +1096,13 @@ fn dumpIfElsePosition(
         try writer.writeAll("if");
         try writeSpan(writer, span);
         try writer.writeAll("\n");
-        try dumpAst(ir_obj, elif.cond, depth + 1, writer);
-        try dumpAst(ir_obj, elif.body, depth + 1, writer);
-        try dumpIfElsePosition(ir_obj, ifx, chain_idx + 1, span, depth + 1, writer);
+        try dumpAst(ir_obj, elif.cond, source, depth + 1, writer);
+        try dumpAst(ir_obj, elif.body, source, depth + 1, writer);
+        try dumpIfElsePosition(ir_obj, ifx, chain_idx + 1, span, source, depth + 1, writer);
         return;
     }
     if (ifx.else_body) |eb| {
-        try dumpAst(ir_obj, eb, depth, writer);
+        try dumpAst(ir_obj, eb, source, depth, writer);
         return;
     }
     // Implicit else → identity. Mirrors legacy `parseIfBody` line 6390.
@@ -1077,6 +1121,7 @@ fn dumpPattern(
     ir_obj: *const IR,
     pat: ast.Pattern,
     parent_span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -1094,7 +1139,7 @@ fn dumpPattern(
             try writeSpan(writer, parent_span);
             try writer.writeAll("\n");
             for (elems) |sub| {
-                try dumpPattern(ir_obj, sub, parent_span, depth + 1, writer);
+                try dumpPattern(ir_obj, sub, parent_span, source, depth + 1, writer);
             }
         },
         .object => |fields| {
@@ -1102,8 +1147,8 @@ fn dumpPattern(
             try writeSpan(writer, parent_span);
             try writer.writeAll("\n");
             for (fields) |fld| {
-                try dumpPatternKey(ir_obj, fld.key, parent_span, depth + 1, writer);
-                try dumpPattern(ir_obj, fld.pattern, parent_span, depth + 1, writer);
+                try dumpPatternKey(ir_obj, fld.key, parent_span, source, depth + 1, writer);
+                try dumpPattern(ir_obj, fld.pattern, parent_span, source, depth + 1, writer);
             }
         },
     }
@@ -1117,6 +1162,7 @@ fn dumpPatternKey(
     ir_obj: *const IR,
     key: ast.PatternKey,
     parent_span: ast.Span,
+    source: []const u8,
     depth: usize,
     writer: anytype,
 ) @TypeOf(writer).Error!void {
@@ -1129,7 +1175,7 @@ fn dumpPatternKey(
             try writeSpan(writer, parent_span);
             try writer.writeAll("\n");
         },
-        .computed => |expr| try dumpAst(ir_obj, expr, depth, writer),
+        .computed => |expr| try dumpAst(ir_obj, expr, source, depth, writer),
     }
 }
 

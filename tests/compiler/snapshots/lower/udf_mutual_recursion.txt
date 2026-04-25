@@ -1,0 +1,5 @@
+# source: def helper: . + 1; def main: helper * 2; 5 | main
+# SemOp
+pipe @41..49
+  load_const(5) @41..42
+  call_user("main") @45..49

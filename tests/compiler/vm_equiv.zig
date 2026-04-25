@@ -290,6 +290,32 @@ const FIXTURES = [_]Fixture{
     // narrow `isZeroArgBuiltin` list — see `src/ast/parser.zig:1601`).
     .{ .name = "builtin_utf8bytelength_bare", .filter = "utf8bytelength", .input = "\"abc\"", .expected_output = "3" },
     .{ .name = "builtin_trim_bare", .filter = "trim", .input = "\"  hi  \"", .expected_output = "\"hi\"" },
+
+    // ── Category 9 — user-defined functions + recursion + filter args ──
+    // Simple zero-arg def — call resolves to inline expansion.
+    .{ .name = "udf_simple_zero_arg", .filter = "def f: . + 1; f", .input = "10", .expected_output = "11" },
+    // Filter arg — re-substitutes the caller's AST sub-tree.
+    .{ .name = "udf_filter_arg_basic", .filter = "def double(x): x + x; double(. + 1)", .input = "5", .expected_output = "12" },
+    // Filter arg used multiple times — substitution happens per use.
+    .{ .name = "udf_filter_arg_multi", .filter = "def thrice(g): [g, g, g]; thrice(.+10)", .input = "5", .expected_output = "[15,15,15]" },
+    // Value arg — `$x` form, captured into a fresh var_id at call site.
+    .{ .name = "udf_value_arg_basic", .filter = "def myadd($x): . + $x; myadd(5)", .input = "10", .expected_output = "15" },
+    // Two value args — both captured/popped around body.
+    .{ .name = "udf_value_arg_two", .filter = "def f($a; $b): $a + $b; f(2; 3)", .input = "null", .expected_output = "5" },
+    // Mixed filter + value args.
+    .{ .name = "udf_mixed_args", .filter = "def f(g; $x): g + $x; f(.+1; 10)", .input = "5", .expected_output = "16" },
+    // Direct self-recursion — fact(5) = 120.
+    .{ .name = "udf_recursion_fact", .filter = "def fact: if . == 0 then 1 else . * (.-1 | fact) end; fact", .input = "5", .expected_output = "120" },
+    // Counting recursion — `loop` increments until reaching the
+    // hard-coded ceiling. Verifies the recursive body's `call_function`
+    // jump emits cleanly with no value-arg captures interfering.
+    .{ .name = "udf_recursion_loop", .filter = "def loop: if . == 5 then . else . + 1 | loop end; loop", .input = "0", .expected_output = "5" },
+    // Two independent functions used in sequence (not mutually recursive,
+    // but both registered + inline-expanded against shared scope).
+    .{ .name = "udf_two_funcs", .filter = "def helper: . + 1; def main: helper * 2; main", .input = "5", .expected_output = "12" },
+    // Function call inside an array constructor — generator semantics
+    // surface through the filter arg.
+    .{ .name = "udf_in_array_ctor", .filter = "def f(g): [g]; f(.[])", .input = "[1,2,3]", .expected_output = "[1,2,3]" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

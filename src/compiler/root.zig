@@ -114,14 +114,25 @@ pub fn compile(
     // `defer` above. The regex pool transfers ownership from the
     // lowerer to the emitted `Compiled` — `takeRegexPool` clears the
     // lowerer's slot so the top-level `deinitRegexPool` defer
-    // becomes a no-op.
+    // becomes a no-op. `external_vars.len` flows in so emit allocates
+    // `external_var_ids` at the final size in one shot. The lowerer's
+    // `function_table` snapshot threads through to emit so cat-9
+    // `call_user` IR nodes can resolve to body_ir_root + canonical
+    // var_ids without re-traversing the AST.
     const pool = lowerer.takeRegexPool();
     var pool_consumed = false;
     errdefer if (!pool_consumed) {
         var p = pool;
         p.deinit();
     };
-    var compiled = emit_mod.emit(fused, external_vars.len, pool, allocator) catch |e| switch (e) {
+    var compiled = emit_mod.emit(
+        fused,
+        external_vars.len,
+        lowerer.function_table.items,
+        lowerer.next_var_id,
+        pool,
+        allocator,
+    ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NewCompilerNotImplemented => return error.NewCompilerNotImplemented,
     };

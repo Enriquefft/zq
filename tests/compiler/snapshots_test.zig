@@ -112,6 +112,12 @@ const FIXTURES = [_]Fixture{
     .{ .name = "datetime_strftime", .expected = @embedFile("snapshots/lower/datetime_strftime.txt") },
     .{ .name = "argbuiltin_split", .expected = @embedFile("snapshots/lower/argbuiltin_split.txt") },
     .{ .name = "argbuiltin_pow", .expected = @embedFile("snapshots/lower/argbuiltin_pow.txt") },
+    // ── Cat-9 — user-defined functions + recursion + filter args ──
+    .{ .name = "udf_simple_def_call", .expected = @embedFile("snapshots/lower/udf_simple_def_call.txt") },
+    .{ .name = "udf_filter_arg", .expected = @embedFile("snapshots/lower/udf_filter_arg.txt") },
+    .{ .name = "udf_value_arg", .expected = @embedFile("snapshots/lower/udf_value_arg.txt") },
+    .{ .name = "udf_recursion", .expected = @embedFile("snapshots/lower/udf_recursion.txt") },
+    .{ .name = "udf_mutual_recursion", .expected = @embedFile("snapshots/lower/udf_mutual_recursion.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

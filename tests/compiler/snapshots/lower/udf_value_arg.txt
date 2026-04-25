@@ -1,0 +1,4 @@
+# source: def myadd($x): . + $x; myadd(5)
+# SemOp
+call_user("myadd") @23..31
+  load_const(5) @29..30

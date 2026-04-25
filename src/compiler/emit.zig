@@ -18,7 +18,7 @@ const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
 const ir = @import("ir.zig");
 const ctypes = @import("types.zig");
-const lower = @import("lower.zig");
+const lower_mod = @import("lower.zig");
 
 /// Errors surfaced by emission. `OutOfMemory` from arena/instruction
 /// allocs; `NewCompilerNotImplemented` for ops outside the supported
@@ -26,6 +26,18 @@ const lower = @import("lower.zig");
 pub const EmitError = error{
     OutOfMemory,
     NewCompilerNotImplemented,
+};
+
+/// Per-function body-IP cache entry. Recursive user-functions emit
+/// their body inline ONCE on the first `call_user` encounter; the
+/// resulting body_ip is recorded here so subsequent `call_user`s
+/// reuse the same IP (`call_function(body_ip)`). Mirrors legacy
+/// `FunctionEntry.recursive_body_ip` at `compiler.zig:209`.
+const FunctionBodyCache = struct {
+    body_ip: u32 = 0,
+    /// Set once the body has been emitted. Subsequent call sites
+    /// short-circuit to `call_function(body_ip)` without re-emitting.
+    emitted: bool = false,
 };
 
 /// Shared emission state. Holds the instruction stream, source map,
@@ -40,6 +52,13 @@ const Emitter = struct {
     ir_obj: ir.IR,
     allocator: std.mem.Allocator,
     next_var_id: u32,
+    /// Per-function-id snapshot from the Lowerer. Indexed by `call_user`
+    /// IR's `extra_data[extra + 0]`. Empty for compiles that don't
+    /// register any user-functions (cat-9 inactive).
+    function_table: []const lower_mod.FunctionEntry,
+    /// Body-IP cache parallel to `function_table` — index-by-fn_id
+    /// records whether the body has been emitted and its IP.
+    fn_body_ip: []FunctionBodyCache,
 
     fn allocVar(self: *Emitter) u32 {
         const id = self.next_var_id;
@@ -67,6 +86,8 @@ const Emitter = struct {
 pub fn emit(
     ir_obj: ir.IR,
     external_var_count: usize,
+    function_table: []const lower_mod.FunctionEntry,
+    next_var_id_seed: u32,
     regex_pool: regex_mod.RegexPool,
     allocator: std.mem.Allocator,
 ) EmitError!ctypes.Compiled {
@@ -87,17 +108,38 @@ pub fn emit(
     errdefer string_buf.deinit(allocator);
     try string_buf.appendSlice(allocator, ir_obj.string_buf.items);
 
+    // Per-fn body-IP cache — initialized fresh, mutated as `call_user`
+    // emit handlers fire. Lifetime tied to the emit call; freed before
+    // returning. Empty for cat-9-inactive compiles.
+    const fn_body_ip: []FunctionBodyCache = if (function_table.len == 0)
+        &.{}
+    else
+        try allocator.alloc(FunctionBodyCache, function_table.len);
+    defer if (function_table.len > 0) allocator.free(fn_body_ip);
+    for (fn_body_ip) |*entry| entry.* = .{};
+
     // The IR root is the last-pushed node (lowering is post-order).
     // An empty IR is a programming error — lowering always produces
     // at least one node for a non-empty AST.
     if (ir_obj.nodes.items.len > 0) {
         const root_idx: u32 = @intCast(ir_obj.nodes.items.len - 1);
+        // The next_var_id seed comes from the Lowerer (cat-9 allocates
+        // canonical var_ids for value-arg captures BEFORE emit runs;
+        // emit reserves any further var_ids above that watermark to
+        // avoid collisions). Falls back to `external_var_count` when
+        // cat-9 is inactive (no UDFs ⇒ Lowerer's seed equals the
+        // external-var watermark).
         var emitter = Emitter{
             .instructions = &instructions,
             .source_map = &source_map,
             .ir_obj = ir_obj,
             .allocator = allocator,
-            .next_var_id = @intCast(external_var_count),
+            .next_var_id = if (next_var_id_seed > external_var_count)
+                next_var_id_seed
+            else
+                @intCast(external_var_count),
+            .function_table = function_table,
+            .fn_body_ip = fn_body_ip,
         };
         try emitNode(&emitter, root_idx);
     }
@@ -624,6 +666,16 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 .alt_bind => try emitPatternAltBind(em, node),
             }
         },
+
+        // ── Category 9 — recursive user-function call ────────────────
+        // The IR `call_user` op only appears for recursive self-calls;
+        // non-recursive calls were inlined into a body-substituted
+        // pipe ladder at lowering time. This handler emits the legacy
+        // `<arg> ; capture_variable ; ... ; (jump-end ; body ;
+        // return_function ; end:) ; call_function(body_ip) ;
+        // pop_variable ; ...` shape from `compileExpand` /
+        // `expandFunctionCall` (`compiler.zig:1066-1123`).
+        .call_user => try emitCallUser(em, node),
 
         else => return error.NewCompilerNotImplemented,
     }
@@ -1673,7 +1725,7 @@ fn emitGeneralAlt(
 // ── Cat-10: builtin call emission ───────────────────────────────────
 //
 // The IR carries the builtin name and argument count; the emitter
-// re-classifies via `lower.classifyBuiltin` (single source of truth)
+// re-classifies via `lower_mod.classifyBuiltin` (single source of truth)
 // and dispatches to the corresponding bytecode shape. Each shape
 // mirrors a specific legacy compile* helper:
 //   * 0-arg          → direct `call_builtin(bid)`
@@ -1693,7 +1745,7 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
     const name = em.ir_obj.string_buf.items[offset .. offset + len];
 
     const arity: usize = node.span_len;
-    const class = lower.classifyBuiltin(name, arity);
+    const class = lower_mod.classifyBuiltin(name, arity);
 
     const bid = nameToBuiltinId(name, arity) orelse
         return error.NewCompilerNotImplemented;
@@ -1849,7 +1901,7 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
 
 /// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single
 /// source of truth shared by emit + the cat-10 classifier — every entry
-/// here corresponds to a class arm in `lower.classifyBuiltin`. The
+/// here corresponds to a class arm in `lower_mod.classifyBuiltin`. The
 /// (name, arity) tuple disambiguates overloaded names (e.g. `flatten`
 /// has both 0-arg and 1-arg forms mapping to different ids).
 fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
@@ -2007,4 +2059,118 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
     }
 
     return null;
+}
+
+// ── Cat-9 — user-function call emit ─────────────────────────────────────────
+//
+// Two layouts dispatched by the IS_INLINE flag in the IR's extra_data:
+//
+// INLINE (non-recursive) — `extra_data[node.extra+3] == CALL_USER_INLINE`:
+//   span = [value_arg_0, ..., body_idx]
+//
+//   <value_arg_0> ; capture_variable(canonical_var_id_0)
+//   <value_arg_1> ; capture_variable(canonical_var_id_1)
+//   ...
+//   <body>                                ; body emitted directly
+//   pop_variable(canonical_var_id_N) ; ... ; pop_variable(canonical_var_id_0)
+//
+// RECURSIVE — `extra_data[node.extra+3] == CALL_USER_RECURSIVE`:
+//   span = [value_arg_0, ..., value_arg_M]   (no body in span)
+//
+//   <value_arg_0> ; capture_variable(canonical_var_id_0)
+//   ...
+//   (first call only:)
+//   jump end_placeholder
+//   body_ip:
+//   <body IR emitted once>                 ; body comes from entry.body_ir_root
+//   return_function
+//   end_placeholder = current IP
+//   call_function(body_ip)
+//   pop_variable(canonical_var_id_N) ; ... ; pop_variable(canonical_var_id_0)
+//
+// Both shapes preserve OUTER current — there are NO `pipe` instructions
+// between the value-arg expressions and `capture_variable`, mirroring
+// legacy's `expandFunctionCall` (`compiler.zig:1066-1123`).
+
+const CALL_USER_INLINE: u32 = 1;
+const CALL_USER_RECURSIVE: u32 = 0;
+
+fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
+    const slots = em.ir_obj.extra_data.items;
+    const fn_id: u32 = slots[node.extra];
+    // slots[node.extra + 1..2] = (name_offset, name_len)
+    const flag = slots[node.extra + 3];
+
+    std.debug.assert(fn_id < em.function_table.len);
+    const entry = em.function_table[fn_id];
+
+    // Collect canonical var_ids for value-args from the function entry.
+    var value_var_ids: std.ArrayListUnmanaged(u32) = .{};
+    defer value_var_ids.deinit(em.allocator);
+    for (entry.params) |param| {
+        if (!param.is_filter) try value_var_ids.append(em.allocator, param.var_id);
+    }
+    const num_value_args = value_var_ids.items.len;
+
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+
+    if (flag == CALL_USER_INLINE) {
+        // Span layout: [value_arg_0, ..., value_arg_M, body_idx].
+        std.debug.assert(span.len == num_value_args + 1);
+        const body_idx = span[span.len - 1];
+
+        // Phase 1 — emit each value arg + capture (no pipe between).
+        for (span[0..num_value_args], value_var_ids.items) |arg_idx, var_id| {
+            try emitNode(em, arg_idx);
+            try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+        }
+
+        // Phase 2 — body inline (current preserved through the
+        // capture_variable popping from value_stack).
+        try emitNode(em, body_idx);
+
+        // Phase 3 — pop value-arg variables in reverse order.
+        var i: usize = num_value_args;
+        while (i > 0) {
+            i -= 1;
+            try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+        }
+        return;
+    }
+
+    // RECURSIVE shape — entry.is_recursive must be true; the body is
+    // emitted ONCE (cached in `fn_body_ip[fn_id]`) and subsequent
+    // call sites resolve to `call_function(body_ip)`.
+    std.debug.assert(flag == CALL_USER_RECURSIVE);
+    std.debug.assert(entry.is_recursive);
+    std.debug.assert(span.len == num_value_args);
+
+    for (span, value_var_ids.items) |arg_idx, var_id| {
+        try emitNode(em, arg_idx);
+        try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+    }
+
+    const cache = &em.fn_body_ip[fn_id];
+    if (!cache.emitted) {
+        const jump_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+        const body_ip: u32 = @intCast(em.instructions.items.len);
+        cache.body_ip = body_ip;
+        cache.emitted = true;
+
+        std.debug.assert(entry.body_ir_root != lower_mod.BODY_IR_NOT_LOWERED);
+        try emitNode(em, entry.body_ir_root);
+        try em.pushInstr(.return_function, .{ .none = {} }, node);
+
+        em.instructions.items[jump_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+    }
+
+    try em.pushInstr(.call_function, .{ .index = @intCast(cache.body_ip) }, node);
+
+    var i: usize = num_value_args;
+    while (i > 0) {
+        i -= 1;
+        try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+    }
 }
