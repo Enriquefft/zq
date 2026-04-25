@@ -1,6 +1,6 @@
 # IR Text Format — Stable Spec
 
-> **Revision**: 1 (R2 — locked). Subsequent changes require a new revision banner + user approval.
+> **Revision**: 2 (Phase 8 — load_-prefix editorial pass). Plan §1.3 row 5 owns the names; spec mirrors. Subsequent changes require a new revision banner + user approval.
 
 ---
 
@@ -41,8 +41,8 @@ normal node serialization).
 ```
 (* byte map: '.'=0 'f'=1 'o'=2 'o'=3 ' '=4 '|'=5 ' '=6 '.'=7 'b'=8 'a'=9 'r'=10 *)
 pipe @0..11
-  field("foo") @0..4
-  field("bar") @7..11
+  load_field("foo") @0..4
+  load_field("bar") @7..11
 ```
 
 ---
@@ -140,14 +140,14 @@ Plan §1.3 row 6 (verbatim):
 > Switch tables enumerate one namespace at a time.
 
 **Convention chosen: flat tag names.** Op tags are emitted without a namespace
-prefix (e.g., `field`, `pipe`, `key_count`). The dump separates namespaces with a
+prefix (e.g., `load_field`, `pipe`, `key_count`). The dump separates namespaces with a
 comment banner line so the split is visible without verbose prefixes:
 
 ```
 # SemOp
 pipe @0..11
-  field("foo") @0..4
-  field("bar") @7..11
+  load_field("foo") @0..4
+  load_field("bar") @7..11
 # EmitOp
 key_count @0..13
 ```
@@ -192,7 +192,7 @@ row 5: "string-buf ids, regex-pool ids, flag bitsets"), the dump renders values
 
 | Data type | Dump form | Example |
 |---|---|---|
-| String-buf id | resolved literal, quoted | `field("foo")` |
+| String-buf id | resolved literal, quoted | `load_field("foo")` |
 | Regex pool id | pool index + pattern source | `match(re_4 "/^foo/i")` |
 | Update-assign op kind | `flags=` + decimal bitset | `update_assign("k", flags=3)` |
 | Format-spec id | resolved format name, quoted | `format("@base64")` |
@@ -247,9 +247,9 @@ invisible to the dump.
              ' '=10 '.'=11 'b'=12 ' '=13 'e'=14 'l'=15 's'=16 'e'=17 ' '=18
              '.'=19 'c'=20 ' '=21 'e'=22 'n'=23 'd'=24 *)
 if @0..25
-  field("a") @3..5
-  field("b") @11..13
-  field("c") @19..21
+  load_field("a") @3..5
+  load_field("b") @11..13
+  load_field("c") @19..21
 ```
 
 The `arr_ctor`, `obj_ctor`, `interp`, `foreach`, and `call_user`/`call_builtin`
@@ -280,8 +280,8 @@ Plan §3 R3 step 9 (verbatim):
   # source: .foo | .bar
   # SemOp
   pipe @0..11
-    field("foo") @0..4
-    field("bar") @7..11
+    load_field("foo") @0..4
+    load_field("bar") @7..11
   ```
 
 - **Fuse snapshot** (`tests/compiler/snapshots/fuse/<name>.txt`):
@@ -299,7 +299,7 @@ Plan §3 R3 step 9 (verbatim):
 
 - The `# source:` header line(s) come first; the body (starting with the namespace
   banner) follows immediately.
-- Snapshot filenames are snake_case ASCII, e.g., `field_access.txt`,
+- Snapshot filenames are snake_case ASCII, e.g., `load_field.txt`,
   `pipe_chain.txt`, `keys_length_fuse.txt`.
 
 ---
@@ -328,7 +328,7 @@ The format is **append-only**:
 ```
 # source: .foo
 # SemOp
-field("foo") @0..4
+load_field("foo") @0..4
 ```
 
 ### Pipe: `.foo | .bar`
@@ -337,8 +337,8 @@ field("foo") @0..4
 # source: .foo | .bar
 # SemOp
 pipe @0..11
-  field("foo") @0..4
-  field("bar") @7..11
+  load_field("foo") @0..4
+  load_field("bar") @7..11
 ```
 
 ### Array index: `.[0]`
@@ -346,7 +346,7 @@ pipe @0..11
 ```
 # source: .[0]
 # SemOp
-index(0) @0..4
+load_index(0) @0..4
 ```
 
 ### Fuse rewrite: `keys | length` → `key_count`

@@ -1,0 +1,3 @@
+# source: .[]
+# SemOp
+iterate @0..3

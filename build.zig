@@ -569,6 +569,30 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| new_compile_leak_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(new_compile_leak_tests).step);
 
+    // ── snapshots-update (NOT in test_step) ───────────────────────────────
+    // Regenerate `tests/compiler/snapshots/lower/*.txt` from the current
+    // dumper output. Drives the same `compiler.dump` the snapshot test
+    // uses (single source of truth). Run after deliberate IR changes;
+    // commit the resulting diff. Plan §3 R3 step 9.
+    // Invocation: `zig build snapshots-update`.
+    const snapshots_update_step = b.step("snapshots-update", "Regenerate compiler lower snapshots");
+    const snapshots_update_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_update.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    snapshots_update_mod.addImport("ast", ast_module);
+    snapshots_update_mod.addImport("compiler", compiler_module);
+    const snapshots_update_exe = b.addExecutable(.{
+        .name = "zq-snapshots-update",
+        .root_module = snapshots_update_mod,
+    });
+    if (shim_build_step) |step| snapshots_update_exe.step.dependOn(&step.step);
+    const snapshots_update_run = b.addRunArtifact(snapshots_update_exe);
+    snapshots_update_run.stdio = .inherit;
+    if (b.args) |args| snapshots_update_run.addArgs(args);
+    snapshots_update_step.dependOn(&snapshots_update_run.step);
+
     // ── vm-equiv (NOT in test_step) ───────────────────────────────────────
     // VM-equivalence harness for Phase 2R Cluster A R3 (scaffold).
     // Compiles each fixture via legacy AND new backends; Phase 6 SKIPs all

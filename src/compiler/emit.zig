@@ -1,8 +1,10 @@
 //! IR → bytecode emission — Phase 2R / R3.
 //!
-//! Phase 7 (Cluster B) covers category 1 ops (`load_const`, `identity`,
-//! `recurse`, `neg`, `not`, `call_builtin`/type). Other ops surface as
-//! `error.NewCompilerNotImplemented`; the harness reports SKIP for them.
+//! The emitter walks the IR tree recursively from the root. Op
+//! handlers decide the relative order of child visits and own
+//! instruction emission. AST shapes outside the supported category
+//! surface as `error.NewCompilerNotImplemented`; the harness reports
+//! SKIP for them.
 //!
 //! The output `Compiled` matches the legacy compiler's shape exactly
 //! (plan §1.3 row 7). The instructions list is owned by the supplied
@@ -18,23 +20,19 @@ const ir = @import("ir.zig");
 const ctypes = @import("types.zig");
 
 /// Errors surfaced by emission. `OutOfMemory` from arena/instruction
-/// allocs; `NewCompilerNotImplemented` for ops outside category 1.
+/// allocs; `NewCompilerNotImplemented` for ops outside the supported
+/// category set.
 pub const EmitError = error{
     OutOfMemory,
     NewCompilerNotImplemented,
 };
 
-/// Lower-half of `Operand.str_ref` — used for `push_string` ops where
-/// the operand encodes a slice into the final `string_buf`. We emit the
-/// raw byte offsets directly, no special encoding.
-const StringRef = types_mod.Tape.StringRef;
-
-/// Emit bytecode from `ir_obj`. The emitter walks the IR node array in
-/// order — Phase 7's lowering produces a post-order traversal so the
-/// IR sequence already matches bytecode emission order. Variable-arity
-/// ops (which span `extra_children`) will need an explicit traversal in
-/// later categories; category 1 ops are fixed-arity (≤1 child) so the
-/// linear walk suffices.
+/// Emit bytecode from `ir_obj`. The emitter walks the IR tree
+/// recursively from the root (the last-pushed node, since lowering
+/// uses post-order construction). Each op handler decides the order
+/// of child visits relative to its own instruction emission — binary
+/// `pipe` interleaves (left, pipe, right); unary `try_` brackets its
+/// child with `fork_try`/`pop_try`; leaves emit one instruction.
 pub fn emit(
     ir_obj: ir.IR,
     external_var_count: usize,
@@ -51,22 +49,18 @@ pub fn emit(
     //      copied verbatim. The IR's `extra_data` already encodes
     //      `(offset, len)` against this buffer; we keep those offsets
     //      stable by appending to a fresh `string_buf` starting at 0.
-    //   2. Newly-emitted strings (none for category 1) — would append
-    //      after the IR's bytes.
-    //
-    // Category 1 only owns `load_const`'s string-literal payload, which
-    // is already in `ir_obj.string_buf`. Other categories will append
-    // here as they emit `push_string`, `load_key`, etc.
+    //   2. Newly-emitted strings (none today) — would append after the
+    //      IR's bytes.
     var string_buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer string_buf.deinit(allocator);
     try string_buf.appendSlice(allocator, ir_obj.string_buf.items);
 
-    // Emit one bytecode instruction per IR node in linear order. The
-    // post-order traversal of lowering means children appear before
-    // their parent in `ir_obj.nodes` — matches the VM's stack-based
-    // evaluation semantics exactly (push operand, then op).
-    for (ir_obj.nodes.items) |node| {
-        try emitNode(&instructions, &source_map, ir_obj, node, allocator);
+    // The IR root is the last-pushed node (lowering is post-order).
+    // An empty IR is a programming error — lowering always produces
+    // at least one node for a non-empty AST.
+    if (ir_obj.nodes.items.len > 0) {
+        const root_idx: u32 = @intCast(ir_obj.nodes.items.len - 1);
+        try emitNode(&instructions, &source_map, ir_obj, root_idx, allocator);
     }
 
     // Trailing `yield_output` matches the legacy compiler's contract
@@ -84,9 +78,6 @@ pub fn emit(
     const src_map_slice = try source_map.toOwnedSlice(allocator);
     errdefer allocator.free(src_map_slice);
 
-    // Category 1 has no UDFs. Mirror legacy: `function_table` is a view
-    // into `string_buf` with zero length (no separate allocation, no
-    // separate free).
     const function_defs: []const types_mod.FunctionDef = &.{};
 
     const ext_var_ids = try allocator.alloc(u32, external_var_count);
@@ -108,32 +99,20 @@ fn emitNode(
     instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
     source_map: *std.ArrayListUnmanaged(u32),
     ir_obj: ir.IR,
-    node: ir.Node,
+    node_idx: u32,
     allocator: std.mem.Allocator,
 ) EmitError!void {
+    const node = ir_obj.nodes.items[node_idx];
     switch (node.op) {
         .load_const => {
-            const slots = ir_obj.extra_data.items;
-            const kind: ir.LiteralKind = @enumFromInt(slots[node.extra]);
-            switch (kind) {
+            const value = ir.loadConstValue(&ir_obj, node);
+            switch (value) {
                 .null_val => try push(instructions, source_map, .push_null, .{ .none = {} }, node, allocator),
-                .false_val => try push(instructions, source_map, .push_bool, .{ .bool = false }, node, allocator),
-                .true_val => try push(instructions, source_map, .push_bool, .{ .bool = true }, node, allocator),
-                .int => {
-                    const lo: u64 = slots[node.extra + 1];
-                    const hi: u64 = slots[node.extra + 2];
-                    const u: u64 = lo | (hi << 32);
-                    const n: i64 = @bitCast(u);
-                    try push(instructions, source_map, .push_int, .{ .int = n }, node, allocator);
-                },
-                .float => {
-                    const lo: u64 = slots[node.extra + 1];
-                    const hi: u64 = slots[node.extra + 2];
-                    const u: u64 = lo | (hi << 32);
-                    const f: f64 = @bitCast(u);
-                    try push(instructions, source_map, .push_float, .{ .float = f }, node, allocator);
-                },
+                .bool_val => |b| try push(instructions, source_map, .push_bool, .{ .bool = b }, node, allocator),
+                .int => |n| try push(instructions, source_map, .push_int, .{ .int = n }, node, allocator),
+                .float => |f| try push(instructions, source_map, .push_float, .{ .float = f }, node, allocator),
                 .string => {
+                    const slots = ir_obj.extra_data.items;
                     const offset: u32 = slots[node.extra + 1];
                     const len: u32 = slots[node.extra + 2];
                     try push(
@@ -159,25 +138,22 @@ fn emitNode(
             allocator,
         ),
 
-        .neg => try push(instructions, source_map, .negate, .{ .none = {} }, node, allocator),
+        .neg => {
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try push(instructions, source_map, .negate, .{ .none = {} }, node, allocator);
+        },
 
         .not => try push(instructions, source_map, .not, .{ .none = {} }, node, allocator),
 
         .call_builtin => {
             // Category 1 hits this only for `type` (the brief assigns
-            // `type` to category 1 alongside `not`). The IR's
-            // `extra_data[extra]` and `extra_data[extra+1]` carry the
-            // `(offset, len)` of the builtin name in
-            // `ir_obj.string_buf`. We resolve that to a `BuiltinId`
-            // and emit `call_builtin`.
+            // `type` to category 1 alongside `not`). Other builtins are
+            // category 10's responsibility.
             const slots = ir_obj.extra_data.items;
             const offset: u32 = slots[node.extra];
             const len: u32 = slots[node.extra + 1];
             const name = ir_obj.string_buf.items[offset .. offset + len];
 
-            // Only a hardcoded category-1 set is allowed at this
-            // stage; anything else means lowering admitted an op the
-            // emitter doesn't know yet.
             const bid: types_mod.BuiltinId = if (std.mem.eql(u8, name, "type"))
                 .type_
             else
@@ -190,6 +166,68 @@ fn emitNode(
                 node,
                 allocator,
             );
+        },
+
+        // ── Category 2 ──────────────────────────────────────────────
+        .load_field => {
+            const slots = ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            try push(
+                instructions,
+                source_map,
+                .load_key,
+                .{ .str_ref = .{ .offset = offset, .len = len } },
+                node,
+                allocator,
+            );
+        },
+
+        .load_index => {
+            const slots = ir_obj.extra_data.items;
+            const lo: u64 = slots[node.extra];
+            const hi: u64 = slots[node.extra + 1];
+            const u: u64 = lo | (hi << 32);
+            const n: i64 = @bitCast(u);
+            try push(instructions, source_map, .load_index, .{ .index = n }, node, allocator);
+        },
+
+        .iterate => try push(instructions, source_map, .each, .{ .none = {} }, node, allocator),
+
+        .slice => {
+            const slots = ir_obj.extra_data.items;
+            const from_u: u32 = slots[node.extra];
+            const to_u: u32 = slots[node.extra + 1];
+            const flags: u32 = slots[node.extra + 2];
+            const args = types_mod.SliceArgs{
+                .from = @bitCast(from_u),
+                .to = @bitCast(to_u),
+                .has_from = (flags & 1) != 0,
+                .has_to = (flags & 2) != 0,
+            };
+            try push(instructions, source_map, .slice, .{ .slice_args = args }, node, allocator);
+        },
+
+        // Pipe: emit left, then `pipe` instruction, then right. The
+        // legacy walker emits the same shape — `pipe` between adjacent
+        // suffix elements, never bracketing both children.
+        .pipe => {
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+        },
+
+        // Try wrap: record the start IP, emit the inner expression,
+        // insert `fork_try` at the recorded start, then append
+        // `pop_try`. Mirrors the legacy `?`-segment-wrap
+        // (`insertRawInstr(segment_start, fork_try)` + emit `pop_try`).
+        // The catch IP stays 0 — postfix `?` swallows errors silently.
+        .try_ => {
+            const start: usize = instructions.items.len;
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try instructions.insert(allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
+            try source_map.insert(allocator, start, node.src_start);
+            try push(instructions, source_map, .pop_try, .{ .none = {} }, node, allocator);
         },
 
         else => return error.NewCompilerNotImplemented,

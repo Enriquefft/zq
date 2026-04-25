@@ -1,9 +1,11 @@
 //! AST → IR lowering — Phase 2R / R3.
 //!
-//! Phase 7 (Cluster B) lands category 1: literals, identity, recursive
-//! descent, and unary ops. Other AST shapes return
+//! Categories landed: 1 (literals, identity, recurse, unary) and 2
+//! (field/index/iterate/slice + postfix `?`, including Suffix chains).
+//! AST shapes outside these categories return
 //! `error.NewCompilerNotImplemented` (caught by the harness as
-//! SKIP-NotImplemented at vm-equiv time).
+//! SKIP-NotImplemented at vm-equiv time; the dispatcher falls back
+//! to legacy at runtime).
 //!
 //! Plan §3 R3 step 6 enumerates the operator categories; plan §1.3
 //! freezes the IR variable-arity contract; spec
@@ -195,6 +197,123 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             });
         },
 
+        // ── Static-key field access `.foo` / `.["foo"]` (category 2) ─
+        // Bare-identifier zero-arg builtins (e.g. `utf8bytelength`,
+        // `mktime`) reach the AST as `field_access` because the AST
+        // parser uses a narrower zero-arg-builtin list than the legacy
+        // compiler. A leading `.` in the source span is the structural
+        // marker that this is a true field access; absent that, defer
+        // to legacy (cat-10 owns the wider builtin alphabet).
+        .field_access => |fa| {
+            const is_dot_field = sp.start < ctx.src.len and ctx.src[sp.start] == '.';
+            if (!is_dot_field) return error.NewCompilerNotImplemented;
+            const extra_idx = try ctx.internString(fa.name);
+            return ctx.pushNode(.{
+                .op = .load_field,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Static-int array index `.[N]` (category 2) ──────────────
+        .index_access => |ia| {
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const u: u64 = @bitCast(ia.index);
+            try ctx.out.extra_data.append(alloc, @truncate(u));
+            try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
+            return ctx.pushNode(.{
+                .op = .load_index,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Iterate `.[]` (category 2) ──────────────────────────────
+        .iterate => return ctx.pushNode(.{
+            .op = .iterate,
+            .src_start = sp.start,
+            .src_len = sp.len,
+        }),
+
+        // ── Slice `.[from:to]` (category 2) ─────────────────────────
+        .slice => |sl| {
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            // Pack the four SliceArgs fields into two u32 slots: slot 0
+            // packs `from` (i32 low) | `to` (i32 high); slot 1 packs the
+            // two has_* booleans into the low two bits. Mirrors the
+            // legacy `types.SliceArgs` ABI without re-importing the
+            // shared types module across the compiler boundary.
+            const from_u: u32 = @bitCast(sl.from);
+            const to_u: u32 = @bitCast(sl.to);
+            try ctx.out.extra_data.append(alloc, from_u);
+            try ctx.out.extra_data.append(alloc, to_u);
+            const flags: u32 = (@as(u32, @intFromBool(sl.has_from))) | (@as(u32, @intFromBool(sl.has_to)) << 1);
+            try ctx.out.extra_data.append(alloc, flags);
+            return ctx.pushNode(.{
+                .op = .slice,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Postfix optional `expr?` (category 2) ───────────────────
+        // Wraps the inner expression in `try_`, matching the legacy
+        // `fork_try`/`pop_try` segment-wrap. Cat-2 owns the postfix
+        // form; the explicit `try expr catch handler` keyword is cat-6.
+        .optional => |un| {
+            const child = try lowerNode(ctx, un.operand);
+            return ctx.pushNode(.{
+                .op = .try_,
+                .children = .{ child, 0 },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Suffix chain (category 2) ───────────────────────────────
+        // Each non-`optional` SuffixOp produces a new pipe layer
+        // wrapping (accumulated_chain, new_op_node). Each `optional`
+        // op wraps the rightmost chain element in `try_` — matching
+        // the legacy segment-wrap semantic where `?` only covers the
+        // segment from the most recent pipe onwards.
+        .suffix => |sf| {
+            var cur = try lowerNode(ctx, sf.base);
+            for (sf.ops) |op| {
+                switch (op) {
+                    .optional => {
+                        // Wrap the current rightmost element. If `cur` is
+                        // a `pipe`, replace its right child with `try_(R)`;
+                        // otherwise wrap `cur` itself. Mirrors the
+                        // legacy `?`-only-wraps-the-last-segment rule.
+                        cur = try wrapRightmostInTry(ctx, cur, sf.base.span);
+                    },
+                    .field, .bracket_str => |name| {
+                        const op_idx = try lowerSuffixField(ctx, name, sf.base.span);
+                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                    },
+                    .index => |i| {
+                        const op_idx = try lowerSuffixIndex(ctx, i, sf.base.span);
+                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                    },
+                    .iterate => {
+                        const op_idx = try lowerSuffixIterate(ctx, sf.base.span);
+                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                    },
+                    .slice => |sl| {
+                        const op_idx = try lowerSuffixSlice(ctx, sl, sf.base.span);
+                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                    },
+                    .bracket_expr => return error.NewCompilerNotImplemented,
+                }
+            }
+            return cur;
+        },
+
         // ── Builtin call: `not` / `type` (category 1 zero-arg) ────
         // Most builtins are category 10, but `not` and `type` are the
         // only zero-arg builtins category 1 owns (per orchestrator
@@ -247,6 +366,108 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
     }
+}
+
+/// Append a `load_field` node for a SuffixOp `.field` / `.bracket_str`.
+fn lowerSuffixField(ctx: *Lowerer, name: []const u8, span: ast.Span) error{OutOfMemory}!u32 {
+    const extra_idx = try ctx.internString(name);
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .load_field,
+        .extra = extra_idx,
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Append a `load_index` node for a SuffixOp `.index`.
+fn lowerSuffixIndex(ctx: *Lowerer, i: i64, span: ast.Span) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    const u: u64 = @bitCast(i);
+    try ctx.out.extra_data.append(alloc, @truncate(u));
+    try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .load_index,
+        .extra = extra_idx,
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Append an `iterate` node for a SuffixOp `.iterate`.
+fn lowerSuffixIterate(ctx: *Lowerer, span: ast.Span) error{OutOfMemory}!u32 {
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .iterate,
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Append a `slice` node for a SuffixOp `.slice`.
+fn lowerSuffixSlice(ctx: *Lowerer, sl: ast.Node.Slice, span: ast.Span) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    const from_u: u32 = @bitCast(sl.from);
+    const to_u: u32 = @bitCast(sl.to);
+    try ctx.out.extra_data.append(alloc, from_u);
+    try ctx.out.extra_data.append(alloc, to_u);
+    const flags: u32 = (@as(u32, @intFromBool(sl.has_from))) | (@as(u32, @intFromBool(sl.has_to)) << 1);
+    try ctx.out.extra_data.append(alloc, flags);
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .slice,
+        .extra = extra_idx,
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Append a `pipe` node connecting `left` and `right`. The span
+/// covers the full suffix-chain origin so source-position parity with
+/// the legacy `pipe` instruction's `last_tok_offset` stays trivial.
+fn lowerSuffixPipe(ctx: *Lowerer, left: u32, right: u32, span: ast.Span) error{OutOfMemory}!u32 {
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .pipe,
+        .children = .{ left, right },
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Wrap the rightmost element of `cur` in `try_`. If `cur` is a
+/// `pipe(L, R)` we wrap `R` only and return a fresh pipe over `(L,
+/// try_(R))`; otherwise we wrap `cur` itself. Mirrors the legacy
+/// `?`-segment-wrap rule where `?` only wraps from `segment_start`
+/// onwards (the segment is the most-recent pipe-right side).
+fn wrapRightmostInTry(ctx: *Lowerer, cur: u32, span: ast.Span) error{OutOfMemory}!u32 {
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    const node = ctx.out.nodes.items[cur];
+    if (node.op == .pipe) {
+        const left = node.children[0];
+        const right = node.children[1];
+        const wrapped = try ctx.pushNode(.{
+            .op = .try_,
+            .children = .{ right, 0 },
+            .src_start = sp.start,
+            .src_len = sp.len,
+        });
+        return ctx.pushNode(.{
+            .op = .pipe,
+            .children = .{ left, wrapped },
+            .src_start = sp.start,
+            .src_len = sp.len,
+        });
+    }
+    return ctx.pushNode(.{
+        .op = .try_,
+        .children = .{ cur, 0 },
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
 }
 
 /// Validate a string-literal body (without surrounding quotes) for the

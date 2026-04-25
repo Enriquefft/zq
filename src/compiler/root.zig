@@ -6,9 +6,11 @@
 //!
 //!   src → ast.parse → AST → lower → IR → fuse → IR → emit → CompileResult
 //!
-//! Phase 7 (Cluster B) lands category 1 lowering: literals, identity,
-//! recursive descent, and unary ops. Other AST shapes surface as
-//! `error.NewCompilerNotImplemented`; the harness reports SKIP for them.
+//! Categories landed: 1 (literals/identity/recurse/unary) and 2
+//! (field/index/iterate/slice + postfix `?`, including Suffix
+//! chains). Other AST shapes surface as
+//! `error.NewCompilerNotImplemented`; the harness reports SKIP and
+//! the production dispatcher falls back to legacy.
 const std = @import("std");
 
 const ast = @import("ast");

@@ -7,10 +7,9 @@
 //! the rest of the file is the expected dump (including the `# SemOp`
 //! banner and the indented IR tree).
 //!
-//! Plan §3 R3 step 9: regeneration uses `zig build snapshots-update`.
-//! At this commit we ship fixtures hand-written from the spec's worked
-//! examples; the regeneration step is a Cluster B+ TODO once the
-//! fixture corpus grows past category 1.
+//! Plan §3 R3 step 9: regeneration uses `zig build snapshots-update`,
+//! which rewrites every fixture from the dumper's current output.
+//! Hand-edits to fixture text become drift on the next regen.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -35,6 +34,11 @@ const FIXTURES = [_]Fixture{
     .{ .name = "unary_neg", .expected = @embedFile("snapshots/lower/unary_neg.txt") },
     .{ .name = "not_zero_arg", .expected = @embedFile("snapshots/lower/not_zero_arg.txt") },
     .{ .name = "type_zero_arg", .expected = @embedFile("snapshots/lower/type_zero_arg.txt") },
+    .{ .name = "load_field", .expected = @embedFile("snapshots/lower/load_field.txt") },
+    .{ .name = "load_index", .expected = @embedFile("snapshots/lower/load_index.txt") },
+    .{ .name = "iterate", .expected = @embedFile("snapshots/lower/iterate.txt") },
+    .{ .name = "slice", .expected = @embedFile("snapshots/lower/slice.txt") },
+    .{ .name = "try_optional", .expected = @embedFile("snapshots/lower/try_optional.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive
@@ -47,7 +51,7 @@ fn extractSource(snapshot: []const u8) []const u8 {
     return after[0..newline];
 }
 
-test "snapshot fixtures: lower category 1" {
+test "snapshot fixtures: lower" {
     const alloc = std.testing.allocator;
     inline for (FIXTURES) |fx| {
         const filter = extractSource(fx.expected);

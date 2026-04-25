@@ -20,8 +20,9 @@ const Fixture = struct {
     /// JSON input fed through the production parser to build a Tape.
     input: []const u8,
     /// Reference value stream — one JSON value per emitted output, separated
-    /// by '\n'. Used as a sanity check against the legacy execution; the
-    /// cross-backend diff is byte-for-byte legacy-vs-new at run time.
+    /// by '\n'. When set, BOTH backends must match this string AND each other
+    /// (3-way comparison). When left empty (`""`), the harness only asserts
+    /// legacy-vs-new equivalence and does not pin the absolute value stream.
     expected_output: []const u8 = "",
     /// When true, the legacy compiler is expected to fail. We then check
     /// the new compiler reports the same error class.
@@ -45,6 +46,17 @@ const FIXTURES = [_]Fixture{
     .{ .name = "nested", .filter = ".foo.bar", .input = "{\"foo\":{\"bar\":2}}", .expected_output = "2" },
     .{ .name = "pipe", .filter = ".foo | .bar", .input = "{\"foo\":{\"bar\":3}}", .expected_output = "3" },
     .{ .name = "index", .filter = ".[0]", .input = "[10,20]", .expected_output = "10" },
+    // Cat-2 dedicated fixtures (Phase 8)
+    .{ .name = "iterate_top", .filter = ".[]", .input = "[1,2,3]", .expected_output = "1\n2\n3" },
+    .{ .name = "field_iterate", .filter = ".foo[]", .input = "{\"foo\":[10,20]}", .expected_output = "10\n20" },
+    .{ .name = "slice_top", .filter = ".[1:3]", .input = "[10,20,30,40]", .expected_output = "[20,30]" },
+    .{ .name = "slice_open_left", .filter = ".[:2]", .input = "[1,2,3,4]", .expected_output = "[1,2]" },
+    .{ .name = "optional_missing", .filter = ".foo?", .input = "{}", .expected_output = "null" },
+    .{ .name = "optional_type_err", .filter = ".foo?", .input = "[1,2]", .expected_output = "" },
+    .{ .name = "field_quoted", .filter = ".[\"foo\"]", .input = "{\"foo\":42}", .expected_output = "42" },
+    .{ .name = "neg_index", .filter = ".[-1]", .input = "[10,20,30]", .expected_output = "30" },
+    .{ .name = "chain_index_field", .filter = ".[0].x", .input = "[{\"x\":7}]", .expected_output = "7" },
+    .{ .name = "chain_field_index", .filter = ".a[1]", .input = "{\"a\":[10,20]}", .expected_output = "20" },
     .{ .name = "arith", .filter = "1+1", .input = "null", .expected_output = "2" },
     .{ .name = "select", .filter = "select(.id > 100)", .input = "{\"id\":150}", .expected_output = "{\"id\":150}" },
     .{ .name = "map", .filter = "map(.id) | add", .input = "[{\"id\":1},{\"id\":2}]", .expected_output = "3" },
@@ -99,21 +111,6 @@ fn runQuery(
 
     const owned = try buf.toOwnedSlice(alloc);
     return .{ .output = owned, .err = null };
-}
-
-fn parseTape(input: []const u8, alloc: std.mem.Allocator) !struct {
-    parser: parser_mod.Parser,
-    tape: types_mod.Tape,
-} {
-    var p = try parser_mod.Parser.init(alloc);
-    errdefer p.deinit();
-
-    const result = try p.feed(input, true);
-    const tape = switch (result) {
-        .done => |d| d.tape,
-        .need_more => return error.UnexpectedEof,
-    };
-    return .{ .parser = p, .tape = tape };
 }
 
 pub fn main() !void {
@@ -219,13 +216,21 @@ pub fn main() !void {
             break :blk std.mem.eql(u8, legacy_err_name.?, new_err_name.?);
         };
 
-        if (same_bytes and same_err) {
+        // 3-way comparison: when `expected_output` is set, both backends
+        // must match it AND each other. When empty, fall back to the
+        // legacy-vs-new pairwise check (backward-compatible default).
+        const has_expected = fx.expected_output.len > 0;
+        const matches_expected = !has_expected or
+            (std.mem.eql(u8, legacy_run.output, fx.expected_output) and
+                std.mem.eql(u8, new_run.output, fx.expected_output));
+
+        if (same_bytes and same_err and matches_expected) {
             match += 1;
             try w.print("MATCH name={s} filter={s}\n", .{ fx.name, fx.filter });
         } else {
             mismatch += 1;
             try w.print(
-                "MISMATCH name={s} filter={s} input={s}\n  legacy_out=`{s}` legacy_err={s}\n  new_out=   `{s}` new_err=   {s}\n",
+                "MISMATCH name={s} filter={s} input={s}\n  legacy_out=`{s}` legacy_err={s}\n  new_out=   `{s}` new_err=   {s}\n  expected=  `{s}`\n",
                 .{
                     fx.name,
                     fx.filter,
@@ -234,6 +239,7 @@ pub fn main() !void {
                     legacy_err_name orelse "<none>",
                     new_run.output,
                     new_err_name orelse "<none>",
+                    fx.expected_output,
                 },
             );
         }

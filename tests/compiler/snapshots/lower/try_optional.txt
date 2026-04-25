@@ -1,0 +1,4 @@
+# source: .foo?
+# SemOp
+try @0..5
+  load_field("foo") @0..4

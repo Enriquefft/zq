@@ -23,6 +23,19 @@ pub const LiteralKind = enum(u32) {
     string = 5,
 };
 
+/// Decoded `load_const` payload — single-source-of-truth for emit /
+/// dumper / fuse / snapshot consumers. The string variant references
+/// the IR's `string_buf` directly (the IR arena owns the bytes for the
+/// caller's lifetime). Plan §3 R3 step 9 — seam 1 (single-source const
+/// decode). All decode sites must route through `loadConstValue`.
+pub const ConstValue = union(enum) {
+    null_val,
+    bool_val: bool,
+    int: i64,
+    float: f64,
+    string: []const u8,
+};
+
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
 /// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
@@ -40,8 +53,18 @@ pub const Op = enum(u8) {
     /// `lower.zig` for the AST `.identity` kind (plan §3 R3 step 6
     /// category 1). Maps to bytecode `Instruction.Op.identity`.
     identity,
-    field,
-    index,
+    /// Static-key field access (`.foo`, `.["foo"]`). `extra` indexes a
+    /// 2-slot `(offset, len)` pair into `string_buf`. Maps to legacy
+    /// `Instruction.Op.load_key`. Plan §1.3 row 5.
+    load_field,
+    /// Static-int array index (`.[N]`). `extra` indexes a 2-slot
+    /// `(lo32, hi32)` of an i64. Maps to legacy `Instruction.Op.load_index`.
+    /// Plan §1.3 row 5.
+    load_index,
+    /// Array/string slice (`.[from:to]`). `extra` indexes a 2-slot
+    /// `(packed_from_to, flags)` payload — see `lower.zig` for the bit
+    /// layout. Maps to legacy `Instruction.Op.slice` (operand
+    /// `slice_args`). Plan §1.3 row 5.
     slice,
 
     pipe,
@@ -86,7 +109,7 @@ pub const Op = enum(u8) {
 ///
 /// Storage layout:
 /// - `children[0..1]` — fixed-arity child indices for nodes with ≤2 children
-///   (the common case: `pipe`, `comma`, `cmp`, `arith`, `field`, etc.).
+///   (the common case: `pipe`, `comma`, `cmp`, `arith`, `try_`, etc.).
 /// - `(span_start, span_len)` — slice into `IR.extra_children` for nodes with
 ///   ≥3 children (`if_`, `reduce`, `foreach`, `obj_ctor`, `arr_ctor`,
 ///   `interp`, `call_*`, `destructure`).
@@ -155,6 +178,38 @@ pub const IR = struct {
     }
 };
 
+/// Single-source-of-truth decoder for `load_const` payloads. The IR's
+/// `extra_data[node.extra]` slot is the discriminant; trailing slots
+/// carry the concrete value. Callers must guarantee `node.op == .load_const`;
+/// debug builds will panic on mismatch.
+pub fn loadConstValue(ir_obj: *const IR, node: Node) ConstValue {
+    std.debug.assert(node.op == .load_const);
+    const slots = ir_obj.extra_data.items;
+    const kind: LiteralKind = @enumFromInt(slots[node.extra]);
+    return switch (kind) {
+        .null_val => .null_val,
+        .false_val => .{ .bool_val = false },
+        .true_val => .{ .bool_val = true },
+        .int => blk: {
+            const lo: u64 = slots[node.extra + 1];
+            const hi: u64 = slots[node.extra + 2];
+            const u: u64 = lo | (hi << 32);
+            break :blk .{ .int = @bitCast(u) };
+        },
+        .float => blk: {
+            const lo: u64 = slots[node.extra + 1];
+            const hi: u64 = slots[node.extra + 2];
+            const u: u64 = lo | (hi << 32);
+            break :blk .{ .float = @bitCast(u) };
+        },
+        .string => blk: {
+            const offset: u32 = slots[node.extra + 1];
+            const len: u32 = slots[node.extra + 2];
+            break :blk .{ .string = ir_obj.string_buf.items[offset .. offset + len] };
+        },
+    };
+}
+
 // ── Text dumper (used by snapshot tests) ─────────────────────────────────────
 // Spec: research/compiler-ir-format.md §10. Indented-tree, one node per line,
 // child indent +2 spaces, `# SemOp` banner once at the top, every line ends
@@ -178,7 +233,7 @@ pub fn dump(
     ast_root: *const ast.Node,
     source: []const u8,
     writer: anytype,
-) !void {
+) @TypeOf(writer).Error!void {
     try writer.print("# source: {s}\n", .{source});
     try writer.writeAll("# SemOp\n");
     try dumpAst(ir_obj, ast_root, 0, writer);
@@ -204,7 +259,7 @@ fn dumpAst(
     node: *const ast.Node,
     depth: usize,
     writer: anytype,
-) !void {
+) @TypeOf(writer).Error!void {
     switch (node.kind) {
         .literal => |lit| {
             try writeIndent(writer, depth);
@@ -247,6 +302,44 @@ fn dumpAst(
             try writer.writeAll("\n");
             try dumpAst(ir_obj, un.operand, depth + 1, writer);
         },
+        .field_access => |fa| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_field(");
+            try writeStringLit(writer, fa.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .index_access => |ia| {
+            try writeIndent(writer, depth);
+            try writer.print("load_index({d})", .{ia.index});
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .iterate => {
+            try writeIndent(writer, depth);
+            try writer.writeAll("iterate");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .slice => |sl| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("slice(");
+            if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
+            try writer.writeAll(", ");
+            if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .optional => |un| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("try");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, un.operand, depth + 1, writer);
+        },
+        .suffix => |sf| try dumpSuffix(ir_obj, &sf, node.span, depth, writer),
         .builtin_call => |bc| {
             try writeIndent(writer, depth);
             if (bc.args.len == 0 and std.mem.eql(u8, bc.name, "not")) {
@@ -272,6 +365,128 @@ fn dumpAst(
             try writer.writeAll("\n");
         },
     }
+}
+
+/// Render a suffix-chain as a left-deep `pipe` tree mirroring the
+/// `lower.zig` Suffix → pipe-chain expansion. Each non-`optional` op
+/// appends a new pipe layer (left = accumulated chain, right = new op).
+/// Each `optional` op wraps the rightmost chain element in `try`,
+/// matching the legacy `?`-segment-wrap semantic. Single source of
+/// truth — the same fold runs at lowering time.
+///
+/// Walks the ops list to construct an abstract chain shape, then
+/// renders it recursively. The abstract shape is encoded as a
+/// trailing index: `last_kind` identifies whether the rightmost
+/// element is a SuffixOp or the bare base; `prefix_len` tells the
+/// renderer how much of the chain to recurse into. This keeps the
+/// dumper allocation-free.
+fn dumpSuffix(
+    ir_obj: *const IR,
+    sf: *const ast.Node.Suffix,
+    span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    try renderSuffixChain(ir_obj, sf, sf.ops.len, span, depth, writer);
+}
+
+/// Render the chain `sf.base + sf.ops[0 .. ops_len]`. The rightmost
+/// op (excluding trailing `optional`s, which wrap it) is the right
+/// child of the topmost `pipe`; everything before it is the left
+/// subtree (rendered recursively by trimming `ops_len`). Trailing
+/// `optional`s on the right child collapse into nested `try` wraps.
+fn renderSuffixChain(
+    ir_obj: *const IR,
+    sf: *const ast.Node.Suffix,
+    ops_len: usize,
+    span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    // Skip trailing `optional` ops — they wrap the right-child op.
+    var rh_end = ops_len;
+    var try_wrap_count: usize = 0;
+    while (rh_end > 0 and sf.ops[rh_end - 1] == .optional) {
+        try_wrap_count += 1;
+        rh_end -= 1;
+    }
+
+    if (rh_end == 0) {
+        // No non-optional ops — every op is a trailing `optional`.
+        // Render `try^N(base)` (N nested try wraps over the base).
+        var i: usize = 0;
+        while (i < try_wrap_count) : (i += 1) {
+            try writeIndent(writer, depth + i);
+            try writer.writeAll("try");
+            try writeSpan(writer, span);
+            try writer.writeAll("\n");
+        }
+        try dumpAst(ir_obj, sf.base, depth + try_wrap_count, writer);
+        return;
+    }
+
+    // Topmost pipe: left = chain[0 .. rh_end-1], right = ops[rh_end-1]
+    // possibly wrapped in `try` (one wrap per trailing optional).
+    try writeIndent(writer, depth);
+    try writer.writeAll("pipe");
+    try writeSpan(writer, span);
+    try writer.writeAll("\n");
+
+    // Left subtree: recursive call with reduced ops_len. If
+    // rh_end - 1 == 0 the left subtree is just the base.
+    if (rh_end - 1 == 0) {
+        try dumpAst(ir_obj, sf.base, depth + 1, writer);
+    } else {
+        try renderSuffixChain(ir_obj, sf, rh_end - 1, span, depth + 1, writer);
+    }
+
+    // Right subtree: the rightmost non-optional op, wrapped in
+    // `try_wrap_count` nested `try`s.
+    var t: usize = 0;
+    while (t < try_wrap_count) : (t += 1) {
+        try writeIndent(writer, depth + 1 + t);
+        try writer.writeAll("try");
+        try writeSpan(writer, span);
+        try writer.writeAll("\n");
+    }
+    try dumpSuffixOp(sf.ops[rh_end - 1], depth + 1 + try_wrap_count, span, writer);
+}
+
+/// Render a single SuffixOp as the IR node it lowers to. Used by
+/// `dumpSuffix` for inner ops; standalone shapes (top-level
+/// `field_access`, `iterate`, etc.) flow through `dumpAst` directly.
+fn dumpSuffixOp(
+    op: ast.Node.SuffixOp,
+    depth: usize,
+    span: ast.Span,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    try writeIndent(writer, depth);
+    switch (op) {
+        .field => |name| {
+            try writer.writeAll("load_field(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+        },
+        .bracket_str => |name| {
+            try writer.writeAll("load_field(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+        },
+        .index => |i| try writer.print("load_index({d})", .{i}),
+        .iterate => try writer.writeAll("iterate"),
+        .slice => |sl| {
+            try writer.writeAll("slice(");
+            if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
+            try writer.writeAll(", ");
+            if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
+            try writer.writeAll(")");
+        },
+        .optional => unreachable, // handled by renderSuffixChain wrap
+        .bracket_expr => try writer.writeAll("# unimplemented(bracket_expr)"),
+    }
+    try writeSpan(writer, span);
+    try writer.writeAll("\n");
 }
 
 /// JSON-style escape per spec §3 (`string_lit`). Bytes 0x00..0x1F other

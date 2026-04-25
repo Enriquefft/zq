@@ -19,6 +19,10 @@ const prefilter_mod = @import("prefilter");
 /// is the same one passed to `compile`.
 pub const Compiled = struct {
     instructions: []types_mod.Instruction,
+    /// MUST be set to a static `&.{}` when empty (NOT `alloc(.., 0)`) —
+    /// `Compiled.deinit` cannot distinguish an owned zero-length heap
+    /// alloc from a static empty slice, and freeing a non-allocator
+    /// pointer crashes under `.safety = true`.
     function_table: []const types_mod.FunctionDef,
     string_buf: []u8,
     external_var_ids: []u32,
