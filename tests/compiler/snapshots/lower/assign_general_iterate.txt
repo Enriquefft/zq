@@ -1,0 +1,7 @@
+# source: .a[] = 0
+# SemOp
+update_assign(general[set]) @0..8
+  pipe @0..4
+    load_field("a") @0..2
+    iterate @0..4
+  load_const(0) @7..8

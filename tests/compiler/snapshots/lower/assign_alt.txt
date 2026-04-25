@@ -1,0 +1,4 @@
+# source: .a //= "x"
+# SemOp
+update_assign(alt, path=".a") @0..10
+  load_const("x") @7..10

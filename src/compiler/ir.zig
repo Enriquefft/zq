@@ -67,6 +67,36 @@ pub const LogicalKind = enum(u32) {
     or_ = 1,
 };
 
+/// `update_assign` op-kind discriminant. Stored as a u32 in
+/// `extra_data[node.extra]`. The first 8 entries cover the operator
+/// alphabet shared by `update_assign` and `assign_general` AST node
+/// kinds (`ast.Node.UpdateAssign.AssignOp`); `general` is a form
+/// marker used when the LHS is non-trivial (the AST routed the
+/// expression through `assign_general` rather than `update_assign`)
+/// and an additional `extra_data[node.extra + 1]` slot carries the
+/// actual operator kind (one of the first 8). Plan §1.3 row 5
+/// (`update_assign | binary + extra → op kind`); plan §3 R3 step 6
+/// item 8.
+///
+/// Single source of truth — the same enum decodes lowering, dumper,
+/// fuse, and emit. Adding a new operator alphabet entry means
+/// updating exactly one `switch` here.
+pub const UpdateOpKind = enum(u32) {
+    set = 0, // =
+    add = 1, // +=
+    sub = 2, // -=
+    mul = 3, // *=
+    div = 4, // /=
+    mod = 5, // %=
+    alt = 6, // //=
+    update = 7, // |=
+    /// `assign_general` form — LHS is a non-trivial path expression
+    /// (paren-grouped, comma'd, `.[]`, function-based, ...). The
+    /// trailing `extra_data[node.extra + 1]` slot carries the actual
+    /// operator kind (one of the first 8).
+    general = 8,
+};
+
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
 /// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
@@ -503,6 +533,34 @@ fn dumpAst(
             try writer.writeAll("\n");
             try dumpStringParts(ir_obj, fs.parts, node.span, depth + 1, writer);
         },
+        .update_assign => |ua| {
+            // Fast-path AST shape: `.path1.path2[N] OP= rhs`. The path
+            // steps are encoded inline in `extra_data` (no IR child for
+            // the LHS path); `rhs` is lowered as a normal AST node and
+            // appears as the only indented child.
+            try writeIndent(writer, depth);
+            try writer.writeAll("update_assign(");
+            try writer.writeAll(updateOpName(ua.op));
+            try writer.writeAll(", path=");
+            try writePathSteps(writer, ua.path);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, ua.rhs, depth + 1, writer);
+        },
+        .assign_general => |ag| {
+            // General-LHS AST shape. The dump renders both LHS and
+            // RHS as indented children, mirroring the IR's two child
+            // edges. Operator alphabet shared with `update_assign`.
+            try writeIndent(writer, depth);
+            try writer.writeAll("update_assign(general[");
+            try writer.writeAll(updateOpName(ag.op));
+            try writer.writeAll("])");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, ag.lhs, depth + 1, writer);
+            try dumpAst(ir_obj, ag.rhs, depth + 1, writer);
+        },
         else => {
             try writeIndent(writer, depth);
             try writer.print("# unimplemented({s})", .{@tagName(node.kind)});
@@ -707,6 +765,52 @@ fn dumpSuffixOp(
     }
     try writeSpan(writer, span);
     try writer.writeAll("\n");
+}
+
+/// Map an `ast.Node.UpdateAssign.AssignOp` to its dump tag. Single
+/// source of truth shared by both `update_assign` and `assign_general`
+/// dump paths — the operator alphabet is one and the same.
+fn updateOpName(op: ast.Node.UpdateAssign.AssignOp) []const u8 {
+    return switch (op) {
+        .eq => "set",
+        .plus_eq => "add",
+        .minus_eq => "sub",
+        .star_eq => "mul",
+        .slash_eq => "div",
+        .percent_eq => "mod",
+        .double_slash_eq => "alt",
+        .pipe_eq => "update",
+    };
+}
+
+/// Render a path-step sequence as a `.foo.bar[2]` style string for
+/// the fast-path `update_assign` dump payload. Path steps are stored
+/// inline in `extra_data`; the dumper has direct access to the AST
+/// here so it renders straight from the AST representation. The
+/// resulting string is wrapped in quotes for parser ergonomics — the
+/// snapshot tests diff bytes only, so the format stays stable.
+fn writePathSteps(writer: anytype, steps: []const ast.Node.PathStep) !void {
+    try writer.writeByte('"');
+    for (steps) |step| {
+        switch (step) {
+            .key => |name| {
+                try writer.writeByte('.');
+                // Keys may contain non-ident characters; keep raw bytes
+                // (snapshot test compares bytes). Escape backslash and
+                // double-quote for round-trip safety.
+                for (name) |c| {
+                    switch (c) {
+                        '"' => try writer.writeAll("\\\""),
+                        '\\' => try writer.writeAll("\\\\"),
+                        else => try writer.writeByte(c),
+                    }
+                }
+            },
+            .index => |i| try writer.print("[{d}]", .{i}),
+            .iterate => try writer.writeAll("[]"),
+        }
+    }
+    try writer.writeByte('"');
 }
 
 /// JSON-style escape per spec §3 (`string_lit`). Bytes 0x00..0x1F other

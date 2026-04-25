@@ -507,14 +507,22 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // `src/ast/parser.zig:846-851`).
         .object_construct => |oc| {
             const alloc = ctx.arena.allocator();
-            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            // Collect (key, value) pair indices in a local buffer first;
+            // any nested obj/arr/interp lowering also writes to
+            // `extra_children`, so bulk-appending at the end keeps our
+            // `span_start..span_start+span_len` slice contiguous and
+            // points to OUR pairs only.
+            var pairs: std.ArrayListUnmanaged(u32) = .{};
+            defer pairs.deinit(alloc);
             for (oc.fields) |fld| {
                 const key_idx = try lowerObjectKey(ctx, &fld);
                 const value_idx = try lowerObjectFieldValue(ctx, &fld);
-                try ctx.out.extra_children.append(alloc, key_idx);
-                try ctx.out.extra_children.append(alloc, value_idx);
+                try pairs.append(alloc, key_idx);
+                try pairs.append(alloc, value_idx);
             }
-            const span_len: u32 = @intCast(2 * oc.fields.len);
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, pairs.items);
+            const span_len: u32 = @intCast(pairs.items.len);
             return ctx.pushNode(.{
                 .op = .obj_ctor,
                 .span_start = span_start,
@@ -531,14 +539,22 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // (`[range(3)]`, `[.[]]`) appear as a single child whose own
         // backtracking semantics drive the `yield_output` ladder.
         .array_construct => |ac| {
-            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
-            var span_len: u32 = 0;
+            const alloc = ctx.arena.allocator();
+            // Collect element indices in a local buffer first — nested
+            // obj/arr/interp lowering writes to `extra_children`, so a
+            // direct append-as-we-go would interleave their data with
+            // ours and break our span. Bulk-append at the end.
+            var elems: std.ArrayListUnmanaged(u32) = .{};
+            defer elems.deinit(alloc);
             if (ac.expr) |inner| {
                 // Flatten the comma chain. Comma is left-associative in
                 // the AST (`comma(comma(a, b), c)`), so we recursively
                 // collect every leaf in source order.
-                try collectArrayElems(ctx, inner, &span_len);
+                try collectArrayElems(ctx, inner, &elems);
             }
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, elems.items);
+            const span_len: u32 = @intCast(elems.items.len);
             return ctx.pushNode(.{
                 .op = .arr_ctor,
                 .span_start = span_start,
@@ -556,9 +572,16 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // `save_input` / tostring / `add` / `restore_input` pattern.
         // `format` is the same shape with a non-zero format-spec id.
         .string_interp => |si| {
+            const alloc = ctx.arena.allocator();
+            // Interp parts may include nested obj/arr constructors that
+            // also write `extra_children`; collect into a local buffer
+            // and bulk-append so our span stays contiguous.
+            var parts: std.ArrayListUnmanaged(u32) = .{};
+            defer parts.deinit(alloc);
+            try lowerStringParts(ctx, si.parts, &parts);
             const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
-            try lowerStringParts(ctx, si.parts);
-            const span_len: u32 = @intCast(si.parts.len);
+            try ctx.out.extra_children.appendSlice(alloc, parts.items);
+            const span_len: u32 = @intCast(parts.items.len);
             return ctx.pushNode(.{
                 .op = .interp,
                 .span_start = span_start,
@@ -581,9 +604,13 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // as `format(span_len=1, child=load_const(...))` and emit
         // detects the shape.
         .format_string => |fs| {
+            const alloc = ctx.arena.allocator();
+            var parts: std.ArrayListUnmanaged(u32) = .{};
+            defer parts.deinit(alloc);
+            try lowerStringParts(ctx, fs.parts, &parts);
             const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
-            try lowerStringParts(ctx, fs.parts);
-            const span_len: u32 = @intCast(fs.parts.len);
+            try ctx.out.extra_children.appendSlice(alloc, parts.items);
+            const span_len: u32 = @intCast(parts.items.len);
             const extra_idx = try ctx.internString(fs.format);
             return ctx.pushNode(.{
                 .op = .format,
@@ -595,9 +622,101 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             });
         },
 
+        // ── Update assignment, fast path (cat-8) ────────────────────
+        // `.path1.path2[N] OP= rhs`. The AST guarantees `path` is a
+        // chain of `key`/`index` steps only — `peekIsUpdateAssign`
+        // bails to `assign_general` the moment it sees a non-static
+        // step (`.[]`, `.[ident]`, `.[expr]`). Single SemOp
+        // (`update_assign`) per plan §1.3 row 5; operator alphabet
+        // shared with `assign_general` via `UpdateOpKind`.
+        .update_assign => |ua| {
+            const alloc = ctx.arena.allocator();
+            const rhs_idx = try lowerNode(ctx, ua.rhs);
+
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const kind = updateOpKindFromAssignOp(ua.op);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(kind));
+            // Path steps follow in extra_data. Layout per step (3 slots):
+            //   [0] = step kind (0 = key, 1 = index)
+            //   [1] = payload_lo (string offset for key, lo32 of i64 for index)
+            //   [2] = payload_hi (string len for key, hi32 of i64 for index)
+            // Iterate steps cannot reach this fast path (parser
+            // invariant — see `peekIsUpdateAssign` at parser.zig:1344).
+            try ctx.out.extra_data.append(alloc, @intCast(ua.path.len));
+            for (ua.path) |step| {
+                switch (step) {
+                    .key => |name| {
+                        const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+                        try ctx.out.string_buf.appendSlice(alloc, name);
+                        try ctx.out.extra_data.append(alloc, 0); // kind = key
+                        try ctx.out.extra_data.append(alloc, offset);
+                        try ctx.out.extra_data.append(alloc, @intCast(name.len));
+                    },
+                    .index => |i| {
+                        const u: u64 = @bitCast(i);
+                        try ctx.out.extra_data.append(alloc, 1); // kind = index
+                        try ctx.out.extra_data.append(alloc, @truncate(u));
+                        try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
+                    },
+                    .iterate => unreachable, // parser guarantees this
+                }
+            }
+
+            return ctx.pushNode(.{
+                .op = .update_assign,
+                .children = .{ 0, rhs_idx },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Update assignment, general LHS (cat-8) ──────────────────
+        // `LHS OP= rhs` where the LHS is any path expression: paren,
+        // comma, iteration, function call. Lowers LHS as a regular
+        // expression — the emitter will wrap it in `path_begin` /
+        // `path_end` to harvest the path set. Operator alphabet shared
+        // with `update_assign` via `UpdateOpKind` (`general` form +
+        // trailing operator slot).
+        .assign_general => |ag| {
+            const alloc = ctx.arena.allocator();
+            const lhs_idx = try lowerNode(ctx, ag.lhs);
+            const rhs_idx = try lowerNode(ctx, ag.rhs);
+
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.UpdateOpKind.general));
+            const inner_kind = updateOpKindFromAssignOp(ag.op);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(inner_kind));
+
+            return ctx.pushNode(.{
+                .op = .update_assign,
+                .children = .{ lhs_idx, rhs_idx },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
     }
+}
+
+/// Map AST `AssignOp` → `UpdateOpKind` (excluding `general`, which is a
+/// form marker, not an operator). Single source of truth shared by both
+/// fast-path and general lowering; `general` form callers pass the inner
+/// op through this same helper.
+fn updateOpKindFromAssignOp(op: ast.Node.UpdateAssign.AssignOp) ir.UpdateOpKind {
+    return switch (op) {
+        .eq => .set,
+        .plus_eq => .add,
+        .minus_eq => .sub,
+        .star_eq => .mul,
+        .slash_eq => .div,
+        .percent_eq => .mod,
+        .double_slash_eq => .alt,
+        .pipe_eq => .update,
+    };
 }
 
 /// Append a `load_field` node for a SuffixOp `.field` / `.bracket_str`.
@@ -780,37 +899,41 @@ fn synthLoadConstString(
 }
 
 /// Recursive walk of the array-construct inner expression, flattening
-/// comma chains into element children. Each element appends to
-/// `extra_children` and bumps `span_len`. Non-comma nodes recurse via
-/// `lowerNode` and contribute exactly one child.
+/// comma chains into element children. Appends each leaf's IR-node
+/// index into `out` (a local buffer the caller bulk-merges into
+/// `extra_children` after all elements are lowered — see the array
+/// construct arm for why we cannot append directly).
 fn collectArrayElems(
     ctx: *Lowerer,
     node: *const ast.Node,
-    span_len: *u32,
+    out: *std.ArrayListUnmanaged(u32),
 ) LowerError!void {
     if (node.kind == .comma) {
         const c = node.kind.comma;
-        try collectArrayElems(ctx, c.left, span_len);
-        try collectArrayElems(ctx, c.right, span_len);
+        try collectArrayElems(ctx, c.left, out);
+        try collectArrayElems(ctx, c.right, out);
         return;
     }
     const alloc = ctx.arena.allocator();
     const child_idx = try lowerNode(ctx, node);
-    try ctx.out.extra_children.append(alloc, child_idx);
-    span_len.* += 1;
+    try out.append(alloc, child_idx);
 }
 
-/// Lower an `interp` / `format` parts list into the variadic span.
-/// Literal parts synthesize a `load_const(string)` node; expr parts
-/// recurse via `lowerNode`. Each part contributes one child.
-fn lowerStringParts(ctx: *Lowerer, parts: []const ast.Node.StringPart) LowerError!void {
+/// Lower an `interp` / `format` parts list, appending each lowered
+/// child's IR-node index into `out` (a local buffer the caller
+/// bulk-merges into `extra_children` after all parts are lowered).
+fn lowerStringParts(
+    ctx: *Lowerer,
+    parts: []const ast.Node.StringPart,
+    out: *std.ArrayListUnmanaged(u32),
+) LowerError!void {
     const alloc = ctx.arena.allocator();
     for (parts) |part| {
         const child_idx: u32 = switch (part) {
             .literal => |s| try synthLoadConstString(ctx, s, 0, 0),
             .expr => |expr| try lowerNode(ctx, expr),
         };
-        try ctx.out.extra_children.append(alloc, child_idx);
+        try out.append(alloc, child_idx);
     }
 }
 

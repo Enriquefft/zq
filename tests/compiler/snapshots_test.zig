@@ -66,6 +66,15 @@ const FIXTURES = [_]Fixture{
     .{ .name = "interp_nested", .expected = @embedFile("snapshots/lower/interp_nested.txt") },
     .{ .name = "format_at_base64", .expected = @embedFile("snapshots/lower/format_at_base64.txt") },
     .{ .name = "format_at_csv_tail", .expected = @embedFile("snapshots/lower/format_at_csv_tail.txt") },
+    .{ .name = "assign_set", .expected = @embedFile("snapshots/lower/assign_set.txt") },
+    .{ .name = "assign_add", .expected = @embedFile("snapshots/lower/assign_add.txt") },
+    .{ .name = "assign_sub", .expected = @embedFile("snapshots/lower/assign_sub.txt") },
+    .{ .name = "assign_mul", .expected = @embedFile("snapshots/lower/assign_mul.txt") },
+    .{ .name = "assign_div", .expected = @embedFile("snapshots/lower/assign_div.txt") },
+    .{ .name = "assign_mod", .expected = @embedFile("snapshots/lower/assign_mod.txt") },
+    .{ .name = "assign_alt", .expected = @embedFile("snapshots/lower/assign_alt.txt") },
+    .{ .name = "assign_update", .expected = @embedFile("snapshots/lower/assign_update.txt") },
+    .{ .name = "assign_general_iterate", .expected = @embedFile("snapshots/lower/assign_general_iterate.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

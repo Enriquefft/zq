@@ -27,6 +27,36 @@ pub const EmitError = error{
     NewCompilerNotImplemented,
 };
 
+/// Shared emission state. Holds the instruction stream, source map,
+/// IR (for child lookup), allocator, and a running `next_var_id`
+/// counter. The counter starts above `external_var_count` so externally
+/// declared variables retain their pre-assigned ids (mirrors the legacy
+/// compiler's `Ctx.next_var_id` initialization at
+/// `src/query/src/compiler.zig:1319-1390`).
+const Emitter = struct {
+    instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
+    source_map: *std.ArrayListUnmanaged(u32),
+    ir_obj: ir.IR,
+    allocator: std.mem.Allocator,
+    next_var_id: u32,
+
+    fn allocVar(self: *Emitter) u32 {
+        const id = self.next_var_id;
+        self.next_var_id += 1;
+        return id;
+    }
+
+    fn pushInstr(
+        self: *Emitter,
+        op: types_mod.Instruction.Op,
+        operand: types_mod.Instruction.Operand,
+        node: ir.Node,
+    ) error{OutOfMemory}!void {
+        try self.instructions.append(self.allocator, .{ .op = op, .operand = operand });
+        try self.source_map.append(self.allocator, node.src_start);
+    }
+};
+
 /// Emit bytecode from `ir_obj`. The emitter walks the IR tree
 /// recursively from the root (the last-pushed node, since lowering
 /// uses post-order construction). Each op handler decides the order
@@ -60,7 +90,14 @@ pub fn emit(
     // at least one node for a non-empty AST.
     if (ir_obj.nodes.items.len > 0) {
         const root_idx: u32 = @intCast(ir_obj.nodes.items.len - 1);
-        try emitNode(&instructions, &source_map, ir_obj, root_idx, allocator);
+        var emitter = Emitter{
+            .instructions = &instructions,
+            .source_map = &source_map,
+            .ir_obj = ir_obj,
+            .allocator = allocator,
+            .next_var_id = @intCast(external_var_count),
+        };
+        try emitNode(&emitter, root_idx);
     }
 
     // Trailing `yield_output` matches the legacy compiler's contract
@@ -95,107 +132,89 @@ pub fn emit(
     };
 }
 
-fn emitNode(
-    instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
-    source_map: *std.ArrayListUnmanaged(u32),
-    ir_obj: ir.IR,
-    node_idx: u32,
-    allocator: std.mem.Allocator,
-) EmitError!void {
-    const node = ir_obj.nodes.items[node_idx];
+fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
+    const node = em.ir_obj.nodes.items[node_idx];
     switch (node.op) {
         .load_const => {
-            const value = ir.loadConstValue(&ir_obj, node);
+            const value = ir.loadConstValue(&em.ir_obj, node);
             switch (value) {
-                .null_val => try push(instructions, source_map, .push_null, .{ .none = {} }, node, allocator),
-                .bool_val => |b| try push(instructions, source_map, .push_bool, .{ .bool = b }, node, allocator),
-                .int => |n| try push(instructions, source_map, .push_int, .{ .int = n }, node, allocator),
-                .float => |f| try push(instructions, source_map, .push_float, .{ .float = f }, node, allocator),
+                .null_val => try em.pushInstr(.push_null, .{ .none = {} }, node),
+                .bool_val => |b| try em.pushInstr(.push_bool, .{ .bool = b }, node),
+                .int => |n| try em.pushInstr(.push_int, .{ .int = n }, node),
+                .float => |f| try em.pushInstr(.push_float, .{ .float = f }, node),
                 .string => {
-                    const slots = ir_obj.extra_data.items;
+                    const slots = em.ir_obj.extra_data.items;
                     const offset: u32 = slots[node.extra + 1];
                     const len: u32 = slots[node.extra + 2];
-                    try push(
-                        instructions,
-                        source_map,
+                    try em.pushInstr(
                         .push_string,
                         .{ .str_ref = .{ .offset = offset, .len = len } },
                         node,
-                        allocator,
                     );
                 },
             }
         },
 
-        .identity => try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator),
+        .identity => try em.pushInstr(.push_current, .{ .none = {} }, node),
 
-        .recurse => try push(
-            instructions,
-            source_map,
+        .recurse => try em.pushInstr(
             .call_builtin,
             .{ .index = @intFromEnum(types_mod.BuiltinId.recurse) },
             node,
-            allocator,
         ),
 
         .neg => {
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try push(instructions, source_map, .negate, .{ .none = {} }, node, allocator);
+            try emitNode(em, node.children[0]);
+            try em.pushInstr(.negate, .{ .none = {} }, node);
         },
 
-        .not => try push(instructions, source_map, .not, .{ .none = {} }, node, allocator),
+        .not => try em.pushInstr(.not, .{ .none = {} }, node),
 
         .call_builtin => {
             // Category 1 hits this only for `type` (the brief assigns
             // `type` to category 1 alongside `not`). Other builtins are
             // category 10's responsibility.
-            const slots = ir_obj.extra_data.items;
+            const slots = em.ir_obj.extra_data.items;
             const offset: u32 = slots[node.extra];
             const len: u32 = slots[node.extra + 1];
-            const name = ir_obj.string_buf.items[offset .. offset + len];
+            const name = em.ir_obj.string_buf.items[offset .. offset + len];
 
             const bid: types_mod.BuiltinId = if (std.mem.eql(u8, name, "type"))
                 .type_
             else
                 return error.NewCompilerNotImplemented;
-            try push(
-                instructions,
-                source_map,
+            try em.pushInstr(
                 .call_builtin,
                 .{ .index = @intFromEnum(bid) },
                 node,
-                allocator,
             );
         },
 
         // ── Category 2 ──────────────────────────────────────────────
         .load_field => {
-            const slots = ir_obj.extra_data.items;
+            const slots = em.ir_obj.extra_data.items;
             const offset: u32 = slots[node.extra];
             const len: u32 = slots[node.extra + 1];
-            try push(
-                instructions,
-                source_map,
+            try em.pushInstr(
                 .load_key,
                 .{ .str_ref = .{ .offset = offset, .len = len } },
                 node,
-                allocator,
             );
         },
 
         .load_index => {
-            const slots = ir_obj.extra_data.items;
+            const slots = em.ir_obj.extra_data.items;
             const lo: u64 = slots[node.extra];
             const hi: u64 = slots[node.extra + 1];
             const u: u64 = lo | (hi << 32);
             const n: i64 = @bitCast(u);
-            try push(instructions, source_map, .load_index, .{ .index = n }, node, allocator);
+            try em.pushInstr(.load_index, .{ .index = n }, node);
         },
 
-        .iterate => try push(instructions, source_map, .each, .{ .none = {} }, node, allocator),
+        .iterate => try em.pushInstr(.each, .{ .none = {} }, node),
 
         .slice => {
-            const slots = ir_obj.extra_data.items;
+            const slots = em.ir_obj.extra_data.items;
             const from_u: u32 = slots[node.extra];
             const to_u: u32 = slots[node.extra + 1];
             const flags: u32 = slots[node.extra + 2];
@@ -205,16 +224,16 @@ fn emitNode(
                 .has_from = (flags & 1) != 0,
                 .has_to = (flags & 2) != 0,
             };
-            try push(instructions, source_map, .slice, .{ .slice_args = args }, node, allocator);
+            try em.pushInstr(.slice, .{ .slice_args = args }, node);
         },
 
         // Pipe: emit left, then `pipe` instruction, then right. The
         // legacy walker emits the same shape — `pipe` between adjacent
         // suffix elements, never bracketing both children.
         .pipe => {
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            try emitNode(em, node.children[0]);
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+            try emitNode(em, node.children[1]);
         },
 
         // Comma: emit a fork bracketing the left arm with a jump-end so
@@ -223,16 +242,16 @@ fn emitNode(
         // fork target = right_start; jump target = end. Backpatch both
         // after the corresponding subtree has been emitted.
         .comma => {
-            const fork_pos: usize = instructions.items.len;
-            try push(instructions, source_map, .fork, .{ .index = 0 }, node, allocator);
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            const jump_pos: usize = instructions.items.len;
-            try push(instructions, source_map, .jump, .{ .index = 0 }, node, allocator);
-            const right_start: u32 = @intCast(instructions.items.len);
-            instructions.items[fork_pos].operand = .{ .index = right_start };
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
-            const end_ip: u32 = @intCast(instructions.items.len);
-            instructions.items[jump_pos].operand = .{ .index = end_ip };
+            const fork_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.fork, .{ .index = 0 }, node);
+            try emitNode(em, node.children[0]);
+            const jump_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.jump, .{ .index = 0 }, node);
+            const right_start: u32 = @intCast(em.instructions.items.len);
+            em.instructions.items[fork_pos].operand = .{ .index = right_start };
+            try emitNode(em, node.children[1]);
+            const end_ip: u32 = @intCast(em.instructions.items.len);
+            em.instructions.items[jump_pos].operand = .{ .index = end_ip };
         },
 
         // Try wrap: record the start IP, emit the inner expression,
@@ -241,11 +260,11 @@ fn emitNode(
         // (`insertRawInstr(segment_start, fork_try)` + emit `pop_try`).
         // The catch IP stays 0 — postfix `?` swallows errors silently.
         .try_ => {
-            const start: usize = instructions.items.len;
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try instructions.insert(allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
-            try source_map.insert(allocator, start, node.src_start);
-            try push(instructions, source_map, .pop_try, .{ .none = {} }, node, allocator);
+            const start: usize = em.instructions.items.len;
+            try emitNode(em, node.children[0]);
+            try em.instructions.insert(em.allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
+            try em.source_map.insert(em.allocator, start, node.src_start);
+            try em.pushInstr(.pop_try, .{ .none = {} }, node);
         },
 
         // ── Category 5 ──────────────────────────────────────────────
@@ -255,9 +274,9 @@ fn emitNode(
         // `parseAdditive`/`parseMultiplicative` shape at
         // `src/query/src/compiler.zig:2699-2729`.
         .arith => {
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
-            const slots = ir_obj.extra_data.items;
+            try emitNode(em, node.children[0]);
+            try emitNode(em, node.children[1]);
+            const slots = em.ir_obj.extra_data.items;
             const kind: ir.ArithKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
                 .add => .add,
@@ -266,13 +285,13 @@ fn emitNode(
                 .div => .div,
                 .mod => .mod,
             };
-            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+            try em.pushInstr(op, .{ .none = {} }, node);
         },
 
         .cmp => {
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
-            const slots = ir_obj.extra_data.items;
+            try emitNode(em, node.children[0]);
+            try emitNode(em, node.children[1]);
+            const slots = em.ir_obj.extra_data.items;
             const kind: ir.CmpKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
                 .eq => .eq,
@@ -282,7 +301,7 @@ fn emitNode(
                 .gt => .gt,
                 .ge => .ge,
             };
-            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+            try em.pushInstr(op, .{ .none = {} }, node);
         },
 
         // Logical: emit lhs + rhs, then `and_op`/`or_op`. Legacy's VM
@@ -290,15 +309,15 @@ fn emitNode(
         // eagerly and reduces to a boolean — jq does not short-circuit
         // at the bytecode layer.
         .logical => {
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
-            const slots = ir_obj.extra_data.items;
+            try emitNode(em, node.children[0]);
+            try emitNode(em, node.children[1]);
+            const slots = em.ir_obj.extra_data.items;
             const kind: ir.LogicalKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
                 .and_ => .and_op,
                 .or_ => .or_op,
             };
-            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+            try em.pushInstr(op, .{ .none = {} }, node);
         },
 
         // Alternative `//`: mirror the legacy `parseAlternative` shape at
@@ -325,55 +344,34 @@ fn emitNode(
         //   <RHS>
         //   L_end:
         .alt => {
-            const fork_alt_pos: usize = instructions.items.len;
-            try push(
-                instructions,
-                source_map,
-                .fork_alt,
-                .{ .index = 0 },
-                node,
-                allocator,
-            );
+            const fork_alt_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.fork_alt, .{ .index = 0 }, node);
 
-            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try emitNode(em, node.children[0]);
 
-            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
-            try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator);
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
 
-            const jif_pos: usize = instructions.items.len;
-            try push(
-                instructions,
-                source_map,
-                .jump_if_false,
-                .{ .index = 0 },
-                node,
-                allocator,
-            );
+            const jif_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
 
             // Truthy: drop alt-handler, re-push value, jump past RHS.
-            try push(instructions, source_map, .pop_try, .{ .none = {} }, node, allocator);
-            try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator);
+            try em.pushInstr(.pop_try, .{ .none = {} }, node);
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
 
-            const jump_end_pos: usize = instructions.items.len;
-            try push(
-                instructions,
-                source_map,
-                .jump,
-                .{ .index = 0 },
-                node,
-                allocator,
-            );
+            const jump_end_pos: usize = em.instructions.items.len;
+            try em.pushInstr(.jump, .{ .index = 0 }, node);
 
             // Falsy: backtrack into the alt-handler, which jumps to RHS.
-            instructions.items[jif_pos].operand = .{ .index = @intCast(instructions.items.len) };
-            try push(instructions, source_map, .backtrack, .{ .none = {} }, node, allocator);
+            em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+            try em.pushInstr(.backtrack, .{ .none = {} }, node);
 
-            const right_ip: u32 = @intCast(instructions.items.len);
-            instructions.items[fork_alt_pos].operand = .{ .index = right_ip };
+            const right_ip: u32 = @intCast(em.instructions.items.len);
+            em.instructions.items[fork_alt_pos].operand = .{ .index = right_ip };
 
-            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            try emitNode(em, node.children[1]);
 
-            instructions.items[jump_end_pos].operand = .{ .index = @intCast(instructions.items.len) };
+            em.instructions.items[jump_end_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
         },
 
         // ── Category 7 ──────────────────────────────────────────────
@@ -384,17 +382,17 @@ fn emitNode(
         // Matches legacy `parseObjectLiteral`
         // (`src/query/src/compiler.zig:6702`).
         .obj_ctor => {
-            try push(instructions, source_map, .object_construct_start, .{ .none = {} }, node, allocator);
-            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            try em.pushInstr(.object_construct_start, .{ .none = {} }, node);
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
             // Pairs are (k, v); span_len is always even (lowering invariant).
             std.debug.assert(span.len % 2 == 0);
             var pi: usize = 0;
             while (pi < span.len) : (pi += 2) {
-                try emitNode(instructions, source_map, ir_obj, span[pi], allocator);
-                try emitNode(instructions, source_map, ir_obj, span[pi + 1], allocator);
-                try push(instructions, source_map, .object_key, .{ .none = {} }, node, allocator);
+                try emitNode(em, span[pi]);
+                try emitNode(em, span[pi + 1]);
+                try em.pushInstr(.object_key, .{ .none = {} }, node);
             }
-            try push(instructions, source_map, .object_construct_end, .{ .none = {} }, node, allocator);
+            try em.pushInstr(.object_construct_end, .{ .none = {} }, node);
         },
 
         // Array literal `[...]`. Emits the `array_collect_start ... end`
@@ -404,18 +402,18 @@ fn emitNode(
         // backpatching. Matches legacy `parseArrayConstruct`
         // (`src/query/src/compiler.zig:6410`).
         .arr_ctor => {
-            const start_pos = instructions.items.len;
-            try push(instructions, source_map, .array_collect_start, .{ .index = 0 }, node, allocator);
-            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            const start_pos = em.instructions.items.len;
+            try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
             for (span) |elem_idx| {
-                try push(instructions, source_map, .save_input, .{ .none = {} }, node, allocator);
-                try emitNode(instructions, source_map, ir_obj, elem_idx, allocator);
-                try push(instructions, source_map, .yield_output, .{ .none = {} }, node, allocator);
-                try push(instructions, source_map, .restore_input, .{ .none = {} }, node, allocator);
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, elem_idx);
+                try em.pushInstr(.yield_output, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
             }
-            const end_pos: u32 = @intCast(instructions.items.len);
-            try push(instructions, source_map, .array_collect_end, .{ .none = {} }, node, allocator);
-            instructions.items[start_pos].operand = .{ .index = end_pos };
+            const end_pos: u32 = @intCast(em.instructions.items.len);
+            try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+            em.instructions.items[start_pos].operand = .{ .index = end_pos };
         },
 
         // String interpolation `"... \(expr) ..."`. The parts span is
@@ -427,7 +425,7 @@ fn emitNode(
         // `compileStringInterpolation`
         // (`src/query/src/compiler.zig:5604`).
         .interp => {
-            try emitInterpLadder(instructions, source_map, ir_obj, node, null, allocator);
+            try emitInterpLadder(em, node, null);
         },
 
         // Format application `@fmt "..."`. Three legacy shapes:
@@ -438,10 +436,10 @@ fn emitNode(
         // Cat-7 owns shapes 1 and 2 (both arrive as `format_string`
         // AST). Shape 3 is `builtin_call` — cat-10's responsibility.
         .format => {
-            const slots = ir_obj.extra_data.items;
+            const slots = em.ir_obj.extra_data.items;
             const offset: u32 = slots[node.extra];
             const len: u32 = slots[node.extra + 1];
-            const fmt_name = ir_obj.string_buf.items[offset .. offset + len];
+            const fmt_name = em.ir_obj.string_buf.items[offset .. offset + len];
             // `fmt_name` carries a leading '@' (parser
             // `internFormatName`); legacy `formatBuiltinId` matches on
             // the unprefixed name.
@@ -452,29 +450,40 @@ fn emitNode(
             // Detect by inspecting the children: every part must be a
             // synthesized `load_const(string)` and there must be
             // exactly one such part.
-            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
             if (span.len == 1) {
-                const child = ir_obj.nodes.items[span[0]];
+                const child = em.ir_obj.nodes.items[span[0]];
                 if (child.op == .load_const) {
-                    const value = ir.loadConstValue(&ir_obj, child);
+                    const value = ir.loadConstValue(&em.ir_obj, child);
                     if (value == .string) {
-                        const c_slots = ir_obj.extra_data.items;
+                        const c_slots = em.ir_obj.extra_data.items;
                         const c_off: u32 = c_slots[child.extra + 1];
                         const c_len: u32 = c_slots[child.extra + 2];
-                        try push(
-                            instructions,
-                            source_map,
+                        try em.pushInstr(
                             .push_string,
                             .{ .str_ref = .{ .offset = c_off, .len = c_len } },
                             node,
-                            allocator,
                         );
                         return;
                     }
                 }
             }
 
-            try emitInterpLadder(instructions, source_map, ir_obj, node, bid, allocator);
+            try emitInterpLadder(em, node, bid);
+        },
+
+        // ── Category 8 ──────────────────────────────────────────────
+        // Update assignment. Single SemOp encoding the entire family
+        // (=, +=, -=, *=, /=, %=, //=, |=) for both fast-path
+        // (`update_assign` AST) and general-LHS (`assign_general` AST)
+        // forms. The op-kind discriminant lives in
+        // `extra_data[node.extra]`; a `.general` discriminant
+        // additionally consumes `extra_data[node.extra + 1]` for the
+        // inner operator alphabet. See `ir.UpdateOpKind`.
+        .update_assign => {
+            const slots = em.ir_obj.extra_data.items;
+            const kind: ir.UpdateOpKind = @enumFromInt(slots[node.extra]);
+            try emitUpdateAssign(em, node, kind);
         },
 
         else => return error.NewCompilerNotImplemented,
@@ -489,40 +498,34 @@ fn emitNode(
 /// is supplied (only for `format` nodes), each expr part funnels
 /// through `call_builtin(format_bid)` before `tostring`.
 fn emitInterpLadder(
-    instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
-    source_map: *std.ArrayListUnmanaged(u32),
-    ir_obj: ir.IR,
+    em: *Emitter,
     node: ir.Node,
     format_bid: ?types_mod.BuiltinId,
-    allocator: std.mem.Allocator,
 ) EmitError!void {
-    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
     // First part is a literal — push it directly. Empty literal still
     // pushes the empty string so the trailing `add`s have a base.
     const first_idx = span[0];
-    const first_node = ir_obj.nodes.items[first_idx];
+    const first_node = em.ir_obj.nodes.items[first_idx];
     std.debug.assert(first_node.op == .load_const);
-    const first_slots = ir_obj.extra_data.items;
+    const first_slots = em.ir_obj.extra_data.items;
     const first_off: u32 = first_slots[first_node.extra + 1];
     const first_len: u32 = first_slots[first_node.extra + 2];
-    try push(
-        instructions,
-        source_map,
+    try em.pushInstr(
         .push_string,
         .{ .str_ref = .{ .offset = first_off, .len = first_len } },
         node,
-        allocator,
     );
 
     var i: usize = 1;
     while (i < span.len) : (i += 1) {
         const child_idx = span[i];
-        const child = ir_obj.nodes.items[child_idx];
+        const child = em.ir_obj.nodes.items[child_idx];
         // Literal segment → push + add.
         if (child.op == .load_const) blk: {
-            const value = ir.loadConstValue(&ir_obj, child);
+            const value = ir.loadConstValue(&em.ir_obj, child);
             if (value != .string) break :blk; // not a literal segment — fall through
-            const c_slots = ir_obj.extra_data.items;
+            const c_slots = em.ir_obj.extra_data.items;
             const c_off: u32 = c_slots[child.extra + 1];
             const c_len: u32 = c_slots[child.extra + 2];
             // Match legacy behavior: empty literal segments are
@@ -530,45 +533,36 @@ fn emitInterpLadder(
             // stays identical (`compileStringInterpolation` line
             // 5650/5660 guards on `tail_raw.len > 0`).
             if (c_len > 0) {
-                try push(
-                    instructions,
-                    source_map,
+                try em.pushInstr(
                     .push_string,
                     .{ .str_ref = .{ .offset = c_off, .len = c_len } },
                     node,
-                    allocator,
                 );
-                try push(instructions, source_map, .add, .{ .none = {} }, node, allocator);
+                try em.pushInstr(.add, .{ .none = {} }, node);
             }
             continue;
         }
 
         // Expr segment → save_input ; <expr> ; pipe ; [format_bid? ;
         // pipe ;] tostring ; add ; restore_input.
-        try push(instructions, source_map, .save_input, .{ .none = {} }, node, allocator);
-        try emitNode(instructions, source_map, ir_obj, child_idx, allocator);
-        try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+        try em.pushInstr(.save_input, .{ .none = {} }, node);
+        try emitNode(em, child_idx);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
         if (format_bid) |bid| {
-            try push(
-                instructions,
-                source_map,
+            try em.pushInstr(
                 .call_builtin,
                 .{ .index = @intFromEnum(bid) },
                 node,
-                allocator,
             );
-            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
         }
-        try push(
-            instructions,
-            source_map,
+        try em.pushInstr(
             .call_builtin,
             .{ .index = @intFromEnum(types_mod.BuiltinId.tostring) },
             node,
-            allocator,
         );
-        try push(instructions, source_map, .add, .{ .none = {} }, node, allocator);
-        try push(instructions, source_map, .restore_input, .{ .none = {} }, node, allocator);
+        try em.pushInstr(.add, .{ .none = {} }, node);
+        try em.pushInstr(.restore_input, .{ .none = {} }, node);
     }
 }
 
@@ -589,14 +583,644 @@ fn formatBuiltinId(name: []const u8) ?types_mod.BuiltinId {
     return null;
 }
 
-fn push(
-    instructions: *std.ArrayListUnmanaged(types_mod.Instruction),
-    source_map: *std.ArrayListUnmanaged(u32),
-    op: types_mod.Instruction.Op,
-    operand: types_mod.Instruction.Operand,
-    node: ir.Node,
-    allocator: std.mem.Allocator,
+// ── Update-assign emission (cat-8) ───────────────────────────────────────────
+//
+// Both fast-path (`update_assign` AST) and general-LHS
+// (`assign_general` AST) forms route through the single `update_assign`
+// SemOp. The op-kind discriminant in `extra_data[node.extra]` selects
+// between {set, add, sub, mul, div, mod, alt, update, general}; for
+// `general` the inner operator alphabet lives in
+// `extra_data[node.extra + 1]`.
+//
+// The emit ladders mirror the legacy compiler's
+// `parseUpdateAssign` (fast path) and `compilePathExprUpdate`
+// (general path) at `src/query/src/compiler.zig:1610-1909`. VM
+// semantics are preserved byte-for-byte against legacy.
+
+/// One step of an update-assign fast-path navigation chain. Decoded
+/// inline from `extra_data` by `decodeFastPath`. The kind discriminant
+/// matches the lowering encoding (0 = key, 1 = index).
+const FastPathStep = union(enum) {
+    key: types_mod.Tape.StringRef,
+    index: i64,
+};
+
+/// Decode the fast-path payload starting at `extra_idx`. The first slot
+/// is the op-kind discriminant; the second is the step count; then 3
+/// slots per step (kind + 2-slot payload).
+fn decodeFastPath(
+    em: *Emitter,
+    extra_idx: u32,
+    out_steps: *std.ArrayListUnmanaged(FastPathStep),
 ) error{OutOfMemory}!void {
-    try instructions.append(allocator, .{ .op = op, .operand = operand });
-    try source_map.append(allocator, node.src_start);
+    const slots = em.ir_obj.extra_data.items;
+    const num_steps = slots[extra_idx + 1];
+    var i: u32 = 0;
+    while (i < num_steps) : (i += 1) {
+        const base = extra_idx + 2 + 3 * i;
+        const step_kind = slots[base];
+        const lo: u64 = slots[base + 1];
+        const hi: u64 = slots[base + 2];
+        if (step_kind == 0) {
+            try out_steps.append(em.allocator, .{
+                .key = .{ .offset = @intCast(lo), .len = @intCast(hi) },
+            });
+        } else {
+            const u: u64 = lo | (hi << 32);
+            const n: i64 = @bitCast(u);
+            try out_steps.append(em.allocator, .{ .index = n });
+        }
+    }
+}
+
+/// Emit the fast-path navigation ladder: `save_input` then
+/// `navigate_key`/`navigate_index` per step.
+fn emitNavigation(em: *Emitter, node: ir.Node, steps: []const FastPathStep) error{OutOfMemory}!void {
+    for (steps) |step| {
+        try em.pushInstr(.save_input, .{ .none = {} }, node);
+        switch (step) {
+            .key => |sr| try em.pushInstr(.navigate_key, .{ .str_ref = sr }, node),
+            .index => |i| try em.pushInstr(.navigate_index, .{ .index = i }, node),
+        }
+    }
+}
+
+/// Emit the fast-path update ladder: `update_key`/`update_index` per
+/// step in REVERSE order (innermost first), matching legacy's
+/// `emitUpdateChain`.
+fn emitUpdateChain(em: *Emitter, node: ir.Node, steps: []const FastPathStep) error{OutOfMemory}!void {
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        switch (steps[i]) {
+            .key => |sr| try em.pushInstr(.update_key, .{ .str_ref = sr }, node),
+            .index => |idx| try em.pushInstr(.update_index, .{ .index = idx }, node),
+        }
+    }
+}
+
+/// Top-level `update_assign` dispatcher. Routes between fast path
+/// (kind != .general) and general path (kind == .general).
+fn emitUpdateAssign(em: *Emitter, node: ir.Node, kind: ir.UpdateOpKind) EmitError!void {
+    if (kind == .general) {
+        // For general form, the operator alphabet is in slot+1.
+        const slots = em.ir_obj.extra_data.items;
+        const inner: ir.UpdateOpKind = @enumFromInt(slots[node.extra + 1]);
+        try emitGeneralUpdate(em, node, inner);
+        return;
+    }
+    try emitFastPathUpdate(em, node, kind);
+}
+
+/// Fast-path update emission. Mirrors legacy `parseUpdateAssign`
+/// (`src/query/src/compiler.zig:1610-1782`).
+fn emitFastPathUpdate(em: *Emitter, node: ir.Node, kind: ir.UpdateOpKind) EmitError!void {
+    var steps: std.ArrayListUnmanaged(FastPathStep) = .{};
+    defer steps.deinit(em.allocator);
+    try decodeFastPath(em, node.extra, &steps);
+
+    const rhs_idx = node.children[1];
+
+    switch (kind) {
+        // `|= rhs` — navigate first, then evaluate RHS against
+        // navigated value, then update.
+        .update => {
+            try emitNavigation(em, node, steps.items);
+            try emitNode(em, rhs_idx);
+            try emitUpdateChain(em, node, steps.items);
+        },
+        // `= rhs` — evaluate RHS against original input first, THEN
+        // navigate, THEN update.
+        .set => {
+            try emitNode(em, rhs_idx);
+            try emitNavigation(em, node, steps.items);
+            try emitUpdateChain(em, node, steps.items);
+        },
+        // Compound `+=` `-=` `*=` `/=` `%=` — captured-orig pattern.
+        .add, .sub, .mul, .div, .mod => {
+            const tmp_var = em.allocVar();
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+            try em.pushInstr(.capture_variable, .{ .index = tmp_var }, node);
+
+            // Navigate to target
+            try emitNavigation(em, node, steps.items);
+
+            // Push navigated value (left operand)
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+
+            // Restore original input as current for RHS evaluation
+            try em.pushInstr(.load_variable, .{ .index = tmp_var }, node);
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+            // Evaluate RHS against original input
+            try emitNode(em, rhs_idx);
+
+            // Apply arithmetic
+            const arith_op: types_mod.Instruction.Op = switch (kind) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .div,
+                .mod => .mod,
+                else => unreachable,
+            };
+            try em.pushInstr(arith_op, .{ .none = {} }, node);
+
+            // Update chain
+            try emitUpdateChain(em, node, steps.items);
+        },
+        // `//=` — alternative-assignment.
+        .alt => {
+            const tmp_var = em.allocVar();
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+            try em.pushInstr(.capture_variable, .{ .index = tmp_var }, node);
+
+            // Navigate
+            try emitNavigation(em, node, steps.items);
+
+            // Alt fork: . // rhs
+            const fork_alt_pos = em.instructions.items.len;
+            try em.pushInstr(.fork_alt, .{ .index = 0 }, node);
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+            const jif_pos = em.instructions.items.len;
+            try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+            // Truthy: keep value, jump to end
+            try em.pushInstr(.pop_try, .{ .none = {} }, node);
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+            const jump_end_pos = em.instructions.items.len;
+            try em.pushInstr(.jump, .{ .index = 0 }, node);
+            // Falsy: backtrack to alt-handler (right side)
+            em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+            try em.pushInstr(.backtrack, .{ .none = {} }, node);
+            // Right side: restore original input + evaluate RHS
+            const right_ip: u32 = @intCast(em.instructions.items.len);
+            em.instructions.items[fork_alt_pos].operand = .{ .index = right_ip };
+            try em.pushInstr(.load_variable, .{ .index = tmp_var }, node);
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+            try emitNode(em, rhs_idx);
+            em.instructions.items[jump_end_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+
+            // Update chain
+            try emitUpdateChain(em, node, steps.items);
+        },
+        .general => unreachable, // dispatcher routes general elsewhere
+    }
+}
+
+/// Capture a slice of recently-emitted instructions and truncate the
+/// stream back to `start`. Mirrors legacy `captureAndTruncate` —
+/// returns an owned buffer the caller must free. Used to copy the
+/// LHS bytecode (which gets re-emitted inside `path_begin`/`path_end`)
+/// or the RHS bytecode (re-emitted under `$orig` redirect).
+const CapturedInstrs = struct {
+    instrs: []types_mod.Instruction,
+    src_offsets: []u32,
+    original_start: u32,
+
+    fn deinit(self: *CapturedInstrs, alloc: std.mem.Allocator) void {
+        alloc.free(self.instrs);
+        alloc.free(self.src_offsets);
+    }
+};
+
+fn captureAndTruncate(em: *Emitter, start: usize) error{OutOfMemory}!CapturedInstrs {
+    const slice = em.instructions.items[start..];
+    const off_slice = em.source_map.items[start..];
+    const buf = try em.allocator.alloc(types_mod.Instruction, slice.len);
+    errdefer em.allocator.free(buf);
+    const off_buf = try em.allocator.alloc(u32, off_slice.len);
+    errdefer em.allocator.free(off_buf);
+    @memcpy(buf, slice);
+    @memcpy(off_buf, off_slice);
+    em.instructions.items.len = start;
+    em.source_map.items.len = start;
+    return .{ .instrs = buf, .src_offsets = off_buf, .original_start = @intCast(start) };
+}
+
+/// Append a captured instruction buffer at the current emit position,
+/// rebasing internal jump targets. Mirrors legacy `appendRebasedInstrsCopy`
+/// at `src/query/src/compiler.zig:2314`.
+fn appendRebasedInstrs(em: *Emitter, captured: CapturedInstrs) error{OutOfMemory}!void {
+    const new_start: i64 = @intCast(em.instructions.items.len);
+    const offset: i64 = new_start - @as(i64, @intCast(captured.original_start));
+    const copy = try em.allocator.alloc(types_mod.Instruction, captured.instrs.len);
+    defer em.allocator.free(copy);
+    @memcpy(copy, captured.instrs);
+    rebaseInstrs(copy, offset);
+    try em.instructions.appendSlice(em.allocator, copy);
+    try em.source_map.appendSlice(em.allocator, captured.src_offsets);
+}
+
+/// Shift internal jump targets in a copied instruction buffer by
+/// `offset` so the buffer can be replayed at a different IP.
+/// Targets internal to the buffer (relative jumps) are untouched —
+/// jq bytecode uses absolute IPs only, so we recompute every relevant
+/// `.index` operand. Conservative: every op carrying an `.index`
+/// operand that the VM treats as an instruction pointer is shifted.
+fn rebaseInstrs(buf: []types_mod.Instruction, offset: i64) void {
+    for (buf) |*instr| {
+        switch (instr.op) {
+            .jump,
+            .jump_if_false,
+            .fork,
+            .fork_try,
+            .fork_alt,
+            .array_collect_start,
+            .limit_start,
+            .label_begin,
+            => {
+                if (offset != 0) {
+                    const cur: i64 = @intCast(instr.operand.index);
+                    instr.operand = .{ .index = @intCast(cur + offset) };
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Emit the `[path(LHS)]` collection — captures every path the LHS
+/// expression yields against the current input. The IR's LHS subtree
+/// has already been lowered as a regular expression; we re-emit it
+/// here under `path_begin`/`path_end` brackets.
+fn emitPathCollection(em: *Emitter, node: ir.Node, lhs_idx: u32) EmitError!void {
+    const ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+
+    const path_begin_ip = em.instructions.items.len;
+    try em.pushInstr(.path_begin, .{ .index = 0 }, node);
+
+    try emitNode(em, lhs_idx);
+
+    try em.pushInstr(.path_end, .{ .none = {} }, node);
+    em.instructions.items[path_begin_ip].operand = .{ .index = @intCast(em.instructions.items.len - 1) };
+
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+
+    const ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[ace_start].operand = .{ .index = ace_end };
+}
+
+/// Emit `[]` (empty array literal).
+fn emitEmptyArray(em: *Emitter, node: ir.Node) error{OutOfMemory}!void {
+    const start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    const end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[start].operand = .{ .index = end };
+}
+
+/// General-LHS update emission. Routes `LHS OP= rhs` for arbitrary
+/// LHS expressions via the `_modify`/`_assign` desugar pattern. The
+/// IR has children: `[lhs_idx, rhs_idx]`; the inner operator alphabet
+/// is the second extra slot.
+fn emitGeneralUpdate(em: *Emitter, node: ir.Node, inner: ir.UpdateOpKind) EmitError!void {
+    const lhs_idx = node.children[0];
+    const rhs_idx = node.children[1];
+
+    // Pre-allocate temp vars matching legacy's slot order
+    // (`compilePathExprUpdate` at compiler.zig:1827-1838). The slot
+    // order ensures bytecode-level identity for the var ids.
+    const orig_var = em.allocVar();
+    const paths_var = em.allocVar();
+    const acc_var = em.allocVar();
+    const dels_var = em.allocVar();
+    const p_var = em.allocVar();
+    _ = em.allocVar(); // r_var (not used in some forms)
+
+    // $orig = current input
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = orig_var }, node);
+
+    // $paths = [path(LHS)]
+    try emitPathCollection(em, node, lhs_idx);
+    try em.pushInstr(.capture_variable, .{ .index = paths_var }, node);
+
+    // Capture RHS bytecode for re-emission inside the loop body.
+    const rhs_capture_start = em.instructions.items.len;
+    try emitNode(em, rhs_idx);
+    var rhs = try captureAndTruncate(em, rhs_capture_start);
+    defer rhs.deinit(em.allocator);
+
+    switch (inner) {
+        // `LHS |= f` — _modify desugar.
+        .update => {
+            try emitGeneralPipeEq(em, node, orig_var, paths_var, acc_var, dels_var, p_var, rhs);
+        },
+        // `LHS = v` — set every path to v(orig).
+        .set => {
+            try emitGeneralEq(em, node, orig_var, paths_var, acc_var, p_var, rhs);
+        },
+        // `LHS op= v` for arith ops.
+        .add, .sub, .mul, .div, .mod => {
+            const arith_op: types_mod.Instruction.Op = switch (inner) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .div,
+                .mod => .mod,
+                else => unreachable,
+            };
+            try emitGeneralCompound(em, node, orig_var, paths_var, acc_var, p_var, arith_op, rhs);
+        },
+        // `LHS //= f` — alternative-assignment.
+        .alt => {
+            try emitGeneralAlt(em, node, orig_var, paths_var, acc_var, p_var, rhs);
+        },
+        .general => unreachable, // nested general unreachable — discriminant excludes
+    }
+}
+
+/// `LHS |= f` general-form ladder. Mirrors legacy
+/// `emitGeneralPipeEqUpdate` (`src/query/src/compiler.zig:1981`).
+fn emitGeneralPipeEq(
+    em: *Emitter,
+    node: ir.Node,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    dels_var: u32,
+    p_var: u32,
+    rhs: CapturedInstrs,
+) EmitError!void {
+    const r_var = em.allocVar();
+
+    // $acc = $orig
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    // $dels = []
+    try emitEmptyArray(em, node);
+    try em.pushInstr(.capture_variable, .{ .index = dels_var }, node);
+
+    // For each $p in $paths:
+    try em.pushInstr(.load_variable, .{ .index = paths_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const inner_ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = p_var }, node);
+
+    // $r = [ ($acc | getpath($p)) | f ]
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.getpath) }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    const r_ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try appendRebasedInstrs(em, rhs);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    const r_ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[r_ace_start].operand = .{ .index = r_ace_end };
+    try em.pushInstr(.capture_variable, .{ .index = r_var }, node);
+
+    // if length($r) == 0 then $dels += [$p] else $acc = setpath($acc; $p; $r[0])
+    try em.pushInstr(.load_variable, .{ .index = r_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.length) }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.push_int, .{ .int = 0 }, node);
+    try em.pushInstr(.eq, .{ .none = {} }, node);
+
+    const jif_pos = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+
+    // THEN: $dels = $dels + [$p]
+    try em.pushInstr(.load_variable, .{ .index = dels_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    const p_arr_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    const p_arr_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[p_arr_start].operand = .{ .index = p_arr_end };
+    try em.pushInstr(.add, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = dels_var }, node);
+    const jump_end_pos = em.instructions.items.len;
+    try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+    // ELSE: $acc = setpath($acc; $p; $r[0])
+    em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = r_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_index, .{ .index = 0 }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.setpath) }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    em.instructions.items[jump_end_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const inner_ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    // Apply pending deletions: $acc | delpaths($dels)
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = dels_var }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.delpaths) }, node);
+}
+
+/// `LHS = v` general-form ladder. Mirrors legacy
+/// `emitGeneralEqUpdate` (`src/query/src/compiler.zig:2095`).
+fn emitGeneralEq(
+    em: *Emitter,
+    node: ir.Node,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    rhs: CapturedInstrs,
+) EmitError!void {
+    const value_var = em.allocVar();
+
+    // $value = $orig | v
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try appendRebasedInstrs(em, rhs);
+    try em.pushInstr(.capture_variable, .{ .index = value_var }, node);
+
+    // $acc = $orig
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    // For each $p in $paths: $acc = setpath($acc; $p; $value)
+    try em.pushInstr(.load_variable, .{ .index = paths_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const inner_ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = p_var }, node);
+
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = value_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.setpath) }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const inner_ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+}
+
+/// `LHS op= v` general-form compound ladder. Mirrors legacy
+/// `emitGeneralCompoundUpdate` (`src/query/src/compiler.zig:2151`).
+fn emitGeneralCompound(
+    em: *Emitter,
+    node: ir.Node,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    arith_op: types_mod.Instruction.Op,
+    rhs: CapturedInstrs,
+) EmitError!void {
+    const tmp_var = em.allocVar();
+
+    // $tmp = $orig | v
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try appendRebasedInstrs(em, rhs);
+    try em.pushInstr(.capture_variable, .{ .index = tmp_var }, node);
+
+    // $acc = $orig
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    // For each $p
+    try em.pushInstr(.load_variable, .{ .index = paths_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const inner_ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = p_var }, node);
+
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    // Stage path
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    // Stage value: getpath($acc; $p) op $tmp
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.getpath) }, node);
+    try em.pushInstr(.load_variable, .{ .index = tmp_var }, node);
+    try em.pushInstr(arith_op, .{ .none = {} }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.setpath) }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const inner_ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+}
+
+/// `LHS //= v` general-form alternative-assignment ladder. Mirrors
+/// legacy `emitGeneralAlternativeUpdate`
+/// (`src/query/src/compiler.zig:2211`).
+fn emitGeneralAlt(
+    em: *Emitter,
+    node: ir.Node,
+    orig_var: u32,
+    paths_var: u32,
+    acc_var: u32,
+    p_var: u32,
+    rhs: CapturedInstrs,
+) EmitError!void {
+    const tmp_var = em.allocVar();
+
+    // $tmp = $orig | f
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try appendRebasedInstrs(em, rhs);
+    try em.pushInstr(.capture_variable, .{ .index = tmp_var }, node);
+
+    // $acc = $orig
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    // For each $p
+    try em.pushInstr(.load_variable, .{ .index = paths_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const inner_ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = p_var }, node);
+
+    // current = getpath($acc; $p)
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.getpath) }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    const jif_pos = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+    // THEN: keep — no change to $acc, just backtrack
+    const jump_end_pos = em.instructions.items.len;
+    try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+    // ELSE: $acc = setpath($acc; $p; $tmp)
+    em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = p_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = tmp_var }, node);
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.call_builtin, .{ .index = @intFromEnum(types_mod.BuiltinId.setpath) }, node);
+    try em.pushInstr(.capture_variable, .{ .index = acc_var }, node);
+
+    em.instructions.items[jump_end_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const inner_ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[inner_ace_start].operand = .{ .index = inner_ace_end };
+
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
 }

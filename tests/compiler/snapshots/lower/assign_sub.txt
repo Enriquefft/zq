@@ -1,0 +1,4 @@
+# source: .a -= 1
+# SemOp
+update_assign(sub, path=".a") @0..7
+  load_const(1) @6..7

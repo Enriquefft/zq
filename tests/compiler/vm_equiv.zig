@@ -117,6 +117,19 @@ const FIXTURES = [_]Fixture{
     .{ .name = "pipe_chain", .filter = ".a | .b | .c", .input = "{\"a\":{\"b\":{\"c\":7}}}", .expected_output = "7" },
     .{ .name = "comma_simple", .filter = ".a, .b", .input = "{\"a\":1,\"b\":2}", .expected_output = "1\n2" },
     .{ .name = "comma_chain", .filter = ".a, .b, .c", .input = "{\"a\":1,\"b\":2,\"c\":3}", .expected_output = "1\n2\n3" },
+
+    // ── Category 8 — update assignments (fast path) ───────────────
+    .{ .name = "assign_set_basic", .filter = ".a = 1", .input = "{\"a\":0}", .expected_output = "{\"a\":1}" },
+    .{ .name = "assign_add", .filter = ".a += 1", .input = "{\"a\":5}", .expected_output = "{\"a\":6}" },
+    .{ .name = "assign_sub", .filter = ".a -= 2", .input = "{\"a\":7}", .expected_output = "{\"a\":5}" },
+    .{ .name = "assign_mul", .filter = ".a *= 3", .input = "{\"a\":4}", .expected_output = "{\"a\":12}" },
+    .{ .name = "assign_div", .filter = ".a /= 2", .input = "{\"a\":10}", .expected_output = "{\"a\":5}" },
+    .{ .name = "assign_mod", .filter = ".a %= 3", .input = "{\"a\":10}", .expected_output = "{\"a\":1}" },
+    .{ .name = "assign_alt_falsy", .filter = ".a //= 99", .input = "{\"a\":null}", .expected_output = "{\"a\":99}" },
+    .{ .name = "assign_alt_truthy", .filter = ".a //= 99", .input = "{\"a\":7}", .expected_output = "{\"a\":7}" },
+    .{ .name = "assign_update", .filter = ".a |= . + 1", .input = "{\"a\":5}", .expected_output = "{\"a\":6}" },
+    // ── Category 8 — update assignments (general LHS) ─────────────
+    .{ .name = "assign_general_iterate", .filter = ".a[] = 0", .input = "{\"a\":[1,2,3]}", .expected_output = "{\"a\":[0,0,0]}" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.
