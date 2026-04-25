@@ -5,6 +5,11 @@ const compiler = @import("src/compiler.zig");
 const vm = @import("src/vm.zig");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
+const build_options = @import("build_options");
+// Phase 2R scaffold. Imported unconditionally so the symbol is reachable
+// when `-Dcompile=new` is selected. Today the new path always returns
+// `error.NewCompilerNotImplemented`; R3 fills it in.
+const new_compiler = @import("compiler");
 
 pub const PrefilterSet = prefilter_mod.PrefilterSet;
 
@@ -65,8 +70,38 @@ pub const CompiledQuery = struct {
 
     /// Compile `src` into bytecode. Returns a CompileResult union:
     /// `.ok` on success, `.err` with source location on compile error.
-    /// Only returns error.OutOfMemory as a Zig error.
+    ///
+    /// Backend dispatch is comptime-keyed off `-Dcompile=`. Default
+    /// (`legacy`) hits the production compiler at `src/query/src/compiler.zig`.
+    /// `new` (Phase 2R scaffold) routes to `src/compiler/` and currently
+    /// always returns `error.NewCompilerNotImplemented` — R3 will refine.
+    ///
+    /// TODO(R3): when the new compiler returns a real `CompileResult`,
+    /// drop the `NewCompilerNotImplemented` member from the error set and
+    /// merge the two arms into one.
+    /// TODO(R3): `src/main.zig`'s catch on this call (line ~195) prints
+    /// "out of memory" for any error from this set. Acceptable while the
+    /// new path is gated behind `-Dcompile=new`; surface a clearer message
+    /// when the new backend becomes a runtime-selectable option.
     pub fn compile(
+        src: []const u8,
+        opts: Opts,
+        allocator: std.mem.Allocator,
+    ) error{ OutOfMemory, NewCompilerNotImplemented }!CompileResult {
+        switch (comptime build_options.compile_backend) {
+            .legacy => return compileLegacy(src, opts, allocator),
+            .new => {
+                // The new pipeline returns `!noreturn` today (errors only).
+                // The `try` propagates `NewCompilerNotImplemented` /
+                // `OutOfMemory` straight to the caller.
+                try new_compiler.compile(src, allocator);
+            },
+        }
+    }
+
+    /// Production compile path — extracted so the dispatcher above stays
+    /// trivial. Body is the original (legacy) implementation.
+    fn compileLegacy(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,

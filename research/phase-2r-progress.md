@@ -130,3 +130,51 @@ Legacy baselines locked. R3 must hold or improve median µs / p99 µs / σ
 per filter, peak RSS, binary size, and the 1023/1161 test count floor.
 
 Next: Phase 4 — IR-format spec (`research/compiler-ir-format.md`).
+
+## Phase 4 — R2 IR-Format Spec (Cluster A)
+
+Date: 2026-04-25
+Commit: 90dce829bd0f5f472f1dc70a95d129ad2ca87ea8
+Branch: redesign/compiler
+Status: PROCEED (after 1 fix attempt)
+
+### Changes
+- research/compiler-ir-format.md (new, 388 lines): stable diffable
+  indented-tree IR text format spec. Pins node syntax, span semantics
+  (start..end byte-exclusive), flat op-tag namespace with SemOp/EmitOp
+  banners, inline extra-data rendering, snapshot directives in EBNF,
+  regex pool ref escape rules, cross-namespace tag uniqueness, and
+  append-only stability.
+
+### Verification
+- zig build: PASS (no source changes)
+- zig build test: not re-run (no source changes; baselines unchanged)
+- All 11 required sections present.
+- Worked examples (.foo | .bar, keys | length, if/then/else,
+  fuse-rewrite to key_count) all use byte-exact spans, consistent
+  across §2/§4/§7/§10.
+
+### Reviewer pass
+- code-reviewer: BLOCK initially (span values inconsistent across
+  §2/§10; EBNF missing fuse directives `# before`/`# after`;
+  regex pool ref serialization underspecified). All 3 cleared in
+  fix attempt #1.
+- architect-reviewer: PROCEED. Plan §1.3 row 6 (SemOp/EmitOp), row 5
+  (extra_children), row 8 (diffable), §3 R3 step 9 (indent format),
+  §1.2 (span semantics), §1 invariants — all PASS.
+- future-readiness-reviewer: PROCEED. Minor flags: partial-regen
+  not specified (additive future), no JSON dump surface (additive
+  future). No foreclosures.
+
+### Open issues for R3 (Phase 5/6)
+- Op enum implementation in src/compiler/ir.zig.
+- Lowering rules in src/compiler/lower.zig.
+- Snapshot directories tests/compiler/snapshots/{lower,fuse}/.
+- Optional: partial-regen support (`zig build snapshots-update -- <name>`).
+- Optional: typed JSON dump surface.
+
+### Phase 4 acceptance: MET
+IR text format is implementable from the spec without further questions;
+R3 implementers conform to it.
+
+Next: Phase 5 — compiler scaffold + dispatch flag.

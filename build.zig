@@ -20,11 +20,23 @@ pub fn build(b: *std.Build) void {
     // packaging so `nix build` stays hermetic (no cargo/rustc at build time).
     const shim_archive_opt = b.option([]const u8, "shim-archive", "Path to prebuilt libzq_regex_shim.a (skips cargo)");
     const strip_opt = b.option(bool, "strip", "Strip symbols from release binary (default: true in release, false in debug)");
+    // Compiler backend selector — Phase 2R. `legacy` (default) uses the
+    // production compiler at `src/query/src/compiler.zig`; `new` routes to
+    // the Phase 2R scaffold at `src/compiler/`. The new path returns
+    // `error.NewCompilerNotImplemented` until R3 (Phase 6+) lands real
+    // operator lowering. Default MUST stay `legacy` so production builds
+    // and the test suite are unaffected.
+    const compile_backend = b.option(
+        CompileBackend,
+        "compile",
+        "Compiler backend: legacy (default, prod) or new (Phase 2R, scaffold)",
+    ) orelse CompileBackend.legacy;
     const options = b.addOptions();
     options.addOption([]const u8, "version", ver);
     options.addOption(bool, "regex_enabled", regex_enabled);
     options.addOption(bool, "lsp_enabled", lsp_enabled);
     options.addOption(bool, "profile_enabled", profile_enabled);
+    options.addOption(CompileBackend, "compile_backend", compile_backend);
     // One concrete options module, imported everywhere via addImport. Using
     // `addOptions(...)` on each consumer module would create *separate*
     // modules backed by the same generated source file — that collides when
@@ -164,6 +176,18 @@ pub fn build(b: *std.Build) void {
     prefilter_module.addImport("regex", regex_module);
     prefilter_module.addImport("ast", ast_module);
 
+    // Phase 2R compiler scaffold. Wired into every module that imports
+    // `query` so the `-Dcompile=new` dispatcher in `src/query/root.zig`
+    // can call `compiler.compile` without dragging the whole module
+    // graph through a re-root. Today the new path always errors; R3
+    // fills in real lowering/fuse/emit per the plan.
+    const compiler_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("build_options", build_options_module);
+
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
         .target = target,
@@ -177,6 +201,8 @@ pub fn build(b: *std.Build) void {
     // the same parser the LSP uses — no second source-byte scanner.
     query_module.addImport("ast", ast_module);
     query_module.addImport("prefilter", prefilter_module);
+    query_module.addImport("compiler", compiler_module);
+    query_module.addImport("build_options", build_options_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding
@@ -573,6 +599,12 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| regex_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(regex_tests).step);
 }
+
+/// Phase 2R compiler-backend selector. Defaults to `legacy` (production);
+/// `new` opts into the scaffold at `src/compiler/` (errors at runtime until
+/// R3). Surfaced via `-Dcompile=legacy|new` and read by `src/query/root.zig`
+/// via `build_options.compile_backend`.
+const CompileBackend = enum { legacy, new };
 
 /// Map a zig target to the rust target triple the Cargo crate is built against.
 ///
