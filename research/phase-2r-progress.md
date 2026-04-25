@@ -251,7 +251,7 @@ zig build vm-equiv); harness green under -Dcompile=legacy (sanity).
 ## Phase 6 — R3 vm-equiv Harness (Cluster A)
 
 Date: 2026-04-25
-Commit: <will be filled in after the commit>
+Commit: 5e0b67fff3bf10f37a6587a63f34e4dd7349e6e8
 Branch: redesign/compiler
 Status: PROCEED (after 1 fix attempt for path drift)
 
@@ -308,7 +308,7 @@ under default -Dcompile=legacy; baseline preserved.
 
 ## Handoff: A → B
 
-Last commit: <Phase 6 commit hash will be filled in>
+Last commit: 5e0b67fff3bf10f37a6587a63f34e4dd7349e6e8
 Phase 6 vm-equiv (legacy): green (11 fixtures SKIP-NotImplemented;
   vm-equiv-errpos 5 fixtures SKIP-NotImplemented; legacy_drift=0;
   vm_equiv compile_err=0).
