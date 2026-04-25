@@ -248,6 +248,134 @@ fn emitNode(
             try push(instructions, source_map, .pop_try, .{ .none = {} }, node, allocator);
         },
 
+        // ── Category 5 ──────────────────────────────────────────────
+        // Emit lhs (pushes its result on the value stack), then rhs
+        // (pushes another), then the binary op (pops both, pushes the
+        // result). Matches the legacy parser's
+        // `parseAdditive`/`parseMultiplicative` shape at
+        // `src/query/src/compiler.zig:2699-2729`.
+        .arith => {
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            const slots = ir_obj.extra_data.items;
+            const kind: ir.ArithKind = @enumFromInt(slots[node.extra]);
+            const op: types_mod.Instruction.Op = switch (kind) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .div,
+                .mod => .mod,
+            };
+            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+        },
+
+        .cmp => {
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            const slots = ir_obj.extra_data.items;
+            const kind: ir.CmpKind = @enumFromInt(slots[node.extra]);
+            const op: types_mod.Instruction.Op = switch (kind) {
+                .eq => .eq,
+                .ne => .ne,
+                .lt => .lt,
+                .le => .le,
+                .gt => .gt,
+                .ge => .ge,
+            };
+            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+        },
+
+        // Logical: emit lhs + rhs, then `and_op`/`or_op`. Legacy's VM
+        // (`src/query/src/vm.zig:6575-6589`) evaluates both operands
+        // eagerly and reduces to a boolean — jq does not short-circuit
+        // at the bytecode layer.
+        .logical => {
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+            const slots = ir_obj.extra_data.items;
+            const kind: ir.LogicalKind = @enumFromInt(slots[node.extra]);
+            const op: types_mod.Instruction.Op = switch (kind) {
+                .and_ => .and_op,
+                .or_ => .or_op,
+            };
+            try push(instructions, source_map, op, .{ .none = {} }, node, allocator);
+        },
+
+        // Alternative `//`: mirror the legacy `parseAlternative` shape at
+        // `src/query/src/compiler.zig:2453-2491`. Legacy emits the LHS
+        // first then `insertRawInstr(chain_start, fork_alt)` because
+        // parser-driven compilation cannot peek `//` until after LHS is
+        // already in the buffer. Tree-walking emission can place the
+        // `fork_alt` first directly — semantically identical, and it
+        // avoids the IP-rebase that nested `//` would otherwise need
+        // (each nested alt's recorded chain_start overlaps the outer
+        // one and `insert` would shift sibling fork_alts' operands).
+        // Layout:
+        //   fork_alt L_right       ← backpatch to RHS start
+        //   <LHS>
+        //   pipe                   ← lift value-stack top to current
+        //   push_current           ← dup current for truthiness check
+        //   jump_if_false L_falsy
+        //   pop_try                ← truthy: drop alt-handler
+        //   push_current           ← truthy: re-push committed value
+        //   jump L_end
+        //   L_falsy:
+        //   backtrack              ← alt-handler runs; jumps to L_right
+        //   L_right:
+        //   <RHS>
+        //   L_end:
+        .alt => {
+            const fork_alt_pos: usize = instructions.items.len;
+            try push(
+                instructions,
+                source_map,
+                .fork_alt,
+                .{ .index = 0 },
+                node,
+                allocator,
+            );
+
+            try emitNode(instructions, source_map, ir_obj, node.children[0], allocator);
+
+            try push(instructions, source_map, .pipe, .{ .none = {} }, node, allocator);
+            try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator);
+
+            const jif_pos: usize = instructions.items.len;
+            try push(
+                instructions,
+                source_map,
+                .jump_if_false,
+                .{ .index = 0 },
+                node,
+                allocator,
+            );
+
+            // Truthy: drop alt-handler, re-push value, jump past RHS.
+            try push(instructions, source_map, .pop_try, .{ .none = {} }, node, allocator);
+            try push(instructions, source_map, .push_current, .{ .none = {} }, node, allocator);
+
+            const jump_end_pos: usize = instructions.items.len;
+            try push(
+                instructions,
+                source_map,
+                .jump,
+                .{ .index = 0 },
+                node,
+                allocator,
+            );
+
+            // Falsy: backtrack into the alt-handler, which jumps to RHS.
+            instructions.items[jif_pos].operand = .{ .index = @intCast(instructions.items.len) };
+            try push(instructions, source_map, .backtrack, .{ .none = {} }, node, allocator);
+
+            const right_ip: u32 = @intCast(instructions.items.len);
+            instructions.items[fork_alt_pos].operand = .{ .index = right_ip };
+
+            try emitNode(instructions, source_map, ir_obj, node.children[1], allocator);
+
+            instructions.items[jump_end_pos].operand = .{ .index = @intCast(instructions.items.len) };
+        },
+
         else => return error.NewCompilerNotImplemented,
     }
 }

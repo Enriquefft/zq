@@ -36,6 +36,37 @@ pub const ConstValue = union(enum) {
     string: []const u8,
 };
 
+/// `arith` op-kind discriminant. Stored as a u32 in `extra_data[node.extra]`.
+/// Mirrors `ast.Node.Arithmetic.ArithOp` one-for-one. Single source of
+/// truth for emit + dumper + fuse decode (plan §1.3 row 5).
+pub const ArithKind = enum(u32) {
+    add = 0,
+    sub = 1,
+    mul = 2,
+    div = 3,
+    mod = 4,
+};
+
+/// `cmp` op-kind discriminant. Stored as a u32 in `extra_data[node.extra]`.
+/// Mirrors `ast.Node.Comparison.CmpOp` one-for-one.
+pub const CmpKind = enum(u32) {
+    eq = 0,
+    ne = 1,
+    lt = 2,
+    le = 3,
+    gt = 4,
+    ge = 5,
+};
+
+/// `logical` op-kind discriminant. Stored as a u32 in `extra_data[node.extra]`.
+/// `and_` / `or_` because `and`/`or` are Zig keywords; the dumper renders
+/// them as `and`/`or` (mirroring the spec §3 op-name strip-trailing-underscore
+/// convention used for `if_`, `try_`).
+pub const LogicalKind = enum(u32) {
+    and_ = 0,
+    or_ = 1,
+};
+
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
 /// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
@@ -356,6 +387,61 @@ fn dumpAst(
             try dumpAst(ir_obj, bc.right, depth + 1, writer);
         },
         .suffix => |sf| try dumpSuffix(ir_obj, &sf, node.span, depth, writer),
+        .arithmetic => |bn| {
+            const op_name = switch (bn.op) {
+                .add => "add",
+                .sub => "sub",
+                .mul => "mul",
+                .div => "div",
+                .mod => "mod",
+            };
+            try writeIndent(writer, depth);
+            try writer.print("arith({s})", .{op_name});
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bn.left, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+        },
+        .comparison => |bn| {
+            const op_name = switch (bn.op) {
+                .eq => "eq",
+                .ne => "ne",
+                .lt => "lt",
+                .le => "le",
+                .gt => "gt",
+                .ge => "ge",
+            };
+            try writeIndent(writer, depth);
+            try writer.print("cmp({s})", .{op_name});
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bn.left, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+        },
+        .and_expr => |bn| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("logical(and)");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bn.left, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+        },
+        .or_expr => |bn| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("logical(or)");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bn.left, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+        },
+        .alternative => |bn| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("alt");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, bn.left, depth + 1, writer);
+            try dumpAst(ir_obj, bn.right, depth + 1, writer);
+        },
         .builtin_call => |bc| {
             try writeIndent(writer, depth);
             if (bc.args.len == 0 and std.mem.eql(u8, bc.name, "not")) {

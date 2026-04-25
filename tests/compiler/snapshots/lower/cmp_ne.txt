@@ -1,0 +1,5 @@
+# source: 1!=2
+# SemOp
+cmp(ne) @0..4
+  load_const(1) @0..1
+  load_const(2) @3..4

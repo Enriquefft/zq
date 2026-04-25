@@ -57,6 +57,35 @@ const FIXTURES = [_]Fixture{
     .{ .name = "chain_index_field", .filter = ".[0].x", .input = "[{\"x\":7}]", .expected_output = "7" },
     .{ .name = "chain_field_index", .filter = ".a[1]", .input = "{\"a\":[10,20]}", .expected_output = "20" },
     .{ .name = "arith", .filter = "1+1", .input = "null", .expected_output = "2" },
+
+    // ── Category 5 — arithmetic ───────────────────────────────────
+    .{ .name = "arith_sub", .filter = "10-3", .input = "null", .expected_output = "7" },
+    .{ .name = "arith_mul", .filter = "4*5", .input = "null", .expected_output = "20" },
+    .{ .name = "arith_div", .filter = "20/4", .input = "null", .expected_output = "5" },
+    .{ .name = "arith_mod", .filter = "10%3", .input = "null", .expected_output = "1" },
+    .{ .name = "arith_chain", .filter = "1+2*3", .input = "null", .expected_output = "7" },
+    .{ .name = "arith_field", .filter = ".x + .y", .input = "{\"x\":2,\"y\":3}", .expected_output = "5" },
+
+    // ── Category 5 — comparison ───────────────────────────────────
+    .{ .name = "cmp_eq_true", .filter = "1==1", .input = "null", .expected_output = "true" },
+    .{ .name = "cmp_ne_true", .filter = "1!=2", .input = "null", .expected_output = "true" },
+    .{ .name = "cmp_lt_true", .filter = "1<2", .input = "null", .expected_output = "true" },
+    .{ .name = "cmp_le_true", .filter = "2<=2", .input = "null", .expected_output = "true" },
+    .{ .name = "cmp_gt_true", .filter = "3>2", .input = "null", .expected_output = "true" },
+    .{ .name = "cmp_ge_false", .filter = "1>=2", .input = "null", .expected_output = "false" },
+    .{ .name = "cmp_field", .filter = ".id > 100", .input = "{\"id\":150}", .expected_output = "true" },
+
+    // ── Category 5 — logical and/or ───────────────────────────────
+    .{ .name = "logical_and_tt", .filter = "true and true", .input = "null", .expected_output = "true" },
+    .{ .name = "logical_and_tf", .filter = "true and false", .input = "null", .expected_output = "false" },
+    .{ .name = "logical_or_tf", .filter = "true or false", .input = "null", .expected_output = "true" },
+    .{ .name = "logical_or_ff", .filter = "false or false", .input = "null", .expected_output = "false" },
+
+    // ── Category 5 — alternative `//` ─────────────────────────────
+    .{ .name = "alt_null_lhs", .filter = "null // 5", .input = "null", .expected_output = "5" },
+    .{ .name = "alt_false_lhs", .filter = "false // 7", .input = "null", .expected_output = "7" },
+    .{ .name = "alt_truthy_lhs", .filter = "1 // 5", .input = "null", .expected_output = "1" },
+
     .{ .name = "select", .filter = "select(.id > 100)", .input = "{\"id\":150}", .expected_output = "{\"id\":150}" },
     .{ .name = "map", .filter = "map(.id) | add", .input = "[{\"id\":1},{\"id\":2}]", .expected_output = "3" },
     .{ .name = "udf_simple", .filter = "def f: . + 1; f", .input = "10", .expected_output = "11" },

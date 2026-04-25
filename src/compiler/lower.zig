@@ -338,6 +338,108 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             return cur;
         },
 
+        // ── Arithmetic `+ - * / %` (category 5) ────────────────────
+        // Lower lhs and rhs first; parent records `(left, right)` index
+        // edges and stashes the op-kind discriminant in `extra_data`.
+        // Matches `ast.Node.Arithmetic.ArithOp` enum order one-for-one
+        // (`ir.ArithKind` is the single source of truth).
+        .arithmetic => |bn| {
+            const left = try lowerNode(ctx, bn.left);
+            const right = try lowerNode(ctx, bn.right);
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const kind: ir.ArithKind = switch (bn.op) {
+                .add => .add,
+                .sub => .sub,
+                .mul => .mul,
+                .div => .div,
+                .mod => .mod,
+            };
+            try ctx.out.extra_data.append(alloc, @intFromEnum(kind));
+            return ctx.pushNode(.{
+                .op = .arith,
+                .children = .{ left, right },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Comparison `== != < <= > >=` (category 5) ─────────────
+        .comparison => |bn| {
+            const left = try lowerNode(ctx, bn.left);
+            const right = try lowerNode(ctx, bn.right);
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const kind: ir.CmpKind = switch (bn.op) {
+                .eq => .eq,
+                .ne => .ne,
+                .lt => .lt,
+                .le => .le,
+                .gt => .gt,
+                .ge => .ge,
+            };
+            try ctx.out.extra_data.append(alloc, @intFromEnum(kind));
+            return ctx.pushNode(.{
+                .op = .cmp,
+                .children = .{ left, right },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Logical `and` / `or` (category 5) ──────────────────────
+        // Single `logical` op; `extra_data[extra]` holds the
+        // `LogicalKind` discriminant (and/or). Legacy emits the runtime
+        // `and_op`/`or_op` opcodes which evaluate both sides eagerly
+        // — jq does NOT short-circuit at the bytecode level
+        // (`src/query/src/vm.zig:6575-6589`). The new compiler matches
+        // that emission shape so VM-equivalence holds byte-for-byte.
+        .and_expr => |bn| {
+            const left = try lowerNode(ctx, bn.left);
+            const right = try lowerNode(ctx, bn.right);
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LogicalKind.and_));
+            return ctx.pushNode(.{
+                .op = .logical,
+                .children = .{ left, right },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+        .or_expr => |bn| {
+            const left = try lowerNode(ctx, bn.left);
+            const right = try lowerNode(ctx, bn.right);
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LogicalKind.or_));
+            return ctx.pushNode(.{
+                .op = .logical,
+                .children = .{ left, right },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Alternative `//` (category 5) ──────────────────────────
+        // No `extra` — `alt` is shape-only. Emit lowers it to the
+        // `fork_alt`/truthiness/backtrack scaffold legacy uses
+        // (`src/query/src/compiler.zig:2453`).
+        .alternative => |bn| {
+            const left = try lowerNode(ctx, bn.left);
+            const right = try lowerNode(ctx, bn.right);
+            return ctx.pushNode(.{
+                .op = .alt,
+                .children = .{ left, right },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Builtin call: `not` / `type` (category 1 zero-arg) ────
         // Most builtins are category 10, but `not` and `type` are the
         // only zero-arg builtins category 1 owns (per orchestrator

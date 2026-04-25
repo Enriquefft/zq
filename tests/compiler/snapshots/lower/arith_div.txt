@@ -1,0 +1,5 @@
+# source: 20/4
+# SemOp
+arith(div) @0..4
+  load_const(20) @0..2
+  load_const(4) @3..4

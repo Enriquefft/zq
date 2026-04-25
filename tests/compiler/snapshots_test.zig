@@ -43,6 +43,20 @@ const FIXTURES = [_]Fixture{
     .{ .name = "pipe_chain", .expected = @embedFile("snapshots/lower/pipe_chain.txt") },
     .{ .name = "comma_simple", .expected = @embedFile("snapshots/lower/comma_simple.txt") },
     .{ .name = "comma_pipe_mixed", .expected = @embedFile("snapshots/lower/comma_pipe_mixed.txt") },
+    .{ .name = "arith_add", .expected = @embedFile("snapshots/lower/arith_add.txt") },
+    .{ .name = "arith_sub", .expected = @embedFile("snapshots/lower/arith_sub.txt") },
+    .{ .name = "arith_mul", .expected = @embedFile("snapshots/lower/arith_mul.txt") },
+    .{ .name = "arith_div", .expected = @embedFile("snapshots/lower/arith_div.txt") },
+    .{ .name = "arith_mod", .expected = @embedFile("snapshots/lower/arith_mod.txt") },
+    .{ .name = "arith_chain", .expected = @embedFile("snapshots/lower/arith_chain.txt") },
+    .{ .name = "cmp_eq", .expected = @embedFile("snapshots/lower/cmp_eq.txt") },
+    .{ .name = "cmp_ne", .expected = @embedFile("snapshots/lower/cmp_ne.txt") },
+    .{ .name = "cmp_lt", .expected = @embedFile("snapshots/lower/cmp_lt.txt") },
+    .{ .name = "cmp_ge", .expected = @embedFile("snapshots/lower/cmp_ge.txt") },
+    .{ .name = "logical_and", .expected = @embedFile("snapshots/lower/logical_and.txt") },
+    .{ .name = "logical_or", .expected = @embedFile("snapshots/lower/logical_or.txt") },
+    .{ .name = "alt_basic", .expected = @embedFile("snapshots/lower/alt_basic.txt") },
+    .{ .name = "alt_chain", .expected = @embedFile("snapshots/lower/alt_chain.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive
