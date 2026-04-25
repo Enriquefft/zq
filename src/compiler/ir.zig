@@ -11,6 +11,18 @@
 //! `deinit` is a no-op on the lists themselves; the arena owns the storage.
 const std = @import("std");
 
+/// `load_const` payload discriminant. Encoded into `extra_data[node.extra]`
+/// by `lower.zig` and decoded by `emit.zig`; the trailing slots carry the
+/// concrete value (lo32/hi32 for int/float, offset/len for string).
+pub const LiteralKind = enum(u32) {
+    null_val = 0,
+    false_val = 1,
+    true_val = 2,
+    int = 3,
+    float = 4,
+    string = 5,
+};
+
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
 /// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
@@ -97,9 +109,6 @@ pub const Node = struct {
 };
 
 comptime {
-    // 1 (op) + 1*3 padding + 8 (children) + 4 (span_start) + 4 (span_len)
-    // + 4 (extra) + 4 (src_start) + 4 (src_len) = 32 bytes on a 4-byte
-    // aligned struct. The `<= 32` ceiling guards future field additions.
     std.debug.assert(@sizeOf(Node) <= 32);
 }
 

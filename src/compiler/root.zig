@@ -90,26 +90,15 @@ pub fn compile(
 
     // Stage 4: emit IR → bytecode. The emitter copies bytes the VM
     // needs into the caller's allocator; the IR arena is freed by
-    // `defer` above.
-    var compiled = emit_mod.emit(fused, allocator) catch |e| switch (e) {
+    // `defer` above. `external_vars.len` flows in so emit allocates
+    // `external_var_ids` at the final size in one shot.
+    var compiled = emit_mod.emit(fused, external_vars.len, allocator) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NewCompilerNotImplemented => return error.NewCompilerNotImplemented,
     };
+    var compiled_consumed = false;
+    defer if (!compiled_consumed) compiled.deinit(allocator);
 
-    // External-var IDs: matches legacy contract — every declared external
-    // var is reserved a unique `u32` ID slot in the emitted bytecode.
-    // Category 1 filters never reference them, so the IDs are unused
-    // at runtime; main.zig still indexes by `external_vars.len` to
-    // bind `$ARGS` (legacy declares ARGS as the trailing entry). We
-    // assign IDs sequentially starting at 0 (no other vars in this
-    // category).
-    if (external_vars.len > 0) {
-        allocator.free(compiled.external_var_ids);
-        compiled.external_var_ids = try allocator.alloc(u32, external_vars.len);
-        for (compiled.external_var_ids, 0..) |*id, i| {
-            id.* = @intCast(i);
-        }
-    }
-
+    compiled_consumed = true;
     return .{ .ok = compiled };
 }

@@ -1,19 +1,10 @@
-//! Source-position parity for compile errors. Phase 6 scaffold.
+//! Source-position parity for compile errors.
 //!
 //! Plan §1.4 row 5 — exact match on `(kind, offset, len)` between the
 //! legacy and new compilers for a curated corpus of malformed filters.
-//! At Phase 6 the new backend always returns `NewCompilerNotImplemented`,
-//! so every fixture is reported as SKIP and the binary exits 0.
-//!
-//! Cluster B+ retrofits the actual comparison once the new compiler can
-//! emit `CompileResult.err` for these cases.
-//!
-//! Authoring note: each fixture's expected triple was discovered by
-//! running `zig build vm-equiv-probe` (see `tests/vm_equiv_probe.zig`)
-//! and transcribing the legacy compiler's actual emission. Do NOT invent
-//! values.
-//!
-//! Module note: see `tests/vm_equiv.zig` — same dep-graph constraint.
+//! Each fixture's expected triple is discovered by running
+//! `zig build vm-equiv-probe` and transcribing the legacy compiler's
+//! emission. Do NOT invent values.
 
 const std = @import("std");
 const query = @import("query");
@@ -27,15 +18,11 @@ const ErrFixture = struct {
     expected_len: u32,
 };
 
-/// Populated from `zig build vm-equiv-probe` output. Phase 6 ships these
-/// as legacy-side sanity checks; the cross-backend comparison only fires
-/// once Cluster B+ wires the new backend's compile-error path.
+/// Populated from `zig build vm-equiv-probe` output. The legacy compiler
+/// reports every syntax-shape error as `query_syntax_error` with a
+/// zero-length span pointing at the offending position; the new backend
+/// must reproduce that triple.
 const FIXTURES = [_]ErrFixture{
-    // Triples below transcribed from `zig build vm-equiv-probe` on
-    // commit 9d70ce2 (Phase 5). The legacy compiler reports every
-    // syntax-shape error as `query_syntax_error` with a zero-length
-    // span pointing at the offending position; that's the contract
-    // the new backend must reproduce.
     .{ .name = "unclosed_str", .filter = "\"foo", .expected_kind = "query_syntax_error", .expected_offset = 0, .expected_len = 0 },
     .{ .name = "trailing_pipe", .filter = ". |", .expected_kind = "query_syntax_error", .expected_offset = 3, .expected_len = 0 },
     .{ .name = "trailing_arith", .filter = "1 +", .expected_kind = "query_syntax_error", .expected_offset = 3, .expected_len = 0 },
@@ -101,13 +88,8 @@ pub fn main() !void {
             continue;
         }
 
-        // New-backend side — Phase 7 wires the real call via
-        // `query.CompiledQuery.compileNew`. Errors that match the
-        // legacy triple count as a pass; mismatches surface loudly.
-        // NotImplemented is reported as SKIP (the curated corpus is
-        // syntax-shape errors, which Cluster B's first phase covers
-        // by routing through `ast.parse` errors before lowering even
-        // touches the AST).
+        // New-backend side. Errors matching the legacy triple count as
+        // PASS; mismatches surface loudly. NotImplemented is SKIP.
         const new_result = query.CompiledQuery.compileNew(fx.filter, .{}, alloc) catch |e| switch (e) {
             error.NewCompilerNotImplemented => {
                 skipped += 1;

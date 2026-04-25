@@ -109,39 +109,24 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
     switch (node.kind) {
         // ── Literals (category 1) ─────────────────────────────────
         .literal => |lit| {
-            // `load_const` carries the constant value in `extra_data`.
-            // Encoding (in sync with `emit.zig`'s `load_const` decoder):
-            //
-            //   slot[extra] = literal-kind discriminant
-            //     0 = null
-            //     1 = false
-            //     2 = true
-            //     3 = int   (slot[extra+1] = lo32, slot[extra+2] = hi32)
-            //     4 = float (slot[extra+1] = lo32, slot[extra+2] = hi32)
-            //     5 = string (slot[extra+1] = offset, slot[extra+2] = len)
-            //
-            // Plan §1.3 row 5 mandates `extra` is a single u32 anchor;
-            // the variable-arity payload after it is op-private. The
-            // dumper renders the literal by reading the AST (snapshot
-            // pairs IR + AST), so the slot layout is internal contract
-            // between `lower.zig` and `emit.zig`.
             const alloc = ctx.arena.allocator();
             const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
             switch (lit) {
                 .null_val => {
-                    try ctx.out.extra_data.append(alloc, 0);
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.null_val));
                 },
                 .bool_val => |b| {
-                    try ctx.out.extra_data.append(alloc, if (b) 2 else 1);
+                    const k: ir.LiteralKind = if (b) .true_val else .false_val;
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(k));
                 },
                 .int => |n| {
-                    try ctx.out.extra_data.append(alloc, 3);
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.int));
                     const u: u64 = @bitCast(n);
                     try ctx.out.extra_data.append(alloc, @truncate(u));
                     try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
                 },
                 .float => |f| {
-                    try ctx.out.extra_data.append(alloc, 4);
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.float));
                     const u: u64 = @bitCast(f);
                     try ctx.out.extra_data.append(alloc, @truncate(u));
                     try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
@@ -170,7 +155,7 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                             }
                         }
                     }
-                    try ctx.out.extra_data.append(alloc, 5);
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.string));
                     const offset: u32 = @intCast(ctx.out.string_buf.items.len);
                     try ctx.out.string_buf.appendSlice(alloc, s);
                     try ctx.out.extra_data.append(alloc, offset);
@@ -186,24 +171,6 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         },
 
         // ── Identity (category 1) ─────────────────────────────────
-        // The AST exposes `.identity` as a kind-tag with no payload.
-        // Lowering emits the IR `field` op with an empty name? No —
-        // identity stays its own op so emit can fold to a true no-op
-        // (`identity` bytecode). We model it as a zero-arity SemOp.
-        // Plan §1.3 has no `identity` row, but the table lists every
-        // op that needs `extra` or `span`; identity is plain and rides
-        // on a fresh tag. We re-use `recurse`'s slot? No — semantics
-        // differ. Add it inline here.
-        //
-        // The `Op` enum already contains `iterate`, `recurse`, but no
-        // `identity`. We pick a stable tag and route emit accordingly.
-        // To minimize Op-set growth at this stage, we emit an explicit
-        // SemOp `identity` by piggybacking on `iterate`'s neighbor
-        // namespace — but that conflates semantics. A cleaner fix is
-        // to add an explicit `identity` SemOp. The Op enum was sized
-        // generously (one byte tag, plenty of slots); adding a new
-        // tag keeps the namespace clean and matches the spec's
-        // example dumps in §10. See `ir.zig` Op enum addition below.
         .identity => return ctx.pushNode(.{
             .op = .identity,
             .src_start = sp.start,

@@ -1,35 +1,34 @@
 //! VM-equivalence harness for Phase 2R compiler.
 //!
 //! For each fixture: compile via legacy AND via new, then run both
-//! resulting bytecodes against the input JSON and compare output
-//! streams. Phase 7 (Cluster B) wires the new-path call via
-//! `query.CompiledQuery.compileNew`, which re-exports the new
-//! backend through the `query` module so the test binary's dep
-//! graph stays single-rooted (Cluster A handoff issue #1).
+//! resulting bytecodes against the input JSON and byte-compare the
+//! emitted value streams. Mismatches surface a per-fixture diff line
+//! and exit non-zero.
 //!
 //! Plan: research/phase-2r-compiler-redesign-plan.md §3 R3 step 4.
 //! Spec:  research/compiler-ir-format.md (Phase 4).
-//!
-//! Exit codes: 0 on all-match-or-skip, 1 if any mismatch or unexpected
-//! compile error. NotImplemented is reported as SKIP.
 
 const std = @import("std");
 const query = @import("query");
+const parser_mod = @import("parser");
+const output_mod = @import("output");
+const types_mod = @import("types");
 
 const Fixture = struct {
     name: []const u8,
     filter: []const u8,
-    /// JSON input (currently unused; reserved for Cluster B VM run).
+    /// JSON input fed through the production parser to build a Tape.
     input: []const u8,
-    /// Reserved for Cluster B output-stream diff.
+    /// Reference value stream — one JSON value per emitted output, separated
+    /// by '\n'. Used as a sanity check against the legacy execution; the
+    /// cross-backend diff is byte-for-byte legacy-vs-new at run time.
     expected_output: []const u8 = "",
-    /// When true, the legacy compiler is expected to fail. Phase 6 SKIPs
-    /// these; Cluster B will compare error kinds across backends.
+    /// When true, the legacy compiler is expected to fail. We then check
+    /// the new compiler reports the same error class.
     expects_compile_err: bool = false,
 };
 
 const FIXTURES = [_]Fixture{
-    // ── Category 1 fixtures (Phase 7 owns these) ──────────────────
     .{ .name = "literal_null", .filter = "null", .input = "1", .expected_output = "null" },
     .{ .name = "literal_true", .filter = "true", .input = "1", .expected_output = "true" },
     .{ .name = "literal_false", .filter = "false", .input = "1", .expected_output = "false" },
@@ -39,14 +38,9 @@ const FIXTURES = [_]Fixture{
     .{ .name = "identity", .filter = ".", .input = "{\"foo\":1}", .expected_output = "{\"foo\":1}" },
     .{ .name = "recurse", .filter = "..", .input = "[1,2]", .expected_output = "[1,2]\n1\n2" },
     .{ .name = "neg", .filter = "-5", .input = "null", .expected_output = "-5" },
-    // `not` consumes its input — supplying a falsy `null` input yields true.
-    // Cluster B's pipe-category port will enable richer fixtures like
-    // `false | not`; for now we test the bare op with the harness's
-    // input-binding contract (input flows in as `current`).
     .{ .name = "not_zero_arg", .filter = "not", .input = "null", .expected_output = "true" },
     .{ .name = "type_zero_arg", .filter = "type", .input = "[]", .expected_output = "\"array\"" },
 
-    // ── Categories 2+ fixtures (still SKIP-NotImplemented) ────────
     .{ .name = "field", .filter = ".foo", .input = "{\"foo\":1}", .expected_output = "1" },
     .{ .name = "nested", .filter = ".foo.bar", .input = "{\"foo\":{\"bar\":2}}", .expected_output = "2" },
     .{ .name = "pipe", .filter = ".foo | .bar", .input = "{\"foo\":{\"bar\":3}}", .expected_output = "3" },
@@ -60,17 +54,75 @@ const FIXTURES = [_]Fixture{
     .{ .name = "reduce", .filter = "reduce range(10) as $i (0; . + $i)", .input = "null", .expected_output = "45" },
 };
 
+/// One JSON-encoded value per emitted iterator output, separated by '\n'.
+/// Compact format — matches the `--compact-output` mode jq users diff
+/// against. The runtime error (if any) is captured as a structured tag so
+/// we can compare error kinds + offsets across backends without leaking
+/// `ZqError` enum names through `@tagName` mismatches.
+const RunResult = struct {
+    output: []u8,
+    err: ?ErrInfo,
+
+    const ErrInfo = struct {
+        kind: []const u8,
+    };
+
+    fn deinit(self: *RunResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.output);
+    }
+};
+
+fn runQuery(
+    cq: *const query.CompiledQuery,
+    tape: types_mod.Tape,
+    alloc: std.mem.Allocator,
+) !RunResult {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(alloc);
+
+    var sink: output_mod.BufferSink = .{ .list = &buf, .aa = alloc };
+    var first: bool = true;
+
+    var it = try cq.execute(tape, &.{}, alloc);
+    defer it.deinit();
+
+    while (true) {
+        const v_opt = it.next() catch |e| {
+            const owned = try buf.toOwnedSlice(alloc);
+            return .{ .output = owned, .err = .{ .kind = @errorName(e) } };
+        };
+        const v = v_opt orelse break;
+        if (!first) try sink.writeByte('\n');
+        first = false;
+        try output_mod.serialize(&sink, v, .compact, null, .{});
+    }
+
+    const owned = try buf.toOwnedSlice(alloc);
+    return .{ .output = owned, .err = null };
+}
+
+fn parseTape(input: []const u8, alloc: std.mem.Allocator) !struct {
+    parser: parser_mod.Parser,
+    tape: types_mod.Tape,
+} {
+    var p = try parser_mod.Parser.init(alloc);
+    errdefer p.deinit();
+
+    const result = try p.feed(input, true);
+    const tape = switch (result) {
+        .done => |d| d.tape,
+        .need_more => return error.UnexpectedEof,
+    };
+    return .{ .parser = p, .tape = tape };
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
     var match: u32 = 0;
-    // `mismatch` reserved for the Cluster-B+ output-stream diff. Phase 7
-    // only confirms both backends compile a category-1 fixture; the VM
-    // execution diff lands later. Kept declared so the print line stays
-    // stable across phases.
-    const mismatch: u32 = 0;
+    var mismatch: u32 = 0;
     var skipped: u32 = 0;
     var compile_err: u32 = 0;
 
@@ -100,9 +152,6 @@ pub fn main() !void {
             .ok => {},
         }
 
-        // New compile. Routed through `query.CompiledQuery.compileNew`
-        // so the test binary stays single-rooted (Cluster A handoff
-        // issue #1) — see header comment.
         const new_result = query.CompiledQuery.compileNew(fx.filter, .{}, alloc) catch |e| switch (e) {
             error.NewCompilerNotImplemented => {
                 skipped += 1;
@@ -126,14 +175,68 @@ pub fn main() !void {
             .ok => {},
         }
 
-        // Both backends compiled. Phase 7 records a match without
-        // running the VM — the bytecode-shape check below is enough
-        // signal that lowering produced a sensible instruction stream.
-        // Cluster B+ wires the full `tape` + `execute` + output-diff
-        // path; for now, having both compiles succeed on a category-1
-        // fixture is the green bar.
-        match += 1;
-        try w.print("MATCH name={s} filter={s}\n", .{ fx.name, fx.filter });
+        // Both backends compiled. Build a Tape from `fx.input` and run
+        // each compiled query through the VM, capturing its full output
+        // stream (or runtime error). Byte-diff the streams.
+        var legacy_parser = parser_mod.Parser.init(alloc) catch |e| return e;
+        defer legacy_parser.deinit();
+        const legacy_feed = try legacy_parser.feed(fx.input, true);
+        const legacy_tape = switch (legacy_feed) {
+            .done => |d| d.tape,
+            .need_more => {
+                try w.print("INPUT_PARSE_ERR name={s} input={s}\n", .{ fx.name, fx.input });
+                compile_err += 1;
+                continue;
+            },
+        };
+
+        var new_parser = parser_mod.Parser.init(alloc) catch |e| return e;
+        defer new_parser.deinit();
+        const new_feed = try new_parser.feed(fx.input, true);
+        const new_tape = switch (new_feed) {
+            .done => |d| d.tape,
+            .need_more => {
+                try w.print("INPUT_PARSE_ERR name={s} input={s}\n", .{ fx.name, fx.input });
+                compile_err += 1;
+                continue;
+            },
+        };
+
+        const legacy_cq = legacy_result.ok;
+        const new_cq = new_compiled.ok;
+
+        var legacy_run = try runQuery(&legacy_cq, legacy_tape, alloc);
+        defer legacy_run.deinit(alloc);
+        var new_run = try runQuery(&new_cq, new_tape, alloc);
+        defer new_run.deinit(alloc);
+
+        const same_bytes = std.mem.eql(u8, legacy_run.output, new_run.output);
+        const legacy_err_name: ?[]const u8 = if (legacy_run.err) |e| e.kind else null;
+        const new_err_name: ?[]const u8 = if (new_run.err) |e| e.kind else null;
+        const same_err = blk: {
+            if (legacy_err_name == null and new_err_name == null) break :blk true;
+            if (legacy_err_name == null or new_err_name == null) break :blk false;
+            break :blk std.mem.eql(u8, legacy_err_name.?, new_err_name.?);
+        };
+
+        if (same_bytes and same_err) {
+            match += 1;
+            try w.print("MATCH name={s} filter={s}\n", .{ fx.name, fx.filter });
+        } else {
+            mismatch += 1;
+            try w.print(
+                "MISMATCH name={s} filter={s} input={s}\n  legacy_out=`{s}` legacy_err={s}\n  new_out=   `{s}` new_err=   {s}\n",
+                .{
+                    fx.name,
+                    fx.filter,
+                    fx.input,
+                    legacy_run.output,
+                    legacy_err_name orelse "<none>",
+                    new_run.output,
+                    new_err_name orelse "<none>",
+                },
+            );
+        }
     }
 
     try w.print("\nvm_equiv: total={d} match={d} mismatch={d} skipped={d} compile_err={d}\n", .{

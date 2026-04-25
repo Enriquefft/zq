@@ -1,21 +1,10 @@
 //! Shared compile-time types — the seam between `src/compiler/` and the
-//! production query module.
+//! production query module. Both `lower.zig` and `emit.zig` import this
+//! module without depending on each other.
 //!
-//! Plan §2R, handoff issue #10: `lower.zig` and `emit.zig` cannot share a
-//! `CompileResult` shape via `query` (which already depends on the new
-//! compiler), and emitting via `*const anyopaque` was banned. This module
-//! is the third leg: both sides import `types.zig` and never each other.
-//!
-//! Plan §1.3 row 7 (verbatim): `CompileResult` exposes only legacy-shape
-//! fields — `instructions`, `function_table`, `string_buf`,
-//! `external_var_ids`, `source_map`, `regex_pool`, `prefilter`. The new
-//! compiler matches that shape exactly so `src/query/root.zig` can plug
-//! either backend behind the `-Dcompile=` switch without touching its
-//! `CompiledQuery` field set.
-//!
-//! No state lives here — this is the contract layer. New types (e.g. an
-//! eventual `parse_plan`) are added when the first consumer needs them,
-//! per plan §1.3 row 7.
+//! `CompileResult` exposes the same field set the legacy compiler does so
+//! `src/query/root.zig` can plug either backend behind `-Dcompile=` without
+//! touching its `CompiledQuery` field set.
 
 const std = @import("std");
 const types_mod = @import("types");

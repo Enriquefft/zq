@@ -37,6 +37,7 @@ const StringRef = types_mod.Tape.StringRef;
 /// linear walk suffices.
 pub fn emit(
     ir_obj: ir.IR,
+    external_var_count: usize,
     allocator: std.mem.Allocator,
 ) EmitError!ctypes.Compiled {
     var instructions: std.ArrayListUnmanaged(types_mod.Instruction) = .{};
@@ -83,15 +84,14 @@ pub fn emit(
     const src_map_slice = try source_map.toOwnedSlice(allocator);
     errdefer allocator.free(src_map_slice);
 
-    // Function table: empty (category 1 has no UDFs). Matches legacy
-    // shape: `function_defs` allocated as zero-length slice via the
-    // same allocator. The legacy compiler comments this is "kept for
-    // interface compatibility" since bodies are inline-expanded.
-    const function_defs = try allocator.alloc(types_mod.FunctionDef, 0);
-    errdefer allocator.free(function_defs);
+    // Category 1 has no UDFs. Mirror legacy: `function_table` is a view
+    // into `string_buf` with zero length (no separate allocation, no
+    // separate free).
+    const function_defs: []const types_mod.FunctionDef = &.{};
 
-    const ext_var_ids = try allocator.alloc(u32, 0);
+    const ext_var_ids = try allocator.alloc(u32, external_var_count);
     errdefer allocator.free(ext_var_ids);
+    for (ext_var_ids, 0..) |*id, i| id.* = @intCast(i);
 
     return .{
         .instructions = instr_slice,
@@ -112,37 +112,28 @@ fn emitNode(
     allocator: std.mem.Allocator,
 ) EmitError!void {
     switch (node.op) {
-        // ── load_const dispatch ──────────────────────────────────
-        // Encoding contract (in sync with `lower.zig`):
-        //   slot[extra] = literal-kind discriminant
-        //     0 = null
-        //     1 = false
-        //     2 = true
-        //     3 = int   (slot[extra+1] = lo32, slot[extra+2] = hi32)
-        //     4 = float (slot[extra+1] = lo32, slot[extra+2] = hi32)
-        //     5 = string (slot[extra+1] = offset, slot[extra+2] = len)
         .load_const => {
             const slots = ir_obj.extra_data.items;
-            const tag = slots[node.extra];
-            switch (tag) {
-                0 => try push(instructions, source_map, .push_null, .{ .none = {} }, node, allocator),
-                1 => try push(instructions, source_map, .push_bool, .{ .bool = false }, node, allocator),
-                2 => try push(instructions, source_map, .push_bool, .{ .bool = true }, node, allocator),
-                3 => {
+            const kind: ir.LiteralKind = @enumFromInt(slots[node.extra]);
+            switch (kind) {
+                .null_val => try push(instructions, source_map, .push_null, .{ .none = {} }, node, allocator),
+                .false_val => try push(instructions, source_map, .push_bool, .{ .bool = false }, node, allocator),
+                .true_val => try push(instructions, source_map, .push_bool, .{ .bool = true }, node, allocator),
+                .int => {
                     const lo: u64 = slots[node.extra + 1];
                     const hi: u64 = slots[node.extra + 2];
                     const u: u64 = lo | (hi << 32);
                     const n: i64 = @bitCast(u);
                     try push(instructions, source_map, .push_int, .{ .int = n }, node, allocator);
                 },
-                4 => {
+                .float => {
                     const lo: u64 = slots[node.extra + 1];
                     const hi: u64 = slots[node.extra + 2];
                     const u: u64 = lo | (hi << 32);
                     const f: f64 = @bitCast(u);
                     try push(instructions, source_map, .push_float, .{ .float = f }, node, allocator);
                 },
-                5 => {
+                .string => {
                     const offset: u32 = slots[node.extra + 1];
                     const len: u32 = slots[node.extra + 2];
                     try push(
@@ -154,7 +145,6 @@ fn emitNode(
                         allocator,
                     );
                 },
-                else => return error.NewCompilerNotImplemented,
             }
         },
 
@@ -171,24 +161,7 @@ fn emitNode(
 
         .neg => try push(instructions, source_map, .negate, .{ .none = {} }, node, allocator),
 
-        .not => {
-            // Legacy lowers `not` as a zero-arg builtin call. Match
-            // VM-semantics by emitting the same bytecode shape — the
-            // VM reads `BuiltinId.not_` and runs the builtin
-            // (a single-value boolean negation). Plan §1.2: same
-            // output stream + same error kinds, not a bytecode-shape
-            // match — but reusing the legacy bytecode keeps the
-            // VM-side identical and preserves the path-broken
-            // bookkeeping inside `breaksPath`.
-            try push(
-                instructions,
-                source_map,
-                .call_builtin,
-                .{ .index = @intFromEnum(types_mod.BuiltinId.not_) },
-                node,
-                allocator,
-            );
-        },
+        .not => try push(instructions, source_map, .not, .{ .none = {} }, node, allocator),
 
         .call_builtin => {
             // Category 1 hits this only for `type` (the brief assigns

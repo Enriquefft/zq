@@ -558,6 +558,17 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| compiler_snapshots_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(compiler_snapshots_tests).step);
 
+    // Leak regression for the new compiler's external_var_ids path.
+    const new_compile_leak_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/compile_leak_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    new_compile_leak_mod.addImport("query", query_module);
+    const new_compile_leak_tests = b.addTest(.{ .root_module = new_compile_leak_mod });
+    if (shim_build_step) |step| new_compile_leak_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(new_compile_leak_tests).step);
+
     // ── vm-equiv (NOT in test_step) ───────────────────────────────────────
     // VM-equivalence harness for Phase 2R Cluster A R3 (scaffold).
     // Compiles each fixture via legacy AND new backends; Phase 6 SKIPs all
@@ -572,13 +583,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Reaches the legacy backend via `query.CompiledQuery.compileLegacy`.
-    // The new-backend dispatch will route through `compiler.compile()` once
-    // Cluster B resolves the build-runner duplicate-import issue (importing
-    // `compiler` directly here currently duplicates the module in the test
-    // binary's dep graph). See header comment in
-    // `tests/compiler/vm_equiv.zig`.
     vm_equiv_mod.addImport("query", query_module);
+    vm_equiv_mod.addImport("parser", parser_module);
+    vm_equiv_mod.addImport("output", output_module);
+    vm_equiv_mod.addImport("types", types_module);
     const vm_equiv_exe = b.addExecutable(.{
         .name = "zq-vm-equiv",
         .root_module = vm_equiv_mod,

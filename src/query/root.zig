@@ -111,13 +111,11 @@ pub const CompiledQuery = struct {
         }
     }
 
-    /// Always-new compile path. Re-exported here (in addition to the
-    /// dispatcher) so test binaries — the vm-equiv harness in
-    /// particular — can invoke the new backend through the `query`
-    /// module without importing `compiler` directly. That avoids the
-    /// Zig 0.15.2 build-runner duplicate-module constraint Cluster A
-    /// hit in Phase 6 (handoff issue #1) and keeps the dispatch
-    /// surface single-rooted.
+    /// Always-new compile path. Re-exported so test binaries — the
+    /// vm-equiv harness in particular — invoke the new backend through
+    /// the `query` module without importing `compiler` directly, which
+    /// keeps the dispatch surface single-rooted under the Zig 0.15.2
+    /// build-runner's duplicate-module constraint.
     pub fn compileNew(
         src: []const u8,
         opts: Opts,
