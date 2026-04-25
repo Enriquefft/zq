@@ -1,0 +1,4 @@
+# source: join("-")
+# SemOp
+call_builtin("join") @0..9
+  load_const("-") @5..8

@@ -1,0 +1,4 @@
+# source: sort_by(.k)
+# SemOp
+call_builtin("sort_by") @0..11
+  load_field("k") @8..10

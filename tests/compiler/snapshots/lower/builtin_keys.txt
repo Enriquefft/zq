@@ -1,0 +1,3 @@
+# source: keys
+# SemOp
+call_builtin("keys") @0..4

@@ -1,0 +1,6 @@
+# source: map_values(.+1)
+# SemOp
+call_builtin("map_values") @0..15
+  arith(add) @11..14
+    identity @11..12
+    load_const(1) @13..14

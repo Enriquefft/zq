@@ -88,6 +88,20 @@ const FIXTURES = [_]Fixture{
     .{ .name = "destructure_object", .expected = @embedFile("snapshots/lower/destructure_object.txt") },
     .{ .name = "destructure_object_shorthand", .expected = @embedFile("snapshots/lower/destructure_object_shorthand.txt") },
     .{ .name = "alt_bind", .expected = @embedFile("snapshots/lower/alt_bind.txt") },
+    // ── Cat-10 builtin call snapshots — one per IR shape ──────────
+    .{ .name = "builtin_length", .expected = @embedFile("snapshots/lower/builtin_length.txt") },
+    .{ .name = "builtin_keys", .expected = @embedFile("snapshots/lower/builtin_keys.txt") },
+    .{ .name = "builtin_arrays", .expected = @embedFile("snapshots/lower/builtin_arrays.txt") },
+    .{ .name = "builtin_now", .expected = @embedFile("snapshots/lower/builtin_now.txt") },
+    .{ .name = "builtin_split", .expected = @embedFile("snapshots/lower/builtin_split.txt") },
+    .{ .name = "builtin_join", .expected = @embedFile("snapshots/lower/builtin_join.txt") },
+    .{ .name = "builtin_has", .expected = @embedFile("snapshots/lower/builtin_has.txt") },
+    .{ .name = "builtin_flatten1", .expected = @embedFile("snapshots/lower/builtin_flatten1.txt") },
+    .{ .name = "builtin_sort_by", .expected = @embedFile("snapshots/lower/builtin_sort_by.txt") },
+    .{ .name = "builtin_map_values", .expected = @embedFile("snapshots/lower/builtin_map_values.txt") },
+    .{ .name = "builtin_pow", .expected = @embedFile("snapshots/lower/builtin_pow.txt") },
+    .{ .name = "builtin_setpath", .expected = @embedFile("snapshots/lower/builtin_setpath.txt") },
+    .{ .name = "builtin_fma", .expected = @embedFile("snapshots/lower/builtin_fma.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

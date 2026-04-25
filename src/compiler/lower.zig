@@ -243,14 +243,31 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
 
         // ── Static-key field access `.foo` / `.["foo"]` (category 2) ─
         // Bare-identifier zero-arg builtins (e.g. `utf8bytelength`,
-        // `mktime`) reach the AST as `field_access` because the AST
-        // parser uses a narrower zero-arg-builtin list than the legacy
-        // compiler. A leading `.` in the source span is the structural
-        // marker that this is a true field access; absent that, defer
-        // to legacy (cat-10 owns the wider builtin alphabet).
+        // `mktime`, `arrays`, `strings`) reach the AST as `field_access`
+        // because the AST parser uses a narrower zero-arg-builtin list
+        // than the legacy compiler. A leading `.` in the source span is
+        // the structural marker that distinguishes a true field access
+        // from a bare-ident builtin reference; absent that, route through
+        // the cat-10 builtin classifier — the legacy compiler dispatches
+        // the same names through `zeroArgBuiltinId` at
+        // `src/query/src/compiler.zig:5771`.
         .field_access => |fa| {
             const is_dot_field = sp.start < ctx.src.len and ctx.src[sp.start] == '.';
-            if (!is_dot_field) return error.NewCompilerNotImplemented;
+            if (!is_dot_field) {
+                // Bare ident — try cat-10's classifier. If the name is a
+                // known zero-arg builtin, lower as a `call_builtin` leaf.
+                // Otherwise defer to legacy.
+                if (classifyBuiltin(fa.name, 0) == .zero_arg) {
+                    const extra_idx_b = try ctx.internString(fa.name);
+                    return ctx.pushNode(.{
+                        .op = .call_builtin,
+                        .extra = extra_idx_b,
+                        .src_start = sp.start,
+                        .src_len = sp.len,
+                    });
+                }
+                return error.NewCompilerNotImplemented;
+            }
             const extra_idx = try ctx.internString(fa.name);
             return ctx.pushNode(.{
                 .op = .load_field,
@@ -556,64 +573,14 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // brief). Other zero-arg builtins (`length`, `keys`, ...) are
         // category 10's responsibility. We accept here only the names
         // the brief lists.
-        .builtin_call => |bc| {
-            // ── path(expr) (category 6) ─────────────────────────────
-            // Single-arg `path()` lowers to a unary `path_begin` IR
-            // node wrapping the body. Emit produces the legacy
-            // `path_begin <body> path_end` bytecode pair (the
-            // `path_end` SemOp stays in the enum but is not produced
-            // by lowering — it appears only in bytecode).
-            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "path")) {
-                const body = try lowerNode(ctx, bc.args[0]);
-                return ctx.pushNode(.{
-                    .op = .path_begin,
-                    .children = .{ body, 0 },
-                    .src_start = sp.start,
-                    .src_len = sp.len,
-                });
-            }
-
-            if (bc.args.len == 0) {
-                // `not` is a logical op the brief explicitly assigns
-                // to category 1 (unary). The IR encodes it as the
-                // dedicated `not` op so the bytecode stays a single
-                // `not` instruction (no `call_builtin` overhead).
-                if (std.mem.eql(u8, bc.name, "not")) {
-                    // `not` consumes its current input — the parser
-                    // exposes it as a zero-arg builtin call (no
-                    // operand AST). The IR mirrors that: a SemOp
-                    // `not` with no children. Emit threads the
-                    // `current` value through the bytecode `not`
-                    // op directly.
-                    return ctx.pushNode(.{
-                        .op = .not,
-                        .src_start = sp.start,
-                        .src_len = sp.len,
-                    });
-                }
-
-                // `type` and other zero-arg builtins fall through to
-                // a generic `call_builtin` lowering that category 10
-                // will own. For now, emit `call_builtin` only for the
-                // category-1-relevant `type` — other builtins surface
-                // as NotImplemented so vm-equiv reports SKIP and the
-                // category-10 implementer fills them in.
-                if (std.mem.eql(u8, bc.name, "type")) {
-                    // Stash the builtin name in `string_buf` and
-                    // record `(offset, len)` in `extra_data`. The
-                    // encoding matches plan §1.3 row 5: a single
-                    // `extra` index pointing at the name pair.
-                    const extra_idx = try ctx.internString(bc.name);
-                    return ctx.pushNode(.{
-                        .op = .call_builtin,
-                        .extra = extra_idx,
-                        .src_start = sp.start,
-                        .src_len = sp.len,
-                    });
-                }
-            }
-            return error.NewCompilerNotImplemented;
-        },
+        // ── Builtin call (cat-10 owns the wider alphabet; cat-1 + cat-6
+        // already own `not`/`type`/`path` and route through the same
+        // classifier). The classifier dispatches by (name, arity) to one
+        // of five call-shape buckets: 0-arg / 1-arg-value / 1-arg-filter
+        // / 2-arg-math / 3-arg-math. Names outside the five buckets
+        // surface `NewCompilerNotImplemented` for the harness to SKIP
+        // (regex, generator-arg shapes, complex desugars).
+        .builtin_call => |bc| return lowerBuiltinCall(ctx, &bc, sp.start, sp.len),
 
         // ── Object constructor `{...}` (category 7) ──────────────────
         // Each AST `ObjectField` is lowered to a (key_idx, value_idx)
@@ -975,6 +942,304 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
 
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
+    }
+}
+
+// ─── Cat-10: builtin calls ──────────────────────────────────────────
+//
+// Category-10 covers the wider builtin alphabet (everything beyond
+// `not`/`type`/`path` already owned by earlier categories). The lowering
+// strategy groups builtins by call-shape so the IR + emission paths stay
+// shared across many names rather than per-builtin one-offs:
+//
+//   * `zero_arg`     — leaf `call_builtin(name)`. Emit as
+//                      `call_builtin(bid)`. Covers `length`, `keys`,
+//                      `keys_unsorted`, `values`, `empty`, `tostring`,
+//                      `tonumber`, math zero-args, etc.
+//   * `value_arg1`   — `<arg> ; call_builtin(bid)` (no save/restore).
+//                      Mirrors legacy `compileValueArgBuiltin1`'s
+//                      simple-no-comma path.
+//   * `filter_arg1`  — `save_input ; array_collect_start ; each ; <f> ;
+//                      yield_output ; array_collect_end ;
+//                      call_builtin(bid)`. Mirrors legacy
+//                      `compileFilterArgBuiltin`.
+//   * `math2`        — `save_input ; <a> ; restore_input ; save_input ;
+//                      <b> ; restore_input ; call_builtin(bid)`. Mirrors
+//                      legacy `compileTwoArgMath` / `compileSetpath`.
+//   * `math3`        — same as math2 with three save/restore cycles.
+//                      Mirrors legacy `compileThreeArgMath`.
+//
+// IR shape (single-source per plan §1.3 row 5: `call_builtin | span →
+// args + extra → fn id`):
+//   * `Node.extra` indexes into `extra_data`: 2 slots (offset, len) for
+//     the builtin name, decoded back through `string_buf`.
+//   * `Node.span_start/span_len` indexes into `extra_children`: each slot
+//     is the IR-node index of one positional argument, in source order.
+//
+// Builtins outside the call-shape buckets above (regex, generators with
+// commas, the desugar set: map/select/range/walk/INDEX/IN/JOIN/del/pick/
+// reduce/foreach/while/until/repeat/limit/first/last/with_entries/any/all/
+// isempty/in/contains/inside/indices/index/rindex/error/halt_error/debug/
+// skip/nth) surface `error.NewCompilerNotImplemented` for the harness to
+// SKIP and route through legacy at runtime. Those shapes use save/restore
+// bracketing patterns, per-arg fork trees, or hidden-var allocation that
+// don't reduce to a flat `call_builtin` SemOp; later phases will land
+// them as additional categories.
+pub const BuiltinClass = enum {
+    /// AST → unary `not` SemOp (cat-1).
+    not,
+    /// AST → unary `path_begin` SemOp (cat-6 — owns `path()`).
+    path,
+    /// 0-arg builtin → leaf `call_builtin(name)`.
+    zero_arg,
+    /// 1-arg value builtin (no save/restore around the arg).
+    value_arg1,
+    /// 1-arg filter-arg builtin (`map`-shaped: array_collect + each).
+    filter_arg1,
+    /// 2-arg math/path builtin (save/restore bracketed eval).
+    math2,
+    /// 3-arg math builtin (`fma`).
+    math3,
+    /// Names that lower-time cannot handle in this phase.
+    not_implemented,
+};
+
+/// Classify a builtin call by its (name, arity) tuple. The classifier is
+/// the single source of truth shared by lowering and emission — emit's
+/// `call_builtin` arm decides the bytecode pattern by re-running this
+/// classifier on the dumped name + IR span_len. Names not handled here
+/// surface `not_implemented` so the harness routes the query to legacy.
+pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
+    // Owned by other categories — early-out before consulting the tables.
+    if (arity == 0 and std.mem.eql(u8, name, "not")) return .not;
+    if (arity == 1 and std.mem.eql(u8, name, "path")) return .path;
+
+    if (arity == 0) {
+        if (isZeroArgBuiltin(name)) return .zero_arg;
+        return .not_implemented;
+    }
+    if (arity == 1 and isValueArg1Builtin(name)) return .value_arg1;
+    if (arity == 1 and isFilterArg1Builtin(name)) return .filter_arg1;
+    if (arity == 2 and isMath2Builtin(name)) return .math2;
+    if (arity == 3 and isMath3Builtin(name)) return .math3;
+    return .not_implemented;
+}
+
+/// Names accepted as zero-arg builtin calls. Mirrors legacy
+/// `zeroArgBuiltinId` (`src/query/src/compiler.zig:2749`) — every name
+/// whose 0-arg form maps to a single `call_builtin(bid)` instruction.
+/// Names with both 0-arg and N-arg forms (e.g. `add`, `flatten`) appear
+/// here AND in the appropriate higher-arity helper.
+fn isZeroArgBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "length") or
+        std.mem.eql(u8, name, "keys") or
+        std.mem.eql(u8, name, "keys_unsorted") or
+        std.mem.eql(u8, name, "values") or
+        std.mem.eql(u8, name, "type") or
+        std.mem.eql(u8, name, "empty") or
+        std.mem.eql(u8, name, "tostring") or
+        std.mem.eql(u8, name, "tonumber") or
+        std.mem.eql(u8, name, "add") or
+        std.mem.eql(u8, name, "sort") or
+        std.mem.eql(u8, name, "reverse") or
+        std.mem.eql(u8, name, "flatten") or
+        std.mem.eql(u8, name, "min") or
+        std.mem.eql(u8, name, "max") or
+        std.mem.eql(u8, name, "to_entries") or
+        std.mem.eql(u8, name, "from_entries") or
+        std.mem.eql(u8, name, "unique") or
+        std.mem.eql(u8, name, "paths") or
+        std.mem.eql(u8, name, "leaf_paths") or
+        std.mem.eql(u8, name, "tojson") or
+        std.mem.eql(u8, name, "fromjson") or
+        std.mem.eql(u8, name, "transpose") or
+        std.mem.eql(u8, name, "ascii_downcase") or
+        std.mem.eql(u8, name, "ascii_upcase") or
+        std.mem.eql(u8, name, "ascii") or
+        std.mem.eql(u8, name, "explode") or
+        std.mem.eql(u8, name, "implode") or
+        std.mem.eql(u8, name, "abs") or
+        std.mem.eql(u8, name, "floor") or
+        std.mem.eql(u8, name, "ceil") or
+        std.mem.eql(u8, name, "round") or
+        std.mem.eql(u8, name, "sqrt") or
+        std.mem.eql(u8, name, "fabs") or
+        std.mem.eql(u8, name, "nan") or
+        std.mem.eql(u8, name, "infinite") or
+        std.mem.eql(u8, name, "isinfinite") or
+        std.mem.eql(u8, name, "isnan") or
+        std.mem.eql(u8, name, "isnormal") or
+        std.mem.eql(u8, name, "have_decnum") or
+        std.mem.eql(u8, name, "have_literal_numbers") or
+        std.mem.eql(u8, name, "exp") or
+        std.mem.eql(u8, name, "exp2") or
+        std.mem.eql(u8, name, "exp10") or
+        std.mem.eql(u8, name, "log") or
+        std.mem.eql(u8, name, "log2") or
+        std.mem.eql(u8, name, "log10") or
+        std.mem.eql(u8, name, "cbrt") or
+        std.mem.eql(u8, name, "sin") or
+        std.mem.eql(u8, name, "cos") or
+        std.mem.eql(u8, name, "tan") or
+        std.mem.eql(u8, name, "asin") or
+        std.mem.eql(u8, name, "acos") or
+        std.mem.eql(u8, name, "atan") or
+        std.mem.eql(u8, name, "rint") or
+        std.mem.eql(u8, name, "nearbyint") or
+        std.mem.eql(u8, name, "trunc") or
+        std.mem.eql(u8, name, "significand") or
+        std.mem.eql(u8, name, "logb") or
+        std.mem.eql(u8, name, "j0") or
+        std.mem.eql(u8, name, "j1") or
+        std.mem.eql(u8, name, "lgamma") or
+        std.mem.eql(u8, name, "tgamma") or
+        std.mem.eql(u8, name, "arrays") or
+        std.mem.eql(u8, name, "objects") or
+        std.mem.eql(u8, name, "strings") or
+        std.mem.eql(u8, name, "numbers") or
+        std.mem.eql(u8, name, "booleans") or
+        std.mem.eql(u8, name, "nulls") or
+        std.mem.eql(u8, name, "scalars") or
+        std.mem.eql(u8, name, "normals") or
+        std.mem.eql(u8, name, "iterables") or
+        std.mem.eql(u8, name, "builtins") or
+        std.mem.eql(u8, name, "stderr") or
+        std.mem.eql(u8, name, "input") or
+        std.mem.eql(u8, name, "inputs") or
+        std.mem.eql(u8, name, "env") or
+        std.mem.eql(u8, name, "halt") or
+        std.mem.eql(u8, name, "toboolean") or
+        std.mem.eql(u8, name, "utf8bytelength") or
+        std.mem.eql(u8, name, "trim") or
+        std.mem.eql(u8, name, "ltrim") or
+        std.mem.eql(u8, name, "rtrim") or
+        std.mem.eql(u8, name, "now") or
+        std.mem.eql(u8, name, "gmtime") or
+        std.mem.eql(u8, name, "mktime") or
+        std.mem.eql(u8, name, "todate") or
+        std.mem.eql(u8, name, "fromdate") or
+        std.mem.eql(u8, name, "todateiso8601") or
+        std.mem.eql(u8, name, "fromdateiso8601");
+}
+
+/// Names accepted as 1-arg value-arg builtins. Mirrors the
+/// `compileValueArgBuiltin1` dispatch sites in
+/// `src/query/src/compiler.zig:5839-5908`. Excludes the regex family
+/// (`test`, `match`, `sub`, `gsub`, `capture`, `scan`, `splits`) — those
+/// require regex-pool packing into `call_builtin`'s operand and surface
+/// as `not_implemented` until a dedicated regex category lands.
+fn isValueArg1Builtin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "split") or
+        std.mem.eql(u8, name, "join") or
+        std.mem.eql(u8, name, "startswith") or
+        std.mem.eql(u8, name, "endswith") or
+        std.mem.eql(u8, name, "ltrimstr") or
+        std.mem.eql(u8, name, "rtrimstr") or
+        std.mem.eql(u8, name, "trimstr") or
+        std.mem.eql(u8, name, "getpath") or
+        std.mem.eql(u8, name, "delpaths") or
+        std.mem.eql(u8, name, "bsearch") or
+        std.mem.eql(u8, name, "strftime") or
+        std.mem.eql(u8, name, "strptime") or
+        std.mem.eql(u8, name, "strflocaltime") or
+        std.mem.eql(u8, name, "flatten") or
+        std.mem.eql(u8, name, "has");
+}
+
+/// Names accepted as 1-arg filter-arg builtins. Mirrors legacy
+/// `compileFilterArgBuiltin` callers and `compileMapValues`.
+fn isFilterArg1Builtin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "sort_by") or
+        std.mem.eql(u8, name, "group_by") or
+        std.mem.eql(u8, name, "min_by") or
+        std.mem.eql(u8, name, "max_by") or
+        std.mem.eql(u8, name, "unique_by") or
+        std.mem.eql(u8, name, "map_values");
+}
+
+/// Names accepted as 2-arg math/path builtins (legacy
+/// `compileTwoArgMath` + `compileSetpath`).
+fn isMath2Builtin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "pow") or
+        std.mem.eql(u8, name, "atan2") or
+        std.mem.eql(u8, name, "remainder") or
+        std.mem.eql(u8, name, "hypot") or
+        std.mem.eql(u8, name, "scalb") or
+        std.mem.eql(u8, name, "scalbln") or
+        std.mem.eql(u8, name, "ldexp") or
+        std.mem.eql(u8, name, "drem") or
+        std.mem.eql(u8, name, "setpath");
+}
+
+/// Names accepted as 3-arg math builtins (only `fma` today).
+fn isMath3Builtin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "fma");
+}
+
+/// Lower a `BuiltinCall` AST node into the IR. Walks the (name, arity)
+/// classifier, lowers each arg first (post-order), then emits a single
+/// SemOp with the args wired into `extra_children` and the name interned
+/// into `string_buf` via `extra_data`. The class is rediscovered at emit
+/// time from name + span_len — no extra discriminant slot.
+fn lowerBuiltinCall(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    const class = classifyBuiltin(bc.name, bc.args.len);
+    switch (class) {
+        .not => return ctx.pushNode(.{
+            .op = .not,
+            .src_start = src_start,
+            .src_len = src_len,
+        }),
+        .path => {
+            const body = try lowerNode(ctx, bc.args[0]);
+            return ctx.pushNode(.{
+                .op = .path_begin,
+                .children = .{ body, 0 },
+                .src_start = src_start,
+                .src_len = src_len,
+            });
+        },
+        .zero_arg => {
+            const extra_idx = try ctx.internString(bc.name);
+            return ctx.pushNode(.{
+                .op = .call_builtin,
+                .extra = extra_idx,
+                .src_start = src_start,
+                .src_len = src_len,
+            });
+        },
+        .value_arg1, .filter_arg1, .math2, .math3 => {
+            // Lower every arg first into a scratch buffer — recursive
+            // lowering of nested calls (or ctors) writes to
+            // `extra_children`, so building our span via direct append
+            // would interleave foreign entries. Bulk-append at the end
+            // keeps the parent's `(span_start, span_len)` slice
+            // contiguous (same pattern as `obj_ctor` / `arr_ctor`).
+            const alloc = ctx.arena.allocator();
+            var arg_idxs: std.ArrayListUnmanaged(u32) = .{};
+            defer arg_idxs.deinit(alloc);
+            for (bc.args) |arg_ast| {
+                const arg_idx = try lowerNode(ctx, arg_ast);
+                try arg_idxs.append(alloc, arg_idx);
+            }
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, arg_idxs.items);
+            const span_len: u32 = @intCast(arg_idxs.items.len);
+            const extra_idx = try ctx.internString(bc.name);
+            return ctx.pushNode(.{
+                .op = .call_builtin,
+                .span_start = span_start,
+                .span_len = span_len,
+                .extra = extra_idx,
+                .src_start = src_start,
+                .src_len = src_len,
+            });
+        },
+        .not_implemented => return error.NewCompilerNotImplemented,
     }
 }
 

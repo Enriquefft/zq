@@ -18,6 +18,7 @@ const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
 const ir = @import("ir.zig");
 const ctypes = @import("types.zig");
+const lower = @import("lower.zig");
 
 /// Errors surfaced by emission. `OutOfMemory` from arena/instruction
 /// allocs; `NewCompilerNotImplemented` for ops outside the supported
@@ -170,25 +171,27 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
 
         .not => try em.pushInstr(.not, .{ .none = {} }, node),
 
-        .call_builtin => {
-            // Category 1 hits this only for `type` (the brief assigns
-            // `type` to category 1 alongside `not`). Other builtins are
-            // category 10's responsibility.
-            const slots = em.ir_obj.extra_data.items;
-            const offset: u32 = slots[node.extra];
-            const len: u32 = slots[node.extra + 1];
-            const name = em.ir_obj.string_buf.items[offset .. offset + len];
-
-            const bid: types_mod.BuiltinId = if (std.mem.eql(u8, name, "type"))
-                .type_
-            else
-                return error.NewCompilerNotImplemented;
-            try em.pushInstr(
-                .call_builtin,
-                .{ .index = @intFromEnum(bid) },
-                node,
-            );
-        },
+        // Category-10 builtin call. The IR carries the builtin name
+        // (interned in `string_buf` via `extra_data[node.extra..+2]`)
+        // plus 0..N argument children in `(span_start, span_len)`. The
+        // emitter looks up the `BuiltinId` from the name + classifies
+        // the call shape using the same (name, arity) classifier the
+        // lowerer used — single source of truth, plan §1.3 row 5.
+        //
+        // Five emission shapes (matching legacy):
+        //   * 0-arg          → `call_builtin(bid)`
+        //   * value_arg1     → `<arg> ; call_builtin(bid)` (no save/restore)
+        //   * filter_arg1    → `save_input ; array_collect_start ; each ;
+        //                       <f> ; yield_output ; array_collect_end ;
+        //                       call_builtin(bid)` (mirrors
+        //                       `compileFilterArgBuiltin`)
+        //   * math2          → save+arg+restore (twice) ; call_builtin(bid)
+        //                       (mirrors `compileTwoArgMath` /
+        //                       `compileSetpath`)
+        //   * math3          → save+arg+restore (three times) ;
+        //                       call_builtin(bid) (mirrors
+        //                       `compileThreeArgMath`)
+        .call_builtin => try emitCallBuiltin(em, node),
 
         // ── Category 2 ──────────────────────────────────────────────
         .load_field => {
@@ -1664,4 +1667,273 @@ fn emitGeneralAlt(
 
     try em.pushInstr(.pipe, .{ .none = {} }, node);
     try em.pushInstr(.load_variable, .{ .index = acc_var }, node);
+}
+
+// ── Cat-10: builtin call emission ───────────────────────────────────
+//
+// The IR carries the builtin name and argument count; the emitter
+// re-classifies via `lower.classifyBuiltin` (single source of truth)
+// and dispatches to the corresponding bytecode shape. Each shape
+// mirrors a specific legacy compile* helper:
+//   * 0-arg          → direct `call_builtin(bid)`
+//   * value_arg1     → `compileValueArgBuiltin1` simple-no-comma path
+//   * filter_arg1    → `compileFilterArgBuiltin`
+//   * math2          → `compileTwoArgMath` / `compileSetpath`
+//   * math3          → `compileThreeArgMath`
+//
+// Every shape ends with `call_builtin(bid)` — the operand is the
+// `BuiltinId` integer; non-regex builtins ignore the upper bits of the
+// operand (regex builtins pack pool index + n-flag there, and that
+// family lands in a later category).
+fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
+    const slots = em.ir_obj.extra_data.items;
+    const offset: u32 = slots[node.extra];
+    const len: u32 = slots[node.extra + 1];
+    const name = em.ir_obj.string_buf.items[offset .. offset + len];
+
+    const arity: usize = node.span_len;
+    const class = lower.classifyBuiltin(name, arity);
+
+    const bid = nameToBuiltinId(name, arity) orelse
+        return error.NewCompilerNotImplemented;
+
+    switch (class) {
+        .zero_arg => {
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
+        },
+        .value_arg1 => {
+            // `<arg> ; call_builtin(bid)` — no save/restore, matches
+            // legacy `compileValueArgBuiltin1` simple-no-comma path.
+            // The argument expression's own emission may push to the
+            // value stack; legacy semantics expect that result to be
+            // consumed by the builtin (e.g. `split(",")` pops the
+            // pattern off the stack).
+            const arg_idx = em.ir_obj.extra_children.items[node.span_start];
+            try emitNode(em, arg_idx);
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
+        },
+        .filter_arg1 => {
+            // `save_input ; array_collect_start ; each ; <f> ;
+            //  yield_output ; array_collect_end ; call_builtin(bid)`.
+            // Mirrors legacy `compileFilterArgBuiltin`
+            // (`compiler.zig:4472`) — collect every iteration's filter
+            // result into a fresh array, then hand the array + original
+            // input to the builtin which uses the array as the
+            // sort/group/min/max key set. The leading `save_input`
+            // preserves the original array on the if_stack so the
+            // builtin can pair keys with elements.
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            const start_pos = em.instructions.items.len;
+            try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+            try em.pushInstr(.each, .{ .none = {} }, node);
+            const arg_idx = em.ir_obj.extra_children.items[node.span_start];
+            try emitNode(em, arg_idx);
+            try em.pushInstr(.yield_output, .{ .none = {} }, node);
+            const end_ip: u32 = @intCast(em.instructions.items.len);
+            try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+            em.instructions.items[start_pos].operand = .{ .index = end_ip };
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
+        },
+        .math2 => {
+            // `save_input ; <a> ; restore_input ; save_input ; <b> ;
+            //  restore_input ; call_builtin(bid)`. Mirrors legacy
+            //  `compileTwoArgMath` (`compiler.zig:3707`) and
+            //  `compileSetpath` (`compiler.zig:3676`).
+            const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, args[0]);
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, args[1]);
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
+        },
+        .math3 => {
+            // Same as math2 but with three save/restore cycles.
+            // Mirrors legacy `compileThreeArgMath` (`compiler.zig:3867`).
+            const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, args[0]);
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, args[1]);
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, args[2]);
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
+        },
+        // The lowerer never produces these classes through `call_builtin`
+        // (it routes them to dedicated SemOps), so emit unreachable —
+        // hitting them indicates an upstream classifier drift.
+        .not, .path => unreachable,
+        .not_implemented => return error.NewCompilerNotImplemented,
+    }
+}
+
+/// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single
+/// source of truth shared by emit + the cat-10 classifier — every entry
+/// here corresponds to a class arm in `lower.classifyBuiltin`. The
+/// (name, arity) tuple disambiguates overloaded names (e.g. `flatten`
+/// has both 0-arg and 1-arg forms mapping to different ids).
+fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
+    if (arity == 0) {
+        if (std.mem.eql(u8, name, "length")) return .length;
+        if (std.mem.eql(u8, name, "keys")) return .keys;
+        if (std.mem.eql(u8, name, "keys_unsorted")) return .keys_unsorted;
+        if (std.mem.eql(u8, name, "values")) return .values;
+        if (std.mem.eql(u8, name, "type")) return .type_;
+        if (std.mem.eql(u8, name, "empty")) return .empty;
+        if (std.mem.eql(u8, name, "tostring")) return .tostring;
+        if (std.mem.eql(u8, name, "tonumber")) return .tonumber;
+        if (std.mem.eql(u8, name, "add")) return .add;
+        if (std.mem.eql(u8, name, "sort")) return .sort;
+        if (std.mem.eql(u8, name, "reverse")) return .reverse;
+        if (std.mem.eql(u8, name, "flatten")) return .flatten;
+        if (std.mem.eql(u8, name, "min")) return .min;
+        if (std.mem.eql(u8, name, "max")) return .max;
+        if (std.mem.eql(u8, name, "to_entries")) return .to_entries;
+        if (std.mem.eql(u8, name, "from_entries")) return .from_entries;
+        if (std.mem.eql(u8, name, "unique")) return .unique;
+        if (std.mem.eql(u8, name, "paths")) return .paths;
+        if (std.mem.eql(u8, name, "leaf_paths")) return .leaf_paths;
+        if (std.mem.eql(u8, name, "tojson")) return .tojson;
+        if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
+        if (std.mem.eql(u8, name, "transpose")) return .transpose_;
+        if (std.mem.eql(u8, name, "ascii_downcase")) return .ascii_downcase;
+        if (std.mem.eql(u8, name, "ascii_upcase")) return .ascii_upcase;
+        if (std.mem.eql(u8, name, "ascii")) return .ascii_;
+        if (std.mem.eql(u8, name, "explode")) return .explode_;
+        if (std.mem.eql(u8, name, "implode")) return .implode_;
+        if (std.mem.eql(u8, name, "abs")) return .abs;
+        if (std.mem.eql(u8, name, "floor")) return .floor_;
+        if (std.mem.eql(u8, name, "ceil")) return .ceil_;
+        if (std.mem.eql(u8, name, "round")) return .round_;
+        if (std.mem.eql(u8, name, "sqrt")) return .sqrt_;
+        if (std.mem.eql(u8, name, "fabs")) return .fabs_;
+        if (std.mem.eql(u8, name, "nan")) return .nan_;
+        if (std.mem.eql(u8, name, "infinite")) return .infinite_;
+        if (std.mem.eql(u8, name, "isinfinite")) return .isinfinite_;
+        if (std.mem.eql(u8, name, "isnan")) return .isnan_;
+        if (std.mem.eql(u8, name, "isnormal")) return .isnormal_;
+        if (std.mem.eql(u8, name, "have_decnum")) return .have_decnum_;
+        if (std.mem.eql(u8, name, "have_literal_numbers")) return .have_decnum_;
+        if (std.mem.eql(u8, name, "exp")) return .exp_;
+        if (std.mem.eql(u8, name, "exp2")) return .exp2_;
+        if (std.mem.eql(u8, name, "exp10")) return .exp10_;
+        if (std.mem.eql(u8, name, "log")) return .log_;
+        if (std.mem.eql(u8, name, "log2")) return .log2_;
+        if (std.mem.eql(u8, name, "log10")) return .log10_;
+        if (std.mem.eql(u8, name, "cbrt")) return .cbrt_;
+        if (std.mem.eql(u8, name, "sin")) return .sin_;
+        if (std.mem.eql(u8, name, "cos")) return .cos_;
+        if (std.mem.eql(u8, name, "tan")) return .tan_;
+        if (std.mem.eql(u8, name, "asin")) return .asin_;
+        if (std.mem.eql(u8, name, "acos")) return .acos_;
+        if (std.mem.eql(u8, name, "atan")) return .atan_;
+        if (std.mem.eql(u8, name, "rint")) return .rint_;
+        if (std.mem.eql(u8, name, "nearbyint")) return .nearbyint_;
+        if (std.mem.eql(u8, name, "trunc")) return .trunc_;
+        if (std.mem.eql(u8, name, "significand")) return .significand_;
+        if (std.mem.eql(u8, name, "logb")) return .logb_;
+        if (std.mem.eql(u8, name, "j0")) return .j0_;
+        if (std.mem.eql(u8, name, "j1")) return .j1_;
+        if (std.mem.eql(u8, name, "lgamma")) return .lgamma_;
+        if (std.mem.eql(u8, name, "tgamma")) return .tgamma_;
+        if (std.mem.eql(u8, name, "arrays")) return .arrays_;
+        if (std.mem.eql(u8, name, "objects")) return .objects_;
+        if (std.mem.eql(u8, name, "strings")) return .strings_;
+        if (std.mem.eql(u8, name, "numbers")) return .numbers_;
+        if (std.mem.eql(u8, name, "booleans")) return .booleans_;
+        if (std.mem.eql(u8, name, "nulls")) return .nulls_;
+        if (std.mem.eql(u8, name, "scalars")) return .scalars_;
+        if (std.mem.eql(u8, name, "normals")) return .normals_;
+        if (std.mem.eql(u8, name, "iterables")) return .iterables_;
+        if (std.mem.eql(u8, name, "builtins")) return .builtins_;
+        if (std.mem.eql(u8, name, "stderr")) return .stderr_;
+        if (std.mem.eql(u8, name, "input")) return .input_;
+        if (std.mem.eql(u8, name, "inputs")) return .inputs_;
+        if (std.mem.eql(u8, name, "env")) return .env_;
+        if (std.mem.eql(u8, name, "halt")) return .halt_;
+        if (std.mem.eql(u8, name, "toboolean")) return .toboolean;
+        if (std.mem.eql(u8, name, "utf8bytelength")) return .utf8bytelength;
+        if (std.mem.eql(u8, name, "trim")) return .trim_;
+        if (std.mem.eql(u8, name, "ltrim")) return .ltrim_;
+        if (std.mem.eql(u8, name, "rtrim")) return .rtrim_;
+        if (std.mem.eql(u8, name, "now")) return .now_;
+        if (std.mem.eql(u8, name, "gmtime")) return .gmtime_;
+        if (std.mem.eql(u8, name, "mktime")) return .mktime_;
+        if (std.mem.eql(u8, name, "todate")) return .todate_;
+        if (std.mem.eql(u8, name, "fromdate")) return .fromdate_;
+        if (std.mem.eql(u8, name, "todateiso8601")) return .todateiso8601_;
+        if (std.mem.eql(u8, name, "fromdateiso8601")) return .fromdateiso8601_;
+        return null;
+    }
+
+    if (arity == 1) {
+        if (std.mem.eql(u8, name, "split")) return .split_;
+        if (std.mem.eql(u8, name, "join")) return .join_;
+        if (std.mem.eql(u8, name, "startswith")) return .startswith_;
+        if (std.mem.eql(u8, name, "endswith")) return .endswith_;
+        if (std.mem.eql(u8, name, "ltrimstr")) return .ltrimstr_;
+        if (std.mem.eql(u8, name, "rtrimstr")) return .rtrimstr_;
+        if (std.mem.eql(u8, name, "trimstr")) return .trimstr_;
+        if (std.mem.eql(u8, name, "getpath")) return .getpath;
+        if (std.mem.eql(u8, name, "delpaths")) return .delpaths;
+        if (std.mem.eql(u8, name, "bsearch")) return .bsearch_;
+        if (std.mem.eql(u8, name, "strftime")) return .strftime_;
+        if (std.mem.eql(u8, name, "strptime")) return .strptime_;
+        if (std.mem.eql(u8, name, "strflocaltime")) return .strflocaltime_;
+        if (std.mem.eql(u8, name, "flatten")) return .flatten_n;
+        if (std.mem.eql(u8, name, "has")) return .has;
+
+        // Filter-arg builtins.
+        if (std.mem.eql(u8, name, "sort_by")) return .sort_by;
+        if (std.mem.eql(u8, name, "group_by")) return .group_by;
+        if (std.mem.eql(u8, name, "min_by")) return .min_by;
+        if (std.mem.eql(u8, name, "max_by")) return .max_by;
+        if (std.mem.eql(u8, name, "unique_by")) return .unique_by;
+        if (std.mem.eql(u8, name, "map_values")) return .map_values_;
+        return null;
+    }
+
+    if (arity == 2) {
+        if (std.mem.eql(u8, name, "pow")) return .pow_;
+        if (std.mem.eql(u8, name, "atan2")) return .atan2_;
+        if (std.mem.eql(u8, name, "remainder")) return .remainder_;
+        if (std.mem.eql(u8, name, "hypot")) return .hypot_;
+        if (std.mem.eql(u8, name, "scalb")) return .scalb_;
+        if (std.mem.eql(u8, name, "scalbln")) return .scalbln_;
+        if (std.mem.eql(u8, name, "ldexp")) return .ldexp_;
+        if (std.mem.eql(u8, name, "drem")) return .drem_;
+        if (std.mem.eql(u8, name, "setpath")) return .setpath;
+        return null;
+    }
+
+    if (arity == 3) {
+        if (std.mem.eql(u8, name, "fma")) return .fma_;
+        return null;
+    }
+
+    return null;
 }

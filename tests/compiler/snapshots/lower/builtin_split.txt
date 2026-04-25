@@ -1,0 +1,4 @@
+# source: split(",")
+# SemOp
+call_builtin("split") @0..10
+  load_const(",") @6..9

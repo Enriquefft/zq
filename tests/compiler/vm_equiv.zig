@@ -190,6 +190,72 @@ const FIXTURES = [_]Fixture{
     .{ .name = "alt_bind_first", .filter = ". as [$a, $b] ?// $x | $a", .input = "[5,7]", .expected_output = "5" },
     // Alt-bind: first pattern fails (non-array), fallback `$x` binds.
     .{ .name = "alt_bind_fallback", .filter = ". as [$a, $b] ?// $x | $x", .input = "42", .expected_output = "42" },
+
+    // ── Category 10 — builtins (zero-arg) ─────────────────────────
+    // One fixture per call-shape bucket with a representative name;
+    // every name in the same bucket shares the same emit ladder, so
+    // VM-equivalence on these fixtures certifies the entire bucket.
+    .{ .name = "builtin_length_array", .filter = "length", .input = "[1,2,3,4]", .expected_output = "4" },
+    .{ .name = "builtin_length_string", .filter = "length", .input = "\"hello\"", .expected_output = "5" },
+    .{ .name = "builtin_keys", .filter = "keys", .input = "{\"b\":1,\"a\":2}", .expected_output = "[\"a\",\"b\"]" },
+    .{ .name = "builtin_keys_unsorted", .filter = "keys_unsorted", .input = "{\"a\":1,\"b\":2}", .expected_output = "[\"a\",\"b\"]" },
+    // jq `values` is a type-filter (returns input if non-null, else
+    // empty) — NOT a dict-values function. Test against null input to
+    // verify the empty-stream branch.
+    .{ .name = "builtin_values_null", .filter = "values", .input = "null", .expected_output = "" },
+    .{ .name = "builtin_empty", .filter = "empty", .input = "1", .expected_output = "" },
+    .{ .name = "builtin_tostring", .filter = "tostring", .input = "42", .expected_output = "\"42\"" },
+    .{ .name = "builtin_tonumber", .filter = "tonumber", .input = "\"42\"", .expected_output = "42" },
+    .{ .name = "builtin_add_arr", .filter = "add", .input = "[1,2,3]", .expected_output = "6" },
+    .{ .name = "builtin_sort", .filter = "sort", .input = "[3,1,2]", .expected_output = "[1,2,3]" },
+    .{ .name = "builtin_reverse", .filter = "reverse", .input = "[1,2,3]", .expected_output = "[3,2,1]" },
+    .{ .name = "builtin_min", .filter = "min", .input = "[3,1,2]", .expected_output = "1" },
+    .{ .name = "builtin_max", .filter = "max", .input = "[3,1,2]", .expected_output = "3" },
+    .{ .name = "builtin_to_entries", .filter = "to_entries", .input = "{\"a\":1}", .expected_output = "[{\"key\":\"a\",\"value\":1}]" },
+    .{ .name = "builtin_unique", .filter = "unique", .input = "[3,1,2,1,3]", .expected_output = "[1,2,3]" },
+    .{ .name = "builtin_floor", .filter = "floor", .input = "3.7", .expected_output = "3" },
+    .{ .name = "builtin_ceil", .filter = "ceil", .input = "3.2", .expected_output = "4" },
+    .{ .name = "builtin_sqrt", .filter = "sqrt", .input = "16", .expected_output = "4" },
+    .{ .name = "builtin_abs", .filter = "abs", .input = "-5", .expected_output = "5" },
+    .{ .name = "builtin_explode", .filter = "explode", .input = "\"hi\"", .expected_output = "[104,105]" },
+    .{ .name = "builtin_ascii_upcase", .filter = "ascii_upcase", .input = "\"hi\"", .expected_output = "\"HI\"" },
+    // Bare-ident builtins (`arrays`, `strings`, `numbers`,
+    // `utf8bytelength`) reach the AST as `field_access` because the AST
+    // parser's narrow zero-arg list rejects them. Cat-10 routes them
+    // through the wider classifier — these fixtures exercise that path.
+    .{ .name = "builtin_arrays_filter", .filter = "arrays", .input = "[1,2]", .expected_output = "[1,2]" },
+    .{ .name = "builtin_strings_filter", .filter = "strings", .input = "\"x\"", .expected_output = "\"x\"" },
+    .{ .name = "builtin_numbers_filter", .filter = "numbers", .input = "5", .expected_output = "5" },
+    .{ .name = "builtin_utf8bytelength", .filter = "utf8bytelength", .input = "\"abc\"", .expected_output = "3" },
+
+    // ── Category 10 — builtins (1-arg value) ──────────────────────
+    .{ .name = "builtin_split", .filter = "split(\",\")", .input = "\"a,b,c\"", .expected_output = "[\"a\",\"b\",\"c\"]" },
+    .{ .name = "builtin_join", .filter = "join(\"-\")", .input = "[\"a\",\"b\",\"c\"]", .expected_output = "\"a-b-c\"" },
+    .{ .name = "builtin_startswith_t", .filter = "startswith(\"he\")", .input = "\"hello\"", .expected_output = "true" },
+    .{ .name = "builtin_startswith_f", .filter = "startswith(\"xy\")", .input = "\"hello\"", .expected_output = "false" },
+    .{ .name = "builtin_endswith_t", .filter = "endswith(\"lo\")", .input = "\"hello\"", .expected_output = "true" },
+    .{ .name = "builtin_ltrimstr", .filter = "ltrimstr(\"foo\")", .input = "\"foobar\"", .expected_output = "\"bar\"" },
+    .{ .name = "builtin_rtrimstr", .filter = "rtrimstr(\"bar\")", .input = "\"foobar\"", .expected_output = "\"foo\"" },
+    .{ .name = "builtin_getpath", .filter = "getpath([\"a\",\"b\"])", .input = "{\"a\":{\"b\":42}}", .expected_output = "42" },
+    .{ .name = "builtin_has_t", .filter = "has(\"a\")", .input = "{\"a\":1}", .expected_output = "true" },
+    .{ .name = "builtin_has_f", .filter = "has(\"x\")", .input = "{\"a\":1}", .expected_output = "false" },
+    .{ .name = "builtin_flatten1", .filter = "flatten(1)", .input = "[[1,2],[3,4]]", .expected_output = "[1,2,3,4]" },
+
+    // ── Category 10 — builtins (1-arg filter) ─────────────────────
+    .{ .name = "builtin_sort_by", .filter = "sort_by(.k)", .input = "[{\"k\":3},{\"k\":1},{\"k\":2}]", .expected_output = "[{\"k\":1},{\"k\":2},{\"k\":3}]" },
+    .{ .name = "builtin_group_by", .filter = "group_by(.k)", .input = "[{\"k\":1,\"v\":1},{\"k\":1,\"v\":2},{\"k\":2,\"v\":3}]", .expected_output = "[[{\"k\":1,\"v\":1},{\"k\":1,\"v\":2}],[{\"k\":2,\"v\":3}]]" },
+    .{ .name = "builtin_min_by", .filter = "min_by(.k)", .input = "[{\"k\":3},{\"k\":1},{\"k\":2}]", .expected_output = "{\"k\":1}" },
+    .{ .name = "builtin_max_by", .filter = "max_by(.k)", .input = "[{\"k\":3},{\"k\":1},{\"k\":2}]", .expected_output = "{\"k\":3}" },
+    .{ .name = "builtin_unique_by", .filter = "unique_by(.k)", .input = "[{\"k\":2},{\"k\":1},{\"k\":2}]", .expected_output = "[{\"k\":1},{\"k\":2}]" },
+    .{ .name = "builtin_map_values", .filter = "map_values(. + 1)", .input = "{\"a\":1,\"b\":2}", .expected_output = "{\"a\":2,\"b\":3}" },
+
+    // ── Category 10 — builtins (2-arg math/path) ──────────────────
+    .{ .name = "builtin_pow", .filter = "pow(2; 8)", .input = "null", .expected_output = "256" },
+    .{ .name = "builtin_atan2", .filter = "atan2(0; 1)", .input = "null", .expected_output = "0" },
+    .{ .name = "builtin_setpath", .filter = "setpath([\"a\"]; 9)", .input = "{\"a\":1}", .expected_output = "{\"a\":9}" },
+
+    // ── Category 10 — builtins (3-arg math) ───────────────────────
+    .{ .name = "builtin_fma", .filter = "fma(2; 3; 4)", .input = "null", .expected_output = "10" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

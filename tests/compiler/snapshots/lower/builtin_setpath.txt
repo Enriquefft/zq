@@ -1,0 +1,6 @@
+# source: setpath(["a"]; 9)
+# SemOp
+call_builtin("setpath") @0..17
+  arr_ctor @8..13
+    load_const("a") @9..12
+  load_const(9) @15..16
