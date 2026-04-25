@@ -176,17 +176,24 @@ pub fn build(b: *std.Build) void {
     prefilter_module.addImport("regex", regex_module);
     prefilter_module.addImport("ast", ast_module);
 
-    // Phase 2R compiler scaffold. Wired into every module that imports
-    // `query` so the `-Dcompile=new` dispatcher in `src/query/root.zig`
-    // can call `compiler.compile` without dragging the whole module
-    // graph through a re-root. Today the new path always errors; R3
-    // fills in real lowering/fuse/emit per the plan.
+    // Phase 2R compiler. Wired into every module that imports `query`
+    // so the `-Dcompile=new` dispatcher in `src/query/root.zig` can
+    // call `compiler.compile` without re-rooting the module graph.
+    // Imports `ast` so the typed AST root flows in (plan §1.3 row 4 —
+    // no virtual dispatch, switch on tag); imports `types`, `error`,
+    // `regex`, and `prefilter` so the emit-side `Compiled` matches the
+    // legacy shape exactly (plan §1.3 row 7).
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     compiler_module.addImport("build_options", build_options_module);
+    compiler_module.addImport("ast", ast_module);
+    compiler_module.addImport("types", types_module);
+    compiler_module.addImport("error", error_module);
+    compiler_module.addImport("regex", regex_module);
+    compiler_module.addImport("prefilter", prefilter_module);
 
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
@@ -536,6 +543,20 @@ pub fn build(b: *std.Build) void {
     bench_compile_run.stdio = .inherit;
     if (b.args) |args| bench_compile_run.addArgs(args);
     bench_compile_step.dependOn(&bench_compile_run.step);
+
+    // ── compiler snapshot tests (in test_step) ────────────────────────────
+    // Snapshot diff for the IR text dumper produced by `lower` — fixtures
+    // pinned in `tests/compiler/snapshots/lower/`. Plan §3 R3 step 9.
+    const compiler_snapshots_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_snapshots_mod.addImport("ast", ast_module);
+    compiler_snapshots_mod.addImport("compiler", compiler_module);
+    const compiler_snapshots_tests = b.addTest(.{ .root_module = compiler_snapshots_mod });
+    if (shim_build_step) |step| compiler_snapshots_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(compiler_snapshots_tests).step);
 
     // ── vm-equiv (NOT in test_step) ───────────────────────────────────────
     // VM-equivalence harness for Phase 2R Cluster A R3 (scaffold).

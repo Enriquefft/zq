@@ -73,29 +73,82 @@ pub const CompiledQuery = struct {
     ///
     /// Backend dispatch is comptime-keyed off `-Dcompile=`. Default
     /// (`legacy`) hits the production compiler at `src/query/src/compiler.zig`.
-    /// `new` (Phase 2R scaffold) routes to `src/compiler/` and currently
-    /// always returns `error.NewCompilerNotImplemented` — R3 will refine.
-    ///
-    /// TODO(R3): when the new compiler returns a real `CompileResult`,
-    /// drop the `NewCompilerNotImplemented` member from the error set and
-    /// merge the two arms into one.
-    /// TODO(R3): `src/main.zig`'s catch on this call (line ~195) prints
-    /// "out of memory" for any error from this set. Acceptable while the
-    /// new path is gated behind `-Dcompile=new`; surface a clearer message
-    /// when the new backend becomes a runtime-selectable option.
+    /// `new` (Phase 2R) routes to `src/compiler/` and falls back to
+    /// legacy on `NewCompilerNotImplemented`. The fallback is the
+    /// transitional contract for R3: the new compiler progressively
+    /// absorbs operator categories; tests stay green throughout
+    /// because legacy handles every uncovered category. R5 deletes
+    /// the fallback (and the `-Dcompile` flag entirely) once category
+    /// 12 lands and parity is proven.
     pub fn compile(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,
-    ) error{ OutOfMemory, NewCompilerNotImplemented }!CompileResult {
+    ) error{OutOfMemory}!CompileResult {
         switch (comptime build_options.compile_backend) {
             .legacy => return compileLegacy(src, opts, allocator),
             .new => {
-                // The new pipeline returns `!noreturn` today (errors only).
-                // The `try` propagates `NewCompilerNotImplemented` /
-                // `OutOfMemory` straight to the caller.
-                try new_compiler.compile(src, allocator);
+                // Transitional dispatch for R3:
+                //   - new + .ok  → use new compiler's bytecode
+                //   - new + .err → fall back to legacy. The two
+                //     parsers diverge on a handful of edge cases
+                //     (e.g. comma-in-index-position) the AST parser
+                //     surfaces as parse errors before lowering even
+                //     runs; legacy is the source of truth until R5
+                //     consolidates the parser.
+                //   - new + NewCompilerNotImplemented → fall back
+                //     to legacy. New owns operator categories
+                //     incrementally; legacy covers the rest.
+                const result = compileNew(src, opts, allocator) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.NewCompilerNotImplemented => return compileLegacy(src, opts, allocator),
+                };
+                switch (result) {
+                    .ok => return result,
+                    .err => return compileLegacy(src, opts, allocator),
+                }
             },
+        }
+    }
+
+    /// Always-new compile path. Re-exported here (in addition to the
+    /// dispatcher) so test binaries — the vm-equiv harness in
+    /// particular — can invoke the new backend through the `query`
+    /// module without importing `compiler` directly. That avoids the
+    /// Zig 0.15.2 build-runner duplicate-module constraint Cluster A
+    /// hit in Phase 6 (handoff issue #1) and keeps the dispatch
+    /// surface single-rooted.
+    pub fn compileNew(
+        src: []const u8,
+        opts: Opts,
+        allocator: std.mem.Allocator,
+    ) error{ OutOfMemory, NewCompilerNotImplemented }!CompileResult {
+        // Translate the query-module's `ExternalVarDecl` slice into the
+        // compiler-module's shape. They are field-equivalent today; an
+        // explicit copy keeps the cross-module contract crisp.
+        var ext_decls: []new_compiler.ExternalVarDecl = &.{};
+        if (opts.external_vars.len > 0) {
+            ext_decls = try allocator.alloc(new_compiler.ExternalVarDecl, opts.external_vars.len);
+            for (opts.external_vars, ext_decls) |src_decl, *dst| {
+                dst.* = .{ .name = src_decl.name };
+            }
+        }
+        defer if (ext_decls.len > 0) allocator.free(ext_decls);
+
+        const result = try new_compiler.compile(src, ext_decls, allocator);
+        switch (result) {
+            .ok => |compiled| return .{ .ok = CompiledQuery{
+                .allocator = allocator,
+                .instructions = compiled.instructions,
+                .function_table = compiled.function_table,
+                .string_buf = compiled.string_buf,
+                .external_var_ids = compiled.external_var_ids,
+                .source_map = compiled.source_map,
+                .opts = opts,
+                .regex_pool = compiled.regex_pool,
+                .prefilter = compiled.prefilter,
+            } },
+            .err => |ce| return .{ .err = ce },
         }
     }
 

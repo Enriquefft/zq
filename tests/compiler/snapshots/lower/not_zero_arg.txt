@@ -1,0 +1,3 @@
+# source: not
+# SemOp
+not @0..3

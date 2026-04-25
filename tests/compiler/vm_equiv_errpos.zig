@@ -49,6 +49,7 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     var skipped: u32 = 0;
+    var passed: u32 = 0;
     var legacy_unexpected_ok: u32 = 0;
     var legacy_kind_drift: u32 = 0;
 
@@ -100,15 +101,70 @@ pub fn main() !void {
             continue;
         }
 
-        // New-backend side — Phase 6: hard-coded SKIP. Same rationale as
-        // `tests/vm_equiv.zig` (avoid duplicate `compiler` module in the
-        // test binary's dep graph). Cluster B+ wires the real call.
-        skipped += 1;
-        try w.print("SKIP name={s} reason=new-compiler-not-implemented\n", .{fx.name});
+        // New-backend side — Phase 7 wires the real call via
+        // `query.CompiledQuery.compileNew`. Errors that match the
+        // legacy triple count as a pass; mismatches surface loudly.
+        // NotImplemented is reported as SKIP (the curated corpus is
+        // syntax-shape errors, which Cluster B's first phase covers
+        // by routing through `ast.parse` errors before lowering even
+        // touches the AST).
+        const new_result = query.CompiledQuery.compileNew(fx.filter, .{}, alloc) catch |e| switch (e) {
+            error.NewCompilerNotImplemented => {
+                skipped += 1;
+                try w.print("SKIP name={s} reason=new-compiler-not-implemented\n", .{fx.name});
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        var new_compiled = new_result;
+        defer switch (new_compiled) {
+            .ok => |*cq| cq.deinit(),
+            .err => {},
+        };
+
+        switch (new_compiled) {
+            .ok => {
+                try w.print("NEW_OK_UNEXPECTED name={s} filter={s}\n", .{ fx.name, fx.filter });
+                legacy_unexpected_ok += 1;
+                continue;
+            },
+            .err => |ne| {
+                const new_kind_name = @tagName(ne.kind);
+                if (!std.mem.eql(u8, new_kind_name, fx.expected_kind) or
+                    ne.offset != fx.expected_offset or
+                    ne.len != fx.expected_len)
+                {
+                    try w.print(
+                        "NEW_DRIFT name={s} filter={s} expected={s}@{d}+{d} got={s}@{d}+{d}\n",
+                        .{
+                            fx.name,
+                            fx.filter,
+                            fx.expected_kind,
+                            fx.expected_offset,
+                            fx.expected_len,
+                            new_kind_name,
+                            ne.offset,
+                            ne.len,
+                        },
+                    );
+                    legacy_kind_drift += 1;
+                    continue;
+                }
+            },
+        }
+
+        passed += 1;
+        try w.print("PASS name={s} kind={s} offset={d} len={d}\n", .{
+            fx.name,
+            fx.expected_kind,
+            fx.expected_offset,
+            fx.expected_len,
+        });
     }
 
-    try w.print("\nvm_equiv_errpos: total={d} skipped={d} legacy_unexpected_ok={d} legacy_drift={d}\n", .{
+    try w.print("\nvm_equiv_errpos: total={d} passed={d} skipped={d} legacy_unexpected_ok={d} legacy_drift={d}\n", .{
         FIXTURES.len,
+        passed,
         skipped,
         legacy_unexpected_ok,
         legacy_kind_drift,

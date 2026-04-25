@@ -24,6 +24,10 @@ pub const Op = enum(u8) {
     // ── SemOp namespace (lowered from AST) ────────────────────────────────
     load_const,
     load_var,
+    /// Identity `.` — pass-through of the current input. Emitted by
+    /// `lower.zig` for the AST `.identity` kind (plan §3 R3 step 6
+    /// category 1). Maps to bytecode `Instruction.Op.identity`.
+    identity,
     field,
     index,
     slice,
@@ -141,3 +145,140 @@ pub const IR = struct {
         self.string_buf.deinit(alloc);
     }
 };
+
+// ── Text dumper (used by snapshot tests) ─────────────────────────────────────
+// Spec: research/compiler-ir-format.md §10. Indented-tree, one node per line,
+// child indent +2 spaces, `# SemOp` banner once at the top, every line ends
+// with `@<start>..<end>` source bytes. The dumper is callable in any build —
+// the spec promises stable output, so snapshot tests reach for it directly.
+
+const ast = @import("ast");
+
+/// Dump `ir_obj` lowered from `ast_root` into `writer`. Emits one
+/// `# source:` directive line + the `# SemOp` banner + the IR tree.
+/// The `source` parameter is the original filter text used as the
+/// `# source:` payload — the dumper does not parse it, only echoes it.
+///
+/// Order of emission walks the AST: every IR node was produced in the
+/// order of `lowerNode`, so we walk the AST recursively and print the
+/// IR node corresponding to each AST step. This keeps the dump
+/// deterministic across re-runs and matches the spec's worked examples
+/// (§10) without depending on internal `nodes.items` ordering.
+pub fn dump(
+    ir_obj: *const IR,
+    ast_root: *const ast.Node,
+    source: []const u8,
+    writer: anytype,
+) !void {
+    try writer.print("# source: {s}\n", .{source});
+    try writer.writeAll("# SemOp\n");
+    try dumpAst(ir_obj, ast_root, 0, writer);
+}
+
+fn writeIndent(writer: anytype, depth: usize) !void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        try writer.writeAll("  ");
+    }
+}
+
+fn writeSpan(writer: anytype, span: ast.Span) !void {
+    try writer.print(" @{d}..{d}", .{ span.start, span.end });
+}
+
+/// Render the IR shape lowered from `node`, recurse into AST children
+/// in lowering order. Mirrors `lowerNode` in `lower.zig`. Categories
+/// not yet ported emit `# unimplemented(<kind>)` comment lines so the
+/// snapshot diff still produces a stable record.
+fn dumpAst(
+    ir_obj: *const IR,
+    node: *const ast.Node,
+    depth: usize,
+    writer: anytype,
+) !void {
+    switch (node.kind) {
+        .literal => |lit| {
+            try writeIndent(writer, depth);
+            switch (lit) {
+                .null_val => try writer.writeAll("load_const(null)"),
+                .bool_val => |b| try writer.print("load_const({s})", .{if (b) "true" else "false"}),
+                .int => |n| try writer.print("load_const({d})", .{n}),
+                .float => |f| {
+                    // Use the shortest repro-able form; snapshot files
+                    // are diffed byte-for-byte so we want a stable
+                    // representation. `{d}` matches Zig's default
+                    // f64 formatter which is round-trippable.
+                    try writer.print("load_const({d})", .{f});
+                },
+                .string => |s| {
+                    try writer.writeAll("load_const(");
+                    try writeStringLit(writer, s);
+                    try writer.writeAll(")");
+                },
+            }
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .identity => {
+            try writeIndent(writer, depth);
+            try writer.writeAll("identity");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .recurse => {
+            try writeIndent(writer, depth);
+            try writer.writeAll("recurse");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        .unary_neg => |un| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("neg");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, un.operand, depth + 1, writer);
+        },
+        .builtin_call => |bc| {
+            try writeIndent(writer, depth);
+            if (bc.args.len == 0 and std.mem.eql(u8, bc.name, "not")) {
+                try writer.writeAll("not");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                return;
+            }
+            // Generic builtin call: rendered as `call_builtin("name")`.
+            try writer.writeAll("call_builtin(");
+            try writeStringLit(writer, bc.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            for (bc.args) |arg| {
+                try dumpAst(ir_obj, arg, depth + 1, writer);
+            }
+        },
+        else => {
+            try writeIndent(writer, depth);
+            try writer.print("# unimplemented({s})", .{@tagName(node.kind)});
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+    }
+}
+
+/// JSON-style escape per spec §3 (`string_lit`). Bytes 0x00..0x1F other
+/// than \t and \n become `\uXXXX` four-hex; backslash and double-quote
+/// are escaped. Bytes ≥ 0x80 are written raw (UTF-8 source text).
+fn writeStringLit(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11, 12, 14...31 => try writer.print("\\u{X:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
