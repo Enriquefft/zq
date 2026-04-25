@@ -41,3 +41,43 @@ Open work for Phase 2 (next):
   - AST-shape diff verification per plan §3 R1 step 8.
 
 Next orchestrator: `phase-2r-orchestrator-A.md`, start Phase 2.
+
+## Phase 2 — R1 Supersession Bookkeeping (Cluster A)
+
+Date: 2026-04-25
+Commit: c9d4a696221854a66dae6c9dd0e85bc0561fd315
+Branch: redesign/compiler
+Status: PROCEED (3/3 reviewers)
+
+### Changes
+- TODO.md: collapsed AST-walk entry (-141/+1) to one-line pointer
+  → research/phase-2r-compiler-redesign-plan.md
+- research/phase-2-ast-walk-plan.md: prepended [SUPERSEDED] banner
+  (file body retained for historical reference; src/ast/nodes.zig:82
+  doc-comment still resolves)
+
+### Verification
+- zig build: PASS (exit 0)
+- zig build test: 1023/1161 passed, 27 skipped, 111 failed
+  → recorded as legacy baseline; failures are pre-existing jq-compat
+    semantic divergence, not R1 regression.
+- LSP wiring: PASS (--lsp flag intact at src/main.zig:136,1386,1562)
+- AST-shape diff vs c1ef970^: 5 grammar-affecting diffs, all KEEP
+  (Stage 8 assign_general, BUG-005 d1, BUG-006, update-path
+   .rbracket, isBuiltinName alignment)
+- build.zig walker refs: 0 (rg "ast\.compiler|ast_compile_equiv")
+- walker source files: confirmed deleted
+
+### Reviewer summary
+- code-reviewer: PROCEED — no bugs/leaks/edges/scope creep.
+- architect-reviewer: PROCEED — §1 invariants intact, R1 acceptance met,
+  AST-diff classification sound. Informational note: plan R1 step 9
+  ("single atomic commit") split across 15f20df + c9d4a69; end state
+  equivalent, no invariant violated.
+- future-readiness-reviewer: PROCEED — no lost followups, no dangling
+  refs, agents-first preserved.
+
+### Phase 2 acceptance: MET
+Tree clean; legacy is sole compiler; LSP intact; baseline counts recorded.
+
+Next: Phase 3 — bench harness + legacy baselines (R2).

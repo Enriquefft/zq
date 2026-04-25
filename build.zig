@@ -489,6 +489,28 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| bench_regex_tests.step.dependOn(&step.step);
     bench_regex_step.dependOn(&b.addRunArtifact(bench_regex_tests).step);
 
+    // ── bench-compile (NOT in test_step) ──────────────────────────────────
+    // Compile-only throughput baseline for the legacy compiler (Phase 2R / Phase 3).
+    // Always built with ReleaseFast — perf bench requires it.
+    // Invocation: `zig build bench-compile`
+    const bench_compile_step = b.step("bench-compile", "Compile-only throughput baseline (legacy)");
+    const bench_compile_mod = b.createModule(.{
+        .root_source_file = b.path("src/compiler/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_compile_mod.addImport("query", query_module);
+    bench_compile_mod.addImport("error", error_module);
+    const bench_compile_exe = b.addExecutable(.{
+        .name = "zq-bench-compile",
+        .root_module = bench_compile_mod,
+    });
+    if (shim_build_step) |step| bench_compile_exe.step.dependOn(&step.step);
+    const bench_compile_run = b.addRunArtifact(bench_compile_exe);
+    bench_compile_run.stdio = .inherit;
+    if (b.args) |args| bench_compile_run.addArgs(args);
+    bench_compile_step.dependOn(&bench_compile_run.step);
+
     // ── Microbench (NOT in test_step) ─────────────────────────────────────
     // Per-stage latency harness — Phase 0 of the research roadmap. Drives
     // production modules (parser/query/output) directly and emits NDJSON
