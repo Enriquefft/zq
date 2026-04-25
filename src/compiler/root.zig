@@ -22,6 +22,7 @@ const lower_mod = @import("lower.zig");
 const fuse_mod = @import("fuse.zig");
 const emit_mod = @import("emit.zig");
 const ctypes = @import("types.zig");
+const harvest_mod = @import("harvest.zig");
 
 // Re-export for downstream callers / tests (snapshot harness reaches
 // in for `Lowerer` + `lowerNode` + `dump` to drive the dumper without
@@ -139,6 +140,47 @@ pub fn compile(
     pool_consumed = true; // emit owns the pool now (transferred into `compiled`).
     var compiled_consumed = false;
     defer if (!compiled_consumed) compiled.deinit(allocator);
+
+    // Stage 5: harvest prefilter literals from IR (Phase 18).
+    // Read-only IR walk; no mutations. The IR is still valid because
+    // `arena` hasn't been freed yet (the defer above runs on return).
+    // On OOM or harvest failure, we simply skip the prefilter — the
+    // filter still runs correctly without it.
+    const prefilter = @import("prefilter");
+    var literal_groups: std.ArrayList(harvest_mod.LiteralGroup) = .{};
+    const harvest_result = harvest_mod.harvestFromIr(
+        allocator,
+        &fused,
+        &compiled.regex_pool,
+        &literal_groups,
+    );
+    if (harvest_result) |_| {
+        // Transfer ownership into compiled.prefilter.
+        if (literal_groups.items.len > 0) {
+            // Convert to the legacy PrefilterSet format.
+            var legacy_groups = std.ArrayList(prefilter.LiteralGroup){};
+            try legacy_groups.ensureTotalCapacity(allocator, literal_groups.items.len);
+            for (literal_groups.items) |g| {
+                legacy_groups.appendAssumeCapacity(.{
+                    .literals = g.literals,
+                    .all_required = g.all_required,
+                });
+            }
+            compiled.prefilter = try prefilter.PrefilterSet.ownFrom(
+                allocator,
+                legacy_groups.items,
+            );
+        }
+    } else |err| switch (err) {
+        error.OutOfMemory => {
+            // OOM during harvest: fall back to no prefilter. Clean up
+            // any partial groups in the list.
+            for (literal_groups.items) |g| {
+                for (g.literals) |lit| allocator.free(lit);
+                allocator.free(g.literals);
+            }
+        },
+    }
 
     compiled_consumed = true;
     return .{ .ok = compiled };
