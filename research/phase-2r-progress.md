@@ -81,3 +81,52 @@ Status: PROCEED (3/3 reviewers)
 Tree clean; legacy is sole compiler; LSP intact; baseline counts recorded.
 
 Next: Phase 3 — bench harness + legacy baselines (R2).
+
+## Phase 3 — R2 Bench Harness + Legacy Baselines (Cluster A)
+
+Date: 2026-04-25
+Commit: 018e6b8fc938514e47e0b4e2522ee3450021d062
+Branch: redesign/compiler
+Status: PROCEED (after 1 fix attempt)
+
+### Changes
+- src/compiler/bench.zig (new, ~164 lines): 17-filter compile-only bench
+  driver, ReleaseFast, N=1000 + 50 warmup, per-iteration ArenaAllocator,
+  TSV ns-precision stdout.
+- build.zig: `zig build bench-compile` step (addExecutable, ReleaseFast,
+  outside test_step).
+- research/compiler-baselines.md (new): legacy compile-only baselines.
+
+### Verification
+- zig build: PASS
+- zig build bench-compile: PASS, 17 rows, 0 compile errors
+- zig build test: 1023 passed / 27 skipped / 111 failed (delta vs R1: 0)
+- 3 fresh-process bench runs aggregated; median/p99/σ per filter recorded.
+- Peak RSS: 51.2 MB. Binary size: 9,450,465 B (≈9.0 MB).
+
+### Filter corpus (17)
+10 compat + 3 UDF (incl. udf.semicolon = `def f(a;b): a + b; f(.x;.y)`)
++ 1 regex literal + 1 dynamic regex + 1 reduce + 1 deep pipe/comma.
+
+### Reviewer pass
+- code-reviewer: BLOCK initially (doc test-count contradiction line 89);
+  resolved in fix attempt #1.
+- architect-reviewer: PROCEED w/ flags. Filter substitution rationale was
+  wrong (legacy DOES accept `def f(a;b)`; original failure was `add`
+  builtin shadow). Fixed: udf.composed → udf.semicolon. Plan-conflict
+  flagged (hash-pin timing) → second-opinion verdict NO CONFLICT
+  (§1 specifies location, not timing; §3.2 R2 acceptance does not
+  require pin).
+- future-readiness-reviewer: PROCEED. Suggested R3 enhancements: TSV
+  companion + arg parsing.
+
+### Open issues for R3 (Phase 5/6)
+- Implement compat-fixture hash pin in baselines.md.
+- Optional: TSV companion + bench arg parsing for filter subsetting.
+- Cosmetic: bench.zig p99 comment off-by-one (989 vs 990 — index correct).
+
+### Phase 3 acceptance: MET
+Legacy baselines locked. R3 must hold or improve median µs / p99 µs / σ
+per filter, peak RSS, binary size, and the 1023/1161 test count floor.
+
+Next: Phase 4 — IR-format spec (`research/compiler-ir-format.md`).
