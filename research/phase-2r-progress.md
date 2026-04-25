@@ -362,3 +362,46 @@ Open issues for Cluster B (R3 operator porting + parity):
      captured 2026-04-25).
 
 Next orchestrator: phase-2r-orchestrator-B.md, start Phase 7.
+
+## Phase 8 — cat-2 (field/index/iterate/slice/try-postfix) close-out
+
+**Status**: CLOSED — PROCEED  
+**Cluster**: B (sequential pre-wave to Wave A)  
+**Phase base**: cc6de23 (Phase 7 close)  
+**Implementer commit**: 37cf231  
+**Fix-loop commit**: e3c7817 (hygiene scrub)  
+**Phase close**: e3c7817
+
+### Acceptance gates
+- Tests `-Dcompile=new`: 1027/1165 (=baseline, zero regressions)
+- Tests `-Dcompile=legacy`: 1027/1165 (=baseline)
+- Binary new: +0.166% vs cc6de23 (well under +1%)
+- Binary legacy: +0.0023% vs cc6de23
+- vm-equiv: 24/24 MATCH (cat-1 + cat-2; 8 SKIP for later categories)
+- errpos: 5/5 PASS
+- Snapshots: 5 new files (load_field, load_index, iterate, slice, try_optional)
+- All 5 Phase 8 entry prereqs DONE
+
+### Reviewer alignment
+- correctness: PROCEED (high) — 5 MINOR
+- invariants: PROCEED (high) — 1 MINOR + 1 NIT, all 5 prereqs DONE
+- surface: PROCEED (high) — 1 MINOR + multiple GOODs
+- synth: PROCEED
+
+### Bench (informational, not gating)
+- Corpus mean wall: legacy 11.38 µs, new 11.65 µs (+2.35% mean, σ-dominated noise band)
+- RSS: legacy 51.29 MB, new 51.57 MB (+0.55%, parity range)
+- Bench WARN due to FILTER_CORPUS gap (cat-1 standalone missing, cat-2 partial) — known Cluster-B exit blocker, unchanged from Phase 7
+
+### New deferred items (carried forward)
+1. Spec residue `research/compiler-ir-format.md:172` (`field` → `load_field`) → fold into Phase 9 prereqs
+2. `loadConstValue` half-applied for `.string` payload → Phase 9 cleanup backlog
+3. `compiled_consumed` defer dead code in `src/compiler/root.zig:101-105` → Phase 9 cleanup backlog (merges with Phase 7 deferred5)
+4. Snapshot coverage gap (chain forms, open-right slice) → Wave A/B implementer backlog
+5. vm-equiv missing slice_open_right + escape-rejection → Cluster-B fixture expansion
+6. `.["foo"]` AST escape decode — pre-existing, separate tracking
+
+### Phase 9 entry prereqs
+1. Spec residue line 172 fix
+2. Naming policy continuity for cat-3 (operators/arith) — confirm row 5 names before lowering
+3. Snapshot fixtures must include cat-3 forms; build on snapshots-update tooling
