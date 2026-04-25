@@ -78,6 +78,15 @@ pub fn compile(
         .out = ir_mod.IR.init(&arena),
         .opts = .{},
     };
+    // Pre-declare external variables in the root scope (var ids 0..N-1).
+    // Mirrors legacy `compile`'s seeding at
+    // `src/query/src/compiler.zig:1390-1406`. Required so cat-4
+    // `$external_var` references resolve to the same operand index.
+    for (external_vars) |ev| {
+        _ = lowerer.declareVar(ev.name) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
     _ = lower_mod.lowerNode(&lowerer, parse_result.root) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NewCompilerNotImplemented => return error.NewCompilerNotImplemented,

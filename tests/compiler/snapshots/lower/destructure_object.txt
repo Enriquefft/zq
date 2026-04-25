@@ -1,0 +1,11 @@
+# source: . as {a: $av, b: $bv} | $av
+# SemOp
+pipe @0..27
+  identity @0..1
+  pipe @0..27
+    destructure(object) @0..27
+      load_const("a") @0..27
+      destructure(as, "av") @0..27
+      load_const("b") @0..27
+      destructure(as, "bv") @0..27
+    load_var("av") @24..27

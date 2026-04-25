@@ -81,6 +81,13 @@ const FIXTURES = [_]Fixture{
     .{ .name = "if_elif", .expected = @embedFile("snapshots/lower/if_elif.txt") },
     .{ .name = "path_simple", .expected = @embedFile("snapshots/lower/path_simple.txt") },
     .{ .name = "path_iterate", .expected = @embedFile("snapshots/lower/path_iterate.txt") },
+    .{ .name = "var_load", .expected = @embedFile("snapshots/lower/var_load.txt") },
+    .{ .name = "as_simple", .expected = @embedFile("snapshots/lower/as_simple.txt") },
+    .{ .name = "destructure_array", .expected = @embedFile("snapshots/lower/destructure_array.txt") },
+    .{ .name = "destructure_nested", .expected = @embedFile("snapshots/lower/destructure_nested.txt") },
+    .{ .name = "destructure_object", .expected = @embedFile("snapshots/lower/destructure_object.txt") },
+    .{ .name = "destructure_object_shorthand", .expected = @embedFile("snapshots/lower/destructure_object_shorthand.txt") },
+    .{ .name = "alt_bind", .expected = @embedFile("snapshots/lower/alt_bind.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

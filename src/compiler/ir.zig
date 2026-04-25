@@ -97,6 +97,26 @@ pub const UpdateOpKind = enum(u32) {
     general = 8,
 };
 
+/// `destructure` pattern-kind discriminant. Stored as a u32 in
+/// `extra_data[node.extra]` (slot 0). Mirrors the AST `Pattern` union
+/// plus the binding-context alt (`?//` desugar). Single source of truth
+/// for emit + dumper + fuse decode (plan §1.3 row 5).
+///
+/// Per-kind extra-data layout (slot 0 is always the kind):
+///   .as       → slot 1: name_offset, slot 2: name_len, slot 3: var_id
+///   .array    → no trailing slots; sub-patterns live in `extra_children`
+///                 via `Node.span_start`/`Node.span_len`
+///   .object   → no trailing slots; key/sub-pattern pairs in `extra_children`
+///                 (interleaved: k0, p0, k1, p1, …)
+///   .alt_bind → no trailing slots; alternative sub-patterns in
+///                 `extra_children` (top-level patterns only)
+pub const PatternKind = enum(u32) {
+    as = 0,
+    array = 1,
+    object = 2,
+    alt_bind = 3,
+};
+
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
 /// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
@@ -602,6 +622,60 @@ fn dumpAst(
         // else (no `else` clause) materializes as `identity` — matches
         // legacy `parseIfBody` (`src/query/src/compiler.zig:6390`).
         .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, depth, writer),
+        // ── Variable load `$name` (category 4) ──────────────────────
+        // Mirrors `lowerVariable` — the IR is a leaf `load_var` whose
+        // payload echoes the variable name. Var-id resolution happens
+        // at lower-time but is not surfaced in the dump (the dump
+        // captures source-level shape, not bytecode operand values).
+        .variable_ref => |vr| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_var(");
+            try writeStringLit(writer, vr.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+        },
+        // ── `expr as PATTERN | body` (category 4) ───────────────────
+        // Lowering shape: `pipe(expr, pipe(destructure(PATTERN), body))`.
+        // The dump mirrors that nested-pipe layout so snapshot diffs
+        // line up with the lowered IR. The destructure node renders
+        // its sub-pattern children inline.
+        .as_pattern => |ap| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("pipe");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, ap.expr, depth + 1, writer);
+            try writeIndent(writer, depth + 1);
+            try writer.writeAll("pipe");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpPattern(ir_obj, ap.pattern, node.span, depth + 2, writer);
+            try dumpAst(ir_obj, ap.body, depth + 2, writer);
+        },
+        // ── `expr as P1 ?// P2 ?// … | body` (category 4) ──────────
+        // Lowering shape: `pipe(expr, pipe(destructure(alt_bind, …), body))`.
+        // Each top-level alternative is itself a pattern subnode of the
+        // outer alt_bind destructure.
+        .destruct_alt => |da| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("pipe");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, da.expr, depth + 1, writer);
+            try writeIndent(writer, depth + 1);
+            try writer.writeAll("pipe");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try writeIndent(writer, depth + 2);
+            try writer.writeAll("destructure(alt_bind)");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            for (da.patterns) |alt_pat| {
+                try dumpPattern(ir_obj, alt_pat, node.span, depth + 3, writer);
+            }
+            try dumpAst(ir_obj, da.body, depth + 2, writer);
+        },
         else => {
             try writeIndent(writer, depth);
             try writer.print("# unimplemented({s})", .{@tagName(node.kind)});
@@ -913,6 +987,71 @@ fn dumpIfElsePosition(
     try writer.writeAll("identity");
     try writeSpan(writer, span);
     try writer.writeAll("\n");
+}
+
+/// Render a destructuring pattern as a `destructure` IR node. Matches
+/// `lowerPattern` in `lower.zig` so the text dump and the lowered IR
+/// shape stay aligned. The `parent_span` is the AST span of the
+/// enclosing `as_pattern` / `destruct_alt` (patterns themselves do not
+/// carry AST spans).
+fn dumpPattern(
+    ir_obj: *const IR,
+    pat: ast.Pattern,
+    parent_span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    try writeIndent(writer, depth);
+    switch (pat) {
+        .simple => |name| {
+            try writer.writeAll("destructure(as, ");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+            try writeSpan(writer, parent_span);
+            try writer.writeAll("\n");
+        },
+        .array => |elems| {
+            try writer.writeAll("destructure(array)");
+            try writeSpan(writer, parent_span);
+            try writer.writeAll("\n");
+            for (elems) |sub| {
+                try dumpPattern(ir_obj, sub, parent_span, depth + 1, writer);
+            }
+        },
+        .object => |fields| {
+            try writer.writeAll("destructure(object)");
+            try writeSpan(writer, parent_span);
+            try writer.writeAll("\n");
+            for (fields) |fld| {
+                try dumpPatternKey(ir_obj, fld.key, parent_span, depth + 1, writer);
+                try dumpPattern(ir_obj, fld.pattern, parent_span, depth + 1, writer);
+            }
+        },
+    }
+}
+
+/// Render an object-pattern key (static or computed) as the IR sub-node
+/// the lowerer synthesizes. Static keys become `load_const(string)`;
+/// computed keys recurse into the AST expression. Mirrors
+/// `lowerPatternKey` in `lower.zig`.
+fn dumpPatternKey(
+    ir_obj: *const IR,
+    key: ast.PatternKey,
+    parent_span: ast.Span,
+    depth: usize,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    switch (key) {
+        .static => |name| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_const(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+            try writeSpan(writer, parent_span);
+            try writer.writeAll("\n");
+        },
+        .computed => |expr| try dumpAst(ir_obj, expr, depth, writer),
+    }
 }
 
 /// JSON-style escape per spec §3 (`string_lit`). Bytes 0x00..0x1F other

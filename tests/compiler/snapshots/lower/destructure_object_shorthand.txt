@@ -1,0 +1,11 @@
+# source: . as {$a, $b} | $a
+# SemOp
+pipe @0..18
+  identity @0..1
+  pipe @0..18
+    destructure(object) @0..18
+      load_const("a") @0..18
+      destructure(as, "a") @0..18
+      load_const("b") @0..18
+      destructure(as, "b") @0..18
+    load_var("a") @16..18

@@ -67,6 +67,17 @@ pub const Lowerer = struct {
     /// reads this to populate `CompileResult.err` for parity with the
     /// legacy compiler's error shape (kind, offset, len).
     compile_err: err_mod.CompileError = .{ .kind = .query_syntax_error, .offset = 0, .len = 0 },
+    /// Variable-name → variable-id table. External vars are pre-declared
+    /// at id 0..N-1 (matching legacy `compile`'s root-scope seeding); each
+    /// `as`-pattern variable claims the next id. Categorical scope rules
+    /// are deferred — cat-4 only needs flat lookup and stable monotonic
+    /// id assignment to mirror the legacy bytecode operands. Backed by
+    /// the IR's arena so the entries die with the compile.
+    var_table: std.StringHashMapUnmanaged(u32) = .{},
+    /// Next variable id to allocate. Mirrors legacy `Ctx.next_var_id`.
+    /// Cat-4 only declares vars in `as`-patterns; user-function param
+    /// vars (cat-9) and label vars (cat-12) reuse the same counter.
+    next_var_id: u32 = 0,
 
     /// Append a node and return its index. Plan §1.3 row 3 — children
     /// are u32 indices, never pointers.
@@ -94,6 +105,38 @@ pub const Lowerer = struct {
     fn span(node: *const Node) struct { start: u32, len: u32 } {
         const s = node.span;
         return .{ .start = s.start, .len = if (s.end >= s.start) s.end - s.start else 0 };
+    }
+
+    /// Declare a variable, allocating a fresh id. Mirrors legacy
+    /// `declareVariable` (`src/query/src/compiler.zig:312`): if a
+    /// variable with the same name already exists at the current scope,
+    /// the new id SHADOWS the prior one. Cat-4 has no nested scope yet,
+    /// so the table is flat.
+    pub fn declareVar(self: *Lowerer, name: []const u8) error{OutOfMemory}!u32 {
+        const alloc = self.arena.allocator();
+        const id = self.next_var_id;
+        self.next_var_id += 1;
+        try self.var_table.put(alloc, name, id);
+        return id;
+    }
+
+    /// Reuse an existing variable in the current scope, or allocate a
+    /// fresh id if none exists. Mirrors legacy `reuseOrDeclareVariable`
+    /// (`src/query/src/compiler.zig:339`); used by `?//` for the
+    /// second-and-onwards alternative patterns so that shared variable
+    /// names map to the SAME var_id across alternatives.
+    fn reuseOrDeclareVar(self: *Lowerer, name: []const u8) error{OutOfMemory}!u32 {
+        if (self.var_table.get(name)) |existing| return existing;
+        return self.declareVar(name);
+    }
+
+    /// Look up a variable id by name. Returns null if the variable is
+    /// not declared at any scope visible from the current site. Cat-4
+    /// reports the same `query_syntax_error` legacy emits at parse time
+    /// (`src/query/src/compiler.zig:6455`) by surfacing
+    /// `LowerDiagnostic` on null.
+    fn lookupVar(self: *Lowerer, name: []const u8) ?u32 {
+        return self.var_table.get(name);
     }
 };
 
@@ -624,6 +667,11 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // child of `arr_ctor`. Empty `[]` has zero children. Generators
         // (`[range(3)]`, `[.[]]`) appear as a single child whose own
         // backtracking semantics drive the `yield_output` ladder.
+        //
+        // Cat-7 buffering fix (cat-4 epoch): same scratch-buffer
+        // strategy as `obj_ctor` above — recursive lowering of nested
+        // constructor elements grows `extra_children`, which would
+        // pollute our contiguous span if we appended per-element.
         .array_construct => |ac| {
             const alloc = ctx.arena.allocator();
             // Collect element indices in a local buffer first — nested
@@ -657,6 +705,11 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // Emit ladders the children into the legacy `push_string` /
         // `save_input` / tostring / `add` / `restore_input` pattern.
         // `format` is the same shape with a non-zero format-spec id.
+        //
+        // Cat-7 buffering fix (cat-4 epoch): same scratch-buffer
+        // strategy — expr parts may recurse into more complex shapes
+        // that grow `extra_children`, so we collect indices in scratch
+        // before publishing the parent span.
         .string_interp => |si| {
             const alloc = ctx.arena.allocator();
             // Interp parts may include nested obj/arr constructors that
@@ -778,6 +831,143 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                 .op = .update_assign,
                 .children = .{ lhs_idx, rhs_idx },
                 .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Variable load `$name` (category 4) ─────────────────────
+        // Resolve the name to a var_id at lower-time so emit can stamp
+        // the `load_variable` operand directly. Legacy emits the same
+        // shape via `parseVariableReference`
+        // (`src/query/src/compiler.zig:6442`); the `$__loc__` magic
+        // var routes through legacy fallback today (cat-4 owns plain
+        // user vars only).
+        .variable_ref => |vr| {
+            if (std.mem.eql(u8, vr.name, "__loc__")) {
+                // `$__loc__` is a synthetic compile-time object literal.
+                // Cat-4 doesn't own that lowering; fall back to legacy.
+                return error.NewCompilerNotImplemented;
+            }
+            const var_id = ctx.lookupVar(vr.name) orelse {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp.start,
+                    .len = 0,
+                };
+                return error.LowerDiagnostic;
+            };
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+            try ctx.out.string_buf.appendSlice(alloc, vr.name);
+            try ctx.out.extra_data.append(alloc, offset);
+            try ctx.out.extra_data.append(alloc, @intCast(vr.name.len));
+            try ctx.out.extra_data.append(alloc, var_id);
+            return ctx.pushNode(.{
+                .op = .load_var,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── `expr as PATTERN | body` (category 4) ───────────────────
+        // Legacy emits the LHS, then `capture_variable` / destructure
+        // ladder, then continues into the body. The new pipeline
+        // expresses the same flow as
+        // `pipe(expr, pipe(destructure, body))` so emit can reuse
+        // `pipe` lowering — the extra `pipe` instructions are no-ops
+        // when the value stack is empty (vm.zig:992-1003) and so do
+        // not perturb VM-observable output. Variables are declared
+        // BEFORE the body is lowered so `$x` references inside `body`
+        // resolve correctly.
+        .as_pattern => |ap| {
+            const expr_idx = try lowerNode(ctx, ap.expr);
+            try declarePatternVars(ctx, ap.pattern);
+            const dx_idx = try lowerPattern(ctx, ap.pattern, ap.expr.span);
+            const body_idx = try lowerNode(ctx, ap.body);
+            const inner_pipe = try ctx.pushNode(.{
+                .op = .pipe,
+                .children = .{ dx_idx, body_idx },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+            return ctx.pushNode(.{
+                .op = .pipe,
+                .children = .{ expr_idx, inner_pipe },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── `expr as P1 ?// P2 ?// … | body` (category 4) ──────────
+        // Legacy desugars to a fork-try chain that null-initialises
+        // every unique variable across all patterns, then attempts
+        // each pattern strictly (no per-element null-on-missing). On
+        // the first match control jumps to the body; on total failure,
+        // `backtrack` produces empty
+        // (`src/query/src/compiler.zig:2549-2654`).
+        //
+        // The new pipeline expresses the same flow as
+        // `pipe(expr, pipe(destructure(alt_bind, [P1, P2, …]), body))`
+        // — emit consults the `alt_bind` discriminant to produce the
+        // exact ladder. Patterns 2..N reuse var_ids declared by P1
+        // when the names match, mirroring legacy
+        // `scanAndDeclarePatternReuse`.
+        .destruct_alt => |da| {
+            const expr_idx = try lowerNode(ctx, da.expr);
+
+            // Phase 1: declare all pattern variables in source order.
+            // P1 declares fresh ids; P2..N reuse on name match (the
+            // strict-match contract from legacy).
+            if (da.patterns.len > 0) {
+                try declarePatternVars(ctx, da.patterns[0]);
+                for (da.patterns[1..]) |alt_pat| {
+                    try declarePatternVarsReuse(ctx, alt_pat);
+                }
+            }
+
+            // Phase 2: lower each pattern as its own destructure
+            // subtree. The outer `destructure(alt_bind)` records the
+            // per-alternative pattern roots in `extra_children`.
+            // Buffer indices in scratch first because recursive
+            // `lowerPattern` calls themselves grow `extra_children`
+            // (nested array/object patterns) — interleaving would
+            // pollute the parent's span.
+            const alloc = ctx.arena.allocator();
+            var scratch: std.ArrayListUnmanaged(u32) = .{};
+            defer scratch.deinit(alloc);
+            for (da.patterns) |alt_pat| {
+                const pat_idx = try lowerPattern(ctx, alt_pat, da.expr.span);
+                try scratch.append(alloc, pat_idx);
+            }
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, scratch.items);
+            const span_len: u32 = @intCast(da.patterns.len);
+
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.PatternKind.alt_bind));
+
+            const dx_idx = try ctx.pushNode(.{
+                .op = .destructure,
+                .span_start = span_start,
+                .span_len = span_len,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+
+            const body_idx = try lowerNode(ctx, da.body);
+            const inner_pipe = try ctx.pushNode(.{
+                .op = .pipe,
+                .children = .{ dx_idx, body_idx },
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+            return ctx.pushNode(.{
+                .op = .pipe,
+                .children = .{ expr_idx, inner_pipe },
                 .src_start = sp.start,
                 .src_len = sp.len,
             });
@@ -1020,6 +1210,188 @@ fn lowerStringParts(
             .expr => |expr| try lowerNode(ctx, expr),
         };
         try out.append(alloc, child_idx);
+    }
+}
+
+/// Walk an AST destructure pattern declaring every `simple` variable
+/// in the order they appear. Mirrors legacy `scanAndDeclarePattern`
+/// (`src/query/src/compiler.zig:373`): variables are allocated fresh
+/// ids monotonically. Object computed keys do not declare vars (the
+/// expression is evaluated at runtime); only the leaf `simple`
+/// patterns claim ids.
+fn declarePatternVars(ctx: *Lowerer, pat: ast.Pattern) error{OutOfMemory}!void {
+    switch (pat) {
+        .simple => |name| {
+            _ = try ctx.declareVar(name);
+        },
+        .array => |elems| {
+            for (elems) |sub| try declarePatternVars(ctx, sub);
+        },
+        .object => |fields| {
+            for (fields) |fld| try declarePatternVars(ctx, fld.pattern);
+        },
+    }
+}
+
+/// Walk an AST destructure pattern declaring vars with `reuseOrDeclare`
+/// semantics. Used for the second-and-onwards alternatives in a `?//`
+/// chain — names that already exist (declared by P1) MUST share the
+/// same var_id so legacy's null-initialisation contract is preserved.
+/// Mirrors `scanAndDeclarePatternReuse`
+/// (`src/query/src/compiler.zig:443`).
+fn declarePatternVarsReuse(ctx: *Lowerer, pat: ast.Pattern) error{OutOfMemory}!void {
+    switch (pat) {
+        .simple => |name| {
+            _ = try ctx.reuseOrDeclareVar(name);
+        },
+        .array => |elems| {
+            for (elems) |sub| try declarePatternVarsReuse(ctx, sub);
+        },
+        .object => |fields| {
+            for (fields) |fld| try declarePatternVarsReuse(ctx, fld.pattern);
+        },
+    }
+}
+
+/// Lower an AST `Pattern` into a single IR `destructure` node. The
+/// caller is responsible for declaring pattern variables FIRST (via
+/// `declarePatternVars` / `declarePatternVarsReuse`) so that lookups
+/// inside object-pattern computed keys resolve correctly.
+///
+/// Per-kind layout in the IR:
+///   .simple → `destructure(kind=as)` with var-name + var_id in extra_data
+///   .array  → `destructure(kind=array)` with sub-pattern roots in span
+///   .object → `destructure(kind=object)` with (key, sub-pattern) pairs in span
+fn lowerPattern(
+    ctx: *Lowerer,
+    pat: ast.Pattern,
+    parent_span: ast.Span,
+) LowerError!u32 {
+    const sp_start: u32 = parent_span.start;
+    const sp_len: u32 = if (parent_span.end >= parent_span.start)
+        parent_span.end - parent_span.start
+    else
+        0;
+    const alloc = ctx.arena.allocator();
+
+    switch (pat) {
+        .simple => |name| {
+            // Variables are declared by the caller; lookup must succeed.
+            const var_id = ctx.lookupVar(name) orelse unreachable;
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.PatternKind.as));
+            const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+            try ctx.out.string_buf.appendSlice(alloc, name);
+            try ctx.out.extra_data.append(alloc, offset);
+            try ctx.out.extra_data.append(alloc, @intCast(name.len));
+            try ctx.out.extra_data.append(alloc, var_id);
+            return ctx.pushNode(.{
+                .op = .destructure,
+                .extra = extra_idx,
+                .src_start = sp_start,
+                .src_len = sp_len,
+            });
+        },
+        .array => |elems| {
+            // Empty `as []` is a compile error at the legacy parser
+            // (`src/query/src/compiler.zig:402`); mirror the diagnostic.
+            // VM-semantics contract requires the same `query_syntax_error`
+            // kind on rejected queries (plan §1.2 row 3).
+            if (elems.len == 0) {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp_start,
+                    .len = sp_len,
+                };
+                return error.LowerDiagnostic;
+            }
+            // Lower every sub-pattern FIRST and stash the resulting
+            // node indices on the stack. The recursive `lowerPattern`
+            // calls grow `extra_children` themselves (when their own
+            // sub-patterns are non-leaf) — appending child indices
+            // mid-iteration would interleave foreign entries into our
+            // contiguous span. Building a temporary scratch list and
+            // then bulk-appending keeps the parent span tight.
+            var scratch: std.ArrayListUnmanaged(u32) = .{};
+            defer scratch.deinit(alloc);
+            for (elems) |sub| {
+                const sub_idx = try lowerPattern(ctx, sub, parent_span);
+                try scratch.append(alloc, sub_idx);
+            }
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, scratch.items);
+            const span_len: u32 = @intCast(elems.len);
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.PatternKind.array));
+            return ctx.pushNode(.{
+                .op = .destructure,
+                .span_start = span_start,
+                .span_len = span_len,
+                .extra = extra_idx,
+                .src_start = sp_start,
+                .src_len = sp_len,
+            });
+        },
+        .object => |fields| {
+            // Empty `as {}` is a compile error at the legacy parser
+            // (`src/query/src/compiler.zig:425`); mirror the diagnostic.
+            if (fields.len == 0) {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp_start,
+                    .len = sp_len,
+                };
+                return error.LowerDiagnostic;
+            }
+            // Same buffering strategy as `.array` above — build the
+            // (key, sub-pattern) pair list in a scratch buffer first,
+            // then bulk-append. Recursive lowerPatternKey / lowerPattern
+            // calls may grow `extra_children` for nested patterns or
+            // computed-key sub-expressions.
+            var scratch: std.ArrayListUnmanaged(u32) = .{};
+            defer scratch.deinit(alloc);
+            for (fields) |fld| {
+                const key_idx = try lowerPatternKey(ctx, fld.key, parent_span);
+                const sub_idx = try lowerPattern(ctx, fld.pattern, parent_span);
+                try scratch.append(alloc, key_idx);
+                try scratch.append(alloc, sub_idx);
+            }
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.appendSlice(alloc, scratch.items);
+            const span_len: u32 = @intCast(2 * fields.len);
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.PatternKind.object));
+            return ctx.pushNode(.{
+                .op = .destructure,
+                .span_start = span_start,
+                .span_len = span_len,
+                .extra = extra_idx,
+                .src_start = sp_start,
+                .src_len = sp_len,
+            });
+        },
+    }
+}
+
+/// Lower an object-pattern key (static name or `(expr)`). Static keys
+/// synthesise a `load_const(string)` so the destructure-emit ladder can
+/// pop a literal from the value stack uniformly with the computed-key
+/// case. Mirrors legacy `parseAndEmitPattern` for object fields
+/// (`src/query/src/compiler.zig:899-955`) without duplicating the
+/// emission code.
+fn lowerPatternKey(
+    ctx: *Lowerer,
+    key: ast.PatternKey,
+    parent_span: ast.Span,
+) LowerError!u32 {
+    const sp_start: u32 = parent_span.start;
+    const sp_len: u32 = if (parent_span.end >= parent_span.start)
+        parent_span.end - parent_span.start
+    else
+        0;
+    switch (key) {
+        .static => |name| return synthLoadConstString(ctx, name, sp_start, sp_len),
+        .computed => |expr| return lowerNode(ctx, expr),
     }
 }
 

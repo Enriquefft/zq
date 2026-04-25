@@ -1,0 +1,15 @@
+# source: . as [$a, [$b, $c]] | $a + $b + $c
+# SemOp
+pipe @0..34
+  identity @0..1
+  pipe @0..34
+    destructure(array) @0..34
+      destructure(as, "a") @0..34
+      destructure(array) @0..34
+        destructure(as, "b") @0..34
+        destructure(as, "c") @0..34
+    arith(add) @22..34
+      arith(add) @22..29
+        load_var("a") @22..24
+        load_var("b") @27..29
+      load_var("c") @32..34

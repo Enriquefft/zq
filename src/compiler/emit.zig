@@ -593,7 +593,341 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             em.instructions.items[begin_pos].operand = .{ .index = end_pos };
         },
 
+        // ── Category 4 ──────────────────────────────────────────────
+        // Variable load `$name`. The IR carries the var-id resolved by
+        // lowering — emit just stamps `load_variable(var_id)`. Mirrors
+        // legacy `parseVariableReference`
+        // (`src/query/src/compiler.zig:6442-6458`).
+        .load_var => {
+            const slots = em.ir_obj.extra_data.items;
+            // extra_data layout: [name_offset, name_len, var_id]
+            const var_id: i64 = @intCast(slots[node.extra + 2]);
+            try em.pushInstr(.load_variable, .{ .index = var_id }, node);
+        },
+
+        // Destructure pattern. The kind discriminant in extra_data slot 0
+        // selects between simple-as / array / object / alt_bind ladders;
+        // each ladder mirrors the legacy `emitPatternCapture` /
+        // `emitPatternCaptureStrict` / `parseDestructAlt` shapes
+        // (`src/query/src/compiler.zig:594-754`, 2549-2654).
+        .destructure => {
+            const slots = em.ir_obj.extra_data.items;
+            const kind: ir.PatternKind = @enumFromInt(slots[node.extra]);
+            switch (kind) {
+                .as => try emitPatternAs(em, node),
+                .array => try emitPatternArray(em, node),
+                .object => try emitPatternObject(em, node),
+                .alt_bind => try emitPatternAltBind(em, node),
+            }
+        },
+
         else => return error.NewCompilerNotImplemented,
+    }
+}
+
+// ── Cat-4 destructure ladders ─────────────────────────────────────
+//
+// Each emitter consumes a freshly-piped value on the value stack /
+// current and writes the bytecode shape legacy emits for the same
+// pattern shape. The IR's `destructure` op is the SemOp wrapper; its
+// kind picks the ladder. Sub-patterns recurse via `emitNode` so a
+// nested array-in-object pattern composes naturally.
+
+/// `simple` (as) pattern: a single variable bind. Pops a value off the
+/// value stack into `$var` (or uses current when the stack is empty —
+/// see vm.zig `capture_variable` line 1537). Mirrors legacy
+/// `emitPatternCapture(.simple)` at
+/// `src/query/src/compiler.zig:603-605`.
+fn emitPatternAs(em: *Emitter, node: ir.Node) EmitError!void {
+    const slots = em.ir_obj.extra_data.items;
+    // [kind, name_offset, name_len, var_id]
+    const var_id: i64 = @intCast(slots[node.extra + 3]);
+    try em.pushInstr(.capture_variable, .{ .index = var_id }, node);
+}
+
+/// `array` pattern: lift the destructure target onto current via `pipe`,
+/// then for each element emit `save_input ; fork_try ; load_index ;
+/// pop_try ; jump-past-catch ; push_null ; <recurse> ; restore_input`.
+/// Mirrors legacy `emitPatternCapture(.array)` at
+/// `src/query/src/compiler.zig:606-639`.
+fn emitPatternArray(em: *Emitter, node: ir.Node) EmitError!void {
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    for (span, 0..) |sub_idx, i| {
+        try em.pushInstr(.save_input, .{ .none = {} }, node);
+
+        const fork_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.fork_try, .{ .index = 0 }, node);
+        try em.pushInstr(.load_index, .{ .index = @intCast(i) }, node);
+        try em.pushInstr(.pop_try, .{ .none = {} }, node);
+
+        const jump_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+        const catch_ip: u32 = @intCast(em.instructions.items.len);
+        em.instructions.items[fork_pos].operand = .{ .index = catch_ip };
+        try em.pushInstr(.push_null, .{ .none = {} }, node);
+
+        const continue_ip: u32 = @intCast(em.instructions.items.len);
+        em.instructions.items[jump_pos].operand = .{ .index = continue_ip };
+
+        try emitNode(em, sub_idx);
+        try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    }
+}
+
+/// `object` pattern: lift the target onto current via `pipe`, then for
+/// each (key, sub-pattern) pair emit a fork-try ladder pulling the
+/// field out under null-on-missing. Static-key fields use `load_key`;
+/// computed-key fields evaluate the key expression then `load_computed`.
+/// Mirrors legacy `emitPatternCapture(.object)` at
+/// `src/query/src/compiler.zig:640-700`.
+fn emitPatternObject(em: *Emitter, node: ir.Node) EmitError!void {
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    // Pairs are (key, sub-pattern); span_len is even.
+    std.debug.assert(span.len % 2 == 0);
+
+    var pi: usize = 0;
+    while (pi < span.len) : (pi += 2) {
+        const key_idx = span[pi];
+        const sub_idx = span[pi + 1];
+        const key_node = em.ir_obj.nodes.items[key_idx];
+
+        try em.pushInstr(.save_input, .{ .none = {} }, node);
+
+        const fork_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.fork_try, .{ .index = 0 }, node);
+
+        if (key_node.op == .load_const) {
+            // Static key: extract the (offset, len) from the synthesized
+            // string literal and emit `load_key` directly. Avoids the
+            // computed-key replay overhead for the common case.
+            const value = ir.loadConstValue(&em.ir_obj, key_node);
+            std.debug.assert(value == .string);
+            const key_slots = em.ir_obj.extra_data.items;
+            const k_off: u32 = key_slots[key_node.extra + 1];
+            const k_len: u32 = key_slots[key_node.extra + 2];
+            try em.pushInstr(
+                .load_key,
+                .{ .str_ref = .{ .offset = k_off, .len = k_len } },
+                node,
+            );
+        } else {
+            // Computed key: `save_input ; <expr> ; load_computed ;
+            // push_current` so the destructure target is reset to the
+            // current map for the sub-pattern. Mirrors legacy
+            // `compiler.zig:666-693`.
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            try emitNode(em, key_idx);
+            try em.pushInstr(.load_computed, .{ .none = {} }, node);
+            try em.pushInstr(.push_current, .{ .none = {} }, node);
+        }
+
+        try em.pushInstr(.pop_try, .{ .none = {} }, node);
+
+        const jump_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+        const catch_ip: u32 = @intCast(em.instructions.items.len);
+        em.instructions.items[fork_pos].operand = .{ .index = catch_ip };
+        try em.pushInstr(.push_null, .{ .none = {} }, node);
+
+        const continue_ip: u32 = @intCast(em.instructions.items.len);
+        em.instructions.items[jump_pos].operand = .{ .index = continue_ip };
+
+        try emitNode(em, sub_idx);
+        try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    }
+}
+
+/// `alt_bind` pattern: the desugar of `expr as P1 ?// P2 … | body`.
+/// Variables are pre-null-initialised so non-matching alternatives
+/// yield null; each alternative is wrapped in a fork-try with strict
+/// capture. On the first successful match control jumps past the empty
+/// handler; on total failure `backtrack` produces the empty stream.
+/// Mirrors legacy `parseDestructAlt` at
+/// `src/query/src/compiler.zig:2573-2654`.
+fn emitPatternAltBind(em: *Emitter, node: ir.Node) EmitError!void {
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+
+    // Phase 1: collect every unique var_id touched by ANY alternative.
+    // The strict-capture ladder destroys variables that fail to match,
+    // so legacy null-initialises them up-front to keep `body` safe.
+    var seen = std.AutoHashMap(u32, void).init(em.allocator);
+    defer seen.deinit();
+    var ordered_ids: std.ArrayListUnmanaged(u32) = .{};
+    defer ordered_ids.deinit(em.allocator);
+    for (span) |sub_idx| {
+        try collectAltVarIds(em.ir_obj, sub_idx, &seen, &ordered_ids, em.allocator);
+    }
+
+    for (ordered_ids.items) |var_id| {
+        try em.pushInstr(.push_null, .{ .none = {} }, node);
+        try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+    }
+
+    // Phase 2: pipe the destructure target into current, save_input
+    // for each retry. Each alternative is wrapped in fork_try / strict
+    // capture / pop_try / jump-to-body. The catch arm of fork_try
+    // lands at the next alternative's restore_input (or the empty
+    // handler after the last).
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+
+    var jump_to_body: std.ArrayListUnmanaged(usize) = .{};
+    defer jump_to_body.deinit(em.allocator);
+
+    for (span, 0..) |sub_idx, i| {
+        const is_last = (i == span.len - 1);
+
+        if (i > 0) {
+            // Catch landing: restore the saved input and re-save for
+            // the next attempt (or for the empty handler's cleanup).
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(.save_input, .{ .none = {} }, node);
+        }
+
+        const fork_try_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.fork_try, .{ .index = 0 }, node);
+
+        // Push current to value_stack so the strict capture ladder
+        // can pipe it. Mirrors legacy line 2625.
+        try em.pushInstr(.push_current, .{ .none = {} }, node);
+        try emitPatternStrict(em, sub_idx);
+
+        try em.pushInstr(.pop_try, .{ .none = {} }, node);
+        try em.pushInstr(.restore_input, .{ .none = {} }, node);
+
+        const jmp_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.jump, .{ .index = 0 }, node);
+        try jump_to_body.append(em.allocator, jmp_pos);
+
+        const catch_ip: u32 = @intCast(em.instructions.items.len);
+        em.instructions.items[fork_try_pos].operand = .{ .index = catch_ip };
+
+        if (is_last) {
+            // Empty handler: pop the saved input and produce empty.
+            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try em.pushInstr(.backtrack, .{ .none = {} }, node);
+        }
+    }
+
+    // Body lands here — backpatch the per-alternative jumps.
+    const body_ip: u32 = @intCast(em.instructions.items.len);
+    for (jump_to_body.items) |jmp_pos| {
+        em.instructions.items[jmp_pos].operand = .{ .index = body_ip };
+    }
+}
+
+/// Collect the var_ids declared by a (sub-)pattern in declaration order,
+/// deduplicated. Used by `emitPatternAltBind` to seed the null-init
+/// loop. Walks `destructure` IR nodes recursively — `as` carries one
+/// id, `array` and `object` recurse, `alt_bind` is impossible at the
+/// inner level (the AST nests alternatives only at the top).
+fn collectAltVarIds(
+    ir_obj: ir.IR,
+    node_idx: u32,
+    seen: *std.AutoHashMap(u32, void),
+    ordered: *std.ArrayListUnmanaged(u32),
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const node = ir_obj.nodes.items[node_idx];
+    if (node.op != .destructure) return;
+    const slots = ir_obj.extra_data.items;
+    const kind: ir.PatternKind = @enumFromInt(slots[node.extra]);
+    switch (kind) {
+        .as => {
+            const var_id = slots[node.extra + 3];
+            if (!seen.contains(var_id)) {
+                try seen.put(var_id, {});
+                try ordered.append(allocator, var_id);
+            }
+        },
+        .array => {
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span) |sub| try collectAltVarIds(ir_obj, sub, seen, ordered, allocator);
+        },
+        .object => {
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            // Skip key children (offset 0 in each pair); pattern children
+            // live at offset 1.
+            var pi: usize = 1;
+            while (pi < span.len) : (pi += 2) {
+                try collectAltVarIds(ir_obj, span[pi], seen, ordered, allocator);
+            }
+        },
+        .alt_bind => {
+            // Nested `?//` is not a legal AST shape today (parser only
+            // emits one alt-bind per `as`); recurse defensively for
+            // future-proofing.
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span) |sub| try collectAltVarIds(ir_obj, sub, seen, ordered, allocator);
+        },
+    }
+}
+
+/// Emit a pattern subtree under `?//`-strict semantics: load_index /
+/// load_key are NOT wrapped in fork_try, so a TypeError mid-destructure
+/// propagates out to the enclosing `fork_try` and triggers the next
+/// alternative. Mirrors legacy `emitPatternCaptureStrict` at
+/// `src/query/src/compiler.zig:704-755`.
+fn emitPatternStrict(em: *Emitter, node_idx: u32) EmitError!void {
+    const node = em.ir_obj.nodes.items[node_idx];
+    std.debug.assert(node.op == .destructure);
+    const slots = em.ir_obj.extra_data.items;
+    const kind: ir.PatternKind = @enumFromInt(slots[node.extra]);
+    switch (kind) {
+        .as => {
+            const var_id: i64 = @intCast(slots[node.extra + 3]);
+            try em.pushInstr(.capture_variable, .{ .index = var_id }, node);
+        },
+        .array => {
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span, 0..) |sub_idx, i| {
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try em.pushInstr(.load_index, .{ .index = @intCast(i) }, node);
+                try emitPatternStrict(em, sub_idx);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            }
+        },
+        .object => {
+            try em.pushInstr(.pipe, .{ .none = {} }, node);
+            const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            std.debug.assert(span.len % 2 == 0);
+            var pi: usize = 0;
+            while (pi < span.len) : (pi += 2) {
+                const key_idx = span[pi];
+                const sub_idx = span[pi + 1];
+                const key_node = em.ir_obj.nodes.items[key_idx];
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                if (key_node.op == .load_const) {
+                    const value = ir.loadConstValue(&em.ir_obj, key_node);
+                    std.debug.assert(value == .string);
+                    const key_slots = em.ir_obj.extra_data.items;
+                    const k_off: u32 = key_slots[key_node.extra + 1];
+                    const k_len: u32 = key_slots[key_node.extra + 2];
+                    try em.pushInstr(
+                        .load_key,
+                        .{ .str_ref = .{ .offset = k_off, .len = k_len } },
+                        node,
+                    );
+                } else {
+                    try em.pushInstr(.save_input, .{ .none = {} }, node);
+                    try emitNode(em, key_idx);
+                    try em.pushInstr(.load_computed, .{ .none = {} }, node);
+                    try em.pushInstr(.push_current, .{ .none = {} }, node);
+                }
+                try emitPatternStrict(em, sub_idx);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            }
+        },
+        // Strict semantics within an alt_bind nest is undefined territory;
+        // legacy never produces this shape, so reject defensively.
+        .alt_bind => return error.NewCompilerNotImplemented,
     }
 }
 

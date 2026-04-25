@@ -167,6 +167,29 @@ const FIXTURES = [_]Fixture{
     // dispatcher sees no SKIP and the output matches legacy.
     .{ .name = "paren_field", .filter = "(.x)", .input = "{\"x\":42}", .expected_output = "42" },
     .{ .name = "paren_arith", .filter = "(. + 1) * 2", .input = "5", .expected_output = "12" },
+
+    // ── Category 4 — variables, as-pattern, destructure, ?// ──────
+    // Variable load via plain as-bind.
+    .{ .name = "var_load_simple", .filter = "1 as $x | $x", .input = "null", .expected_output = "1" },
+    // Variable used in arithmetic — verifies load_var operand resolves.
+    .{ .name = "as_bind_use", .filter = "5 as $x | $x + 1", .input = "null", .expected_output = "6" },
+    // Identity LHS — destructure target sourced from current input.
+    .{ .name = "as_identity_lhs", .filter = ". as $x | $x", .input = "42", .expected_output = "42" },
+    // Array destructure: extract two elements and combine.
+    .{ .name = "destructure_array_pair", .filter = ". as [$a, $b] | $a + $b", .input = "[10,20]", .expected_output = "30" },
+    // Array destructure missing element → null-on-missing arm.
+    .{ .name = "destructure_array_missing", .filter = ". as [$a, $b] | $b", .input = "[10]", .expected_output = "null" },
+    // Object destructure: explicit `key: $var` pairs.
+    .{ .name = "destructure_object_pair", .filter = ". as {a: $av, b: $bv} | $av + $bv", .input = "{\"a\":10,\"b\":20}", .expected_output = "30" },
+    // Object destructure shorthand `{$a, $b}` (key+var both `a`).
+    .{ .name = "destructure_object_shorthand", .filter = ". as {$a, $b} | $a + $b", .input = "{\"a\":3,\"b\":4}", .expected_output = "7" },
+    // Nested array destructure — verifies recursive pattern emit.
+    .{ .name = "destructure_nested", .filter = ". as [$a, [$b, $c]] | $a + $b + $c", .input = "[1,[2,3]]", .expected_output = "6" },
+    // Alt-bind: first pattern matches, second skipped, body uses var
+    // declared in P1.
+    .{ .name = "alt_bind_first", .filter = ". as [$a, $b] ?// $x | $a", .input = "[5,7]", .expected_output = "5" },
+    // Alt-bind: first pattern fails (non-array), fallback `$x` binds.
+    .{ .name = "alt_bind_fallback", .filter = ". as [$a, $b] ?// $x | $x", .input = "42", .expected_output = "42" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

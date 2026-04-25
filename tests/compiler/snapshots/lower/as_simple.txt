@@ -1,0 +1,7 @@
+# source: 1 as $x | $x
+# SemOp
+pipe @0..12
+  load_const(1) @0..1
+  pipe @0..12
+    destructure(as, "x") @0..12
+    load_var("x") @10..12
