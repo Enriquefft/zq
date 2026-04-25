@@ -38,23 +38,23 @@ Correctness only; time and tokens unlimited. CLAUDE.md applies.
 
 | Role | subagent_type | model | Purpose | Cap |
 |------|---------------|-------|---------|-----|
-| `plan-section-loader` | Explore | haiku | Plan §N digest | 30 |
-| `progress-reader` | Explore | haiku | Load state + log tail + handoff | 25 |
-| `progress-logger` | general-purpose | haiku | Append summary, update memory | 5 |
-| `explorer` | Explore | haiku | Locate files / search | 20 |
-| `implementer` | general-purpose | sonnet | Cutover edits (Phase 22 only) | 10 |
-| `verifier` | general-purpose | haiku | Build/test/grep PASS/FAIL | 10 |
-| `test-runner` | general-purpose | haiku | `zig build test` Debug/ReleaseSafe/ReleaseFast | 10 |
-| `bench-runner` | general-purpose | haiku | `bench-compile` final throughput row | 15 |
-| `guardrail-measurer` | general-purpose | sonnet | Measure 5 guardrails, write baselines | 15 |
+| `plan-section-loader` | Explore | opus | Plan §N digest | 30 |
+| `progress-reader` | Explore | opus | Load state + log tail + handoff | 25 |
+| `progress-logger` | general-purpose | opus | Append summary, update memory | 5 |
+| `explorer` | Explore | opus | Locate files / search | 20 |
+| `implementer` | general-purpose | opus | Cutover edits (Phase 22 only) | 10 |
+| `verifier` | general-purpose | opus | Build/test/grep PASS/FAIL | 10 |
+| `test-runner` | general-purpose | opus | `zig build test` Debug/ReleaseSafe/ReleaseFast | 10 |
+| `bench-runner` | general-purpose | opus | `bench-compile` final throughput row | 15 |
+| `guardrail-measurer` | general-purpose | opus | Measure 5 guardrails, write baselines | 15 |
 | `code-reviewer` | general-purpose | opus | Full-repo bugs, leaks, edges | 30 |
 | `architect-reviewer` | general-purpose | opus | Full-repo plan §1 invariants | 30 |
 | `future-readiness-reviewer` | general-purpose | opus | ROADMAP seam preservation | 30 |
-| `reviewer-synthesizer` | general-purpose | sonnet | 3 reports → verdict | 5 |
+| `reviewer-synthesizer` | general-purpose | opus | 3 reports → verdict | 5 |
 | `root-cause-investigator` | general-purpose | opus | Guardrail failure analysis (forbidden: relax bar) | 20 |
 | `plan-conflict-second-opinion` | Plan | opus | Plan-vs-reality re-read | 15 |
-| `plan-bug-surfacer` | general-purpose | sonnet | Format confirmed conflict | 10 |
-| `git-operator` | general-purpose | haiku | commit/merge → hash | 5 |
+| `plan-bug-surfacer` | general-purpose | opus | Format confirmed conflict | 10 |
+| `git-operator` | general-purpose | opus | commit/merge → hash | 5 |
 
 ### Persistence
 

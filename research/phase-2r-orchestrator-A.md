@@ -41,23 +41,23 @@ zero workarounds, agents-first).
 
 | Role | subagent_type | model | Purpose | Cap |
 |------|---------------|-------|---------|-----|
-| `plan-section-loader` | Explore | haiku | Plan §N digest | 30 |
-| `progress-reader` | Explore | haiku | Load state + log tail | 20 |
-| `progress-logger` | general-purpose | haiku | Append summary, update memory | 5 |
-| `explorer` | Explore | haiku | Locate files / search | 20 |
-| `implementer` | general-purpose | sonnet | Implement one change | 10 |
-| `verifier` | general-purpose | haiku | Build/test/diff PASS/FAIL | 10 |
-| `equiv-runner` | general-purpose | haiku | `vm-equiv -Dcompile=legacy` (Phase 6 sanity) | 10 |
-| `test-runner` | general-purpose | haiku | `zig build test` counts | 5 |
-| `bench-runner` | general-purpose | haiku | `bench-compile` legacy baseline (Phase 3) | 15 |
+| `plan-section-loader` | Explore | opus | Plan §N digest | 30 |
+| `progress-reader` | Explore | opus | Load state + log tail | 20 |
+| `progress-logger` | general-purpose | opus | Append summary, update memory | 5 |
+| `explorer` | Explore | opus | Locate files / search | 20 |
+| `implementer` | general-purpose | opus | Implement one change | 10 |
+| `verifier` | general-purpose | opus | Build/test/diff PASS/FAIL | 10 |
+| `equiv-runner` | general-purpose | opus | `vm-equiv -Dcompile=legacy` (Phase 6 sanity) | 10 |
+| `test-runner` | general-purpose | opus | `zig build test` counts | 5 |
+| `bench-runner` | general-purpose | opus | `bench-compile` legacy baseline (Phase 3) | 15 |
 | `code-reviewer` | general-purpose | opus | Bugs, leaks, edges | 30 |
 | `architect-reviewer` | general-purpose | opus | Plan §1 invariants | 30 |
 | `future-readiness-reviewer` | general-purpose | opus | ROADMAP foreclosure | 30 |
-| `reviewer-synthesizer` | general-purpose | sonnet | 3 reports → verdict | 5 |
+| `reviewer-synthesizer` | general-purpose | opus | 3 reports → verdict | 5 |
 | `root-cause-investigator` | general-purpose | opus | Failure analysis (forbidden: relax bar) | 20 |
 | `plan-conflict-second-opinion` | Plan | opus | Plan-vs-reality re-read | 15 |
-| `plan-bug-surfacer` | general-purpose | sonnet | Format confirmed conflict | 10 |
-| `git-operator` | general-purpose | haiku | tag/commit → hash | 5 |
+| `plan-bug-surfacer` | general-purpose | opus | Format confirmed conflict | 10 |
+| `git-operator` | general-purpose | opus | tag/commit → hash | 5 |
 
 ### Persistence
 

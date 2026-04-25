@@ -39,24 +39,24 @@ Correctness only; time and tokens unlimited. CLAUDE.md applies.
 
 | Role | subagent_type | model | Purpose | Cap |
 |------|---------------|-------|---------|-----|
-| `plan-section-loader` | Explore | haiku | Plan §N digest | 30 |
-| `progress-reader` | Explore | haiku | Load state + log tail + handoff | 25 |
-| `progress-logger` | general-purpose | haiku | Append summary, update memory | 5 |
-| `explorer` | Explore | haiku | Locate files / search | 20 |
-| `implementer` | general-purpose | sonnet | Implement one category (worktree) | 10 |
-| `verifier` | general-purpose | haiku | Build/test/diff PASS/FAIL | 10 |
-| `equiv-runner` | general-purpose | haiku | `vm-equiv -Dcompile=new` per category | 10 |
-| `snapshot-validator` | general-purpose | haiku | Snapshot diffs (lower/fuse) | 10 |
-| `test-runner` | general-purpose | haiku | `zig build test` counts | 5 |
-| `bench-runner` | general-purpose | haiku | `bench-compile -Dcompile=new` (background) | 15 |
+| `plan-section-loader` | Explore | opus | Plan §N digest | 30 |
+| `progress-reader` | Explore | opus | Load state + log tail + handoff | 25 |
+| `progress-logger` | general-purpose | opus | Append summary, update memory | 5 |
+| `explorer` | Explore | opus | Locate files / search | 20 |
+| `implementer` | general-purpose | opus | Implement one category (worktree) | 10 |
+| `verifier` | general-purpose | opus | Build/test/diff PASS/FAIL | 10 |
+| `equiv-runner` | general-purpose | opus | `vm-equiv -Dcompile=new` per category | 10 |
+| `snapshot-validator` | general-purpose | opus | Snapshot diffs (lower/fuse) | 10 |
+| `test-runner` | general-purpose | opus | `zig build test` counts | 5 |
+| `bench-runner` | general-purpose | opus | `bench-compile -Dcompile=new` (background) | 15 |
 | `code-reviewer` | general-purpose | opus | Bugs, leaks, edges | 30 |
 | `architect-reviewer` | general-purpose | opus | Plan §1 invariants, no virtual dispatch | 30 |
 | `future-readiness-reviewer` | general-purpose | opus | Const-fold / extended-fuse / pushdown seams | 30 |
-| `reviewer-synthesizer` | general-purpose | sonnet | 3 reports → verdict | 5 |
+| `reviewer-synthesizer` | general-purpose | opus | 3 reports → verdict | 5 |
 | `root-cause-investigator` | general-purpose | opus | Failure analysis (forbidden: relax bar) | 20 |
 | `plan-conflict-second-opinion` | Plan | opus | Plan-vs-reality re-read | 15 |
-| `plan-bug-surfacer` | general-purpose | sonnet | Format confirmed conflict | 10 |
-| `git-operator` | general-purpose | haiku | commit/merge worktree → hash | 5 |
+| `plan-bug-surfacer` | general-purpose | opus | Format confirmed conflict | 10 |
+| `git-operator` | general-purpose | opus | commit/merge worktree → hash | 5 |
 
 Optional: TeamCreate `phase-2r-review-team`
 {code-reviewer, architect-reviewer, future-readiness-reviewer,
