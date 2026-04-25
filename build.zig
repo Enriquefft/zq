@@ -153,9 +153,9 @@ pub fn build(b: *std.Build) void {
     ast_module.addImport("types", types_module);
 
     // Prefilter harvester — defined early so every downstream module
-    // (query_module, compiler_legacy_module, compiler_ast_module) can import
-    // it by name and stay on a single module root. Phase 2 Stage 12 moved the
-    // AST-idiom matcher into this file so both compile paths share it.
+    // (currently `query_module`) can import it by name and stay on a single
+    // module root. The AST-idiom matcher lives here so the eventual new
+    // compiler can share it without re-rooting the file.
     const prefilter_module = b.createModule(.{
         .root_source_file = b.path("src/query/src/prefilter.zig"),
         .target = target,
@@ -471,69 +471,6 @@ pub fn build(b: *std.Build) void {
     const fuzz_regex_tests = b.addTest(.{ .root_module = fuzz_regex_mod });
     if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
     fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);
-
-    // ── AST-walk compile equivalence harness (NOT in test_step) ──────────
-    // Runs the Stage 0/1 equivalence check between the legacy token-driven
-    // compiler and the new AST walker at `src/ast/compiler.zig`. Exits
-    // nonzero on any mismatch. See `research/phase-2-ast-walk-plan.md` §3.
-    //
-    // Invocation: `zig build ast-compile-equiv`.
-    // Optional `-Dast-equiv-verbose=true` for raw-instruction dumps.
-    const ast_equiv_verbose = b.option(bool, "ast-equiv-verbose", "Dump per-fixture instructions from ast-compile-equiv") orelse false;
-    const ast_equiv_options = b.addOptions();
-    ast_equiv_options.addOption(bool, "ast_equiv_verbose", ast_equiv_verbose);
-    const ast_equiv_options_module = ast_equiv_options.createModule();
-
-    // Legacy compiler exposed as a sibling module so the harness can call
-    // `compile(src, external_vars, alloc)` directly. This mirrors the module
-    // wiring used by `query_module` but targets `src/query/src/compiler.zig`
-    // directly — production `query_module` is untouched.
-    const compiler_legacy_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    compiler_legacy_module.addImport("error", error_module);
-    compiler_legacy_module.addImport("types", types_module);
-    compiler_legacy_module.addImport("lexer", lexer_module);
-    compiler_legacy_module.addImport("regex", regex_module);
-    compiler_legacy_module.addImport("ast", ast_module);
-    // Share the same prefilter module created at the top of this function so
-    // the ast-compile-equiv harness (which also loads the walker) doesn't
-    // double-root `src/query/src/prefilter.zig`. Before Stage 12 the legacy
-    // compiler pulled the file in via a relative `@import("prefilter.zig")`;
-    // now it imports by module name and both compilers share the single
-    // root. See `src/query/src/compiler.zig` and `src/ast/compiler.zig`.
-    compiler_legacy_module.addImport("prefilter", prefilter_module);
-
-    // AST walker exposed as a sibling module. Parallel to the legacy
-    // compiler. Stage 13 cutover collapses these into one.
-    const compiler_ast_module = b.createModule(.{
-        .root_source_file = b.path("src/ast/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    compiler_ast_module.addImport("ast", ast_module);
-    compiler_ast_module.addImport("types", types_module);
-    compiler_ast_module.addImport("error", error_module);
-    compiler_ast_module.addImport("regex", regex_module);
-    compiler_ast_module.addImport("prefilter", prefilter_module);
-
-    const ast_equiv_step = b.step("ast-compile-equiv", "Run AST-walk compile equivalence harness (Phase 2)");
-    const ast_equiv_mod = b.createModule(.{
-        .root_source_file = b.path("tests/ast_compile_equiv.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ast_equiv_mod.addImport("compiler_legacy", compiler_legacy_module);
-    ast_equiv_mod.addImport("compiler_ast", compiler_ast_module);
-    ast_equiv_mod.addImport("types", types_module);
-    ast_equiv_mod.addImport("prefilter", prefilter_module);
-    ast_equiv_mod.addImport("regex", regex_module);
-    ast_equiv_mod.addImport("build_options", ast_equiv_options_module);
-    const ast_equiv_tests = b.addTest(.{ .root_module = ast_equiv_mod });
-    if (shim_build_step) |step| ast_equiv_tests.step.dependOn(&step.step);
-    ast_equiv_step.dependOn(&b.addRunArtifact(ast_equiv_tests).step);
 
     // ── Regex bench (NOT in test_step) ────────────────────────────────────
     // Latency probe. Prints median/p99 per pattern class to stderr. Not part

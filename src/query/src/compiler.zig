@@ -1365,7 +1365,7 @@ pub fn compile(src: []const u8, external_vars: []const ExternalVarDecl, alloc: s
     // guarantees a record producing no regex match also produces no select
     // output — the necessary condition for skipping a record's full parse.
     // Arithmetic, boolean combinators, nested `map`, function calls, etc.
-    // all invalidate the assumption and cause the AST walker to bail (safe
+    // all invalidate the assumption and cause the harvester to bail (safe
     // by default: unrecognised shape → no prefilter).
     harvestPrefilterFromAst(&ctx, alloc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

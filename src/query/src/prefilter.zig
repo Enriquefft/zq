@@ -248,17 +248,17 @@ pub fn groupFromRegex(
     };
 }
 
-// ─── AST-backed harvester (Phase 2 Stage 12) ─────────────────────────────────
+// ─── AST-backed harvester ────────────────────────────────────────────────────
 //
 // Single source of truth for the prefilter shape match: walks an already-parsed
 // AST root and appends any harvestable `LiteralGroup`s onto the caller's list.
 //
-// Both the legacy token-walk compiler (`src/query/src/compiler.zig`) and the
-// AST walker (`src/ast/compiler.zig`) call `harvestFromAstRoot` — legacy after
-// a dedicated `ast.parse(src)`, walker with the AST it already parsed for
-// bytecode emission. The two call sites therefore observe byte-identical
-// prefilter output by construction: the harvest logic depends only on the AST
-// shape, not on the caller's state.
+// Today the legacy token-walk compiler (`src/query/src/compiler.zig`) calls
+// `harvestFromAstRoot` after a dedicated `ast.parse(src)`. The Phase 2R
+// compiler (`src/compiler/`, when it lands) will call the same function with
+// the AST it already parsed for lowering. The harvest logic depends only on
+// the AST shape, not on the caller's state, so both call sites observe
+// identical prefilter output by construction.
 //
 // Matches the exact idiom:
 //

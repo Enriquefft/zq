@@ -794,9 +794,9 @@ pub const Parser = struct {
             const has_colon = if (after_dollar) |t| t.tag == .colon else false;
 
             // Key shape in the AST for both `{$x}` and `{$x: VALUE}` is
-            // `.ident` carrying the variable *name*. The walker detects the
-            // `$` prefix by looking at the source byte at the cursor — see
-            // `emitObjectField` in `src/ast/compiler.zig`.
+            // `.ident` carrying the variable *name*. The compiler detects
+            // the `$` prefix by looking at the source byte at the key
+            // span's start.
             const key: Node.ObjectKey = .{ .ident = var_name };
 
             if (has_colon) {
