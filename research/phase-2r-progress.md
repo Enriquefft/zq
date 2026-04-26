@@ -594,3 +594,47 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Next**: Phase 20 (R3 acceptance verification — no code; gates only)
 
+### Phase 20 — R3 acceptance verification
+**Date**: 2026-04-26
+**HEAD verified**: `2b9706a` (cumulative through P19 + P19 docs commit; no code commits this phase)
+**Plan reference**: §3 R3 acceptance criteria + §1.4 gates 1, 5
+**Mode**: gates-only verification (no source changes, no IR changes, no SemOps)
+
+**Objective**: Verify all R3 acceptance gates pass at HEAD before R4+R5 cutover; record bench numbers vs R2 baseline; classify carry-forward deferrals for P21.
+
+**Gate 1 — R3-EQUIV: PASS**
+- `zig build vm-equiv`: 178 pass / 0 fail / 3 skip (12.54s) — exact P19 baseline match
+- `zig build vm-equiv-errpos`: 5 pass / 0 fail / 0 skip (0.46s); `legacy_drift=0`
+- 3 pre-existing skips are placeholder fixtures awaiting future builtins (`select`, `map`, `reduce`)
+- 0 new skips
+- Plan §3 R3 threshold ("green on all extracted fixtures") MET
+- Plan §1.4 gate 5 (errpos parity, no tolerance) MET
+
+**Gate 2 — R3-SNAP: PASS**
+- 92 lower fixtures + 12 fuse fixtures, paired with `snapshots_test.zig` and `snapshots_fuse_test.zig`
+- `zig build snapshots-update`: rewrote=0 unchanged=104 (deterministic regen)
+- sha256 pre/post diff EMPTY; `git status` clean post-regen
+- 0 fixtures over 200 lines (CONCERN bound), 0 over 500 (FAIL bound)
+- 111 unrelated failures isolated to `tests/compat/regression.zig` (pre-existing jq-compat gaps); not snapshot infra
+
+**Gate 3 — R3-BENCH: PASS by literal threshold**
+- Plan §3 R3 perf threshold (verbatim): "Bench numbers recorded for -Dcompile=new against R2 baseline" — no numeric bound at R3
+- R2 baseline source: `research/compiler-baselines.md:44-63` (legacy at `c9d4a69`, captured 2026-04-25)
+- Targets: `bench-compile` (relevant); skipped `bench-regex` and `microbench` (orthogonal)
+- Method: 3 fresh-process runs each for `-Dcompile=legacy` and `-Dcompile=new`, ReleaseFast
+- Corpus median: NEW=10.30µs, LEGACY=10.12µs, R2=11.51µs
+  - +1.8% vs legacy (within 5% noise band)
+  - **-10.5% vs R2 baseline (improvement)**
+- Per-filter outliers vs ±5% bound: `f.field +49% vs R2`, `f.nested +54% vs LEGACY`, `f.deep_pipe +14.4% vs R2`
+- All filters within 2σ bound (passes σ check on every row)
+- Wall-clock budget: 141s
+
+**Synthesizer verdict**: PROCEED — R3 accepted per plan literal text. §1.4 row 2 (within 5% AND within 2σ of legacy median) is explicitly tagged "measured before R4 cutover" — that's a P21 (R4) gate, not a P20 (R3) gate.
+
+**Carried forward to P21 (R4 acceptance + cutover)**:
+1. `literal_groups` leak (~1-2 KB/compile) — DEFERRED since P18; no investigation in P20 (out-of-scope per Phase 20 entry prereq #5)
+2. Bench artifact (+27%/+58% shape persistent) — same outliers as P18 measurement; addressed by §1.4 row 2 R4 gate
+3. **NEW spec-clarification item**: §1.4 row 2 "within 5%" interpretation — symmetric ±5% bound is mechanically failed by literal-improvement readings (e.g., the -10.5% vs R2 corpus median is a "regression" only by symmetric reading); 2σ guardrail passes universally; P21 synthesizer should interpret as "no slowdown beyond 5%" and credit improvements as PASS
+
+**Phase status**: COMPLETE. Next: P21 (R4+R5 cutover).
+
