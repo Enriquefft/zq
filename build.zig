@@ -558,6 +558,21 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| compiler_snapshots_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(compiler_snapshots_tests).step);
 
+    // Fuse snapshot suite — pinned at `tests/compiler/snapshots/fuse/`.
+    // Plan §3 R3 step 8 (fuse pass) + step 9 (snapshot tests). Drives
+    // the IR-walking dumper so the load-path fold rewrite shows up in
+    // the diff.
+    const compiler_fuse_snapshots_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_fuse_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_fuse_snapshots_mod.addImport("ast", ast_module);
+    compiler_fuse_snapshots_mod.addImport("compiler", compiler_module);
+    const compiler_fuse_snapshots_tests = b.addTest(.{ .root_module = compiler_fuse_snapshots_mod });
+    if (shim_build_step) |step| compiler_fuse_snapshots_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(compiler_fuse_snapshots_tests).step);
+
     // Leak regression for the new compiler's external_var_ids path.
     const new_compile_leak_mod = b.createModule(.{
         .root_source_file = b.path("tests/compiler/compile_leak_test.zig"),

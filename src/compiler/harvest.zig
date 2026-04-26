@@ -208,6 +208,11 @@ fn isPureAccessor(ir_obj: *const ir.IR, node_idx: u32) bool {
         .identity => true,
         .recurse => true,
         .load_field => true,
+        // EmitOp produced by fuse — semantically equivalent to a
+        // pipe-chain of `load_field`s, so equally pure. Without this
+        // arm any prefilter on `select(.a.b | test("…"))` would
+        // regress after Phase 2R/Phase 19's load-path fold landed.
+        .load_path => true,
         .load_index => true,
         .slice => true,
         .iterate => true,

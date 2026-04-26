@@ -248,6 +248,25 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             );
         },
 
+        // ── EmitOp (fuse output) — Phase 2R / R3 step 8 ─────────────
+        // load_path collapses a `.a | .b | .c` pipe-chain to a single
+        // bytecode instruction. The IR payload is `(offset, len)` of a
+        // dot-joined key sequence interned in `string_buf` — same
+        // encoding as `load_field`, so the emit shape is identical
+        // modulo the destination opcode (`.load_path` vs `.load_key`).
+        // Mirrors the legacy fuse output at
+        // `src/query/src/compiler.zig:7228`.
+        .load_path => {
+            const slots = em.ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            try em.pushInstr(
+                .load_path,
+                .{ .str_ref = .{ .offset = offset, .len = len } },
+                node,
+            );
+        },
+
         .load_index => {
             const slots = em.ir_obj.extra_data.items;
             const lo: u64 = slots[node.extra];

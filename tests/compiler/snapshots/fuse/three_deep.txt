@@ -1,0 +1,11 @@
+# source: .a | .b | .c
+# before
+# SemOp
+pipe @0..12
+  pipe @0..7
+    load_field("a") @0..2
+    load_field("b") @5..7
+  load_field("c") @10..12
+# after
+# EmitOp
+load_path("a.b.c") @0..12

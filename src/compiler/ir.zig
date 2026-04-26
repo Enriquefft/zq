@@ -11,6 +11,22 @@
 //! `deinit` is a no-op on the lists themselves; the arena owns the storage.
 const std = @import("std");
 
+/// Op-namespace classification. `SemOp` ops are produced by `lower.zig`;
+/// `EmitOp` ops are produced by `fuse.zig` for emission shortcuts. The
+/// IR-walking dumper switches the banner (`# SemOp` / `# EmitOp`) on
+/// namespace transitions; emit handles both. Spec
+/// `research/compiler-ir-format.md` §4.
+pub const Namespace = enum { sem_op, emit_op };
+
+/// Classify an op tag by its namespace. Single source of truth — the
+/// dumper, fuse, and emit all consult this. Plan §1.3 row 6.
+pub fn opNamespace(op: Op) Namespace {
+    return switch (op) {
+        .load_path => .emit_op,
+        else => .sem_op,
+    };
+}
+
 /// `load_const` payload discriminant. Encoded into `extra_data[node.extra]`
 /// by `lower.zig` and decoded by `emit.zig`; the trailing slots carry the
 /// concrete value (lo32/hi32 for int/float, offset/len for string).
@@ -180,10 +196,14 @@ pub const Op = enum(u8) {
     path_begin,
     path_end,
 
-    // ── EmitOp namespace (reserved; no variants today) ────────────────────
-    // Fuse's output ops (e.g. `load_path`, `key_count`, `key_exists`) and
-    // any future emission shortcuts will be added here. Plan §1.3 row 6:
-    // "none today; reserved namespace for fuse's output and future passes."
+    // ── EmitOp namespace (produced by fuse, consumed by emit) ─────────────
+    // Plan §1.3 row 6 / §3 R3 step 8: chained `.a | .b | .c` field loads
+    // collapse to a single `load_path` whose payload is the dot-joined key
+    // sequence. The payload `extra` indexes a 2-slot `(offset, len)` pair
+    // into `string_buf` — same encoding as `load_field` so emit can route
+    // both through one decode helper. Maps to legacy
+    // `Instruction.Op.load_path` (operand `str_ref`).
+    load_path,
 };
 
 /// A single IR node — the universal record type for both SemOp and EmitOp.
@@ -1302,4 +1322,306 @@ fn writeRegexPoolRef(writer: anytype, bc: *const ast.Node.BuiltinCall) !void {
         }
     }
     try writer.writeAll("\"");
+}
+
+// ── IR-walking dumper (fuse snapshots) ──────────────────────────────────────
+//
+// The AST-walking `dump()` above renders the IR in source order — sufficient
+// for `lower/` snapshots where the IR matches the AST. After fuse, the IR
+// no longer mirrors the AST (chained `load_field`s collapse to `load_path`
+// EmitOps). The fuse snapshot suite (`tests/compiler/snapshots/fuse/`)
+// therefore drives this IR-walking dumper instead, so the post-rewrite
+// shape surfaces in the diff.
+//
+// The dumper writes the namespace banner (`# SemOp` / `# EmitOp`) on entry
+// and re-emits it at every namespace transition encountered during the
+// walk. Single-namespace IRs see exactly one banner; mixed IRs see one
+// per transition. Spec `research/compiler-ir-format.md` §4.
+
+/// Dump-time state for namespace banner switching during a recursive
+/// IR walk. The first emitted node always emits its banner; subsequent
+/// nodes emit a fresh banner only on a SemOp ↔ EmitOp transition.
+const NamespaceTracker = struct {
+    last: ?Namespace = null,
+
+    fn maybeEmit(self: *NamespaceTracker, ns: Namespace, writer: anytype) @TypeOf(writer).Error!void {
+        if (self.last) |prev| {
+            if (prev == ns) return;
+        }
+        self.last = ns;
+        switch (ns) {
+            .sem_op => try writer.writeAll("# SemOp\n"),
+            .emit_op => try writer.writeAll("# EmitOp\n"),
+        }
+    }
+};
+
+/// Dump the IR tree rooted at the last-pushed node. Emits the namespace
+/// banner before the first node and on every SemOp ↔ EmitOp transition,
+/// then walks the tree depth-first, rendering each node with its payload
+/// and source span. Used by the fuse snapshot harness; the `dump()` AST
+/// walker is preferred for `lower/` snapshots because it captures the
+/// source-order shape independent of IR storage choices.
+///
+/// Returns immediately on an empty IR (no banner, no tree). Lowering
+/// always produces at least one node for a non-empty AST, so this only
+/// fires on malformed/no-op inputs.
+pub fn dumpIR(
+    ir_obj: *const IR,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    if (ir_obj.nodes.items.len == 0) return;
+    const root_idx: u32 = @intCast(ir_obj.nodes.items.len - 1);
+    var tracker: NamespaceTracker = .{};
+    try dumpIRNode(ir_obj, root_idx, 0, &tracker, writer);
+}
+
+/// Render a single IR node and recurse into its children. Each node line
+/// is preceded by the appropriate banner if the namespace changed since
+/// the last emitted line.
+fn dumpIRNode(
+    ir_obj: *const IR,
+    node_idx: u32,
+    depth: usize,
+    tracker: *NamespaceTracker,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    const node = ir_obj.nodes.items[node_idx];
+    try tracker.maybeEmit(opNamespace(node.op), writer);
+    try writeIndent(writer, depth);
+    try renderNodePayload(ir_obj, node, writer);
+    try writeIRSpan(writer, node);
+    try writer.writeAll("\n");
+    try dumpIRChildren(ir_obj, node, depth + 1, tracker, writer);
+}
+
+/// Render one node's `op_tag(payload)` head — span and newline are
+/// appended by the caller. Single-source-of-truth payload decoding for
+/// each op variant. Op variants without inline payloads emit only the
+/// tag; variants whose payload semantics aren't fully decoded by the
+/// dumper fall back to `extra=<index>` per spec §6.
+fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
+    switch (node.op) {
+        .load_const => {
+            const value = loadConstValue(ir_obj, node);
+            switch (value) {
+                .null_val => try writer.writeAll("load_const(null)"),
+                .bool_val => |b| try writer.print("load_const({s})", .{if (b) "true" else "false"}),
+                .int => |n| try writer.print("load_const({d})", .{n}),
+                .float => |f| try writer.print("load_const({d})", .{f}),
+                .string => |s| {
+                    try writer.writeAll("load_const(");
+                    try writeStringLit(writer, s);
+                    try writer.writeAll(")");
+                },
+            }
+        },
+        .load_var => {
+            // Var-id lives at extra_data[extra]; the var's name is not
+            // stored on the IR (var_table lives on the Lowerer). Render
+            // as `load_var(id=<n>)` so fuse-snapshot diffs stay stable
+            // without depending on the lowerer's name table.
+            const slots = ir_obj.extra_data.items;
+            const var_id: u32 = slots[node.extra];
+            try writer.print("load_var(id={d})", .{var_id});
+        },
+        .identity => try writer.writeAll("identity"),
+        .load_field => {
+            const slots = ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            const name = ir_obj.string_buf.items[offset .. offset + len];
+            try writer.writeAll("load_field(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+        },
+        .load_index => {
+            const slots = ir_obj.extra_data.items;
+            const lo: u64 = slots[node.extra];
+            const hi: u64 = slots[node.extra + 1];
+            const u: u64 = lo | (hi << 32);
+            const n: i64 = @bitCast(u);
+            try writer.print("load_index({d})", .{n});
+        },
+        .slice => {
+            const slots = ir_obj.extra_data.items;
+            const from_u: u32 = slots[node.extra];
+            const to_u: u32 = slots[node.extra + 1];
+            const flags: u32 = slots[node.extra + 2];
+            const has_from = (flags & 1) != 0;
+            const has_to = (flags & 2) != 0;
+            try writer.writeAll("slice(");
+            if (has_from) try writer.print("{d}", .{@as(i32, @bitCast(from_u))}) else try writer.writeAll("_");
+            try writer.writeAll(", ");
+            if (has_to) try writer.print("{d}", .{@as(i32, @bitCast(to_u))}) else try writer.writeAll("_");
+            try writer.writeAll(")");
+        },
+        .pipe => try writer.writeAll("pipe"),
+        .comma => try writer.writeAll("comma"),
+        .iterate => try writer.writeAll("iterate"),
+        .recurse => try writer.writeAll("recurse"),
+        .try_ => try writer.writeAll("try"),
+        .neg => try writer.writeAll("neg"),
+        .not => try writer.writeAll("not"),
+        // Cat-5 + cat-6 binary/composite ops: render the op-kind via the
+        // shared discriminator enums (single-source-of-truth with the
+        // AST dumper's strings).
+        .arith => {
+            const kind: ArithKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            const name = switch (kind) {
+                .add => "add",
+                .sub => "sub",
+                .mul => "mul",
+                .div => "div",
+                .mod => "mod",
+            };
+            try writer.print("arith({s})", .{name});
+        },
+        .cmp => {
+            const kind: CmpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            const name = switch (kind) {
+                .eq => "eq",
+                .ne => "ne",
+                .lt => "lt",
+                .le => "le",
+                .gt => "gt",
+                .ge => "ge",
+            };
+            try writer.print("cmp({s})", .{name});
+        },
+        .logical => {
+            const kind: LogicalKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            try writer.print("logical({s})", .{switch (kind) {
+                .and_ => "and",
+                .or_ => "or",
+            }});
+        },
+        .alt => try writer.writeAll("alt"),
+        .if_ => try writer.writeAll("if"),
+        .reduce => try writer.writeAll("reduce"),
+        .foreach => try writer.writeAll("foreach"),
+        .interp => try writer.writeAll("interp"),
+        .format => {
+            // Format payload encoding varies by lowering site; render as
+            // `format(extra=<i>)` fallback per spec §6 — fuse fixtures
+            // don't cover format strings.
+            try writer.print("format(extra={d})", .{node.extra});
+        },
+        .obj_ctor => try writer.writeAll("obj_ctor"),
+        .arr_ctor => try writer.writeAll("arr_ctor"),
+        .call_user => {
+            // call_user payload is `extra_data[extra+0]` = fn_id; the
+            // fn name lives on Lowerer's function_table. Render with
+            // the id only — fuse fixtures don't cross UDF boundaries.
+            const fn_id: u32 = ir_obj.extra_data.items[node.extra];
+            try writer.print("call_user(fn_id={d})", .{fn_id});
+        },
+        .call_builtin => {
+            // call_builtin payload is `extra_data[extra+0]` = name
+            // string-buf id (offset), `[extra+1]` = len. Mirrors
+            // load_field's encoding so the fuse dumper resolves both
+            // through the same path.
+            const slots = ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            const name = ir_obj.string_buf.items[offset .. offset + len];
+            try writer.writeAll("call_builtin(");
+            try writeStringLit(writer, name);
+            try writer.writeAll(")");
+        },
+        .update_assign => {
+            const kind: UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            try writer.print("update_assign({s})", .{switch (kind) {
+                .set => "set",
+                .add => "add",
+                .sub => "sub",
+                .mul => "mul",
+                .div => "div",
+                .mod => "mod",
+                .alt => "alt",
+                .update => "update",
+                .general => "general",
+            }});
+        },
+        .destructure => {
+            const kind: PatternKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            try writer.print("destructure({s})", .{switch (kind) {
+                .as => "as",
+                .array => "array",
+                .object => "object",
+                .alt_bind => "alt_bind",
+            }});
+        },
+        .path_begin => try writer.writeAll("path_begin"),
+        .path_end => try writer.writeAll("path_end"),
+
+        // EmitOp namespace: same string-buf encoding as load_field.
+        .load_path => {
+            const slots = ir_obj.extra_data.items;
+            const offset: u32 = slots[node.extra];
+            const len: u32 = slots[node.extra + 1];
+            const path = ir_obj.string_buf.items[offset .. offset + len];
+            try writer.writeAll("load_path(");
+            try writeStringLit(writer, path);
+            try writer.writeAll(")");
+        },
+    }
+}
+
+/// Recurse into a node's children in IR storage order. The depth-2
+/// `children[0..]` slot is used for nodes whose `span_len` is 0; the
+/// variable-arity `extra_children[span_start..]` slice is used
+/// otherwise. Leaves with no children are no-ops.
+fn dumpIRChildren(
+    ir_obj: *const IR,
+    node: Node,
+    depth: usize,
+    tracker: *NamespaceTracker,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    // Leaf ops with no children — bail out without touching `children` or
+    // `span_*` slots which are 0/uninitialized for true leaves. `not` is
+    // a leaf in the IR even though emit treats it as a unary op (it
+    // operates on the implicit current input — see `lower.zig:1539`).
+    switch (node.op) {
+        .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end => return,
+        else => {},
+    }
+    if (node.span_len > 0) {
+        const span_end = node.span_start + node.span_len;
+        for (ir_obj.extra_children.items[node.span_start..span_end]) |child_idx| {
+            try dumpIRNode(ir_obj, child_idx, depth, tracker, writer);
+        }
+        return;
+    }
+    // Fixed-arity slot: 1 or 2 children depending on op. `update_assign`
+    // 's fast-path shape stores `children[0] == 0` as a "no-LHS"
+    // sentinel — the only real child is `children[1]`. The discriminator
+    // is the `UpdateOpKind` in `extra_data[node.extra]`. Mirrors the
+    // same special case in `fuse.zig:childArity`.
+    const arity: struct { u8, u8 } = switch (node.op) {
+        // Binary
+        .pipe, .comma, .arith, .cmp, .logical, .alt => .{ 0, 2 },
+        // Unary
+        .try_, .neg, .path_begin => .{ 0, 1 },
+        .update_assign => blk: {
+            const kind: UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 };
+        },
+        // Composite ops should always use span; if span_len==0 here it's
+        // a malformed IR — render with arity 0 to avoid touching empty
+        // children slots.
+        else => .{ 0, 0 },
+    };
+    var i: u8 = arity[0];
+    while (i < arity[1]) : (i += 1) {
+        try dumpIRNode(ir_obj, node.children[i], depth, tracker, writer);
+    }
+}
+
+/// Render a node's source span as `@<start>..<end>`. The `dump()`
+/// (AST-walking) sibling reaches for the AST's `Span`; the IR-walking
+/// dumper reads `(src_start, src_len)` directly from the node.
+fn writeIRSpan(writer: anytype, node: Node) !void {
+    try writer.print(" @{d}..{d}", .{ node.src_start, node.src_start + node.src_len });
 }

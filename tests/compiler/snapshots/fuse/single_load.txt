@@ -1,0 +1,7 @@
+# source: .foo
+# before
+# SemOp
+load_field("foo") @0..4
+# after
+# SemOp
+load_field("foo") @0..4

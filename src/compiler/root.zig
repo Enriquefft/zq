@@ -31,8 +31,15 @@ pub const Op = ir_mod.Op;
 pub const Node = ir_mod.Node;
 pub const IR = ir_mod.IR;
 pub const dump = ir_mod.dump;
+/// IR-walking dumper (vs `dump` which walks the AST). Used by the
+/// fuse snapshot harness to render the post-rewrite IR shape.
+pub const dumpIR = ir_mod.dumpIR;
 pub const Lowerer = lower_mod.Lowerer;
 pub const lowerNode = lower_mod.lowerNode;
+/// Fuse pass entry point — see `fuse.zig` for the rewrite rules.
+/// Snapshot tests import this directly to drive the IR-level diff.
+pub const fuse = fuse_mod.fuse;
+pub const FuseResult = fuse_mod.Result;
 
 // Re-export the legacy-shape result types so callers can speak in our
 // vocabulary without dragging the compiler module's internals in.
@@ -107,8 +114,19 @@ pub fn compile(
     };
     const lowered = lowerer.out;
 
-    // Stage 3: fuse (no-op in Phase 7).
-    const fused = try fuse_mod.fuse(lowered);
+    // Stage 3: fuse — chained `.a | .b | .c` collapses to one
+    // `load_path` EmitOp (Phase 19, plan §3 R3 step 8). The pass
+    // returns a fresh IR whose node ordering differs from `lowered`,
+    // so any auxiliary table that points into the IR by node index
+    // (cat-9 `function_table.body_ir_root`) must be re-pointed via
+    // `index_map`. Untouched table entries (`BODY_IR_NOT_LOWERED`
+    // sentinel) pass through unchanged.
+    const fuse_result = try fuse_mod.fuse(lowered);
+    const fused = fuse_result.ir;
+    for (lowerer.function_table.items) |*entry| {
+        if (entry.body_ir_root == lower_mod.BODY_IR_NOT_LOWERED) continue;
+        entry.body_ir_root = fuse_result.index_map[entry.body_ir_root];
+    }
 
     // Stage 4: emit IR → bytecode. The emitter copies bytes the VM
     // needs into the caller's allocator; the IR arena is freed by
