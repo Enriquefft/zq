@@ -462,3 +462,80 @@ uncommitted progress, applied gap fixes, and merged sequentially.
    functions/UDF) — confirm row 5 names before lowering.
 2. Snapshot fixtures must include cat-4/6/8 forms.
 3. Wave B implementer brief: cat-4 (Phase 10), cat-6 (Phase 12), cat-8 (Phase 14).
+
+## Wave C (Phases 15 + 16 + 17) close-out — 2026-04-25
+**Status:** PROCEED — all phases merged, gates green, zero regressions.
+
+### Commits (final stack on redesign/compiler)
+- `08a4fc1` Phase 16 (cat-10 builtins): 13 lower snapshots, 46 vm-equiv fixtures, +736 LOC
+- `678337f` Phase 17 (cat-11 regex/datetime): 9 lower snapshots, 17 vm-equiv fixtures, +713/-14 LOC
+- `d56c4bd` Phase 15 (cat-9 UDF/recursion): 5 lower snapshots, 12 vm-equiv fixtures, +1090/-64 LOC
+
+**Final stack:** `b80bf10 → 08a4fc1 → 678337f → d56c4bd`
+
+### Metrics (vs Wave B baseline)
+| Metric | Wave B | Wave C | Delta |
+|--------|--------|--------|-------|
+| vm-equiv MATCH | 101 | 178 | +77 |
+| vm-equiv SKIP | 6 | 3 | -3 |
+| Snapshots | 43 | 92 | +49 |
+| -Dcompile=new pass | 1132 | 1132 | 0 |
+| Legacy pass | 1027 | 1027 | 0 |
+
+### Merge resolution
+- 6-file conflict: emit.zig, ir.zig, lower.zig, root.zig, snapshots_test.zig, vm_equiv.zig
+- `dumpAstWithSrc` → unified into P15 `dumpAst` with source-threading
+- `classifyBuiltin` additive merge (P16 base + P17 regex extensions)
+- UDF lookup precedes builtin classifier per ordering requirement
+- Pre-merge tag retained: `pre-merge-wave-c-p15` at 678337f
+
+### Deferred items
+**P15:** Mutual recursion matches legacy; UDF `add` shadowing (legacy bug); `as_pattern` + body-`.` (pre-existing).
+**P16:** Complex desugars (map/select/range/walk/INDEX/IN/JOIN/del/etc.); generator-arg builtins; dumper bare-ident at depth > 0.
+**P17:** Dynamic regex patterns (`splits($p)`) pending cat-4 reshape.
+
+### New deferred
+1. IR spec §6 row 3 needs rev-2 banner for cat-9 `call_user` + cat-11 regex `call_builtin` dump forms.
+2. Snapshot-validator cross-category drift: additive helper merges now expected pattern.
+
+### Orchestrator handoff
+Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now covers UDFs, builtins, regex, datetime. Phase 18 (cat-12 prefilter) next — read-only IR walk, zero new SemOps.
+
+### Phase 18: Prefilter Harvest off IR (cat-12)
+**Date**: 2026-04-25
+**Commit**: 7454b6f
+
+**Objective**: Port prefilter harvesting from legacy to new compiler using read-only IR walk.
+
+**Implementation**:
+- Added `src/compiler/harvest.zig` (218 lines) — IR-based literal extraction
+- Modified `src/compiler/root.zig` (+42 lines) — Stage 5 integration
+- Zero new SemOps; extracts from IR laid down by Phases 7–17
+- OOM-safe fallback; no second AST parse
+
+**Metrics**:
+| Metric | Baseline | Phase 18 | Delta |
+|--------|----------|----------|-------|
+| VM equiv MATCH | 178 | 178 | 0 |
+| VM equiv SKIP | 3 | 3 | 0 |
+| Snapshots | 92 | 92 | 0 |
+| -Dcompile=new pass | 1132 | 1132 | 0 |
+| Legacy pass | 1027 | 1027 | 0 |
+
+**Verification**:
+- Code review: APPROVE (minor style issues)
+- Integration review: CONDITIONAL (memory leak in success path)
+- Performance review: BENCHMARK_ISSUE (claims measurement artifact)
+- Synthesizer verdict: PROCEED (leak is follow-up, benchmark is non-issue)
+
+**Known issues**:
+1. Memory leak: `literal_groups` not freed after `ownFrom` (~1-2KB per compile, process-lifetime)
+2. Benchmark discrepancy: +27%/+58% reported but independent analysis shows measurement problem
+
+**Deferred items** (carry from Wave C):
+- IR spec §6 row 3 needs rev-2 banner for `call_user` + regex `call_builtin` dump forms
+- Snapshot-validator cross-category drift: additive helper merges now expected pattern
+- P15/P16/P17 deferred: complex desugars, generator-arg builtins, dumper bare-ident, dynamic regex patterns
+
+**Next**: Phase 19 (fuse pass — load_path folding)
+

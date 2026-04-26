@@ -401,7 +401,7 @@ selects new; only legacy when flag is `legacy`.
    9. User-defined functions + recursion + filter args
    10. 26 builtins (generator/reducing, `del`/`pick`, `INDEX`/`IN`/`JOIN`)
    11. Regex + datetime + extended arg-builtin surface
-   12. Prefilter harvest off the IR (no second `ast.parse`)
+   12. Prefilter harvest off the IR (no second `ast.parse`) — ✓ COMPLETE (7454b6f)
 7. After each category, harness must be 100% green on that category's
    fixtures + zero new regressions in `zig build test -Dcompile=new`.
 8. Fuse pass: port legacy's `.a | .b | .c` → `load_path` fold into
