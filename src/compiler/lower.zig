@@ -2032,6 +2032,13 @@ fn lowerObjectFieldValue(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerE
 /// (`src/query/src/compiler.zig:6788`): ident keys take the raw token
 /// bytes; string keys decode JSON escapes; `(expr)` keys evaluate the
 /// expression and leave the result on the value stack.
+///
+/// Computed `(expr):` keys are validated: jq rejects keys that are
+/// provably non-string at compile time (e.g. `{(0):1}`). Latent under
+/// `-Dcompile=new` pre-cutover — the dispatcher at
+/// `src/query/root.zig:108` catches `.err` and falls back to legacy,
+/// masking this rejection. Activates naturally at R5 cutover when the
+/// dispatcher fallback is removed.
 fn lowerObjectKey(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerError!u32 {
     const alloc = ctx.arena.allocator();
     const sp = .{ .start = fld.span.start, .len = if (fld.span.end >= fld.span.start) fld.span.end - fld.span.start else 0 };
@@ -2049,8 +2056,40 @@ fn lowerObjectKey(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerError!u3
             const decoded = try decodeJsonString(alloc, raw_content);
             return synthLoadConstString(ctx, decoded, sp.start, sp.len);
         },
-        .expr => |expr| return lowerNode(ctx, expr),
+        .expr => |expr| {
+            if (isProvablyNonStringKey(expr)) {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = expr.span.start,
+                    .len = if (expr.span.end >= expr.span.start) expr.span.end - expr.span.start else 0,
+                };
+                return error.LowerDiagnostic;
+            }
+            return lowerNode(ctx, expr);
+        },
     }
+}
+
+/// Compile-time check: returns `true` when `node` is provably a non-string
+/// at evaluation time. Used by object-key validation to reject `{(0):1}`
+/// and similar at compile time, matching jq's `parser.y` constant-key check.
+/// Conservative: returns `false` for any input-dependent or string-typed
+/// expression (so `{(.x):1}` and `{("foo"):1}` correctly continue to lower).
+fn isProvablyNonStringKey(node: *const Node) bool {
+    return switch (node.kind) {
+        .literal => |lit| switch (lit) {
+            .string => false,
+            .int, .float, .bool_val, .null_val => true,
+        },
+        .paren => |p| isProvablyNonStringKey(p.operand),
+        // Arithmetic on numbers yields numbers; unary negate on a number
+        // yields a number. Boolean ops and comparisons yield booleans
+        // unconditionally — non-string regardless of operand types.
+        .arithmetic => |b| isProvablyNonStringKey(b.left) and isProvablyNonStringKey(b.right),
+        .unary_neg => |u| isProvablyNonStringKey(u.operand),
+        .comparison, .and_expr, .or_expr => true,
+        else => false,
+    };
 }
 
 /// Synthesize a `load_const(string)` IR node owning `bytes` in the
