@@ -170,7 +170,7 @@ intermediate allocations.
 |---|---|---|---|
 | 1 | VM-semantics test pass rate | 100% on extracted fixtures + every existing `tests/query_test.zig` test green under `-Dcompile=new` | `zig build test -Dcompile=new` + new `vm-equiv` step |
 | 2 | Compile throughput median | within 5% AND within 2σ of legacy median | `zig build bench-compile`; ≥3 fresh-process runs; σ recorded |
-| 3 | Release binary size | within 1% of legacy total | `size zig-out/bin/zq`; strip + debug-info flags held constant between legacy and new measurements; baseline numbers in `research/compiler-baselines.md` |
+| 3 | Release binary size | within 1% of legacy total [recast in §3.5 per P20 deferral resolution; effective bound: within 10% absolute OR within 1% per added pass file] | `size zig-out/bin/zq`; strip + debug-info flags held constant between legacy and new measurements; baseline numbers in `research/compiler-baselines.md` |
 | 4 | Compile peak RSS | within 5% of legacy | `/usr/bin/time -v` over fixture corpus, median across 3 runs |
 | 5 | Source-position parity on errors | exact match on curated runtime/compile error fixtures (~30 cases drawn from `tests/compat/*.zig` `expectCompileError`/`expectError` sites) | new step `vm-equiv-errpos`; no tolerance |
 
@@ -470,6 +470,108 @@ window.
 - `rg "Dcompile" build.zig` returns zero.
 - `zig build test` fully green.
 - All five guardrails final numbers in `research/compiler-baselines.md`.
+
+---
+
+### §3.5 R3-extended — Cluster B+ category completion
+
+#### Rationale
+
+The R5 cutover attempt at the original P21 (HEAD `2b9706a`) failed silently
+on runtime: 12+ AST shapes and builtin names dispatch through the
+`NewCompilerNotImplemented` arm at `src/query/root.zig:104` and route to
+legacy via `compileLegacy`. P20 gate 1 measured 178 vm-equiv MATCH but did
+not measure the dispatcher-fallback rate. The fallback masked
+incompleteness: true new-compiler test coverage was ~1064 pass / ~82 fail
+(measured empirically by P21 cutover implementer with fallback removed),
+not the reported 1133/13.
+
+User-elected Path 1: implement the missing categories (cat-13 through
+cat-18) before retrying cutover. Replans the unit of work from "one
+sitting" to "one phase per cat-N" with explicit serialization and a hard
+dispatcher-fallback policy.
+
+#### Phase grouping
+
+| Phase | Cat | Operators / AST shapes | lower.zig sites | Affinity rationale | Size vs P18 |
+|-------|-----|------------------------|-----------------|--------------------|------------|
+| P22 | cat-13 | `range` (1/2/3-arity), `limit`, `first`, `last`, `nth`, `skip` | `lowerBuiltinCall` (1591) — new generator-arg classifier branches; legacy ref `compileRange/Limit/First/Last/Nth` | All numeric iteration generators sharing a save/restore + bounded-yield bracketing pattern; one shared classifier extension `isGeneratorArg{1,2,3}Builtin` | 1.0× |
+| P23 | cat-14 | `foreach` AST kind, `reduce range(...)` multi-arity completion, `as`-pattern body holes uncovered by P22 | `lowerNode` else (1251) for `.foreach`; revisit `.as_pattern` body lowering at 1113 | All control-flow built around an iterating source + accumulator; foreach reuses the reduce IR shape per §1.3 row 5 | 1.2× |
+| P24 | cat-15 | `label_expr`, `break_expr`, `until`, `while`, `recurse` builtin-call form | `lowerNode` else (1251) for `.label_expr`/`.break_expr`; `lowerBuiltinCall` for `until`/`while`/`recurse` | Backward-jump control flow + label/break unwinding share VM patch-table semantics | 1.3× |
+| P25 | cat-16 | `error` (0/1-arity), `index`, `rindex`, `indices`, `del` general forms | `lowerBuiltinCall` (1591); legacy `compileErrorArg`, `compileIndices/Index/Rindex`, `compileDel` | Error raising + path-substring + path-deletion all manipulate the path-stack/path-builder machinery | 1.2× |
+| P26 | cat-17 | `format_string` interpolation completion: `@text`, `@json`, `@csv`, `@tsv`, `@html`, `@sh`, `@uri`, `@urid`, `@base64`, `@base64d`; `expr | @json` pipe shape | `lowerNode` `.format_string` (973) — verify all parts paths; `formatBuiltinId` table at emit.zig:1088 already complete | All format builtins resolve via existing `formatBuiltinId` table; remaining work is interpolation-segment edge cases | 0.7× |
+| P27 | cat-18 | Dynamic regex patterns (non-literal pattern arg to `test`/`match`/`sub`), `bracket_expr` LHS expression-indexed (`[1,2,3][$x]`, `.[$x]`, `expr[$x]`) | `lowerRegexBuiltinCommon` 1763 (drop the `if (pat_literal == null) return error...`); suffix branch at 625 | Two remaining lowerNode/lower-builtin holes; both require dynamic-arg evaluation paths interacting with `as`-bindings | 1.1× |
+
+#### Per-phase template
+
+Mirrors P15-P18 with one explicit addition for the dispatcher-fallback lesson.
+
+**Implementer (single agent, opus):**
+1. Extend `src/compiler/lower.zig` to handle the cat-N AST kinds / builtin names. Add classifier rows where applicable.
+2. Extend `src/compiler/ir.zig` with new SemOps **only** when an existing op shape from §1.3 row 5 cannot accommodate the operator. New ops MUST live in `SemOp` namespace; document in `research/compiler-ir-format.md`.
+3. Extend `src/compiler/emit.zig` to emit bytecode for new SemOps using the legacy compiler line numbers as the byte-shape reference.
+4. Extend `src/compiler/harvest.zig` only if new operators introduce literal-yielding shapes the prefilter should harvest.
+5. Add lower snapshots in `tests/compiler/snapshots/lower/cat-N-*.txt` — one per distinct IR shape introduced.
+6. Add fuse snapshots only if new shapes interact with `load_path` folding (most cat-13–18 don't).
+7. Add vm-equiv fixtures explicitly exercising new operators. Mandatory: ≥ 8 fixtures per phase covering positive + error + edge-case inputs.
+8. **Fallback-disabled spot-check (informational)**: in a throwaway worktree, comment out the dispatcher fallback at `src/query/root.zig:102-109`; run `zig build vm-equiv` + `zig build test -Dcompile=new`; record failure delta in implementer brief notes. **The dispatcher fallback stays in the actual commit** — informational only, surfaces incompleteness early.
+9. Run `zig build snapshots-update`; commit only if diff is bounded to cat-N additions.
+
+**Verifier trio (parallel, all opus):**
+- `mechanical-verifier`: legacy untouched; opcode integrity; no scope creep; vm-equiv MATCH delta ≥ +8.
+- `equiv-runner`: full vm-equiv + `-Dcompile=new` + `-Dcompile=legacy`; no regressions.
+- `snapshot-validator`: every new SemOp/IR shape has ≥ 1 lower snapshot; deterministic regen; ≤ 200-line snapshots (CONCERN bound from P20).
+
+**Reviewer (single, opus):** BLOCK loop max 2 attempts; on round-3 BLOCK, escalate.
+
+**Git-operator:** ff-merge to `redesign/compiler`; append progress entry under `### Phase NN — cat-N <name>` mirroring P15-P19; update `phase_2r_state.md` inline.
+
+#### Dispatcher fallback policy
+
+**Hard rule until P21-redux:**
+
+> No commit between P22 and P27 inclusive may remove, weaken, or condition the dispatcher fallback at `src/query/root.zig:102-109`. The fallback stays in place across the entire cat-13–18 work cycle. P21-redux's cutover commit is the **only** place where the fallback is removed.
+
+**Rationale:** Removing the fallback during cat-N work causes 69+ test failures and obliterates gate 1/2/4 measurement signal. The fallback is a measurement scaffold (sunset commit: P21-redux), not a workaround per CLAUDE.md.
+
+**Verification of the rule:** each phase's git-operator step diffs `src/query/root.zig:102-109` against `redesign/compiler` tip pre-phase; non-zero diff in those lines → BLOCKING.
+
+#### R3-redux acceptance criteria
+
+Stricter than original §3 R3 acceptance. Replaces it for the cutover (P21-redux):
+
+1. **Cat-13 through cat-18 implemented**: all six phases (P22–P27) merged; each phase's vm-equiv MATCH delta ≥ +8 from its baseline.
+2. **Fallback-disabled gate** (the headline): in a verification worktree, comment out `src/query/root.zig:102-109`. Run `zig build test`. Acceptance threshold: ≤ N failures, where N = the count of plan-sanctioned ZQ-DEFER cases (currently 5 from P21 fix-task 1; may grow if cat-13–18 work surfaces additional defers — each new defer requires explicit plan-file ZQ-DEFER row + user sign-off). Failures categorized as: ZQ-DEFER-tagged (allowed), legacy-only-bug (allowed if pre-existing), uncategorized (BLOCKING).
+3. **vm-equiv full suite**: target ≥ 178 + Σ(per-phase fixture count) ≈ 254 MATCH minimum, 0 FAIL, ≤ 3 SKIP.
+4. **Snapshot suite**: ≥ 1 lower snapshot per new cat-N operator (mandatory); net snapshot count target: ~132 minimum.
+5. **§1.4 R4 guardrails re-measured at the new HEAD post-P27** with fallback-disabled measurements where applicable.
+
+#### Phase count + dependency order
+
+```
+P22 (cat-13) ──► P23 (cat-14)    (foreach reuses reduce-via-range scaffolding)
+P24 (cat-15) ──► P25 (cat-16)    (del paths reuse label/break patch-list)
+P26 (cat-17)                     (independent — anywhere)
+P27 (cat-18)                     (independent — anywhere)
+```
+
+- **Max parallel-team width**: 3 ({P22→P23}, {P24→P25}, {P26 then P27}).
+- **Single-team serial order** (recommended): P22 → P23 → P24 → P25 → P26 → P27 → P21-redux.
+
+#### P21-redux
+
+After P27 closes, P21-redux re-runs original §3 R4+R5 procedure:
+1. Re-measure all five §1.4 gates at the cat-18 HEAD.
+2. Run the fallback-disabled gate (§3.5 acceptance step 2).
+3. Once green: cutover commit removes the dispatcher fallback, `src/query/src/compiler.zig`, the `-Dcompile` build flag, and vm-equiv harnesses (Option B per P21 cutover implementer's selection) in one atomic step.
+
+#### Estimated session count to P21-redux
+
+- Single-team serial: 6 cat-N sittings + 1 P21-redux = **7 sittings**.
+- Two-team parallel: 3–4 sittings + 1 P21-redux = **4–5 sittings**.
+- Three-team parallel (max): 3 sittings + 1 P21-redux = **4 sittings**.
+
+Original plan's "one-sitting R3" assumption (in §3 R3 step 7) is invalidated by the P21 escalation; this section supersedes it.
 
 ---
 
