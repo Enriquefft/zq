@@ -1,0 +1,14 @@
+# source: def get_z: .x | .y | .z; get_z
+# before
+# SemOp
+call_user(fn_id=0) @25..30
+  pipe @11..23
+    pipe @11..18
+      load_field("x") @11..13
+      load_field("y") @16..18
+    load_field("z") @21..23
+# after
+# SemOp
+call_user(fn_id=0) @25..30
+# EmitOp
+  load_path("x.y.z") @11..23

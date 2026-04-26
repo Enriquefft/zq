@@ -34,12 +34,20 @@ pub const dump = ir_mod.dump;
 /// IR-walking dumper (vs `dump` which walks the AST). Used by the
 /// fuse snapshot harness to render the post-rewrite IR shape.
 pub const dumpIR = ir_mod.dumpIR;
+/// Subtree variant of `dumpIR` — renders an arbitrary IR root, used
+/// by the fuse snapshot harness to surface cat-9 function bodies that
+/// live off the main IR root via `function_table.body_ir_root`.
+pub const dumpIRSubtree = ir_mod.dumpIRSubtree;
 pub const Lowerer = lower_mod.Lowerer;
 pub const lowerNode = lower_mod.lowerNode;
 /// Fuse pass entry point — see `fuse.zig` for the rewrite rules.
 /// Snapshot tests import this directly to drive the IR-level diff.
 pub const fuse = fuse_mod.fuse;
 pub const FuseResult = fuse_mod.Result;
+/// Sentinel value used by `function_table.body_ir_root` to mean
+/// "not yet lowered". Surfaced so snapshot tests can skip recursive
+/// UDFs whose body lowering is deferred to the first emit-site.
+pub const BODY_IR_NOT_LOWERED = lower_mod.BODY_IR_NOT_LOWERED;
 
 // Re-export the legacy-shape result types so callers can speak in our
 // vocabulary without dragging the compiler module's internals in.

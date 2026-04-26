@@ -174,6 +174,17 @@ fn regenFuseDir(alloc: std.mem.Allocator, w: anytype) !Stats {
         };
         try compiler.dumpIR(&fuse_out.ir, rw);
 
+        // Recursive-UDF body verification — see snapshots_fuse_test.zig
+        // for the rationale. Each populated `body_ir_root` resolves
+        // through `index_map` and dumps as an off-tree subtree so the
+        // remap path is observable in the diff.
+        for (lowerer.function_table.items, 0..) |entry_fn, fn_id| {
+            if (entry_fn.body_ir_root == compiler.BODY_IR_NOT_LOWERED) continue;
+            const remapped = fuse_out.index_map[entry_fn.body_ir_root];
+            try rw.print("# function_body fn_id={d}\n", .{fn_id});
+            try compiler.dumpIRSubtree(&fuse_out.ir, remapped, rw);
+        }
+
         if (std.mem.eql(u8, rendered.items, original)) {
             unchanged += 1;
             try w.print("UNCHANGED fuse/{s}\n", .{entry.name});

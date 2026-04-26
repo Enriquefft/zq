@@ -1,0 +1,28 @@
+# source: def chain: .a | .b | .c | (.x | chain); chain
+# before
+# SemOp
+call_user(fn_id=0) @40..45
+  pipe @11..38
+    pipe @11..23
+      pipe @11..18
+        load_field("a") @11..13
+        load_field("b") @16..18
+      load_field("c") @21..23
+    pipe @27..37
+      load_field("x") @27..29
+      call_user(fn_id=0) @32..37
+# after
+# SemOp
+call_user(fn_id=0) @40..45
+  pipe @11..38
+# EmitOp
+    load_path("a.b.c.x") @11..29
+# SemOp
+    call_user(fn_id=0) @32..37
+# function_body fn_id=0
+# SemOp
+pipe @11..38
+# EmitOp
+  load_path("a.b.c.x") @11..29
+# SemOp
+  call_user(fn_id=0) @32..37

@@ -13,11 +13,10 @@ pipe @0..23
 # after
 # SemOp
 pipe @0..23
-  pipe @0..18
-    pipe @0..13
+  pipe @0..13
 # EmitOp
-      load_path("a.b") @0..7
+    load_path("a.b") @0..7
 # SemOp
-      iterate @10..13
-    load_field("c") @16..18
-  load_field("d") @21..23
+    iterate @10..13
+# EmitOp
+  load_path("c.d") @16..23

@@ -1376,6 +1376,22 @@ pub fn dumpIR(
     try dumpIRNode(ir_obj, root_idx, 0, &tracker, writer);
 }
 
+/// Dump an arbitrary subtree starting from `root_idx`. Used by the
+/// fuse snapshot harness to render off-tree subtrees that aren't
+/// reachable from the IR's last-pushed node — specifically cat-9
+/// `function_table.body_ir_root` references, which `emit` walks via
+/// the function table rather than via the IR root. Banner switching
+/// follows the same rules as `dumpIR`.
+pub fn dumpIRSubtree(
+    ir_obj: *const IR,
+    root_idx: u32,
+    writer: anytype,
+) @TypeOf(writer).Error!void {
+    if (root_idx >= ir_obj.nodes.items.len) return;
+    var tracker: NamespaceTracker = .{};
+    try dumpIRNode(ir_obj, root_idx, 0, &tracker, writer);
+}
+
 /// Render a single IR node and recurse into its children. Each node line
 /// is preceded by the appropriate banner if the namespace changed since
 /// the last emitted line.

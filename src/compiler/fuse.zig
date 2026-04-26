@@ -1,21 +1,36 @@
 //! IR rewrite passes — Phase 2R / R3 step 8.
 //!
 //! Single rule today: chained static-key field loads collapse to one
-//! `load_path` EmitOp. `.a | .b | .c` lowers to a left-deep
-//! `pipe(pipe(load_field("a"), load_field("b")), load_field("c"))` IR;
-//! this pass rewrites that subtree to a single `load_path("a.b.c")`
-//! whose extra-data payload mirrors `load_field`'s (offset/len into
-//! string_buf). Plan §3 R3 step 8: "port legacy's `.a | .b | .c` →
-//! `load_path` fold into `fuse.zig` as one IR→IR pass. Other fuse
-//! opportunities deferred."
+//! `load_path` EmitOp per maximal contiguous run of `load_field`s
+//! within a pipe tree. Plan §3 R3 step 8: "port legacy's `.a | .b |
+//! .c` → `load_path` fold into `fuse.zig` as one IR→IR pass. Other
+//! fuse opportunities deferred."
 //!
-//! Mirrors the legacy fuse at `src/query/src/compiler.zig:7186` — a
-//! pipe whose every leaf is `load_field` collapses; any non-`load_field`
-//! leaf (e.g. `iterate`, `try_`, `load_index`) breaks the chain. A
-//! single-key chain (just one `load_field`) is NOT folded — emit's
-//! `load_field` handler already produces the same `Instruction.Op.load_key`
-//! the legacy compiler emits, so wrapping it in `load_path` would be
-//! pure overhead.
+//! Legacy fuse (`src/query/src/compiler.zig:7186`) walks the
+//! linearized bytecode stream and folds every maximal run of
+//! consecutive `load_key`s separated only by `pipe` instructions —
+//! including runs that appear AFTER a chain-breaker like `each` /
+//! `load_index`. To match that behavior on the IR-tree shape, this
+//! pass:
+//!
+//!   1. Linearizes a pipe tree's leaves (anything not a `pipe` node)
+//!      into a flat sequence in source order.
+//!   2. Walks the sequence, grouping maximal runs of `load_field`
+//!      leaves; runs of length ≥ 2 collapse to a single `load_path`,
+//!      runs of length 1 (and non-`load_field` leaves) pass through
+//!      unchanged.
+//!   3. Reconstructs a left-deep pipe tree from the resulting
+//!      sequence, matching the IR shape lowering would have produced
+//!      had the source filter been written without the folded
+//!      segments.
+//!
+//! For `.a | .b | .[] | .c | .d` this yields `pipe(pipe(load_path
+//! "a.b", iterate), load_path "c.d")` — both runs fuse, with the
+//! `iterate` segment preserved between them. A single-key chain
+//! (one `load_field`) is NOT folded — emit's `load_field` handler
+//! already produces the same `Instruction.Op.load_key` the legacy
+//! compiler emits, so wrapping it in `load_path` would be pure
+//! overhead.
 //!
 //! The pass produces a fresh `IR` rather than mutating in place. Both
 //! IRs share the input arena (the caller passes the lowered `IR` whose
@@ -119,126 +134,166 @@ const WalkCtx = struct {
 };
 
 /// Walk `src_idx`, copy the subtree into the destination, and apply
-/// the load-path fold rule whenever a pipe-chain of `load_field`s is
-/// detected. Returns the index of the copied/folded node in `out`.
+/// the load-path fold rule whenever a pipe-tree is encountered.
+/// Returns the index of the copied/folded node in `out`. Pipe trees
+/// route through the linearized fold so multi-segment chains separated
+/// by chain-breakers (`iterate`, `load_index`, etc.) still fuse each
+/// run of `load_field`s individually — matching legacy bytecode-level
+/// fuse semantics.
 fn copyAndFold(ctx: *WalkCtx, src_idx: u32) error{OutOfMemory}!u32 {
-    // Path-fold attempt: if this node is a pipe-chain of `load_field`s,
-    // collapse it now. Returns the new index on a successful fold;
-    // null when the chain is broken (any non-`load_field` leaf, or a
-    // single-key chain).
-    if (try tryFoldLoadPath(ctx, src_idx)) |folded_idx| return folded_idx;
-
-    // Default: copy this node, recursing into children. Any subtree
-    // beneath us may still trigger the fold rule independently.
+    const node = ctx.src.nodes.items[src_idx];
+    if (node.op == .pipe) return foldPipeTree(ctx, src_idx);
     return copyNode(ctx, src_idx);
 }
 
-/// Detect and fold a chained-load-path subtree rooted at `src_idx`.
-/// Returns the index of the new `load_path` node on success, null when
-/// the subtree is not a fold candidate (single-key chain or any
-/// non-`load_field` leaf in the chain).
-fn tryFoldLoadPath(ctx: *WalkCtx, src_idx: u32) error{OutOfMemory}!?u32 {
-    const root = ctx.src.nodes.items[src_idx];
-    if (root.op != .pipe) return null;
+/// Linearize the pipe tree rooted at `pipe_idx`, collapse every
+/// maximal run of consecutive `load_field` leaves into a single
+/// `load_path` EmitOp, then rebuild a left-deep pipe tree from the
+/// resulting sequence. Mirrors legacy fuse's bytecode-stream walk
+/// (`src/query/src/compiler.zig:7186`) on the IR-tree shape.
+///
+/// Non-`load_field` leaves recurse through `copyAndFold` themselves —
+/// e.g. an `obj_ctor` value containing its own pipe-chain still folds.
+/// Every consumed source node (the pipe joins + load_field leaves) is
+/// recorded in `index_map`; its new-IR target is the rebuilt pipe-tree
+/// root so external references (cat-9 `body_ir_root`) still land on
+/// the semantically equivalent replacement.
+fn foldPipeTree(ctx: *WalkCtx, pipe_idx: u32) error{OutOfMemory}!u32 {
+    // Step 1 — linearize. Collect every leaf (anything that isn't a
+    // `pipe` node) in source order; remember every visited pipe node
+    // so the index_map can be patched after the rebuild.
+    var leaves: LeafList = .{};
+    var pipes_consumed: ConsumedList = .{};
+    if (!collectLeaves(ctx.src, pipe_idx, &leaves, &pipes_consumed)) {
+        // Buffer overflow — fall back to a leaf-by-leaf copy without
+        // folding. Pathological pipe-trees still compile correctly.
+        return copyNode(ctx, pipe_idx);
+    }
 
-    // Collect every leaf along the pipe-chain into a key list. The
-    // collector walks pipe nodes greedily; a non-`load_field` leaf at
-    // any position aborts the fold (returns null).
-    var keys: KeyList = .{};
-    var consumed: ConsumedList = .{};
-    if (!collectChainKeys(ctx.src, src_idx, &keys, &consumed)) return null;
+    // Step 2 — group + fold consecutive load_field runs. Each output
+    // segment is either a pre-existing leaf (copied via copyAndFold)
+    // or a freshly-emitted load_path collapsing a run of ≥2 leaves.
+    var segments: SegmentList = .{};
+    var i: usize = 0;
+    const leaves_slice = leaves.slice();
+    while (i < leaves_slice.len) : (i += 0) {
+        // Scan the maximal load_field run starting at `i`.
+        var j: usize = i;
+        while (j < leaves_slice.len and leaves_slice[j].op == .load_field) : (j += 1) {}
+        const run_len = j - i;
 
-    // Single-key "chains" don't benefit — `load_field` already maps
-    // straight to legacy `Instruction.Op.load_key`. Mirrors legacy
-    // fuse's `if (keys.items.len == 1) .load_key else .load_path`.
-    if (keys.len < 2) return null;
+        if (run_len >= 2) {
+            const new_idx = try emitLoadPathFromLeaves(ctx, leaves_slice[i..j]);
+            // Every consumed `load_field` maps to the synthesized
+            // `load_path` so `body_ir_root` lookups land somewhere
+            // semantically equivalent.
+            for (leaves_slice[i..j]) |leaf| ctx.record(leaf.src_idx, new_idx);
+            segments.push(new_idx) catch return error.OutOfMemory;
+            i = j;
+        } else if (run_len == 1) {
+            // Single load_field: copy verbatim — emit's `load_field`
+            // handler already produces `Instruction.Op.load_key`.
+            const new_idx = try copyNode(ctx, leaves_slice[i].src_idx);
+            segments.push(new_idx) catch return error.OutOfMemory;
+            i += 1;
+        } else {
+            // Non-load_field leaf: recurse through copyAndFold so
+            // any nested pipe-trees get their own fold pass.
+            const new_idx = try copyAndFold(ctx, leaves_slice[i].src_idx);
+            segments.push(new_idx) catch return error.OutOfMemory;
+            i += 1;
+        }
+    }
 
-    const new_idx = try emitLoadPath(ctx.out, root, &keys);
-    // Every old index consumed by the fold (the chain's pipe joins +
-    // load_field leaves) maps to the new `load_path` node — keeps the
-    // index_map total over `src.nodes` even when nodes vanish in the
-    // rewrite.
-    for (consumed.slice()) |old_idx| ctx.record(old_idx, new_idx);
-    return new_idx;
+    // Step 3 — rebuild a left-deep pipe tree from `segments`. The
+    // root pipe carries the original tree's outermost src span so
+    // diagnostics/path() snapshots still highlight the full source
+    // range.
+    const root = ctx.src.nodes.items[pipe_idx];
+    const new_root = try rebuildPipeTree(ctx.out, segments.slice(), root);
+
+    // Step 4 — patch the index_map. Every consumed pipe node maps to
+    // the rebuilt root (the natural semantic replacement). Folded
+    // load_field leaves were already mapped above; standalone leaves
+    // were mapped by their copyNode call. All consumed pipe indices
+    // get the new root.
+    for (pipes_consumed.slice()) |old_idx| ctx.record(old_idx, new_root);
+
+    return new_root;
 }
 
-/// Walk a pipe-chain rooted at `node_idx` and collect every leaf into
-/// `keys` and every visited node into `consumed`. Returns false (and
-/// leaves both lists partially populated) on the first non-fusable
-/// shape so the caller bails on the fold. A fusable shape is
-/// recursive: a `pipe` whose left and right are both fusable, OR a
-/// `load_field` leaf.
-fn collectChainKeys(
+/// In-order walk of the pipe tree rooted at `node_idx`. Pipe nodes
+/// are followed; every non-pipe node is appended to `leaves` as a
+/// leaf segment. Every visited pipe is appended to `pipes` so the
+/// caller can update `index_map` after the rebuild. Returns false if
+/// either bounded buffer overflows.
+fn collectLeaves(
     src_ir: *const ir.IR,
     node_idx: u32,
-    keys: *KeyList,
-    consumed: *ConsumedList,
+    leaves: *LeafList,
+    pipes: *ConsumedList,
 ) bool {
     const node = src_ir.nodes.items[node_idx];
-    switch (node.op) {
-        .load_field => {
-            const slots = src_ir.extra_data.items;
-            const offset: u32 = slots[node.extra];
-            const len: u32 = slots[node.extra + 1];
-            keys.push(.{
-                .name = src_ir.string_buf.items[offset .. offset + len],
-                .src_start = node.src_start,
-                .src_len = node.src_len,
-            }) catch return false;
-            consumed.push(node_idx) catch return false;
-            return true;
-        },
-        .pipe => {
-            // Walk left then right so the resulting key list is in
-            // source order — `pipe(pipe(.a, .b), .c)` yields `[a, b, c]`,
-            // mirroring `.a | .b | .c`.
-            if (!collectChainKeys(src_ir, node.children[0], keys, consumed)) return false;
-            if (!collectChainKeys(src_ir, node.children[1], keys, consumed)) return false;
-            consumed.push(node_idx) catch return false;
-            return true;
-        },
-        else => return false,
+    if (node.op != .pipe) {
+        leaves.push(.{ .src_idx = node_idx, .op = node.op }) catch return false;
+        return true;
     }
+    if (!collectLeaves(src_ir, node.children[0], leaves, pipes)) return false;
+    if (!collectLeaves(src_ir, node.children[1], leaves, pipes)) return false;
+    pipes.push(node_idx) catch return false;
+    return true;
 }
 
-/// Materialize the folded `load_path` IR node. The dot-joined name is
-/// interned into `out.string_buf`; the resulting `(offset, len)` pair
-/// is appended to `out.extra_data`. The new node's source span starts
-/// at the leftmost key's `src_start` and ends one past the rightmost
-/// key's `src_start + src_len` — preserves the chain's source coverage
-/// so `path()` snapshots and error diagnostics stay accurate.
-fn emitLoadPath(out: *ir.IR, root: ir.Node, keys: *const KeyList) error{OutOfMemory}!u32 {
+/// Materialize a `load_path` node from a run of `load_field` leaves.
+/// The dot-joined name is interned into `out.string_buf`; the new
+/// node's source span covers from the first key's start to the last
+/// key's end so error diagnostics and `path()` dumps still highlight
+/// the original chain text. Mirrors legacy
+/// `internPath`/`load_path`-emit at `compiler.zig:7164-7228`.
+fn emitLoadPathFromLeaves(ctx: *WalkCtx, leaves: []const Leaf) error{OutOfMemory}!u32 {
+    std.debug.assert(leaves.len >= 2);
+    const out = ctx.out;
     const alloc = out.arena.allocator();
 
-    // Intern dot-joined path into the new IR's string_buf. The offset
-    // is the index into `out.string_buf` BEFORE the appendSlice runs;
-    // the joined length is computed up-front so `extra_data` writes
-    // need no fix-up pass.
-    const offset: u32 = @intCast(out.string_buf.items.len);
+    // Resolve each leaf's `(offset, len)` against the source IR's
+    // string_buf — bytes are then re-interned into the OUTPUT IR's
+    // string_buf below. Doing the lookup here (vs in `collectLeaves`)
+    // keeps the linearization step allocation-free for the common case
+    // where no run requires a fold.
+    const src_strings = ctx.src.string_buf.items;
+    const src_extra = ctx.src.extra_data.items;
+
+    // Compute total joined length up front so we can do a single
+    // ensureTotalCapacity against `out.string_buf` and avoid mid-loop
+    // realloc-then-aliased-slice trouble.
     const total_len = blk: {
-        var n: usize = keys.len - 1; // dot separators
-        for (keys.slice()) |k| n += k.name.len;
+        var n: usize = leaves.len - 1; // dot separators
+        for (leaves) |leaf| {
+            const node = ctx.src.nodes.items[leaf.src_idx];
+            const len: u32 = src_extra[node.extra + 1];
+            n += len;
+        }
         break :blk n;
     };
+    const offset: u32 = @intCast(out.string_buf.items.len);
     try out.string_buf.ensureTotalCapacity(alloc, out.string_buf.items.len + total_len);
-    for (keys.slice(), 0..) |k, i| {
+    for (leaves, 0..) |leaf, i| {
         if (i > 0) out.string_buf.appendAssumeCapacity('.');
-        out.string_buf.appendSliceAssumeCapacity(k.name);
+        const node = ctx.src.nodes.items[leaf.src_idx];
+        const off: u32 = src_extra[node.extra];
+        const len: u32 = src_extra[node.extra + 1];
+        out.string_buf.appendSliceAssumeCapacity(src_strings[off .. off + len]);
     }
 
     const extra_idx: u32 = @intCast(out.extra_data.items.len);
     try out.extra_data.append(alloc, offset);
     try out.extra_data.append(alloc, @intCast(total_len));
 
-    // Span: leftmost key's start through rightmost key's end. Preserves
-    // the chain's source coverage so error diagnostics and `path()`
-    // dumps still highlight the original `.a | .b | .c` text.
-    const first = keys.slice()[0];
-    const last = keys.slice()[keys.len - 1];
-    const start = first.src_start;
-    const end = last.src_start + last.src_len;
-    const src_start = @min(start, root.src_start);
-    const src_end = @max(end, root.src_start + root.src_len);
+    // Span covers leftmost-key-start through rightmost-key-end.
+    const first_node = ctx.src.nodes.items[leaves[0].src_idx];
+    const last_node = ctx.src.nodes.items[leaves[leaves.len - 1].src_idx];
+    const src_start = first_node.src_start;
+    const src_end = last_node.src_start + last_node.src_len;
 
     const new_idx: u32 = @intCast(out.nodes.items.len);
     try out.nodes.append(alloc, .{
@@ -248,6 +303,47 @@ fn emitLoadPath(out: *ir.IR, root: ir.Node, keys: *const KeyList) error{OutOfMem
         .src_len = if (src_end >= src_start) src_end - src_start else 0,
     });
     return new_idx;
+}
+
+/// Rebuild a left-deep pipe tree from `segments`. A single segment
+/// returns its index unchanged (no pipe needed); multiple segments
+/// produce `pipe(pipe(...pipe(s0, s1)...sN-2), sN-1)`. Each new pipe's
+/// source span unions its children's spans so diagnostics still reach
+/// the correct source bytes after the rewrite. The outermost pipe also
+/// expands to cover `original_root.src_*` so path() error reports still
+/// highlight the entire original chain text.
+fn rebuildPipeTree(out: *ir.IR, segments: []const u32, original_root: ir.Node) error{OutOfMemory}!u32 {
+    std.debug.assert(segments.len >= 1);
+    if (segments.len == 1) return segments[0];
+
+    const alloc = out.arena.allocator();
+    var current = segments[0];
+    for (segments[1..], 1..) |right, i| {
+        const left_node = out.nodes.items[current];
+        const right_node = out.nodes.items[right];
+        var src_start = @min(left_node.src_start, right_node.src_start);
+        var src_end = @max(
+            left_node.src_start + left_node.src_len,
+            right_node.src_start + right_node.src_len,
+        );
+        // Outermost pipe: ensure span covers the original tree's root
+        // span — handles edge cases where leading/trailing whitespace
+        // around the chain made the pre-fold pipe span wider than the
+        // union of its leaves.
+        if (i == segments.len - 1) {
+            src_start = @min(src_start, original_root.src_start);
+            src_end = @max(src_end, original_root.src_start + original_root.src_len);
+        }
+        const new_idx: u32 = @intCast(out.nodes.items.len);
+        try out.nodes.append(alloc, .{
+            .op = .pipe,
+            .children = .{ current, right },
+            .src_start = src_start,
+            .src_len = if (src_end >= src_start) src_end - src_start else 0,
+        });
+        current = new_idx;
+    }
+    return current;
 }
 
 /// Copy `src_idx` from the source IR into the destination, recursing
@@ -374,51 +470,69 @@ fn childArity(ctx: *const WalkCtx, node: ir.Node) struct { u8, u8 } {
 
 // ── Bounded inline buffers ─────────────────────────────────────────────────
 //
-// Pipe-chains in real filters are short (≤ a few dozen segments). We
+// Pipe-trees in real filters are short (≤ a few dozen leaves). We
 // avoid heap allocations by stack-allocating inline buffers; if a
-// pathological input exceeds the bound the fold simply bails and the
-// chain stays as nested pipes — no correctness loss.
+// pathological input exceeds the bound the fold falls back to a
+// straight `copyNode` walk — no correctness loss, just no fold for
+// that particular tree.
 
-/// Single key collected during the chain walk. Carries a slice
-/// referencing the input IR's `string_buf` (read-only — we re-intern
-/// the dot-joined name into the OUTPUT IR before the input becomes
-/// unused), plus the source-byte span used to recompute the folded
-/// node's coverage.
-const Key = struct {
-    name: []const u8,
-    src_start: u32,
-    src_len: u32,
+/// One linearized leaf collected during the in-order pipe walk.
+/// `src_idx` is the leaf's index in the source IR; `op` is cached so
+/// `foldPipeTree` can group `load_field` runs without re-fetching the
+/// node. Run-grouping reads `op` only; `emitLoadPathFromLeaves`
+/// resolves payloads against `ctx.src` via `src_idx`.
+const Leaf = struct {
+    src_idx: u32,
+    op: ir.Op,
 };
 
-/// Bounded stack buffer of keys collected from a chain. The cap is
-/// generous compared to real-world inputs (longest jq pipe-chains in
-/// the wild are ≤8 segments). Hitting the cap aborts the fold rather
-/// than spilling to the heap — a pathological 64-segment chain still
-/// runs correctly via the unfolded pipe path.
-const MAX_CHAIN_KEYS: usize = 64;
+/// Bounded stack buffer of linearized pipe-tree leaves. The cap is
+/// generous compared to real-world inputs (jq filters typically
+/// stay under a dozen segments). Overflow falls back to `copyNode` —
+/// a 128-segment pipe tree still compiles correctly via the unfolded
+/// path.
+const MAX_LEAVES: usize = 128;
 
-const KeyList = struct {
-    items: [MAX_CHAIN_KEYS]Key = undefined,
+const LeafList = struct {
+    items: [MAX_LEAVES]Leaf = undefined,
     len: usize = 0,
 
-    fn push(self: *KeyList, k: Key) error{Overflow}!void {
-        if (self.len == MAX_CHAIN_KEYS) return error.Overflow;
-        self.items[self.len] = k;
+    fn push(self: *LeafList, l: Leaf) error{Overflow}!void {
+        if (self.len == MAX_LEAVES) return error.Overflow;
+        self.items[self.len] = l;
         self.len += 1;
     }
 
-    fn slice(self: *const KeyList) []const Key {
+    fn slice(self: *const LeafList) []const Leaf {
         return self.items[0..self.len];
     }
 };
 
-/// Bounded stack buffer of source-IR indices consumed by a fold. Used
-/// to populate the index_map after the synthesized `load_path` is
-/// pushed — every fused interior pipe and `load_field` leaf maps to
-/// the new `load_path` index. A chain of N keys consumes
-/// `N + (N - 1)` nodes (N leaves + N−1 pipe joins) so the cap is sized
-/// generously above `2 * MAX_CHAIN_KEYS`.
-const MAX_CONSUMED: usize = 2 * MAX_CHAIN_KEYS;
+/// Bounded stack buffer of new-IR segment indices. Each fold-pass
+/// produces at most one segment per leaf (consecutive load_field runs
+/// collapse into ONE segment, which only makes the count smaller), so
+/// `MAX_LEAVES` is a sound upper bound.
+const SegmentList = struct {
+    items: [MAX_LEAVES]u32 = undefined,
+    len: usize = 0,
+
+    fn push(self: *SegmentList, idx: u32) error{Overflow}!void {
+        if (self.len == MAX_LEAVES) return error.Overflow;
+        self.items[self.len] = idx;
+        self.len += 1;
+    }
+
+    fn slice(self: *const SegmentList) []const u32 {
+        return self.items[0..self.len];
+    }
+};
+
+/// Bounded stack buffer of source-IR pipe indices consumed by a
+/// linearization. Each pipe in the source tree contributes one
+/// element — they all map to the rebuilt-tree root in the index_map
+/// after fold completes. A pipe tree with N leaves has N−1 pipe
+/// joins, so `MAX_LEAVES` is a safe upper bound.
+const MAX_CONSUMED: usize = MAX_LEAVES;
 
 const ConsumedList = struct {
     items: [MAX_CONSUMED]u32 = undefined,

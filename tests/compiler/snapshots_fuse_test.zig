@@ -50,15 +50,38 @@ const FIXTURES = [_]Fixture{
     // `.a` byte to the last `.c` byte. This fixture exercises the
     // span carry-over written by `emitLoadPath`.
     .{ .name = "preserves_span", .expected = @embedFile("snapshots/fuse/preserves_span.txt") },
-    // Sub-chain folds when the outer fold is blocked. `.a | .b` (a
-    // contiguous load_field pair) folds into a load_path even though
-    // the surrounding `.[]` breaks the outer chain.
+    // Sub-chain folds when the outer fold is blocked. Both `.a | .b`
+    // (before the iterate) AND `.c | .d` (after) collapse into
+    // load_paths — matches legacy fuse's bytecode-stream behavior of
+    // re-scanning past chain-breakers.
     .{ .name = "sub_chain_folds", .expected = @embedFile("snapshots/fuse/sub_chain_folds.txt") },
+    // Three independent runs separated by two different chain-breakers
+    // (`iterate` and `load_index`). Verifies the linearized walk fuses
+    // every load_field run, not just the first.
+    .{ .name = "sub_chain_three_runs", .expected = @embedFile("snapshots/fuse/sub_chain_three_runs.txt") },
     // Fold rule fires inside variable-arity contexts (object value).
     // Verifies `copyNode`'s span re-assembly handles a child that
     // collapses from a 5-node pipe chain to a single `load_path`
     // EmitOp without corrupting the parent's `extra_children` slice.
     .{ .name = "fold_inside_obj", .expected = @embedFile("snapshots/fuse/fold_inside_obj.txt") },
+    // Fold inside a non-recursive UDF body. The body is inlined into
+    // the call_user's variable-arity span; the snapshot shows the
+    // body's pipe chain collapsing into a load_path inside the
+    // inlined region.
+    .{ .name = "fold_in_udf_body", .expected = @embedFile("snapshots/fuse/fold_in_udf_body.txt") },
+    // Fold inside a recursive UDF body. Recursive UDFs lower the body
+    // ONCE and route subsequent calls via `function_table.body_ir_root`
+    // (a node index that fuse must re-point through `index_map`).
+    // The fixture's `# function_body fn_id=0` block dumps the body
+    // subtree AFTER remap so the index_map path is observable in the
+    // diff — this is the surface that broke during dev (recursive
+    // `def fact` returned `false` because the stale index pointed at
+    // the wrong node).
+    .{ .name = "fold_in_recursive_udf", .expected = @embedFile("snapshots/fuse/fold_in_recursive_udf.txt") },
+    // Fold inside an `if` then-arm. Exercises the 3-arity span
+    // (cond/then/else) re-assembly path in `copyNode` — distinct from
+    // the variable-arity obj_ctor / call_user paths covered above.
+    .{ .name = "fold_in_if_then", .expected = @embedFile("snapshots/fuse/fold_in_if_then.txt") },
 };
 
 /// Read the leading `# source: <filter>` directive (always the first
@@ -107,6 +130,22 @@ test "snapshot fixtures: fuse" {
 
         const fuse_out = try compiler.fuse(lowerer.out);
         try compiler.dumpIR(&fuse_out.ir, w);
+
+        // Recursive-UDF body verification: when lowering populated any
+        // `function_table.body_ir_root` (cat-9 recursive functions),
+        // emit a `# function_body fn_id=N` directive followed by the
+        // post-remap body subtree. The body root lives off-tree (emit
+        // walks it via `function_table`, not via the IR root), so the
+        // fixture would otherwise hide whether `index_map` correctly
+        // re-pointed the entry. Mirrors `compile()` in `root.zig` —
+        // body_ir_root is patched there and we replay the same
+        // translation here so the snapshot reflects production state.
+        for (lowerer.function_table.items, 0..) |entry, fn_id| {
+            if (entry.body_ir_root == compiler.BODY_IR_NOT_LOWERED) continue;
+            const remapped = fuse_out.index_map[entry.body_ir_root];
+            try w.print("# function_body fn_id={d}\n", .{fn_id});
+            try compiler.dumpIRSubtree(&fuse_out.ir, remapped, w);
+        }
 
         std.testing.expectEqualStrings(fx.expected, actual_buf.items) catch |e| {
             std.debug.print(
