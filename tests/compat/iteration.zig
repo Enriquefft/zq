@@ -116,6 +116,8 @@ test "jq:L269 [(.,1),((.,.[]),(2,3))]" {
     try std.testing.expectEqualStrings("[[\"a\",\"b\"],1,[\"a\",\"b\"],\"a\",\"b\",2,3]", results[0]);
 }
 
+// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
+//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
 test "jq:L273 [([5,5][]),.,.[]]" {
     const results = try h.runFilter(
         "[([5,5][]),.,.[]]",
@@ -357,6 +359,8 @@ test "jq:L349 [-foreach -.[] as $x (0; . + $x)]" {
     try std.testing.expectEqualStrings("[1,3,6]", results[0]);
 }
 
+// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
+//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
 test "jq:L353 [foreach .[] / .[] as $i (0; . + $i)]" {
     const results = try h.runFilter(
         "[foreach .[] / .[] as $i (0; . + $i)]",
@@ -698,6 +702,8 @@ test "jq:L474 del(.[2:4],.[0],.[-2:])" {
     try std.testing.expectEqualStrings("[1,4,5]", results[0]);
 }
 
+// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
+//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
 test "jq:L478 .[2:4] = ([], [_a_,_b_], [_a_,_b_,_c_])" {
     const results = try h.runFilter(
         ".[2:4] = ([], [\"a\",\"b\"], [\"a\",\"b\",\"c\"])",
@@ -713,6 +719,8 @@ test "jq:L478 .[2:4] = ([], [_a_,_b_], [_a_,_b_,_c_])" {
     try std.testing.expectEqualStrings("[0,1,\"a\",\"b\",\"c\",4,5,6,7]", results[2]);
 }
 
+// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
+//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
 test "jq:L490 reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[655..." {
     const results = try h.runFilter(
         "reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[65536:]",
