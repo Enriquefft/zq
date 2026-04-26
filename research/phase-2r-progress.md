@@ -539,3 +539,58 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Next**: Phase 19 (fuse pass — load_path folding)
 
+### Phase 19: Fuse Pass — load_path Folding (§3 R3 step 8)
+**Date**: 2026-04-26
+**Plan reference**: §3 R3 step 8
+**Commits**:
+- `c119934` initial — fuse pass scaffold + single/two/three-deep folds, breakers, span preservation
+- `c3ef637` fix-iter-2 — multi-segment chains, UDF body remap, recursive UDF, if-arm contexts
+- **Final tip**: `c3ef637`
+
+**Objective**: Implement fuse optimization pass that collapses chained `load_field` runs in a pipe tree into single `load_path` ops, matching legacy compiler parity.
+
+**Implementation**:
+- New `src/compiler/fuse.zig` (+557 lines) — linearize-and-rebuild fold over IR pipe trees
+- `src/compiler/ir.zig` (+346 lines) — `load_path` op + supporting helpers
+- `src/compiler/emit.zig` (+19 lines) — emit handler for fused `load_path`
+- `src/compiler/harvest.zig` (+5 lines) — prefilter awareness of `load_path`
+- `src/compiler/root.zig` (+30/-… lines) — Stage 4.5 fuse hook between lower and emit
+- `build.zig` (+15 lines) — fuse snapshot test wiring
+- 12 new fuse snapshots in `tests/compiler/snapshots/fuse/` (8 in initial + 4 in fix-iter-2)
+- `tests/compiler/snapshots_fuse_test.zig` (+158 lines)
+- `tests/compiler/snapshots_update.zig` (+153 lines) — fuse snapshot updater
+
+**Algorithm note**: Linearize-and-rebuild fold (legacy parity): all maximal `load_field` runs in a pipe tree fold to `load_path`, with breakers (`iterate`, `load_index`) preserved between segments.
+
+**Aux state note**: Returns `Result { ir, index_map }`; `function_table.body_ir_root` re-pointed via `index_map` for UDF body folds.
+
+**Metrics**:
+| Metric | Baseline (P18) | Phase 19 | Delta |
+|--------|----------------|----------|-------|
+| vm-equiv MATCH | 178 | 178 | 0 |
+| vm-equiv FAIL | 0 | 0 | 0 |
+| vm-equiv SKIP | 3 | 3 | 0 |
+| Snapshots (lower) | 92 | 92 | 0 (preserved) |
+| Snapshots (fuse) | 0 | 12 | +12 (8 initial + 4 fix-iter-2) |
+| -Dcompile=new pass | 1132 | 1133 | +1 (fuse snapshot test) |
+| -Dcompile=new fail | 13 | 13 | 0 |
+| -Dcompile=new skip | 20 | 20 | 0 |
+| Legacy pass | 1027 | 1028 | +1 |
+| Legacy fail | 111 | 111 | 0 |
+| Legacy skip | 27 | 27 | 0 |
+
+**Verification**:
+- Reviewer round 1: REQUEST-CHANGES (3 items)
+  1. Fold parity for multi-segment chains
+  2. Missing UDF-body fold fixture
+  3. Missing if-arm fold fixture
+- Reviewer round 2: APPROVE
+  - One MINOR non-blocking observation: `fold_in_recursive_udf` body reachability via inlined `call_user` span (recorded for future reference, not actioned in P19)
+- Final phase status: COMPLETE
+
+**Deferred items** (carried forward from P18, not investigated this phase):
+1. Memory leak: `literal_groups` not freed after `ownFrom` (~1-2KB per compile, process-lifetime) — R4 deferral
+2. Benchmark discrepancy: +27%/+58% reported but independent analysis shows measurement problem — R4 deferral
+
+**Next**: Phase 20 (R3 acceptance verification — no code; gates only)
+
