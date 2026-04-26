@@ -638,3 +638,37 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Next: P21 (R4+R5 cutover).
 
+## Phase 21 — R4+R5 cutover escalation (BLOCKED — replan)
+**Date**: 2026-04-26
+**Plan reference**: §3 R4+R5 acceptance criteria + §1.4 gates 1–5
+**Mode**: ESCALATED — fix-task attempts + cutover attempt + revert + replan
+
+**Attempted SHA chain**:
+- `52f3200` — `test(compat): add ZQ-DEFER markers for 5 known regressions` (p21-fix1 attempt 1)
+- `5824806` — `feat(compiler): const-key validator for object construction (latent until R5 cutover)` (p21-fix1 attempt 2)
+- ff-merged into `redesign/compiler` at the head of this entry; no cutover commit was created (implementer reverted before staging).
+
+**Fix-task 1 outcomes** (p21-fix1, two attempts):
+- Attempt 1 (commit `52f3200`): BLOCKED on synthesizer brief errors. Item 1 misclassified a JSON parser issue as a compiler regression; Item 2 validator was correct on its own but the regression it targets is masked by the dispatcher fallback at `src/query/root.zig:108` (`.err => compileLegacy`, `error.NewCompilerNotImplemented => compileLegacy`). Item 3 landed: 5 ZQ-DEFER markers added in `tests/compat/` (regressions documented in-place; not silently skipped).
+- Attempt 2 (commit `5824806`): Validator re-added as latent infrastructure (~40 lines in `src/compiler/lower.zig`, plus helper `isProvablyNonStringKey`). Net-positive regardless of cutover timing; activates at cutover when the dispatcher fallback is removed. Carries no behaviour change at HEAD because the legacy path still owns object-construction validation today.
+
+**Cutover attempt outcome**: BLOCKED on architectural incompleteness. The implementer began the R5 deletion sequence (remove `compileLegacy` fallback in `src/query/root.zig`, retire legacy compile module), ran the full suite, observed 150 `NewCompilerNotImplemented` stack frames spanning 69 unique tests, and reverted the entire cutover diff. **No cutover commit was created.** The `p21-cutover` worktree branch ref survives at `5824806` (same SHA as `redesign/compiler` HEAD post-ff-merge); preserved per cleanup instructions.
+
+**Root cause discovery**: The dispatcher fallback at `src/query/root.zig:108` (`.err => compileLegacy`, `error.NewCompilerNotImplemented => compileLegacy`) was masking new-compiler gaps end-to-end. R3 acceptance (P20) and gate-1 (P21) measurements were inflated by silent legacy fallback hits — every unimplemented operator/AST-shape was being transparently routed to the legacy compiler and counted as a `-Dcompile=new` pass. True new-compiler test coverage at HEAD, with the fallback removed, is approximately **1064 pass / 82 fail** (vs the measured "1133 pass / 13 fail" with the fallback active). The delta (~70 tests) maps cleanly onto the missing categories enumerated below.
+
+**Missing in new compiler** (verified empirically by removing the fallback, running the cutover, and grouping the 150 `NewCompilerNotImplemented` stack frames across 69 unique failing tests):
+- Control flow: `foreach`, `label` / `break`, `until`, `while`, `recurse` builtin call form
+- Range / iteration builtins: `range`, `limit`, `skip`, `nth`, `first`, `last`, `error`
+- Format builtins: `@text`, `@json`, `@csv`, `@base64`, `@base64d`, `@uri`, `@urid`
+- Other: `del` general forms (beyond the desugared shapes already supported), dynamic regex patterns (non-literal pattern), `bracket_expr` expression-indexed shapes (e.g. `[1,2,3][$x]`)
+
+**Decision**: User selected **Path 1** — implement the missing categories before retrying cutover. Phase 2R extends with a Cluster B+ continuation (provisional Phases 22+). The cutover (renamed P21-redux) is deferred until parity is real; the dispatcher fallback at `src/query/root.zig:108` remains in place as the safety net until then.
+
+**Carried forward to P21-redux (post-implementation cutover)**:
+1. All 3 prior R4 deferrals (literal_groups leak, bench artifact PERSISTENT-MEASUREMENT-NOISE, ±5% asymmetric interpretation) — still relevant for the eventual P21-redux gate.
+2. Gate 3 spec-clarification (binary size +4.5% recast as architectural; threshold needs explicit recasting in plan §1.4) — pending until cutover lands.
+3. Gate 5 errpos corpus expansion — post-cutover follow-up unchanged.
+4. 5 ZQ-DEFER-marked tests in `tests/compat/` (committed at `52f3200`) — re-evaluate post-cutover whether each still requires a defer marker or can be addressed alongside the missing-category implementation work in Cluster B+.
+
+**Phase status**: ESCALATED — replanning required before further dispatch. New orchestration plan must enumerate the 12+ missing categories, group them into implementation waves, and define the eventual P21-redux gate set.
+
