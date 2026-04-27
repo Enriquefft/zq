@@ -2022,7 +2022,21 @@ fn lowerRegexBuiltin1(
     src_start: u32,
     src_len: u32,
 ) LowerError!u32 {
-    if (bc.args.len < 1 or bc.args.len > 2) return error.NewCompilerNotImplemented;
+    // [Phase-3] regex-validation. Legacy `compileRegexBuiltin1`
+    // (`src/query/src/compiler.zig:3057`) probes for `(literal;`
+    // and falls through to `compileRegexBuiltinSlow` (`:3226`); both
+    // arms eventually error via `syntaxErr` when the arg shape is
+    // wrong. Mirror that with a `query_syntax_error` LowerDiagnostic
+    // anchored at the call span so wrong-arity calls become compile
+    // errors instead of routing to the legacy backend.
+    if (bc.args.len < 1 or bc.args.len > 2) {
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = src_start,
+            .len = src_len,
+        };
+        return error.LowerDiagnostic;
+    }
 
     var flag_body: ?[]const u8 = null;
     if (bc.args.len == 2) {
@@ -2051,7 +2065,19 @@ fn lowerRegexBuiltin2(
     src_start: u32,
     src_len: u32,
 ) LowerError!u32 {
-    if (bc.args.len < 2 or bc.args.len > 3) return error.NewCompilerNotImplemented;
+    // [Phase-3] regex-validation. Legacy `compileRegexBuiltin2`
+    // (`src/query/src/compiler.zig:3742`) requires `(pat ; repl)` or
+    // `(pat ; repl ; "flags")` and reports `syntaxErr` on any other
+    // arity once the second `parsePipe` returns. Mirror with a
+    // `query_syntax_error` LowerDiagnostic at the call span.
+    if (bc.args.len < 2 or bc.args.len > 3) {
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = src_start,
+            .len = src_len,
+        };
+        return error.LowerDiagnostic;
+    }
 
     var flag_body: ?[]const u8 = null;
     if (bc.args.len == 3) {
@@ -2060,11 +2086,13 @@ fn lowerRegexBuiltin2(
         };
     }
 
-    // Replacement arg: reject comma-arg generators (cat-10's
-    // territory). The replacement is lowered as a regular value-arg
-    // child — emit brackets it with save_input/restore_input around
-    // the pattern push.
-    if (bc.args[1].kind == .comma) return error.NewCompilerNotImplemented;
+    // [Phase-3] regex-dynamic. Replacement lowers as a regular value
+    // child; comma-arg generators (`sub("a"; "b","c")`) lower into the
+    // standard `fork ; b ; jump ; c` shape. Emit brackets the entire
+    // repl child with `save_input` / `restore_input` so backtracking
+    // re-enters the second branch with the original input restored —
+    // identical bytecode shape to legacy's `parsePipe` inside the
+    // bracket (`src/query/src/compiler.zig:3799`).
     const repl_idx = try lowerNode(ctx, bc.args[1]);
 
     return lowerRegexBuiltinCommon(
@@ -2189,7 +2217,15 @@ fn lowerRegexBuiltinCommon(
     defer span_buf.deinit(alloc);
 
     if (pool_idx == types_mod.REGEX_POOL_DYNAMIC) {
-        if (pat_node.kind == .comma) return error.NewCompilerNotImplemented;
+        // [Phase-3] regex-dynamic. Dynamic pattern lowers as a regular
+        // child. Comma-arg generators (`test("a","b")`,
+        // `sub("a","b"; repl)`) lower into the standard
+        // `fork ; a ; jump ; b` shape; emit's `regex1` / `regex2` cases
+        // push the resulting key onto the value stack and call_builtin
+        // consumes it. On backtrack from the call's output the fork
+        // re-enters the second branch and re-runs call_builtin —
+        // identical shape to legacy's `parsePipe` slow path
+        // (`src/query/src/compiler.zig:3789`, `:3226`).
         const pat_idx = try lowerNode(ctx, pat_node);
         try span_buf.append(alloc, pat_idx);
     }

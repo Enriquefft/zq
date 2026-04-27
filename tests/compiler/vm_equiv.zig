@@ -559,6 +559,39 @@ const FIXTURES = [_]Fixture{
     // — proving the fix doesn't regress when as-pattern lives
     // inside a reduce update.
     .{ .name = "cat14_reduce_with_as_body", .filter = "reduce .[] as $x (0; \"x\" as $u | . + $x)", .input = "[1,2,3]", .expected_output = "6" },
+    // ── Phase 3 (P3) — regex-validation + regex-dynamic ──────────
+    // Comma-arg generators in regex builtins. The new compiler
+    // lowers the comma normally; emit's `regex1`/`regex2` cases
+    // wrap the dynamic-pattern child in `save_input`/`restore_input`
+    // and call_builtin re-enters on backtrack. Mirrors legacy's
+    // `parsePipe`-inside-bracket shape (`compileRegexBuiltin1` slow
+    // path `:3226`, `compileRegexBuiltin2` `:3742`).
+    // 1-arg regex with comma pattern — fork enumerates each branch
+    // through the call.
+    .{ .name = "p3_regex_test_comma_pat", .filter = "[test(\"a\",\"o\")]", .input = "\"foobar\"", .expected_output = "[true,true]" },
+    // scan with comma pattern yields each branch's matches in order.
+    .{ .name = "p3_regex_scan_comma_pat", .filter = "[scan(\"a\",\"o\")]", .input = "\"foobar\"", .expected_output = "[\"a\",\"o\",\"o\"]" },
+    // 2-arg sub with comma pattern — pattern fork enumerated, single
+    // literal replacement. jq enumerates each pattern branch through
+    // the call; legacy zq raises TypeError (pre-existing legacy
+    // limitation), so this fixture only enforces legacy↔new err.kind
+    // parity (no absolute pin). Confirms the comma-fork shape lowers
+    // identically on both backends.
+    .{ .name = "p3_regex_sub_comma_pat", .filter = "[sub(\"a\",\"o\"; \"X\")]", .input = "\"foobar\"" },
+    // 2-arg sub with comma replacement — replacement fork enumerated,
+    // single literal pattern. Same legacy↔new parity check (legacy
+    // TypeErrors); proves the bracketed repl child accepts comma.
+    .{ .name = "p3_regex_sub_comma_repl", .filter = "[sub(\"o\"; \"X\",\"Y\")]", .input = "\"foobar\"" },
+    // gsub with comma replacement — same shape, global mode. Parity
+    // check only.
+    .{ .name = "p3_regex_gsub_comma_repl", .filter = "[gsub(\"o\"; \"X\",\"Y\")]", .input = "\"foobar\"" },
+    // ── Validation diagnostics (Phase 3) ─────────────────────────
+    // Wrong arity — legacy emits a `QuerySyntaxError`; the new
+    // compiler now mirrors that as a `query_syntax_error`
+    // LowerDiagnostic at the call span instead of routing back to
+    // legacy via SKIP. Harness checks legacy↔new error parity.
+    .{ .name = "p3_regex_sub_arity_one", .filter = "sub(\"a\")", .input = "\"abc\"", .expects_compile_err = true },
+    .{ .name = "p3_regex_sub_arity_four", .filter = "sub(\"a\"; \"b\"; \"c\"; \"d\")", .input = "\"abc\"", .expects_compile_err = true },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.
