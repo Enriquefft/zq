@@ -947,3 +947,88 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Wave 3 first merge (P25). Next: P23 (cat-14, still in flight) per §3.5 replan.
 
+## Phase 23 — cat-14 (`foreach` AST kind, `reduce` AST kind, cat-4 `as`-pattern body bug fix via new `as_bind` SemOp) — Wave 3 (second to merge, completing the wave; Cluster B+ implementation phases ALL DONE)
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `20a66d0` on `redesign/compiler` (ff-merged from `phase-23-cat-14`)
+**Commits this phase**: 1 (no amend round; primary reviewer APPROVE without followups)
+
+**Rebase history**: branched from `64532e5`; no first-attempt rebase needed (P25 merged in parallel); rebased onto `35d2765` (post-P25 docs) → `20a66d0` (1 stack conflict in vm_equiv.zig, additive append)
+
+**Files changed**: 23 (+687 -109) — biggest diff of all Cluster B+ phases
+- `src/compiler/ir.zig`: 1 new SemOp `as_bind` (between `destructure` and other ops); IR dumper case for `as_bind`; AST dumper cases for `.reduce`/`.foreach`
+- `src/compiler/lower.zig`: REWROTE `.as_pattern` arm (replaced buggy `pipe(expr, pipe(destructure, body))` shape with `as_bind(expr, destructure, body)` SemOp); added `lowerReduce`/`lowerForeach` helpers; `.foreach`/`.reduce` arms in `lowerNode` switch
+- `src/compiler/emit.zig`: new `emitAsBind` (`<expr>; <destructure ladder>; pipe; <body>` — single pipe corresponds to user's `|` between (expr as $x) and body); `emitReduce`; `emitForeach`; `collectPatternVarIdsFromIR` helper (mirrors legacy `collectPatternVarIds`)
+- `research/compiler-ir-format.md` (+15 lines): documents `as_bind` (cat-4), `reduce`, `foreach` ops; explains hidden var_ids in extra_data; cites legacy compiler.zig:3965/4121
+- `tests/compat/iteration.zig`: lifted 1 stale ZQ-DEFER marker (line 273 / jq:L273)
+- `tests/compiler/snapshots_test.zig`: 5 fixture registrations
+- `tests/compiler/vm_equiv.zig`: 11 cat-14 fixtures
+- 5 new snapshot files: `tests/compiler/snapshots/lower/cat-14-{as-pattern-fixed,foreach-4arg,foreach-5arg,reduce-range,reduce}.txt`
+- **11 EXISTING snapshot files MODIFIED** (regenerated to use new `as_bind` IR shape):
+  - 6 as-pattern snapshots: `as_simple.txt`, `var_load.txt`, `destructure_array.txt`, `destructure_nested.txt`, `destructure_object.txt`, `destructure_object_shorthand.txt`
+  - 5 cat-18-with-as snapshots: `cat-18-bracket-array-base.txt`, `cat-18-bracket-mid-chain.txt`, `cat-18-bracket-standalone.txt`, `cat-18-regex-sub-dynamic.txt`, `cat-18-regex-test-dynamic.txt`
+
+**AST shapes covered**: foreach (4-arity + 5-arity with extract clause), reduce (basic + reduce-range), as-pattern body fix (as_bind shape replacing buggy pipe shape)
+
+**1 new SemOp `as_bind`**: justified — pipe-collapse during emit would still fire the inner pipe between expr and destructure; only a dedicated SemOp prevents the stray opcode. Documented in `research/compiler-ir-format.md`. fuse.zig wiring NOT needed (variable-arity span_len>0 ops flow through copyNode generic path; verified via vm-equiv all-green)
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all positive fixtures + primary reviewer code-path comparison + 3 independent regression case tests):
+- foreach 4-arg: byte-for-byte vs `compiler.zig:4121` `compileForeach`
+- foreach 5-arg (with extract): byte-for-byte (extract clause shape)
+- reduce: byte-for-byte vs `compiler.zig:3965` `compileReduce`
+- reduce-range: cat-13 composition (range_gen{1,2,3} from P22 + reduce SemOp)
+- **as_bind**: bytecode mirrors legacy `parseAsPattern` flow (`<expr>; <destructure>; pipe; <body>`); `pipe` corresponds to user's `|`, NOT to outer pipe between expr and destructure (which was the bug)
+
+**Independent as-pattern regression tests** (run by primary reviewer):
+- `'foo' as $k | {"foo":42} | .[$k]` → `42` PASS
+- `5 | 'lit' as $u | . + 1` → `6` PASS
+- `[1,2,3] | 'x' as $unused | .[1]` → `2` PASS
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 268 MATCH / 0 FAIL / 3 SKIP (was 256/0/4; +12 fixtures all MATCH; 1 SKIP lifted to MATCH; 0 new mismatch; 0 new compile_err) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base (lifted DEFER marker; kept conservative on further lifts) |
+| Spot-check (fallback disabled in throwaway) | identical (calls compileNew directly); +12 cat-14 MATCH; cat-4 regression check PASS (all 20 existing as-pattern fixtures still MATCH) |
+
+**Hard rules verified** (mechanical-verifier PASS 13/13 incl. parent-checkout-clean + IR-additive-only audit):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact
+- `src/query/src/compiler.zig` legacy compiler untouched
+- `src/ast/*` untouched
+- `src/compiler/ir.zig` additive only (`as_bind` added; no opcode removed/renamed; reduce/foreach dump arms ADDED)
+- `src/compiler/fuse.zig` untouched (default copyNode passthrough sufficient)
+- `src/compiler/harvest.zig` untouched
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
+- Single commit, conventional message format, single author, no GPG bypass markers
+
+**Reviewer outcome**: 4 verifiers ran. mechanical PASS 13/13; equiv PASS Δ+12 + cat-4 regression check PASS; snapshot PASS (5 new + 11 modified all in expected buckets; ir-format docs complete); primary APPROVE no followups (3 independent regression tests all produce correct output)
+
+**`destruct_alt` (`?//`) handling**: `.destruct_alt` arm UNCHANGED. Implementer's reasoning: `emitPatternAltBind` does its own `pipe`/`save_input`/`restore` bracketing internally — the outer wrapper pipe is a no-op there. Smoke test `"foo" as $k ?// $k | {"foo":42} | .[$k]` returns 42 (correct). Migrating destruct_alt to `as_bind` shape too for IR symmetry is a deferred followup.
+
+**ZQ-DEFER markers reviewed** (4 markers per state-sync):
+- L119 (`[([5,5][]),.,.[]]`): **LIFTED** — passes via legacy now
+- L362 (`foreach .[] / .[]`): **KEPT** — legacy `reduce/foreach .[] / .[]` still hits a vm.zig assertion
+- L705 (`.[2:4] = (...)`): **KEPT** — legacy setpathRecursive bug
+- L722 (`reduce range(65540;65536;-1)`): **KEPT** — legacy parser fails on the inner setpath shape
+
+**Cross-phase notes**:
+- P23 introduced `as_bind` SemOp which CHANGED the lowering shape for ALL existing as-pattern uses. 11 existing snapshots regenerated. cat-4 (P10) work effectively re-baselined under correct semantics.
+- cat-18 (P27) bracket fixtures that used `$x as $y` patterns also got their snapshots regenerated — pure shape change, no semantic change to bracket_expr handling.
+- **Wave 3 cross-phase**: P25 + P23 had only 1 stack conflict (vm_equiv.zig append); zero semantic overlap (orthogonal merge surfaces — P25 in lowerBuiltinCall, P23 in lowerNode)
+
+**emitForeach `saved_input` intentionally NOT popped** (mirrors legacy compileForeach line ~4253) — comment notes "INIT generator backtracks". Known by-design "leak" carried from legacy; not a P23 introduction.
+
+**Subtle ordering note in `lowerReduce`/`lowerForeach`** (per primary reviewer): init lowered BEFORE pushing pattern scope (legacy parses init AFTER pushScope). Documented; legacy never references pattern-var in init in practice. Quick check `reduce range(3) as $x ($x; .)` returns `null` from BOTH backends (parity-safe). Worth re-examination if user adds reduce/foreach fixtures using pattern-var in init.
+
+**Followups for P21-redux / future phases**:
+- **destruct_alt migration to as_bind shape**: deferred for IR symmetry; behaviorally identical today
+- **fuse.zig as_bind opportunities**: if profiling shows hot-path improvements; currently just copyNode-passthrough
+- **Subtle ordering tweak in lowerReduce/lowerForeach**: see note above; deferred pending any fixture that exercises pattern-var in init
+
+**Carried forward to next phase / P21-redux**:
+1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/` — REDUCED to 4 after L119 lift.
+2. Three additional deferrals from P22 (nth gen-form, skip/limit gen-form n, error-format parity for non-UserError types) — unchanged.
+
+**Phase status**: COMPLETE — Cluster B+ implementation phases ALL DONE. Wave 3 complete (P25 → P23). Only P21-redux (R4+R5 cutover) remains. P21-redux scope (deferred to next session): re-measure all 5 R4 acceptance gates with dispatcher fallback removed; if all pass, remove fallback at `src/query/root.zig:102-109`, delete legacy compiler at `src/query/src/{vm,prefilter,compiler}.zig`, remove `-Dcompile` flag, dispatch new compiler unconditionally, merge to `main`.
+
