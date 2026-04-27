@@ -1,0 +1,9 @@
+# source: until(.>=10; .+1)
+# SemOp
+until @0..17
+  cmp(ge) @6..11
+    identity @6..7
+    load_const(10) @9..11
+  arith(add) @13..16
+    identity @13..14
+    load_const(1) @15..16

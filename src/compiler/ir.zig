@@ -196,6 +196,64 @@ pub const Op = enum(u8) {
     path_begin,
     path_end,
 
+    // ── Cat-15: control-flow constructs (label/break/until/while) ──────
+    /// `label $name | <body>`. Allocates a fresh label var_id at lower
+    /// time, registers it as a label binding, lowers the body with
+    /// `$name` visible. `extra_data[node.extra]` carries the var_id;
+    /// `children[0]` is the body IR-node index. Maps to legacy
+    /// `compileLabel` (`src/query/src/compiler.zig:3628`):
+    ///   label_begin(exit_ip)         — backpatched to instr after body
+    ///   capture_variable($name)
+    ///   pipe
+    ///   <body>
+    ///   exit_ip:                      — handleBreak target
+    label,
+    /// `break $name`. Loads the label-var (which holds the break token
+    /// captured by the matching `label`) and emits `break_op`. Lowering
+    /// validates the named binding is a label var (not a regular `as`
+    /// binding) and surfaces a structured compile diagnostic on
+    /// undefined / non-label names. `extra_data[node.extra]` carries the
+    /// resolved var_id. Maps to legacy `parsePipe` `.break_kw` handler
+    /// (`compiler.zig:6245`):
+    ///   load_variable($name)
+    ///   break_op
+    break_,
+    /// `while(cond; update)`. Streams values by emitting `current` then
+    /// piping through `update` while `cond` holds. `children[0]` is the
+    /// cond IR root; `children[1]` is the update IR root. Maps to
+    /// legacy `compileWhile` (`compiler.zig:3428`):
+    ///   loop_top:
+    ///     save_input
+    ///     <cond>
+    ///     jump_if_false → loop_exit
+    ///     restore_input
+    ///     yield_output                 — emit current
+    ///     <update>
+    ///     pipe
+    ///     jump → loop_top
+    ///   loop_exit:
+    ///     restore_input
+    ///     backtrack
+    while_,
+    /// `until(cond; update)`. Applies `update` until `cond` holds, then
+    /// emits the final value. `children[0]` is the cond IR root;
+    /// `children[1]` is the update IR root. Maps to legacy
+    /// `compileUntil` (`compiler.zig:3495`):
+    ///   loop_top:
+    ///     save_input
+    ///     <cond>
+    ///     jump_if_false → loop_body
+    ///     restore_input
+    ///     jump → loop_done
+    ///   loop_body:
+    ///     restore_input
+    ///     <update>
+    ///     pipe
+    ///     jump → loop_top
+    ///   loop_done:
+    ///     push_current
+    until_,
+
     // ── EmitOp namespace (produced by fuse, consumed by emit) ─────────────
     // Plan §1.3 row 6 / §3 R3 step 8: chained `.a | .b | .c` field loads
     // collapse to a single `load_path` whose payload is the dot-joined key
@@ -590,6 +648,25 @@ fn dumpAst(
                 try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
                 return;
             }
+            // Cat-15 — `while(cond; update)` and `until(cond; update)`
+            // lower to dedicated SemOps `while_` / `until_`. Render in
+            // the IR-level shape so snapshot diffs match the lowered tree.
+            if (bc.args.len == 2 and std.mem.eql(u8, bc.name, "while")) {
+                try writer.writeAll("while");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
+                try dumpAst(ir_obj, bc.args[1], source, depth + 1, writer);
+                return;
+            }
+            if (bc.args.len == 2 and std.mem.eql(u8, bc.name, "until")) {
+                try writer.writeAll("until");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
+                try dumpAst(ir_obj, bc.args[1], source, depth + 1, writer);
+                return;
+            }
             // Generic builtin call: rendered as `call_builtin("name")`.
             // For regex builtins with a literal pattern arg, also
             // render the pool ref annotation per spec §6 "Regex pool
@@ -811,6 +888,31 @@ fn dumpAst(
             for (fc.args) |arg| {
                 try dumpAst(ir_obj, arg, source, depth + 1, writer);
             }
+        },
+        // ── Cat-15 — `label $name | <body>` ─────────────────────────
+        // Renders without the var_id (which is allocated only at lower
+        // time and not visible from the AST walk). The IR-side dumper
+        // surfaces the var_id; this one is the source-level shape so
+        // snapshot diffs read like the input filter.
+        .label_expr => |le| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("label(");
+            try writeStringLit(writer, le.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, le.body, source, depth + 1, writer);
+        },
+        // ── Cat-15 — `break $name` ─────────────────────────────────
+        // The body has no children; the var-name is rendered so the
+        // dump remains source-faithful.
+        .break_expr => |be| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("break(");
+            try writeStringLit(writer, be.name);
+            try writer.writeAll(")");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
         },
         else => {
             try writeIndent(writer, depth);
@@ -1571,6 +1673,18 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
         .path_begin => try writer.writeAll("path_begin"),
         .path_end => try writer.writeAll("path_end"),
 
+        // ── Cat-15 control-flow ops ─────────────────────────────────
+        .label => {
+            const var_id: u32 = ir_obj.extra_data.items[node.extra];
+            try writer.print("label(var_id={d})", .{var_id});
+        },
+        .break_ => {
+            const var_id: u32 = ir_obj.extra_data.items[node.extra];
+            try writer.print("break(var_id={d})", .{var_id});
+        },
+        .while_ => try writer.writeAll("while"),
+        .until_ => try writer.writeAll("until"),
+
         // EmitOp namespace: same string-buf encoding as load_field.
         .load_path => {
             const slots = ir_obj.extra_data.items;
@@ -1600,7 +1714,7 @@ fn dumpIRChildren(
     // a leaf in the IR even though emit treats it as a unary op (it
     // operates on the implicit current input — see `lower.zig:1539`).
     switch (node.op) {
-        .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end => return,
+        .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end, .break_ => return,
         else => {},
     }
     if (node.span_len > 0) {
@@ -1617,9 +1731,9 @@ fn dumpIRChildren(
     // same special case in `fuse.zig:childArity`.
     const arity: struct { u8, u8 } = switch (node.op) {
         // Binary
-        .pipe, .comma, .arith, .cmp, .logical, .alt => .{ 0, 2 },
+        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_ => .{ 0, 2 },
         // Unary
-        .try_, .neg, .path_begin => .{ 0, 1 },
+        .try_, .neg, .path_begin, .label => .{ 0, 1 },
         .update_assign => blk: {
             const kind: UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
             break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 };

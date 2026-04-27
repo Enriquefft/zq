@@ -696,6 +696,12 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         // `expandFunctionCall` (`compiler.zig:1066-1123`).
         .call_user => try emitCallUser(em, node),
 
+        // ── Cat-15 — control-flow constructs ──────────────────────────
+        .label => try emitLabel(em, node),
+        .break_ => try emitBreak(em, node),
+        .while_ => try emitWhile(em, node),
+        .until_ => try emitUntil(em, node),
+
         else => return error.NewCompilerNotImplemented,
     }
 }
@@ -1877,8 +1883,10 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         },
         // The lowerer never produces these classes through `call_builtin`
         // (it routes them to dedicated SemOps), so emit unreachable —
-        // hitting them indicates an upstream classifier drift.
-        .not, .path => unreachable,
+        // hitting them indicates an upstream classifier drift. `not`
+        // and `path` go to leaf SemOps; `while_until_2arg` lowers to
+        // `while_`/`until_` SemOps directly (cat-15).
+        .not, .path, .while_until_2arg => unreachable,
         // Cat-13 / cat-17 classes already handled by the early-out
         // switch above — reaching them here would mean the early-out
         // fell through.
@@ -2438,4 +2446,166 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
         i -= 1;
         try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
     }
+}
+
+// ── Cat-15 emission helpers ────────────────────────────────────────
+//
+// Each helper mirrors its legacy counterpart at
+// `src/query/src/compiler.zig` byte-for-byte:
+//   * label  → compileLabel  (3628)
+//   * break  → parsePipe `.break_kw` (6245)
+//   * while  → compileWhile  (3428)
+//   * until  → compileUntil  (3495)
+//
+// Single source of truth: legacy bytecode shape is the contract;
+// vm-equiv runs both backends through the same VM and byte-compares.
+
+/// Emit `label $name | <body>`. The IR carries `var_id` in
+/// `extra_data[node.extra]` and the body in `children[0]`. Mirrors
+/// `compileLabel` (`compiler.zig:3628`):
+///   label_begin(exit_ip)         — backpatched after body emission
+///   capture_variable($var_id)
+///   pipe                         — separates label header from body
+///   <body>
+///   exit_ip:                      — VM `handleBreak` jump target
+///
+/// No `label_end` / `pop_variable` are emitted because iterate loops
+/// would re-execute them on every backtracking pass and prematurely
+/// clear the label frame + break-token variable. Legacy makes the
+/// same intentional omission (`compiler.zig:3661-3667`); cleanup
+/// happens via `handleBreak` (on break) or per-record `reset()`
+/// (no break).
+fn emitLabel(em: *Emitter, node: ir.Node) EmitError!void {
+    const slots = em.ir_obj.extra_data.items;
+    const var_id: u32 = slots[node.extra];
+    const body_idx = node.children[0];
+
+    // label_begin with placeholder exit_ip (backpatched below).
+    const label_begin_ip = em.instructions.items.len;
+    try em.pushInstr(.label_begin, .{ .index = 0 }, node);
+
+    // capture_variable($name) — store break token into the label var.
+    try em.pushInstr(.capture_variable, .{ .index = var_id }, node);
+
+    // pipe — separates the label header from the body. Mirrors legacy
+    // `compileLabel`'s `try ctx.emit(.pipe, ...)` after the
+    // `capture_variable` (`compiler.zig:3655`).
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    // Body.
+    try emitNode(em, body_idx);
+
+    // Backpatch label_begin's exit_ip to the instruction past the body.
+    em.instructions.items[label_begin_ip].operand = .{
+        .index = @intCast(em.instructions.items.len),
+    };
+}
+
+/// Emit `break $name`. The IR carries `var_id` in
+/// `extra_data[node.extra]`; lookup-time validation already confirmed
+/// the var is a label binding (see `lookupLabelVar` in `lower.zig`).
+/// Mirrors legacy `parsePipe` `.break_kw` arm (`compiler.zig:6245`):
+///   load_variable($var_id)
+///   break_op
+fn emitBreak(em: *Emitter, node: ir.Node) error{OutOfMemory}!void {
+    const slots = em.ir_obj.extra_data.items;
+    const var_id: u32 = slots[node.extra];
+    try em.pushInstr(.load_variable, .{ .index = var_id }, node);
+    try em.pushInstr(.break_op, .{ .none = {} }, node);
+}
+
+/// Emit `while(cond; update)`. The IR carries `children[0]=cond` and
+/// `children[1]=update`. Mirrors legacy `compileWhile`
+/// (`compiler.zig:3428`):
+///   loop_top:
+///     save_input
+///     <cond>
+///     jump_if_false → loop_exit
+///     restore_input                ; true path: keep current
+///     yield_output                 ; emit current
+///     <update>                     ; transform current
+///     pipe                         ; transfer to current
+///     jump → loop_top
+///   loop_exit:
+///     restore_input                ; false path: balance save
+///     backtrack                    ; produce no output on exit
+fn emitWhile(em: *Emitter, node: ir.Node) EmitError!void {
+    const cond_idx = node.children[0];
+    const update_idx = node.children[1];
+
+    // loop_top:
+    const loop_top: u32 = @intCast(em.instructions.items.len);
+
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try emitNode(em, cond_idx);
+
+    // jump_if_false → loop_exit (placeholder; backpatched below).
+    const jif_pos = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+
+    // True path: restore current and yield it, then update.
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    try emitNode(em, update_idx);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.jump, .{ .index = loop_top }, node);
+
+    // loop_exit:
+    const loop_exit: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jif_pos].operand = .{ .index = loop_exit };
+
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+}
+
+/// Emit `until(cond; update)`. The IR carries `children[0]=cond` and
+/// `children[1]=update`. Mirrors legacy `compileUntil`
+/// (`compiler.zig:3495`):
+///   loop_top:
+///     save_input
+///     <cond>
+///     jump_if_false → loop_body
+///     restore_input                ; true path: cond met, exit
+///     jump → loop_done
+///   loop_body:
+///     restore_input                ; false path: keep iterating
+///     <update>
+///     pipe
+///     jump → loop_top
+///   loop_done:
+///     push_current                 ; place final value on stack
+fn emitUntil(em: *Emitter, node: ir.Node) EmitError!void {
+    const cond_idx = node.children[0];
+    const update_idx = node.children[1];
+
+    // loop_top:
+    const loop_top: u32 = @intCast(em.instructions.items.len);
+
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try emitNode(em, cond_idx);
+
+    // jump_if_false → loop_body (placeholder).
+    const jif_pos = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+
+    // True path: cond met, restore + jump to done.
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    const jmp_done_pos = em.instructions.items.len;
+    try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+    // loop_body:
+    const loop_body: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jif_pos].operand = .{ .index = loop_body };
+
+    // False path: restore, apply update, loop back.
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try emitNode(em, update_idx);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.jump, .{ .index = loop_top }, node);
+
+    // loop_done:
+    const loop_done: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jmp_done_pos].operand = .{ .index = loop_done };
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
 }

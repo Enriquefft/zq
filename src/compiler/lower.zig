@@ -188,6 +188,14 @@ pub const Lowerer = struct {
     func_hidden_start: ?u32 = null,
     func_hidden_end: ?u32 = null,
 
+    // ── Cat-15: label / break tracking ─────────────────────────────
+    /// Variable ids that are label bindings (allocated via
+    /// `declareLabelVar`). `break $name` validates against this list
+    /// so a regular `as` binding can't be the target of a break.
+    /// Mirrors legacy `Ctx.label_var_ids`
+    /// (`src/query/src/compiler.zig:3641`).
+    label_var_ids: std.ArrayListUnmanaged(u32) = .{},
+
     /// Append a node and return its index. Plan §1.3 row 3 — children
     /// are u32 indices, never pointers.
     fn pushNode(self: *Lowerer, node: ir.Node) error{OutOfMemory}!u32 {
@@ -246,6 +254,30 @@ pub const Lowerer = struct {
     /// `LowerDiagnostic` on null.
     fn lookupVar(self: *Lowerer, name: []const u8) ?u32 {
         return self.var_table.get(name);
+    }
+
+    /// Declare a label variable (cat-15). Allocates a fresh var_id via
+    /// `declareVar` and records it in `label_var_ids` so `break $name`
+    /// can validate the binding is a label, not a regular `as`. Mirrors
+    /// legacy `compileLabel`'s pair of `declareVariable` +
+    /// `label_var_ids.append` (`src/query/src/compiler.zig:3638-3641`).
+    pub fn declareLabelVar(self: *Lowerer, name: []const u8) error{OutOfMemory}!u32 {
+        const id = try self.declareVar(name);
+        try self.label_var_ids.append(self.arena.allocator(), id);
+        return id;
+    }
+
+    /// Look up a label variable by name. Returns the var_id only if
+    /// the name resolves AND the resolved var_id was registered as a
+    /// label (not a regular `as` binding). Mirrors legacy's
+    /// label-vs-regular-binding check at
+    /// `src/query/src/compiler.zig:6253-6261`.
+    pub fn lookupLabelVar(self: *Lowerer, name: []const u8) ?u32 {
+        const id = self.var_table.get(name) orelse return null;
+        for (self.label_var_ids.items) |lid| {
+            if (lid == id) return id;
+        }
+        return null;
     }
 
     /// Intern a regex pattern and return its pool index. Lazily
@@ -1247,6 +1279,75 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             return inlineUserCall(ctx, fn_id, fc.args, sp.start, sp.len);
         },
 
+        // ── Cat-15 — `label $name | <body>` ─────────────────────────
+        // Allocates a fresh var_id for the label binding, registers it
+        // as a label var (so `break $name` validates), then lowers the
+        // body with `$name` visible in the var_table. The body lowers
+        // first into `children[0]`; emit handles the patch-table
+        // bracketing (label_begin + capture_variable + body + exit_ip
+        // backpatch) using the var_id stored in `extra_data`.
+        //
+        // The label binding scope ends after lowering the body — pop
+        // the var_table entry to mirror legacy's `popScope`
+        // (`compiler.zig:3670`). Subsequent siblings won't see `$name`.
+        .label_expr => |le| {
+            const alloc = ctx.arena.allocator();
+
+            // Snapshot var_table state so the binding pops after the
+            // body is lowered. Mirrors legacy popScope semantics.
+            const saved_var_table = ctx.var_table;
+            var fresh_var_table: std.StringHashMapUnmanaged(u32) = .{};
+            var it = saved_var_table.iterator();
+            while (it.next()) |kv| {
+                try fresh_var_table.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+            }
+            ctx.var_table = fresh_var_table;
+            defer {
+                ctx.var_table.deinit(alloc);
+                ctx.var_table = saved_var_table;
+            }
+
+            const var_id = try ctx.declareLabelVar(le.name);
+            const body_idx = try lowerNode(ctx, le.body);
+
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, var_id);
+
+            return ctx.pushNode(.{
+                .op = .label,
+                .children = .{ body_idx, 0 },
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
+        // ── Cat-15 — `break $name` ─────────────────────────────────
+        // Looks up the label var by name; surfaces a structured compile
+        // diagnostic if no such label is in scope. Emit produces
+        // `load_variable($name) ; break_op` at the saved var_id.
+        .break_expr => |be| {
+            const var_id = ctx.lookupLabelVar(be.name) orelse {
+                // Mirrors legacy's syntax-error class for undefined
+                // label refs (`compiler.zig:6252`/`:6261`).
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp.start,
+                    .len = sp.len,
+                };
+                return error.LowerDiagnostic;
+            };
+            const alloc = ctx.arena.allocator();
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            try ctx.out.extra_data.append(alloc, var_id);
+            return ctx.pushNode(.{
+                .op = .break_,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
+
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
     }
@@ -1356,6 +1457,15 @@ pub const BuiltinClass = enum {
     /// is the lowering+emit dispatch key; emit strips it before
     /// consulting `formatBuiltinId`.
     format_apply,
+    /// Cat-15 — `while(cond; update)` / `until(cond; update)`. Both
+    /// 2-arity loop forms share a (cond + update) shape with a
+    /// `loop_top` jump target. Emit picks `while_` vs `until_` SemOp
+    /// from the name. Mirrors legacy `compileWhile`
+    /// (`compiler.zig:3428`) and `compileUntil` (`:3495`). The IR
+    /// uses dedicated SemOps `while_` / `until_` rather than reusing
+    /// `call_builtin` because the bytecode shape carries
+    /// patch-table jumps that don't reduce to a flat builtin call.
+    while_until_2arg,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1401,6 +1511,11 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 2 and isLimitSkipNthBuiltin(name)) return .limit_skip_nth;
     if (arity == 1 and std.mem.eql(u8, name, "first")) return .first_arg1;
     if (arity == 1 and std.mem.eql(u8, name, "last")) return .last_arg1;
+    // Cat-15 control-flow loop builtins. Both share the same
+    // (cond; update) shape; emit picks the SemOp + bytecode pattern by
+    // name. Routed before the generic arity tables because `while`
+    // and `until` are not in any of the math/value/filter buckets.
+    if (arity == 2 and isWhileUntilBuiltin(name)) return .while_until_2arg;
     // 0-arity `first` / `last` desugar to `.[0]` / `.[-1]` — see
     // legacy `compiler.zig:5930-5937`. They reach AST as a
     // `BuiltinCall` because the AST parser lists both names in
@@ -1449,6 +1564,15 @@ pub fn isFormatApplyName(name: []const u8) bool {
         std.mem.eql(u8, bare, "sh") or
         std.mem.eql(u8, bare, "base64") or
         std.mem.eql(u8, bare, "base64d");
+}
+
+/// Recognize `while` / `until` (cat-15). Both share the same
+/// `(cond; update)` shape — backward-jump iteration with one
+/// jump_if_false fork. Emit picks the bytecode pattern (and the
+/// `while_` vs `until_` SemOp at lower time) by name.
+pub fn isWhileUntilBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "while") or
+        std.mem.eql(u8, name, "until");
 }
 
 /// Recognize 1-arg regex builtin names (cat-11). The internal
@@ -1703,6 +1827,27 @@ fn lowerBuiltinCall(
                 .span_start = span_start,
                 .span_len = span_len,
                 .extra = extra_idx,
+                .src_start = src_start,
+                .src_len = src_len,
+            });
+        },
+        .while_until_2arg => {
+            // Cat-15 — `while(cond; update)` / `until(cond; update)`.
+            // Both 2-arg loop builtins lower to dedicated SemOps:
+            // `while_` / `until_` carry `children[0]=cond`,
+            // `children[1]=update`. The patch-table jumps that wire
+            // `loop_top` / `loop_exit` are emitted at emit time from
+            // the SemOp tag (mirrors legacy `compileWhile`/`compileUntil`).
+            std.debug.assert(bc.args.len == 2);
+            const cond_idx = try lowerNode(ctx, bc.args[0]);
+            const update_idx = try lowerNode(ctx, bc.args[1]);
+            const op: ir.Op = if (std.mem.eql(u8, bc.name, "while"))
+                .while_
+            else
+                .until_;
+            return ctx.pushNode(.{
+                .op = op,
+                .children = .{ cond_idx, update_idx },
                 .src_start = src_start,
                 .src_len = src_len,
             });

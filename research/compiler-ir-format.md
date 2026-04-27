@@ -371,6 +371,136 @@ key_count @0..13
 call_builtin("test", re_0 "/^foo/") @0..13
 ```
 
+### Label / break: `label $out | <body>`, `break $out` (cat-15 / Phase 24)
+
+The `label` SemOp wraps a body with a named non-local-exit binding.
+Lowering allocates a fresh `var_id` for `$name` via `declareLabelVar`,
+which records the id in `Lowerer.label_var_ids` so `break $name` can
+verify the binding is a label (not a regular `as` binding). The body
+lowers under a scope that sees `$name`; the binding pops once lowering
+returns. `extra_data[node.extra]` holds the var_id; `children[0]` is
+the body IR-node index.
+
+Emit (`emit.zig:emitLabel`) mirrors legacy `compileLabel`
+(`src/query/src/compiler.zig:3628`) byte-for-byte:
+`label_begin(exit_ip) ; capture_variable($var_id) ; pipe ; <body>` then
+backpatches `exit_ip` to one past the body. No `label_end` /
+`pop_variable` are emitted — iterate-loops would re-execute them on
+every backtracking pass and prematurely clear the LabelFrame +
+break-token (legacy makes the same omission at `compiler.zig:3661-3667`).
+
+The `break_` SemOp is a leaf — `extra_data[node.extra]` carries the
+resolved label var_id; no children. Lookup happens at lower time via
+`lookupLabelVar`, which surfaces `LowerDiagnostic` with
+`query_syntax_error` when the name is undefined or refers to a
+non-label binding (mirrors legacy `compiler.zig:6252-6261`). Emit
+(`emit.zig:emitBreak`) writes `load_variable($var_id) ; break_op`,
+matching legacy's `parsePipe` `.break_kw` arm at `compiler.zig:6245`.
+
+```
+# source: label $out | .
+# SemOp
+label("out") @0..14
+  identity @13..14
+```
+
+```
+# source: label $out | break $out
+# SemOp
+label("out") @0..23
+  break("out") @13..23
+```
+
+The dump renders `label("name")` / `break("name")` (source-level name,
+quoted) for the AST-walking dumper so snapshots stay readable. The
+IR-walking dumper renders `label(var_id=N)` / `break(var_id=N)` —
+emit's resolved binding is the contract there. Both forms quote the
+name through `writeStringLit` so escape handling is uniform with
+other string-bearing payloads.
+
+Invariant: every `break` SemOp's var_id is present in some enclosing
+`label` SemOp's `label_var_ids` entry at lower time. Lowering enforces
+this; emit assumes it. Nested labels stack (the inner-label binding
+shadows the outer name in `var_table`, but both ids remain in
+`label_var_ids` so `break $outer` from within the inner body still
+resolves through the outer name).
+
+### While / until: `while(cond; update)`, `until(cond; update)` (cat-15 / Phase 24)
+
+Both 2-arg loop builtins lower from `BuiltinCall{name, args=[cond,
+update]}` into dedicated SemOps `while_` / `until_` (the `while_until_2arg`
+class in `lower.zig:classifyBuiltin`). Children are fixed-arity:
+`children[0] = cond`, `children[1] = update`. No `extra_data` payload —
+the SemOp tag carries the discriminant.
+
+Why dedicated SemOps rather than `call_builtin`: both shapes carry
+backward-jump patch-table semantics (`loop_top` target, `jump_if_false`
+fork, in-loop yield/pipe sequence) that don't reduce to a flat
+`call_builtin` operand. The IR shape is fixed so emit can wire the
+patches without re-decoding.
+
+Emit (`emit.zig:emitWhile`) mirrors legacy `compileWhile`
+(`src/query/src/compiler.zig:3428`):
+
+```
+loop_top:
+  save_input ; <cond> ; jump_if_false → loop_exit
+  restore_input ; yield_output ; <update> ; pipe
+  jump → loop_top
+loop_exit:
+  restore_input ; backtrack
+```
+
+Emit (`emit.zig:emitUntil`) mirrors legacy `compileUntil`
+(`src/query/src/compiler.zig:3495`):
+
+```
+loop_top:
+  save_input ; <cond> ; jump_if_false → loop_body
+  restore_input ; jump → loop_done
+loop_body:
+  restore_input ; <update> ; pipe ; jump → loop_top
+loop_done:
+  push_current
+```
+
+Invariant: `loop_top` is the IP at the start of the SemOp's emission,
+captured before any instruction is pushed. `jump_if_false` /
+`jump → loop_done` operands are placeholder-zero at push time and
+backpatched after the corresponding target IP is known. The fixed-arity
+`children` slot keeps the cond/update wiring stable across snapshot
+regeneration.
+
+```
+# source: while(.<100; .*2)
+# SemOp
+while @0..17
+  cmp(lt) @6..11
+    identity @6..7
+    load_const(100) @8..11
+  arith(mul) @13..16
+    identity @13..14
+    load_const(2) @15..16
+```
+
+```
+# source: until(.>=10; .+1)
+# SemOp
+until @0..17
+  cmp(ge) @6..11
+    identity @6..7
+    load_const(10) @9..11
+  arith(add) @13..16
+    identity @13..14
+    load_const(1) @15..16
+```
+
+The AST-walking dumper recognizes `while` / `until` by name+arity in
+`builtin_call` and renders the IR-shape directly (op tag without
+parens, two indented children). The dumped op tag strips the trailing
+underscore from the IR enum (`while_` → `while`, `until_` → `until`)
+per the §3 op-name convention.
+
 ---
 
 ## 11. Out-of-scope

@@ -137,6 +137,12 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-17-fmt-string-uri", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-uri.txt") },
     .{ .name = "cat-17-fmt-string-html", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-html.txt") },
     .{ .name = "cat-17-fmt-string-multi-interp", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-multi-interp.txt") },
+    // ── Cat-15 — control flow (label/break, until, while) ────────
+    .{ .name = "cat-15-label", .expected = @embedFile("snapshots/lower/cat-15-label.txt") },
+    .{ .name = "cat-15-label-break", .expected = @embedFile("snapshots/lower/cat-15-label-break.txt") },
+    .{ .name = "cat-15-label-nested", .expected = @embedFile("snapshots/lower/cat-15-label-nested.txt") },
+    .{ .name = "cat-15-until", .expected = @embedFile("snapshots/lower/cat-15-until.txt") },
+    .{ .name = "cat-15-while", .expected = @embedFile("snapshots/lower/cat-15-while.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

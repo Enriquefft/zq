@@ -1,0 +1,4 @@
+# source: label $out | .
+# SemOp
+label("out") @0..14
+  identity @13..14

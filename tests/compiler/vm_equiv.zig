@@ -400,6 +400,30 @@ const FIXTURES = [_]Fixture{
     // expected_output: harness compares pre-error byte streams (both
     // empty) and err.kind tags.
     .{ .name = "cat17_base64d_invalid", .filter = "@base64d", .input = "\"not-valid-base64-==\"", .expected_output = "" },
+    // ── Category 15 — control flow (label/break, until, while) ───────
+    // label/break unwinds the LabelFrame on the fork stack; until/while
+    // share a backward-jump pattern. All four match legacy bytecode
+    // shapes byte-for-byte (ir.label / ir.break_ / ir.while_ / ir.until_).
+    // until — apply update until cond, output final value only.
+    .{ .name = "cat15_until_basic", .filter = "until(.>=10; .+1)", .input = "0", .expected_output = "10" },
+    .{ .name = "cat15_until_already", .filter = "until(.>=10; .+1)", .input = "20", .expected_output = "20" },
+    // while — emit current then update, until cond falsy.
+    .{ .name = "cat15_while_basic", .filter = "[while(.<100; .*2)] | length", .input = "1", .expected_output = "7" },
+    .{ .name = "cat15_while_collect", .filter = "[while(.<10; .+3)]", .input = "1", .expected_output = "[1,4,7]" },
+    // while with cond initially false — generator yields nothing.
+    .{ .name = "cat15_while_initially_false", .filter = "[while(.<0; .+1)]", .input = "5", .expected_output = "[]" },
+    // label/break — break out of an iterator-driven generator. Yields
+    // each range element until 2; then yields 2 once more and breaks
+    // out so 3,4 are never produced.
+    .{ .name = "cat15_label_break_range", .filter = "label $out | range(5) | if . == 2 then ., (. | break $out) else . end", .input = "null", .expected_output = "0\n1\n2" },
+    // label without break — range yields all elements then label exits cleanly.
+    .{ .name = "cat15_label_no_break", .filter = "[label $out | range(3)]", .input = "null", .expected_output = "[0,1,2]" },
+    // Nested labels — break the OUTER label from inside the inner.
+    .{ .name = "cat15_label_nested_outer", .filter = "[label $a | range(5) | label $b | if . == 2 then ., (. | break $a) else . end]", .input = "null", .expected_output = "[0,1,2]" },
+    // break inside a label-bracketed limit — exits early via the outer label.
+    .{ .name = "cat15_label_break_in_limit", .filter = "[label $out | limit(10; range(100) | if . == 4 then ., (. | break $out) else . end)]", .input = "null", .expected_output = "[0,1,2,3,4]" },
+    // break unknown label — both backends surface a compile error.
+    .{ .name = "cat15_break_undefined", .filter = "break $undefined", .input = "null", .expected_output = "", .expects_compile_err = true },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.
