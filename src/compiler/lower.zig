@@ -1589,6 +1589,22 @@ pub const BuiltinClass = enum {
     /// `Emitter.allocVar` matches legacy's `next_var_id` allocation
     /// order (orig before paths).
     del_path,
+    /// P5 — `map(f)` 1-arity. Lowers as a single-child `call_builtin`
+    /// IR node; the array-collect-each-yield bracket is synthesized at
+    /// emit time. Mirrors legacy `compileMap` (`compiler.zig:3338`)
+    /// byte-for-byte: `array_collect_start <end_ip> ; each ; <f> ;
+    /// yield_output ; array_collect_end`. Distinct from `filter_arg1`
+    /// because there is no leading `save_input` and no trailing
+    /// `call_builtin(bid)` — `map` never invokes a runtime builtin;
+    /// the array-collect bracket alone produces the result.
+    map_arg1,
+    /// P5 — `select(f)` 1-arity. Lowers as a single-child
+    /// `call_builtin` IR node; the save/restore + jump bracket is
+    /// synthesized at emit time. Mirrors legacy `compileSelect`
+    /// (`compiler.zig:3376`) byte-for-byte: `save_input ; <f> ;
+    /// jump_if_false skip ; restore_input ; jump done ;
+    /// skip: restore_input ; backtrack ; done:`.
+    select_arg1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1649,6 +1665,13 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 1 and std.mem.eql(u8, name, "error")) return .error_arg1;
     if (arity == 1 and isIndexFamilyBuiltin(name)) return .value_arg1_gen;
     if (arity == 1 and std.mem.eql(u8, name, "del")) return .del_path;
+    // P5 — `map(f)` / `select(f)` 1-arity. Both have dedicated emit
+    // shapes (array-collect-each-yield for map; save/restore + jump
+    // for select) that don't reduce to a flat `call_builtin`. Routed
+    // before the generic arity tables because neither name appears in
+    // `isValueArg1Builtin` or `isFilterArg1Builtin`.
+    if (arity == 1 and std.mem.eql(u8, name, "map")) return .map_arg1;
+    if (arity == 1 and std.mem.eql(u8, name, "select")) return .select_arg1;
     // 0-arity `first` / `last` desugar to `.[0]` / `.[-1]` — see
     // legacy `compiler.zig:5930-5937`. They reach AST as a
     // `BuiltinCall` because the AST parser lists both names in
@@ -1950,7 +1973,7 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
-        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path => {
+        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path, .map_arg1, .select_arg1 => {
             // Lower every arg first into a scratch buffer — recursive
             // lowering of nested calls (or ctors) writes to
             // `extra_children`, so building our span via direct append
