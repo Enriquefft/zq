@@ -1026,9 +1026,18 @@ fn emitPatternStrict(em: *Emitter, node_idx: u32) EmitError!void {
                 try em.pushInstr(.restore_input, .{ .none = {} }, node);
             }
         },
-        // Strict semantics within an alt_bind nest is undefined territory;
-        // legacy never produces this shape, so reject defensively.
-        .alt_bind => return error.NewCompilerNotImplemented,
+        // Strict semantics within an alt_bind nest is unreachable in the
+        // current AST surface. The parser only accepts `?//` at the top
+        // level of an `as` suffix (`compiler.zig:2510-2516`), and
+        // `lowerPattern` (lower.zig:2698-2807) only ever emits the
+        // `as` / `array` / `object` PatternKinds for sub-patterns. The
+        // `alt_bind` PatternKind is exclusively produced by `destruct_alt`
+        // at the outermost destructure node (lower.zig:1237-1289), which
+        // is dispatched via `emitPatternAltBind` (not via this strict
+        // ladder). If a future grammar extension nests `?//` inside a
+        // pattern, the lowering must be revisited before this branch can
+        // emit code; until then, reaching here is a compiler bug.
+        .alt_bind => unreachable,
     }
 }
 
