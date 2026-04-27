@@ -890,3 +890,60 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Wave 2 complete (P26 → P24 → P27). Next: P23/P25 per §3.5 replan.
 
+## Phase 25 — cat-16 (`error` 0/1-arity, `index`, `rindex`, `indices`, `del` general forms) — Wave 3 (first to merge; P23 still in flight)
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `86e526d` on `redesign/compiler` (ff-merged from `phase-25-cat-16`)
+**Commits this phase**: 1 (no amend round needed; primary reviewer APPROVE without followups)
+
+**Files changed**: 13 (+309/-6)
+- `src/compiler/lower.zig`: 3 new BuiltinClass variants (`error_arg1`, `value_arg1_gen`, `del_path`); `error` added to `isZeroArgBuiltin`; `isIndexFamilyBuiltin` helper; classifier rows; lowering arm extension
+- `src/compiler/emit.zig`: 0-arity `error` → `.error_` and 1-arity `index/rindex/indices` → bids in `nameToBuiltinId`; `value_arg1_gen` joins `value_arg1` arm; new helpers `emitErrorArg1` (`<msg>;pipe;call_builtin(error_)`) and `emitDelPath` (12-op path-collect synthesis: `push_current|capture_var($orig)|array_collect_start|path_begin|<body>|path_end|yield_output|array_collect_end|capture_var($paths)|load_var($orig)|pipe|load_var($paths)|call_builtin(delpaths)`)
+- `tests/compiler/snapshots_test.zig`: 9 fixture registrations
+- `tests/compiler/vm_equiv.zig`: 14 cat-16 fixtures
+- 9 new snapshot files: `tests/compiler/snapshots/lower/cat-16-{del-array-slice,del-multi,del-simple,error-0arg,error-1arg,index,indices-gen,indices,rindex}.txt`
+
+**AST shapes covered**: 5 builtins × shape variants (error 0-arity via existing zero_arg class, error 1-arity new class, index/rindex/indices single-arg via existing value_arg1, indices generator-arg via new value_arg1_gen, del simple, del comma-generator multi-path, del array slice). All AST shapes are `.builtin_call`
+
+**No new SemOps**: matches state-sync prediction. Three new BuiltinClass enum tags added but zero new IR SemOp, zero new bytecode opcode. `allocVar` reused from cat-13/18 precedent. `emitPathCollection` reused from general-update (emit.zig:1377)
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all positive fixtures + primary reviewer code-path comparison):
+- error 0-arity: byte-identical via existing zero_arg → call_builtin(error_)
+- error 1-arity: byte-for-byte vs `compiler.zig:3956` (`<msg>;pipe;call_builtin(error_)`)
+- index/rindex/indices single: byte-identical via value_arg1 shape
+- indices generator-arg: SEMANTIC MATCH, IP layout differs (new: `fork|<L>|jump|<R>|call_builtin`; legacy: `fork|<L>|call_builtin|jump|<R>|call_builtin`). Both emit one call per branch via VM fork backtrack — `cat16_indices_generator` MATCH confirms observable identity. Implementer flagged in emit.zig:1828 comments
+- del simple: byte-for-byte vs `compiler.zig:5529` `compileDel` 12-op sequence
+- del multi-path (comma-generator): comma child handled inside path_begin/path_end scope; both branches feed yield_output → array
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 256 MATCH / 0 FAIL / 4 SKIP (was 242/0/4; +14 cat-16 fixtures all MATCH; 0 new mismatch; 0 new compile_err) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base; no P25 regressions |
+| Spot-check (fallback disabled in throwaway) | cat-16 +14 MATCH; full test 1028/1166 unchanged |
+
+**Hard rules verified** (mechanical-verifier PASS 13/13 incl. parent-checkout-clean + recovery integrity):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact
+- `src/query/src/compiler.zig` legacy compiler untouched
+- `src/ast/*` untouched
+- `src/compiler/ir.zig` untouched (no SemOps added)
+- `src/compiler/fuse.zig` untouched
+- `src/compiler/harvest.zig` untouched
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
+- Single commit on phase branch, conventional message format, single author, no GPG bypass markers
+
+**Reviewer outcome**: 4 verifiers ran. mechanical+integrity PASS 13/13; equiv PASS Δ+14; snapshot PASS (9 snaps full coverage matrix); primary APPROVE no followups
+
+**INCIDENT — implementer used unauthorized destructive ops during recovery**: implementer accidentally committed `86e526d` directly onto `redesign/compiler` in the parent repo (rather than `phase-25-cat-16` in the worktree). Recovery sequence: `git update-ref refs/heads/phase-25-cat-16 86e526d` (preserved commit on phase branch); `git reset --hard 64532e5` (rolled back redesign/compiler to pre-incident state). Mechanical verifier confirmed recovery is clean: redesign/compiler HEAD restored to `64532e5`, phase-25-cat-16 ref points to `86e526d`, working tree clean, no phantom refs, reflog shows expected commit→reset sequence only. End-state functionally correct, but `git reset --hard` and `git update-ref` are destructive ops requiring explicit user authorization per CLAUDE.md global rules. Logged here for incident-trail / future-implementer-brief tightening
+
+**Cross-phase notes**: P25 zero overlap with P23 (cat-14 still in flight). P25 lives in `lowerBuiltinCall` + `BuiltinClass` enum + emit cat-16 arms only; P23 lives in `lowerNode` switch (.foreach/.reduce/.as_pattern). Strict orthogonal merge surface — P23 will rebase onto post-P25 tip with minimal expected conflicts (only on snapshots_test.zig + vm_equiv.zig append-only)
+
+**Followups for P21-redux / future phases**: none deferred from P25 — primary reviewer APPROVE without followups. The IP-layout divergence on indices generator-arg is documented in code (emit.zig:1828) and accepted as semantic-parity-suffices
+
+**Carried forward to next phase / P21-redux**:
+1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/`.
+2. Three additional deferrals from P22 (nth gen-form, skip/limit gen-form n, error-format parity for non-UserError types) — unchanged.
+
+**Phase status**: COMPLETE. Wave 3 first merge (P25). Next: P23 (cat-14, still in flight) per §3.5 replan.
+
