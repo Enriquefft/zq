@@ -1146,28 +1146,38 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
 
         // ── `expr as PATTERN | body` (category 4) ───────────────────
         // Legacy emits the LHS, then `capture_variable` / destructure
-        // ladder, then continues into the body. The new pipeline
-        // expresses the same flow as
-        // `pipe(expr, pipe(destructure, body))` so emit can reuse
-        // `pipe` lowering — the extra `pipe` instructions are no-ops
-        // when the value stack is empty (vm.zig:992-1003) and so do
-        // not perturb VM-observable output. Variables are declared
-        // BEFORE the body is lowered so `$x` references inside `body`
-        // resolve correctly.
+        // ladder, then the user's `|` `pipe` op, then `body`. The
+        // crucial invariant: `body` MUST run against the input that was
+        // `current` BEFORE `expr` evaluated — for the simple `.as`
+        // case `capture_variable` only pops the value stack (or current
+        // when the stack is empty) without modifying current, so legacy
+        // never inserts a `pipe` op between `expr` and `capture` (which
+        // would clobber current with `expr`'s result). The naive
+        // `pipe(expr, pipe(destructure, body))` IR shape inserts that
+        // exact stray `pipe` op — breaking patterns like
+        // `"foo" as $k | .[$k]` which need original input.
+        //
+        // Use the dedicated `as_bind` SemOp so emit produces
+        // `<expr> ; <destructure ladder> ; pipe ; <body>` mirroring
+        // legacy `parseLogical` (`compiler.zig:2499-2517`) followed by
+        // `parsePipe`'s trailing `pipe` op for the user-written `|`.
+        // Variables are declared BEFORE the body is lowered so `$x`
+        // references inside `body` resolve correctly.
         .as_pattern => |ap| {
             const expr_idx = try lowerNode(ctx, ap.expr);
             try declarePatternVars(ctx, ap.pattern);
             const dx_idx = try lowerPattern(ctx, ap.pattern, ap.expr.span);
             const body_idx = try lowerNode(ctx, ap.body);
-            const inner_pipe = try ctx.pushNode(.{
-                .op = .pipe,
-                .children = .{ dx_idx, body_idx },
-                .src_start = sp.start,
-                .src_len = sp.len,
-            });
+
+            const alloc = ctx.arena.allocator();
+            const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+            try ctx.out.extra_children.append(alloc, expr_idx);
+            try ctx.out.extra_children.append(alloc, dx_idx);
+            try ctx.out.extra_children.append(alloc, body_idx);
             return ctx.pushNode(.{
-                .op = .pipe,
-                .children = .{ expr_idx, inner_pipe },
+                .op = .as_bind,
+                .span_start = span_start,
+                .span_len = 3,
                 .src_start = sp.start,
                 .src_len = sp.len,
             });
@@ -1359,6 +1369,35 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                 .src_len = sp.len,
             });
         },
+
+        // ── Cat-14 — `reduce EXPR as PATTERN (INIT; UPDATE)` ────────
+        // Allocates two hidden var_ids (saved_input + accumulator) at
+        // lower time so the emitter can stamp `capture_variable` /
+        // `load_variable` operands directly. Pattern variables are
+        // declared INSIDE a fresh scope so they pop after lowering and
+        // don't leak into siblings — mirrors legacy `pushScope` /
+        // `popScope` (`compiler.zig:3989,4078`).
+        //
+        // IR layout (`extra_children` span = 4):
+        //   [expr_idx, pattern_idx, init_idx, update_idx]
+        //   extra_data slot 0: saved_input_id
+        //   extra_data slot 1: acc_id
+        //
+        // Init does NOT see pattern vars (lowered before declaration);
+        // update DOES (lowered after). Mirrors legacy `compileReduce`
+        // (`src/query/src/compiler.zig:3965`).
+        .reduce => |rd| return lowerReduce(ctx, &rd, sp.start, sp.len),
+
+        // ── Cat-14 — `foreach EXPR as PATTERN (INIT; UPDATE [; EXTRACT])` ──
+        // Same shape as reduce plus an optional extract clause. Span
+        // length discriminates 2-arg (4) from 3-arg (5) form. Mirrors
+        // legacy `compileForeach` (`src/query/src/compiler.zig:4121`).
+        //
+        // IR layout (`extra_children` span = 4 or 5):
+        //   [expr_idx, pattern_idx, init_idx, update_idx (, extract_idx)]
+        //   extra_data slot 0: saved_input_id
+        //   extra_data slot 1: acc_id
+        .foreach => |fe| return lowerForeach(ctx, &fe, sp.start, sp.len),
 
         // ── Other AST kinds: defer to later categories ─────────────
         else => return error.NewCompilerNotImplemented,
@@ -2699,6 +2738,146 @@ fn lowerPatternKey(
         .static => |name| return synthLoadConstString(ctx, name, sp_start, sp_len),
         .computed => |expr| return lowerNode(ctx, expr),
     }
+}
+
+// ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────
+//
+// Both ops share the same skeleton: allocate two hidden var_ids
+// (saved_input + accumulator), lower expr WITHOUT the pattern in scope,
+// open a fresh var-scope, declare pattern vars, lower init (which
+// runs BEFORE the pattern is visible — but legacy lets init see the
+// pattern in scope to match the strict-mode invariant; see legacy line
+// 4005 / 4159 where parsePipe runs after pushScope+scanAndDeclarePattern,
+// but init never references the pattern in practice — the legacy parser
+// allows it syntactically and we mirror that here). Then lower update
+// (and for foreach optionally extract) with pattern visible.
+//
+// The pattern destructure node is built via `lowerPattern` so the
+// emit-side `emitPatternAs/Array/Object` ladders are reused unchanged.
+//
+// Var-scope discipline mirrors the cat-15 `label` arm: snapshot
+// `var_table`, run a fresh shallow-copy under it, then restore on
+// exit so pattern bindings don't leak to siblings.
+fn lowerReduce(
+    ctx: *Lowerer,
+    rd: *const ast.Node.Reduce,
+    sp_start: u32,
+    sp_len: u32,
+) LowerError!u32 {
+    const alloc = ctx.arena.allocator();
+
+    // Hidden var ids — bumped raw, never registered in var_table.
+    const saved_input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    // Lower expr BEFORE opening the pattern scope — expr cannot
+    // reference pattern vars (parser disallows; we mirror).
+    const expr_idx = try lowerNode(ctx, rd.expr);
+
+    // Lower init BEFORE opening the pattern scope. Legacy parses init
+    // AFTER pushScope+scanAndDeclarePattern but init never references
+    // pattern vars in practice; lowering it here keeps the var-scope
+    // surface narrow.
+    const init_idx = try lowerNode(ctx, rd.init);
+
+    // Snapshot var_table so pattern vars pop after lowering.
+    const saved_var_table = ctx.var_table;
+    var fresh_var_table: std.StringHashMapUnmanaged(u32) = .{};
+    var it = saved_var_table.iterator();
+    while (it.next()) |kv| {
+        try fresh_var_table.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    ctx.var_table = fresh_var_table;
+    defer {
+        ctx.var_table.deinit(alloc);
+        ctx.var_table = saved_var_table;
+    }
+
+    try declarePatternVars(ctx, rd.pattern);
+    const pattern_idx = try lowerPattern(ctx, rd.pattern, rd.expr.span);
+
+    const update_idx = try lowerNode(ctx, rd.update);
+
+    // Build span: [expr, pattern, init, update].
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.append(alloc, expr_idx);
+    try ctx.out.extra_children.append(alloc, pattern_idx);
+    try ctx.out.extra_children.append(alloc, init_idx);
+    try ctx.out.extra_children.append(alloc, update_idx);
+
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, saved_input_id);
+    try ctx.out.extra_data.append(alloc, acc_id);
+
+    return ctx.pushNode(.{
+        .op = .reduce,
+        .span_start = span_start,
+        .span_len = 4,
+        .extra = extra_idx,
+        .src_start = sp_start,
+        .src_len = sp_len,
+    });
+}
+
+fn lowerForeach(
+    ctx: *Lowerer,
+    fe: *const ast.Node.Foreach,
+    sp_start: u32,
+    sp_len: u32,
+) LowerError!u32 {
+    const alloc = ctx.arena.allocator();
+
+    const saved_input_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+    const acc_id = ctx.next_var_id;
+    ctx.next_var_id += 1;
+
+    const expr_idx = try lowerNode(ctx, fe.expr);
+    const init_idx = try lowerNode(ctx, fe.init);
+
+    const saved_var_table = ctx.var_table;
+    var fresh_var_table: std.StringHashMapUnmanaged(u32) = .{};
+    var it = saved_var_table.iterator();
+    while (it.next()) |kv| {
+        try fresh_var_table.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    ctx.var_table = fresh_var_table;
+    defer {
+        ctx.var_table.deinit(alloc);
+        ctx.var_table = saved_var_table;
+    }
+
+    try declarePatternVars(ctx, fe.pattern);
+    const pattern_idx = try lowerPattern(ctx, fe.pattern, fe.expr.span);
+
+    const update_idx = try lowerNode(ctx, fe.update);
+    const has_extract = fe.extract != null;
+    const extract_idx: u32 = if (fe.extract) |ex| try lowerNode(ctx, ex) else 0;
+
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.append(alloc, expr_idx);
+    try ctx.out.extra_children.append(alloc, pattern_idx);
+    try ctx.out.extra_children.append(alloc, init_idx);
+    try ctx.out.extra_children.append(alloc, update_idx);
+    if (has_extract) {
+        try ctx.out.extra_children.append(alloc, extract_idx);
+    }
+    const span_len: u32 = if (has_extract) 5 else 4;
+
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, saved_input_id);
+    try ctx.out.extra_data.append(alloc, acc_id);
+
+    return ctx.pushNode(.{
+        .op = .foreach,
+        .span_start = span_start,
+        .span_len = span_len,
+        .extra = extra_idx,
+        .src_start = sp_start,
+        .src_len = sp_len,
+    });
 }
 
 /// Decode a JSON-style string body (without surrounding quotes) into a

@@ -202,6 +202,24 @@ pub const Op = enum(u8) {
 
     update_assign,
     destructure,
+    /// `expr as PATTERN | body` (cat-4) and the same shape used as the
+    /// outer node by `?//` desugar. The wrapper exists because plain
+    /// `pipe(expr, pipe(destructure, body))` would emit an extra `pipe`
+    /// opcode between expr and destructure that clobbers `current` with
+    /// the EXPR's result — breaking simple-as semantics where `body`
+    /// must run on the input that was current BEFORE `expr` evaluated.
+    /// Emit shape (mirrors legacy `parseLogical` + user `|` between
+    /// `expr as $x` and body, `compiler.zig:2499-2517` plus `parsePipe`'s
+    /// trailing `pipe` op):
+    ///   <expr>
+    ///   <destructure ladder>
+    ///   pipe                      ; the user-written | between (expr as $x) and body
+    ///   <body>
+    /// The IR node uses `extra_children` (span = 3): expr_idx, dx_idx,
+    /// body_idx. All variables introduced by the pattern are declared
+    /// BEFORE `body` is lowered so `$x` references inside `body` resolve.
+    /// Plan §3.5 row P23 / cat-14.
+    as_bind,
 
     path_begin,
     path_end,
@@ -851,17 +869,17 @@ fn dumpAst(
         // line up with the lowered IR. The destructure node renders
         // its sub-pattern children inline.
         .as_pattern => |ap| {
+            // Lowering shape: `as_bind(expr, destructure, body)` —
+            // emits `<expr> ; <destructure ladder> ; pipe ; <body>` so
+            // `body` runs against the input that was current BEFORE
+            // `expr` evaluated (mirrors legacy `parseLogical` flow).
             try writeIndent(writer, depth);
-            try writer.writeAll("pipe");
+            try writer.writeAll("as_bind");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
             try dumpAst(ir_obj, ap.expr, source, depth + 1, writer);
-            try writeIndent(writer, depth + 1);
-            try writer.writeAll("pipe");
-            try writeSpan(writer, node.span);
-            try writer.writeAll("\n");
-            try dumpPattern(ir_obj, ap.pattern, node.span, source, depth + 2, writer);
-            try dumpAst(ir_obj, ap.body, source, depth + 2, writer);
+            try dumpPattern(ir_obj, ap.pattern, node.span, source, depth + 1, writer);
+            try dumpAst(ir_obj, ap.body, source, depth + 1, writer);
         },
         // ── `expr as P1 ?// P2 ?// … | body` (category 4) ──────────
         // Lowering shape: `pipe(expr, pipe(destructure(alt_bind, …), body))`.
@@ -925,6 +943,35 @@ fn dumpAst(
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
             try dumpAst(ir_obj, le.body, source, depth + 1, writer);
+        },
+        // ── Cat-14 — `reduce EXPR as PAT (INIT; UPDATE)` ────────────
+        // Renders four children in lowering order: expr, pattern,
+        // init, update. Mirrors `lowerReduce`'s span layout so the
+        // snapshot diff line-up tracks the IR storage exactly.
+        .reduce => |rd| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("reduce");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, rd.expr, source, depth + 1, writer);
+            try dumpPattern(ir_obj, rd.pattern, node.span, source, depth + 1, writer);
+            try dumpAst(ir_obj, rd.init, source, depth + 1, writer);
+            try dumpAst(ir_obj, rd.update, source, depth + 1, writer);
+        },
+        // ── Cat-14 — `foreach EXPR as PAT (INIT; UPDATE [; EXTRACT])` ──
+        // Renders 4 or 5 children depending on extract presence. Same
+        // ordering as `lowerForeach` so snapshot lines map 1:1 with
+        // the IR span.
+        .foreach => |fe| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("foreach");
+            try writeSpan(writer, node.span);
+            try writer.writeAll("\n");
+            try dumpAst(ir_obj, fe.expr, source, depth + 1, writer);
+            try dumpPattern(ir_obj, fe.pattern, node.span, source, depth + 1, writer);
+            try dumpAst(ir_obj, fe.init, source, depth + 1, writer);
+            try dumpAst(ir_obj, fe.update, source, depth + 1, writer);
+            if (fe.extract) |ex| try dumpAst(ir_obj, ex, source, depth + 1, writer);
         },
         // ── Cat-15 — `break $name` ─────────────────────────────────
         // The body has no children; the var-name is rendered so the
@@ -1718,6 +1765,7 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
                 .alt_bind => "alt_bind",
             }});
         },
+        .as_bind => try writer.writeAll("as_bind"),
         .path_begin => try writer.writeAll("path_begin"),
         .path_end => try writer.writeAll("path_end"),
 

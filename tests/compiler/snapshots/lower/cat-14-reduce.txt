@@ -1,0 +1,9 @@
+# source: reduce .[] as $x (0; .+$x)
+# SemOp
+reduce @0..26
+  iterate @7..10
+  destructure(as, "x") @0..26
+  load_const(0) @18..19
+  arith(add) @21..25
+    identity @21..22
+    load_var("x") @23..25

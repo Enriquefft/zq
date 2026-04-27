@@ -711,6 +711,13 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         .while_ => try emitWhile(em, node),
         .until_ => try emitUntil(em, node),
 
+        // ── Cat-4 — `expr as PATTERN | body` (as_bind wrapper) ────────
+        .as_bind => try emitAsBind(em, node),
+
+        // ── Cat-14 — reduce / foreach iterating folds ─────────────────
+        .reduce => try emitReduce(em, node),
+        .foreach => try emitForeach(em, node),
+
         else => return error.NewCompilerNotImplemented,
     }
 }
@@ -2791,4 +2798,253 @@ fn emitUntil(em: *Emitter, node: ir.Node) EmitError!void {
     em.instructions.items[jmp_done_pos].operand = .{ .index = loop_done };
 
     try em.pushInstr(.push_current, .{ .none = {} }, node);
+}
+
+// ── Cat-4 — `as_bind` wrapper ──────────────────────────────────────
+//
+// Emit `expr as PATTERN | body` mirroring legacy `parseLogical` +
+// `parsePipe` (`compiler.zig:2499-2517`). Layout:
+//   <expr>                  ; vstack=[expr_result], current=original
+//   <destructure ladder>    ; pops vstack/current into pattern vars
+//   pipe                    ; the user `|`; vstack empty → no-op for
+//                             the simple-as case so current=original;
+//                             for array/object the destructure ladder
+//                             leaves current=expr_result and the pipe
+//                             is a no-op there too (matching legacy).
+//   <body>
+//
+// This shape is the FIX for the bug where a stray `pipe` op between
+// `<expr>` and `<destructure>` was clobbering current with `expr`'s
+// result, breaking patterns like `"foo" as $k | .[$k]`.
+fn emitAsBind(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 3);
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    const expr_idx = span[0];
+    const dx_idx = span[1];
+    const body_idx = span[2];
+
+    try emitNode(em, expr_idx);
+    try emitNode(em, dx_idx);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try emitNode(em, body_idx);
+}
+
+// ── Cat-14 — `reduce` ──────────────────────────────────────────────
+//
+// Mirror legacy `compileReduce` (`src/query/src/compiler.zig:3965`)
+// byte-for-byte. The IR carries (expr, pattern, init, update) in span
+// + (saved_input_id, acc_id) in extra_data.
+//
+// Layout:
+//   push_current
+//   capture_variable($saved)
+//   <INIT>
+//   capture_variable($acc)
+//   load_variable($saved)
+//   pipe                       ; current = original input
+//   fork L_done                ; sentinel: EXPR exhaustion
+//     <EXPR>                   ; generators push their own forkpoints
+//     <pattern destructure>    ; bind EXPR result into pattern vars
+//     load_variable($acc)
+//     pipe                     ; current = accumulator
+//     <UPDATE>
+//     capture_variable($acc)
+//     backtrack                ; advance EXPR via fork stack
+//   L_done:
+//   load_variable($acc)        ; push final acc as result
+//   pop pattern vars (reverse decl order)
+//   pop_variable($acc)
+//
+// $saved is intentionally NOT popped — if INIT is a generator (e.g.
+// `0,1`), the comma fork backtracks after pop and load_variable($saved)
+// must still find the saved value on the second INIT pass (legacy
+// note at compiler.zig:4063-4065).
+fn emitReduce(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 4);
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    const expr_idx = span[0];
+    const pattern_idx = span[1];
+    const init_idx = span[2];
+    const update_idx = span[3];
+
+    const slots = em.ir_obj.extra_data.items;
+    const saved_input_id: i64 = @intCast(slots[node.extra]);
+    const acc_id: i64 = @intCast(slots[node.extra + 1]);
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = saved_input_id }, node);
+
+    try emitNode(em, init_idx);
+    try em.pushInstr(.capture_variable, .{ .index = acc_id }, node);
+
+    try em.pushInstr(.load_variable, .{ .index = saved_input_id }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const fork_pos = em.instructions.items.len;
+    try em.pushInstr(.fork, .{ .index = 0 }, node);
+
+    try emitNode(em, expr_idx);
+    try emitNode(em, pattern_idx);
+    try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try emitNode(em, update_idx);
+    try em.pushInstr(.capture_variable, .{ .index = acc_id }, node);
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const l_done: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[fork_pos].operand = .{ .index = l_done };
+
+    try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
+
+    // Cleanup: pop pattern vars (reverse declaration order) + acc.
+    var pvar_ids: std.ArrayListUnmanaged(u32) = .{};
+    defer pvar_ids.deinit(em.allocator);
+    try collectPatternVarIdsFromIR(em.ir_obj, pattern_idx, &pvar_ids, em.allocator);
+    var pi = pvar_ids.items.len;
+    while (pi > 0) {
+        pi -= 1;
+        try em.pushInstr(.pop_variable, .{ .index = @intCast(pvar_ids.items[pi]) }, node);
+    }
+    try em.pushInstr(.pop_variable, .{ .index = acc_id }, node);
+}
+
+// ── Cat-14 — `foreach` ─────────────────────────────────────────────
+//
+// Mirror legacy `compileForeach` (`src/query/src/compiler.zig:4121`).
+// 2-arg form (no extract): outputs accumulator after each UPDATE.
+// 3-arg form (extract): outputs EXTRACT(accumulator) after each UPDATE.
+// Layout (2-arg form):
+//   push_current
+//   capture_variable($saved)
+//   <INIT>
+//   capture_variable($acc)
+//   load_variable($saved)
+//   pipe                       ; current = original input
+//   array_collect_start(ACE)   ; collect intermediate outputs
+//   fork L_done
+//     <EXPR>
+//     <pattern destructure>
+//     load_variable($acc)
+//     pipe
+//     <UPDATE>
+//     capture_variable($acc)
+//     load_variable($acc)
+//     yield_output             ; buffer intermediate acc in ACE
+//     backtrack
+//   L_done:
+//   ACE: array_collect_end
+//   pipe                       ; current = collected array
+//   pop pattern vars + acc
+//   each                       ; iterate as generator for downstream
+//
+// 3-arg form replaces the inner output section with:
+//   capture_variable($acc); load_variable($acc); pipe; <EXTRACT>;
+//   yield_output; backtrack
+fn emitForeach(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 4 or node.span_len == 5);
+    const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    const expr_idx = span[0];
+    const pattern_idx = span[1];
+    const init_idx = span[2];
+    const update_idx = span[3];
+    const has_extract = node.span_len == 5;
+    const extract_idx: u32 = if (has_extract) span[4] else 0;
+
+    const slots = em.ir_obj.extra_data.items;
+    const saved_input_id: i64 = @intCast(slots[node.extra]);
+    const acc_id: i64 = @intCast(slots[node.extra + 1]);
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = saved_input_id }, node);
+
+    try emitNode(em, init_idx);
+    try em.pushInstr(.capture_variable, .{ .index = acc_id }, node);
+
+    try em.pushInstr(.load_variable, .{ .index = saved_input_id }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    const ace_start = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+
+    const fork_pos = em.instructions.items.len;
+    try em.pushInstr(.fork, .{ .index = 0 }, node);
+
+    try emitNode(em, expr_idx);
+    try emitNode(em, pattern_idx);
+    try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try emitNode(em, update_idx);
+    try em.pushInstr(.capture_variable, .{ .index = acc_id }, node);
+
+    if (has_extract) {
+        try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+        try emitNode(em, extract_idx);
+        try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    } else {
+        try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
+        try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    }
+
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const l_done: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[fork_pos].operand = .{ .index = l_done };
+
+    const ace_end: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[ace_start].operand = .{ .index = ace_end };
+
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    // Pop pattern vars + acc BEFORE the `each` generator (legacy line
+    // 4248-4262: cleanup must happen once, not per element).
+    var pvar_ids: std.ArrayListUnmanaged(u32) = .{};
+    defer pvar_ids.deinit(em.allocator);
+    try collectPatternVarIdsFromIR(em.ir_obj, pattern_idx, &pvar_ids, em.allocator);
+    var pi = pvar_ids.items.len;
+    while (pi > 0) {
+        pi -= 1;
+        try em.pushInstr(.pop_variable, .{ .index = @intCast(pvar_ids.items[pi]) }, node);
+    }
+    try em.pushInstr(.pop_variable, .{ .index = acc_id }, node);
+
+    try em.pushInstr(.each, .{ .none = {} }, node);
+}
+
+/// Collect pattern var_ids in declaration order from a `destructure`
+/// IR subtree. Used by `emitReduce` / `emitForeach` cleanup. Mirrors
+/// legacy `collectPatternVarIds` (`src/query/src/compiler.zig:565`).
+fn collectPatternVarIdsFromIR(
+    ir_obj: ir.IR,
+    node_idx: u32,
+    out: *std.ArrayListUnmanaged(u32),
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    const node = ir_obj.nodes.items[node_idx];
+    if (node.op != .destructure) return;
+    const slots = ir_obj.extra_data.items;
+    const kind: ir.PatternKind = @enumFromInt(slots[node.extra]);
+    switch (kind) {
+        .as => try out.append(allocator, slots[node.extra + 3]),
+        .array => {
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span) |sub| try collectPatternVarIdsFromIR(ir_obj, sub, out, allocator);
+        },
+        .object => {
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            // Pairs (key, sub-pattern); only sub-patterns carry vars.
+            var pi: usize = 1;
+            while (pi < span.len) : (pi += 2) {
+                try collectPatternVarIdsFromIR(ir_obj, span[pi], out, allocator);
+            }
+        },
+        .alt_bind => {
+            // Reduce/foreach patterns never use `?//` — alt_bind only
+            // appears at top-level as_pattern via destruct_alt. Recurse
+            // defensively.
+            const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            for (span) |sub| try collectPatternVarIdsFromIR(ir_obj, sub, out, allocator);
+        },
+    }
 }

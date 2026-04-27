@@ -1,0 +1,10 @@
+# source: reduce range(5) as $i (0; .+$i)
+# SemOp
+reduce @0..31
+  call_builtin("range") @7..15
+    load_const(5) @13..14
+  destructure(as, "i") @0..31
+  load_const(0) @23..24
+  arith(add) @26..30
+    identity @26..27
+    load_var("i") @28..30

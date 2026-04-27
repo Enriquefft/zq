@@ -1,7 +1,6 @@
 # source: . as $x | $x
 # SemOp
-pipe @0..12
+as_bind @0..12
   identity @0..1
-  pipe @0..12
-    destructure(as, "x") @0..12
-    load_var("x") @10..12
+  destructure(as, "x") @0..12
+  load_var("x") @10..12

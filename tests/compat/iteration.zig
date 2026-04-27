@@ -116,8 +116,6 @@ test "jq:L269 [(.,1),((.,.[]),(2,3))]" {
     try std.testing.expectEqualStrings("[[\"a\",\"b\"],1,[\"a\",\"b\"],\"a\",\"b\",2,3]", results[0]);
 }
 
-// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
 test "jq:L273 [([5,5][]),.,.[]]" {
     const results = try h.runFilter(
         "[([5,5][]),.,.[]]",

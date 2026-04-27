@@ -175,6 +175,12 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-18-bracket-mid-chain", .expected = @embedFile("snapshots/lower/cat-18-bracket-mid-chain.txt") },
     .{ .name = "cat-18-bracket-array-base", .expected = @embedFile("snapshots/lower/cat-18-bracket-array-base.txt") },
     .{ .name = "cat-18-bracket-expr-key", .expected = @embedFile("snapshots/lower/cat-18-bracket-expr-key.txt") },
+    // ── Cat-14 (P23) — reduce / foreach + as-pattern body fix ───
+    .{ .name = "cat-14-reduce", .expected = @embedFile("snapshots/lower/cat-14-reduce.txt") },
+    .{ .name = "cat-14-reduce-range", .expected = @embedFile("snapshots/lower/cat-14-reduce-range.txt") },
+    .{ .name = "cat-14-foreach-4arg", .expected = @embedFile("snapshots/lower/cat-14-foreach-4arg.txt") },
+    .{ .name = "cat-14-foreach-5arg", .expected = @embedFile("snapshots/lower/cat-14-foreach-5arg.txt") },
+    .{ .name = "cat-14-as-pattern-fixed", .expected = @embedFile("snapshots/lower/cat-14-as-pattern-fixed.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

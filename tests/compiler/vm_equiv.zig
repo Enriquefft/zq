@@ -522,6 +522,43 @@ const FIXTURES = [_]Fixture{
     // del nested path — multi-level path expression survives the
     // path-collect pipeline.
     .{ .name = "cat16_del_nested", .filter = "del(.a.b)", .input = "{\"a\":{\"b\":1,\"c\":2}}", .expected_output = "{\"a\":{\"c\":2}}" },
+
+    // ── Cat-14 (P23) — foreach / reduce / as-pattern body fix ────
+    // Reduce: classic accumulator over `.[]`.
+    .{ .name = "cat14_reduce_sum_iter", .filter = "reduce .[] as $x (0; .+$x)", .input = "[1,2,3,4,5]", .expected_output = "15" },
+    // Reduce over a generator (`range(N)`) — exercises cat-13 +
+    // cat-14 composition; INIT is a literal int.
+    .{ .name = "cat14_reduce_range", .filter = "reduce range(5) as $i (0; .+$i)", .input = "null", .expected_output = "10" },
+    // Reduce with array destructure pattern — pattern var ladder
+    // wired through pattern_capture.
+    .{ .name = "cat14_reduce_array_destruct", .filter = "reduce .[] as [$a, $b] (0; . + $a + $b)", .input = "[[1,2],[3,4]]", .expected_output = "10" },
+    // Foreach 2-arg form (no extract) — accumulates into the array.
+    .{ .name = "cat14_foreach_2arg", .filter = "[foreach .[] as $x (0; .+$x)]", .input = "[1,2,3]", .expected_output = "[1,3,6]" },
+    // Foreach 3-arg form (extract clause multiplies acc by 10).
+    .{ .name = "cat14_foreach_3arg_extract", .filter = "[foreach .[] as $x (0; .+$x; . * 10)]", .input = "[1,2,3]", .expected_output = "[10,30,60]" },
+    // Foreach over a generator with extract.
+    .{ .name = "cat14_foreach_range_extract", .filter = "[foreach range(3) as $x (0; .+$x; .+10)]", .input = "null", .expected_output = "[10,11,13]" },
+    // ── as-pattern body bug fix (cat-4 fix uncovered by P22) ─────
+    // The bug: `expr as $k | body` was emitting an extra `pipe` op
+    // between `expr` and the destructure ladder, clobbering current
+    // with expr's result. body must run on the input that was
+    // current BEFORE expr evaluated.
+    .{ .name = "cat14_aspat_body_obj_key", .filter = "\"foo\" as $k | .[$k]", .input = "{\"foo\":42}", .expected_output = "42" },
+    .{ .name = "cat14_aspat_body_arr_idx", .filter = "\"x\" as $unused | .[1]", .input = "[10,20,30]", .expected_output = "20" },
+    // Body uses original input numerically — fix confirms current
+    // is still 5 after `"lit" as $u`.
+    .{ .name = "cat14_aspat_body_arith", .filter = "\"lit\" as $u | . + 1", .input = "5", .expected_output = "6" },
+    // Composition: cat-15 label + cat-15 generator break out of an
+    // iterated stream — exercises label/break stack survival across
+    // a typical jq idiom. Mirrors a known-working legacy output.
+    .{ .name = "cat14_label_break_iter", .filter = "[label $out | .[] | if . > 3 then break $out else . end]", .input = "[1,2,3,4,5]", .expected_output = "[1,2,3]" },
+    // Composition: as-pattern body fix nested inside a reduce update.
+    // The accumulator is the original value (current at INIT), and
+    // each EXPR step binds an unrelated string into $u. After the
+    // bug fix, the body of `"x" as $u | .+$x` runs against the acc
+    // — proving the fix doesn't regress when as-pattern lives
+    // inside a reduce update.
+    .{ .name = "cat14_reduce_with_as_body", .filter = "reduce .[] as $x (0; \"x\" as $u | . + $x)", .input = "[1,2,3]", .expected_output = "6" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

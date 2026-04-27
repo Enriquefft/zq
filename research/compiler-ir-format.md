@@ -252,9 +252,24 @@ if @0..25
   load_field("c") @19..21
 ```
 
-The `arr_ctor`, `obj_ctor`, `interp`, `foreach`, and `call_user`/`call_builtin`
-nodes follow the same rule: all children appear indented below the parent, ordered
-as the IR stores them in `extra_children`.
+The `arr_ctor`, `obj_ctor`, `interp`, `reduce`, `foreach`, `as_bind`, and
+`call_user`/`call_builtin` nodes follow the same rule: all children appear indented
+below the parent, ordered as the IR stores them in `extra_children`.
+
+**`as_bind` (cat-4)** — `expr as PATTERN | body` wrapper. Three children:
+expr (lowered), pattern (a `destructure(...)` subtree), body (lowered). The
+node exists to suppress the stray `pipe` op that `pipe(expr, pipe(destructure,
+body))` would emit between expr and the destructure ladder; that op clobbered
+`current` with expr's result and broke simple-as semantics where `body` must
+run on the input that was current BEFORE expr evaluated. Mirrors legacy
+`parseLogical` + `parsePipe` (`compiler.zig:2499-2517`). Plan §3.5 row P23.
+
+**`reduce` / `foreach` (cat-14)** — iterating folds. `reduce` carries 4 children
+(expr, pattern, init, update); `foreach` carries 4 (no extract) or 5 (with
+extract). Both ops also stash two hidden var_ids in `extra_data` (saved_input +
+accumulator) which the emit ladder uses for `capture_variable` / `load_variable`.
+Mirrors legacy `compileReduce` / `compileForeach`
+(`compiler.zig:3965` / `4121`). Plan §3.5 row P23.
 
 ---
 
