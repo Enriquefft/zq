@@ -1771,11 +1771,18 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
     // (`limit_start`/`skip_start`/`nth_start`) and arity-keyed bids
     // (`range1_gen`/`range2_gen`/`range3_gen`) inline. The shared
     // helpers below own the per-name dispatch.
+    //
+    // Cat-17 standalone `@fmt` form (e.g. `@base64`, `@json`) also
+    // bypasses `nameToBuiltinId` because the format-apply BIDs
+    // (`.format_text` etc.) live in a different name table —
+    // `formatBuiltinId` — keyed on the unprefixed name. Mirrors
+    // legacy `compiler.zig:6227-6232`.
     switch (class) {
         .range_gen1, .range_gen2, .range_gen3 => return emitRange(em, node),
         .limit_skip_nth => return emitLimitSkipNth(em, node, name),
         .first_arg1 => return emitFirst(em, node),
         .last_arg1 => return emitLast(em, node),
+        .format_apply => return emitFormatApply(em, node, name),
         else => {},
     }
 
@@ -1872,9 +1879,10 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // (it routes them to dedicated SemOps), so emit unreachable —
         // hitting them indicates an upstream classifier drift.
         .not, .path => unreachable,
-        // Cat-13 classes already handled by the early-out switch above
-        // — reaching them here would mean the early-out fell through.
-        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1 => unreachable,
+        // Cat-13 / cat-17 classes already handled by the early-out
+        // switch above — reaching them here would mean the early-out
+        // fell through.
+        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -2137,6 +2145,23 @@ fn emitLast(em: *Emitter, node: ir.Node) EmitError!void {
     try emitArgToArray(em, node, body_idx);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
     try em.pushInstr(.load_index, .{ .index = -1 }, node);
+}
+
+/// Emit a standalone `@fmt` form (cat-17) — `@base64`, `@json`, etc.
+/// when not followed by a string literal. Mirrors legacy
+/// `compiler.zig:6227-6232`: a single `call_builtin(format_bid)`
+/// applied to the current value. The IR carries the format name with
+/// its leading `@` (parser `internFormatName`); strip it here before
+/// consulting `formatBuiltinId`.
+fn emitFormatApply(em: *Emitter, node: ir.Node, name: []const u8) EmitError!void {
+    std.debug.assert(node.span_len == 0);
+    std.debug.assert(name.len >= 2 and name[0] == '@');
+    const bid = formatBuiltinId(name[1..]) orelse return error.NewCompilerNotImplemented;
+    try em.pushInstr(
+        .call_builtin,
+        .{ .index = @intFromEnum(bid) },
+        node,
+    );
 }
 
 /// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single

@@ -1,0 +1,3 @@
+# source: @uri
+# SemOp
+call_builtin("@uri") @0..4

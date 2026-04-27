@@ -129,6 +129,14 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-13-last-1", .expected = @embedFile("snapshots/lower/cat-13-last-1.txt") },
     .{ .name = "cat-13-nth", .expected = @embedFile("snapshots/lower/cat-13-nth.txt") },
     .{ .name = "cat-13-skip", .expected = @embedFile("snapshots/lower/cat-13-skip.txt") },
+    // ── Cat-17 — format builtins (@text/@json/@csv/@tsv/@html/@sh/@uri/@urid/@base64/@base64d) ──
+    .{ .name = "cat-17-standalone-base64", .expected = @embedFile("snapshots/lower/cat-17-standalone-base64.txt") },
+    .{ .name = "cat-17-standalone-json", .expected = @embedFile("snapshots/lower/cat-17-standalone-json.txt") },
+    .{ .name = "cat-17-standalone-uri", .expected = @embedFile("snapshots/lower/cat-17-standalone-uri.txt") },
+    .{ .name = "cat-17-pipe-json", .expected = @embedFile("snapshots/lower/cat-17-pipe-json.txt") },
+    .{ .name = "cat-17-fmt-string-uri", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-uri.txt") },
+    .{ .name = "cat-17-fmt-string-html", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-html.txt") },
+    .{ .name = "cat-17-fmt-string-multi-interp", .expected = @embedFile("snapshots/lower/cat-17-fmt-string-multi-interp.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

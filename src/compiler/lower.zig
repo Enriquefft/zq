@@ -1348,6 +1348,14 @@ pub const BuiltinClass = enum {
     /// Cat-13 — `last(f)` (1-arity). Desugars to `[f] | .[-1]`.
     /// Mirrors `compileLast` (`compiler.zig:4658`).
     last_arg1,
+    /// Cat-17 — standalone `@fmt` form (e.g. `@base64`, `@json`).
+    /// Arrives as `BuiltinCall { name = "@<fmt>", args = [] }` from
+    /// the parser (`parseFormat` at `parser.zig:1031-1036`,
+    /// `:1053-1056`). Emits a single `call_builtin(format_bid)` per
+    /// legacy `compiler.zig:6227-6232`. The leading `@` in the name
+    /// is the lowering+emit dispatch key; emit strips it before
+    /// consulting `formatBuiltinId`.
+    format_apply,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1361,6 +1369,13 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // Owned by other categories — early-out before consulting the tables.
     if (arity == 0 and std.mem.eql(u8, name, "not")) return .not;
     if (arity == 1 and std.mem.eql(u8, name, "path")) return .path;
+
+    // Cat-17 — standalone `@fmt` form. Parser emits `BuiltinCall {
+    // name = "@<fmt>", args = [] }` for `@base64` / `@json` / etc.
+    // when not followed by a string literal (`parser.zig:1031-1036`,
+    // `:1053-1056`). Dispatched before the generic name tables to
+    // avoid mis-routing through `not_implemented`.
+    if (arity == 0 and isFormatApplyName(name)) return .format_apply;
 
     // Regex builtins (cat-11). Dispatch by name alone, regardless of
     // arity. Lowering may produce span_len ∈ {0, 1, 2} depending on
@@ -1414,6 +1429,26 @@ pub fn isLimitSkipNthBuiltin(name: []const u8) bool {
     return std.mem.eql(u8, name, "limit") or
         std.mem.eql(u8, name, "skip") or
         std.mem.eql(u8, name, "nth");
+}
+
+/// Recognize a standalone `@fmt` builtin call name (cat-17). The
+/// parser emits these as `BuiltinCall { name = "@<fmt>", args = [] }`
+/// via `internFormatName` (`parser.zig:1582-1587`). Acceptance is
+/// gated on the leading `@` plus a known format suffix — keeps
+/// arbitrary `@whatever` from silently routing through this class.
+pub fn isFormatApplyName(name: []const u8) bool {
+    if (name.len < 2 or name[0] != '@') return false;
+    const bare = name[1..];
+    return std.mem.eql(u8, bare, "text") or
+        std.mem.eql(u8, bare, "json") or
+        std.mem.eql(u8, bare, "csv") or
+        std.mem.eql(u8, bare, "tsv") or
+        std.mem.eql(u8, bare, "html") or
+        std.mem.eql(u8, bare, "uri") or
+        std.mem.eql(u8, bare, "urid") or
+        std.mem.eql(u8, bare, "sh") or
+        std.mem.eql(u8, bare, "base64") or
+        std.mem.eql(u8, bare, "base64d");
 }
 
 /// Recognize 1-arg regex builtin names (cat-11). The internal
@@ -1616,6 +1651,21 @@ fn lowerBuiltinCall(
             });
         },
         .zero_arg => {
+            const extra_idx = try ctx.internString(bc.name);
+            return ctx.pushNode(.{
+                .op = .call_builtin,
+                .extra = extra_idx,
+                .src_start = src_start,
+                .src_len = src_len,
+            });
+        },
+        .format_apply => {
+            // Cat-17 — standalone `@fmt`. Reuse the `call_builtin`
+            // SemOp: name carries the leading `@` so emit's
+            // `emitCallBuiltin` re-classifies via `classifyBuiltin`,
+            // strips the `@`, and dispatches to `formatBuiltinId`.
+            // No args, no IR children — same shape as `zero_arg`.
+            // Mirrors legacy `compiler.zig:6227-6232`.
             const extra_idx = try ctx.internString(bc.name);
             return ctx.pushNode(.{
                 .op = .call_builtin,

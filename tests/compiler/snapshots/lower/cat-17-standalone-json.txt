@@ -1,0 +1,3 @@
+# source: @json
+# SemOp
+call_builtin("@json") @0..5

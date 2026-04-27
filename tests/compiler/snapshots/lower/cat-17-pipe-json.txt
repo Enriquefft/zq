@@ -1,0 +1,5 @@
+# source: . | @json
+# SemOp
+pipe @0..9
+  identity @0..1
+  call_builtin("@json") @4..9

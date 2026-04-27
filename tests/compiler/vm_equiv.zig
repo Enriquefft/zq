@@ -357,6 +357,49 @@ const FIXTURES = [_]Fixture{
     // Generator-form n in nth: each n triggers a separate frame, both
     // outputs concatenate into the surrounding array.
     .{ .name = "cat13_nth_gen_form_n", .filter = "[nth(0,2; range(5))]", .input = "null", .expected_output = "[0,2]" },
+
+    // ── Category 17 — format builtins ─────────────────────────────
+    // Two AST surfaces share the format-name table. Coverage matrix:
+    //   1. Standalone `@fmt` (BuiltinCall) — applied to current value.
+    //   2. `expr | @fmt` pipe shape — same BuiltinCall on a piped value.
+    //   3. `@fmt "lit"` (format_string, single literal part) — emits
+    //      bare push_string (legacy compiler.zig:6219-6225).
+    //   4. `@fmt "lit\(expr)tail"` — interp ladder with format apply
+    //      per expr part (legacy compileStringInterpolation).
+    .{ .name = "cat17_csv_arr", .filter = "[1,2,3] | @csv", .input = "null", .expected_output = "\"1,2,3\"" },
+    .{ .name = "cat17_json_obj", .filter = "{\"a\":1} | @json", .input = "null", .expected_output = "\"{\\\"a\\\":1}\"" },
+    .{ .name = "cat17_uri_plain", .filter = "@uri", .input = "\"hello\"", .expected_output = "\"hello\"" },
+    .{ .name = "cat17_uri_space", .filter = "@uri", .input = "\"a b\"", .expected_output = "\"a%20b\"" },
+    .{ .name = "cat17_base64_enc", .filter = "@base64", .input = "\"world\"", .expected_output = "\"d29ybGQ=\"" },
+    .{ .name = "cat17_base64_dec", .filter = "@base64d", .input = "\"d29ybGQ=\"", .expected_output = "\"world\"" },
+    .{ .name = "cat17_text_int", .filter = "42 | @text", .input = "null", .expected_output = "\"42\"" },
+    .{ .name = "cat17_html_escape", .filter = "@html", .input = "\"<a>\"", .expected_output = "\"&lt;a&gt;\"" },
+    // Format-string interpolation: @uri-applies to the interpolated
+    // expression (the literal prefix `key=` is push_string'd raw, the
+    // `.foo` value flows through `call_builtin(.format_uri)` per
+    // emitInterpLadder's format_bid arm).
+    .{ .name = "cat17_uri_interp", .filter = "@uri \"key=\\(.foo)\"", .input = "{\"foo\":\"a b\"}", .expected_output = "\"key=a%20b\"" },
+    // Multi-part interpolation: ≥2 \(...) expressions in one format
+    // string. Exercises the interp ladder iterating multiple times
+    // through the format-bid arm with literal segments between exprs.
+    .{ .name = "cat17_uri_multi_interp", .filter = "@uri \"key1=\\(.a)&key2=\\(.b)\"", .input = "{\"a\":\"hello world\",\"b\":\"f&o=o\"}", .expected_output = "\"key1=hello%20world&key2=f%26o%3Do\"" },
+    // Round-trip @base64 → @base64d.
+    .{ .name = "cat17_base64_roundtrip", .filter = "@base64 | @base64d", .input = "\"hi\"", .expected_output = "\"hi\"" },
+    // Format-string single literal part: emits bare push_string per
+    // legacy compiler.zig:6219-6225 (the format name is dispatch-only;
+    // no actual format apply runs because there is nothing to format).
+    .{ .name = "cat17_csv_string_lit", .filter = "@csv \"hi\"", .input = "null", .expected_output = "\"hi\"" },
+    // @sh shell-quotes a string.
+    .{ .name = "cat17_sh_quote", .filter = "@sh", .input = "\"hi'lo\"", .expected_output = "\"'hi'\\\\''lo'\"" },
+    // @tsv on an array of scalars — tab-separated output.
+    .{ .name = "cat17_tsv_arr", .filter = "[1,\"two\",3] | @tsv", .input = "null", .expected_output = "\"1\\ttwo\\t3\"" },
+    // @urid undoes @uri.
+    .{ .name = "cat17_urid_decode", .filter = "@urid", .input = "\"hello%20world\"", .expected_output = "\"hello world\"" },
+    // Error parity: @base64d on invalid base64 fires a type/decode
+    // error; both backends must surface the same error class. Empty
+    // expected_output: harness compares pre-error byte streams (both
+    // empty) and err.kind tags.
+    .{ .name = "cat17_base64d_invalid", .filter = "@base64d", .input = "\"not-valid-base64-==\"", .expected_output = "" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.
