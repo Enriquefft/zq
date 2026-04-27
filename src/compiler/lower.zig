@@ -1014,11 +1014,16 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         },
 
         // ── Format application `@fmt "..."` (category 7) ─────────────
-        // The `format` field of the AST node is the format name with a
-        // leading `@` (e.g. `"@base64"`); lowering interns the name in
-        // `string_buf` and stamps `(offset, len)` into a fresh
-        // `extra_data` entry. Emit decodes the name back to a
-        // `BuiltinId` (matching legacy `formatBuiltinId`).
+        // The `format` field of the AST node is the bare format name
+        // (e.g. `"base64"`, no leading `@` — parser `internName` at
+        // `parser.zig:1048`/`:1093`). Lowering validates the name
+        // against the legacy registry and stamps `(offset, len)` into
+        // `extra_data`; emit decodes it back to a `BuiltinId` via
+        // `formatBuiltinId` (single source of truth — see
+        // `emit.zig:1110`). Unknown names raise a
+        // `query_syntax_error` LowerDiagnostic mirroring legacy
+        // `parsePrimary`'s `formatBuiltinId(...) orelse syntaxErr`
+        // at `compiler.zig:6210`.
         //
         // Special case: a single literal part with NO interpolations
         // emits as a bare `push_string` (legacy
@@ -1026,6 +1031,25 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // as `format(span_len=1, child=load_const(...))` and emit
         // detects the shape.
         .format_string => |fs| {
+            // Validate format name eagerly — unknown formats are a
+            // compile error, not a backend gap. The bare name reaches
+            // us via `internName`; strip a leading `@` defensively for
+            // shape parity with the standalone `@fmt` AST.
+            const fmt_bare = if (fs.format.len > 0 and fs.format[0] == '@') fs.format[1..] else fs.format;
+            if (!isKnownFormatName(fmt_bare)) {
+                // Mirror legacy parser-time `syntaxErr(last_tok_offset, 0)`
+                // at `compiler.zig:6210`. `last_tok_offset` is the
+                // offset of the just-consumed format ident, which sits
+                // exactly one byte past the `@` (the `at_tok` start).
+                // The `format_string` AST span starts at the `@` token,
+                // so we add 1 to land on the ident byte.
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp.start + 1,
+                    .len = 0,
+                };
+                return error.LowerDiagnostic;
+            }
             const alloc = ctx.arena.allocator();
             var parts: std.ArrayListUnmanaged(u32) = .{};
             defer parts.deinit(alloc);
@@ -1686,7 +1710,18 @@ pub fn isLimitSkipNthBuiltin(name: []const u8) bool {
 /// arbitrary `@whatever` from silently routing through this class.
 pub fn isFormatApplyName(name: []const u8) bool {
     if (name.len < 2 or name[0] != '@') return false;
-    const bare = name[1..];
+    return isKnownFormatName(name[1..]);
+}
+
+/// SSOT registry of legal `@fmt` suffixes. Mirrors legacy
+/// `formatBuiltinId` (`src/query/src/compiler.zig:5573-5585`) and
+/// emit-side `formatBuiltinId` (`src/compiler/emit.zig:1110`); all
+/// three lists must stay in lockstep. Used by lowering to reject
+/// unknown formats with a `query_syntax_error` (mirroring legacy's
+/// parse-time `syntaxErr` at `compiler.zig:6210`) so emit can rely
+/// on `formatBuiltinId` returning a value for any IR `format` /
+/// `format_apply` node it sees.
+pub fn isKnownFormatName(bare: []const u8) bool {
     return std.mem.eql(u8, bare, "text") or
         std.mem.eql(u8, bare, "json") or
         std.mem.eql(u8, bare, "csv") or
@@ -1910,6 +1945,23 @@ fn lowerBuiltinCall(
     src_start: u32,
     src_len: u32,
 ) LowerError!u32 {
+    // Cat-17 — standalone `@<unknown>`. Parser stamps `@` prefix on
+    // format builtin names via `internFormatName`. An unknown suffix
+    // is a compile error, not a backend gap — mirror legacy
+    // `parsePrimary`'s `formatBuiltinId(...) orelse syntaxErr` at
+    // `compiler.zig:6210`. Legacy reports the error at the format
+    // ident token (one byte past the `@`), so `src_start + 1` lands
+    // there. Reject before classifyBuiltin so unknowns don't fall
+    // through the generic name tables.
+    if (bc.args.len == 0 and bc.name.len >= 2 and bc.name[0] == '@' and !isKnownFormatName(bc.name[1..])) {
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = src_start + 1,
+            .len = 0,
+        };
+        return error.LowerDiagnostic;
+    }
+
     const class = classifyBuiltin(bc.name, bc.args.len);
     switch (class) {
         .not => return ctx.pushNode(.{

@@ -28,6 +28,17 @@ const FIXTURES = [_]ErrFixture{
     .{ .name = "trailing_arith", .filter = "1 +", .expected_kind = "query_syntax_error", .expected_offset = 3, .expected_len = 0 },
     .{ .name = "open_bracket", .filter = ".[", .expected_kind = "query_syntax_error", .expected_offset = 2, .expected_len = 0 },
     .{ .name = "incomplete_def", .filter = "def f", .expected_kind = "query_syntax_error", .expected_offset = 5, .expected_len = 0 },
+    // Phase 4 — format-builtin unknown-name parity. Legacy
+    // `parsePrimary` rejects unknown `@<name>` at the format ident
+    // token (one byte past the `@`) via
+    // `formatBuiltinId(...) orelse syntaxErr(last_tok_offset, 0)`
+    // (`src/query/src/compiler.zig:6210`). The new compiler mirrors
+    // this in `lower.zig`'s `format_string` / `builtin_call` arms with
+    // a `LowerDiagnostic` carrying `query_syntax_error` at
+    // `sp.start + 1`. Triples below come from `vm-equiv-probe` 2026-04-27.
+    .{ .name = "p4_format_unknown_standalone", .filter = "@xyz", .expected_kind = "query_syntax_error", .expected_offset = 1, .expected_len = 0 },
+    .{ .name = "p4_format_unknown_lit", .filter = "@xyz \"lit\"", .expected_kind = "query_syntax_error", .expected_offset = 1, .expected_len = 0 },
+    .{ .name = "p4_format_unknown_interp", .filter = "@xyz \"\\(.)\"", .expected_kind = "query_syntax_error", .expected_offset = 1, .expected_len = 0 },
 };
 
 pub fn main() !void {

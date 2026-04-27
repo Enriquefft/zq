@@ -511,7 +511,7 @@ pub const Parser = struct {
                 return p.parseFormat(tok);
             },
             .string_part => {
-                return p.parseStringInterp(tok, null);
+                return p.parseStringInterp(tok, null, null);
             },
             .reduce_kw => {
                 return p.parseReduce(tok);
@@ -1037,7 +1037,13 @@ pub const Parser = struct {
 
         if (after.tag == .string_part) {
             _ = p.advance();
-            return p.parseStringInterp(after, fmt_name);
+            // Pass the `@` token offset so the resulting `format_string`
+            // span starts at `@` (not the string_part). Lowering relies
+            // on this to anchor unknown-format `query_syntax_error`
+            // diagnostics at the format ident byte (one past the `@`),
+            // mirroring legacy `parsePrimary`'s `last_tok_offset`
+            // (`src/query/src/compiler.zig:6210`).
+            return p.parseStringInterp(after, fmt_name, at_tok.offset);
         }
         if (after.tag == .string_lit) {
             _ = p.advance();
@@ -1056,7 +1062,7 @@ pub const Parser = struct {
         } }, Span.from(at_tok.offset, fmt_ident.offset + fmt_ident.len));
     }
 
-    fn parseStringInterp(p: *Parser, first_part_tok: Token, format: ?[]const u8) error{ParseFailed}!*Node {
+    fn parseStringInterp(p: *Parser, first_part_tok: Token, format: ?[]const u8, format_span_start: ?u32) error{ParseFailed}!*Node {
         var parts = std.ArrayList(Node.StringPart){};
 
         // First literal part
@@ -1089,10 +1095,15 @@ pub const Parser = struct {
         const parts_slice = parts.toOwnedSlice(p.arena.allocator()) catch &[_]Node.StringPart{};
 
         if (format) |fmt| {
+            // Anchor span at the `@` token (when known) so lowering
+            // can report unknown-format `query_syntax_error` at the
+            // format ident byte (`sp.start + 1`) — see
+            // `src/compiler/lower.zig` `format_string` arm.
+            const span_start = format_span_start orelse first_part_tok.offset;
             return p.createNode(.{ .format_string = .{
                 .format = p.internName(fmt),
                 .parts = parts_slice,
-            } }, Span.from(first_part_tok.offset, p.lex.pos));
+            } }, Span.from(span_start, p.lex.pos));
         }
         return p.createNode(.{ .string_interp = .{
             .parts = parts_slice,

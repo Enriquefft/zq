@@ -560,11 +560,15 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const offset: u32 = slots[node.extra];
             const len: u32 = slots[node.extra + 1];
             const fmt_name = em.ir_obj.string_buf.items[offset .. offset + len];
-            // `fmt_name` carries a leading '@' (parser
-            // `internFormatName`); legacy `formatBuiltinId` matches on
-            // the unprefixed name.
+            // The IR carries the bare format name as written in the
+            // source (e.g. `"base64"`); the AST parser `internName`
+            // path strips the `@`. Older `internFormatName` paths
+            // retained the prefix, so we strip defensively. Lowering
+            // (`lower.zig` `.format_string` arm) has already rejected
+            // unknown format names with a `query_syntax_error`
+            // diagnostic — `formatBuiltinId` is therefore total here.
             const bare = if (fmt_name.len > 0 and fmt_name[0] == '@') fmt_name[1..] else fmt_name;
-            const bid = formatBuiltinId(bare) orelse return error.NewCompilerNotImplemented;
+            const bid = formatBuiltinId(bare) orelse unreachable;
 
             // Shape 2: single literal part, no exprs → bare push_string.
             // Detect by inspecting the children: every part must be a
@@ -2193,11 +2197,13 @@ fn emitLast(em: *Emitter, node: ir.Node) EmitError!void {
 /// `compiler.zig:6227-6232`: a single `call_builtin(format_bid)`
 /// applied to the current value. The IR carries the format name with
 /// its leading `@` (parser `internFormatName`); strip it here before
-/// consulting `formatBuiltinId`.
+/// consulting `formatBuiltinId`. `classifyBuiltin` only routes to
+/// `format_apply` after `isFormatApplyName` confirms the suffix is in
+/// the SSOT registry (`isKnownFormatName`), so the lookup is total.
 fn emitFormatApply(em: *Emitter, node: ir.Node, name: []const u8) EmitError!void {
     std.debug.assert(node.span_len == 0);
     std.debug.assert(name.len >= 2 and name[0] == '@');
-    const bid = formatBuiltinId(name[1..]) orelse return error.NewCompilerNotImplemented;
+    const bid = formatBuiltinId(name[1..]) orelse unreachable;
     try em.pushInstr(
         .call_builtin,
         .{ .index = @intFromEnum(bid) },

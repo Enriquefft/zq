@@ -1,6 +1,6 @@
 # source: @html "<b>\(.)</b>"
 # SemOp
-format("html") @7..19
-  load_const("<b>") @7..19
+format("html") @0..19
+  load_const("<b>") @0..19
   identity @12..13
-  load_const("</b>") @7..19
+  load_const("</b>") @0..19

@@ -604,6 +604,17 @@ const FIXTURES = [_]Fixture{
     // legacy via SKIP. Harness checks legacy↔new error parity.
     .{ .name = "p3_regex_sub_arity_one", .filter = "sub(\"a\")", .input = "\"abc\"", .expects_compile_err = true },
     .{ .name = "p3_regex_sub_arity_four", .filter = "sub(\"a\"; \"b\"; \"c\"; \"d\")", .input = "\"abc\"", .expects_compile_err = true },
+
+    // ── Validation diagnostics (Phase 4 — format-builtin) ─────────
+    // Unknown `@fmt` names — legacy parser rejects via
+    // `formatBuiltinId(...) orelse syntaxErr` at
+    // `compiler.zig:6210`; new lower mirrors that with a
+    // `query_syntax_error` LowerDiagnostic anchored at the format
+    // node span. Both standalone (`@xyz`) and string-form
+    // (`@xyz "lit"`, `@xyz "\\(.)"`) shapes routed.
+    .{ .name = "p4_format_unknown_standalone", .filter = "@xyz", .input = "\"in\"", .expects_compile_err = true },
+    .{ .name = "p4_format_unknown_lit", .filter = "@xyz \"lit\"", .input = "null", .expects_compile_err = true },
+    .{ .name = "p4_format_unknown_interp", .filter = "@xyz \"\\(.)\"", .input = "\"hi\"", .expects_compile_err = true },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

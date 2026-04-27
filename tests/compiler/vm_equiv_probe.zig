@@ -17,6 +17,10 @@ const FILTERS = [_][]const u8{
     "def f",
     ".foo +",
     "(",
+    // Phase 4 — format-builtin unknown-name diagnostics.
+    "@xyz",
+    "@xyz \"lit\"",
+    "@xyz \"\\(.)\"",
 };
 
 pub fn main() !void {
