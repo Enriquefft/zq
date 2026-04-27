@@ -1460,8 +1460,71 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         //   extra_data slot 1: acc_id
         .foreach => |fe| return lowerForeach(ctx, &fe, sp.start, sp.len),
 
-        // ── Other AST kinds: defer to later categories ─────────────
-        else => return error.NewCompilerNotImplemented,
+        // ── Catch-all (Phase 7 — Wave 1.1 final closure) ───────────
+        //
+        // INVARIANT: every `ast.Node.Kind` union variant that the parser
+        // can emit on a successful (`!hasErrors()`) parse has an explicit
+        // arm above. Reaching this `else =>` would mean the AST surface
+        // grew a new variant without a corresponding lowering — that is a
+        // compiler bug, not a runtime SKIP condition, so we mark it
+        // `unreachable` rather than raising `NewCompilerNotImplemented`.
+        //
+        // Coverage proof — explicit arms above cover every variant of
+        // `ast.Node.Kind` (`src/ast/nodes.zig:22-92`):
+        //
+        //   pipe, comma, func_def, alternative, or_expr, and_expr,
+        //   comparison, arithmetic, unary_neg, as_pattern, destruct_alt,
+        //   identity, recurse, field_access, index_access, iterate, slice,
+        //   literal, paren, variable_ref, optional, array_construct,
+        //   object_construct, string_interp, format_string, builtin_call,
+        //   func_call, if_expr, try_catch, reduce, foreach, label_expr,
+        //   break_expr, update_assign, assign_general, suffix.
+        //
+        // The 36th variant — `error_node` (`src/ast/nodes.zig:91`) — is
+        // emitted by `parser.makeError` (`src/ast/parser.zig:100-103`),
+        // and EVERY `makeError` call also pushes an entry into
+        // `parse_result.errors` via `addError`. The `compile()` driver at
+        // `src/compiler/root.zig:74-85` returns `.err` BEFORE invoking
+        // `lowerNode` whenever `parse_result.hasErrors()` is true, so an
+        // `error_node` cannot reach this switch in practice.
+        //
+        // Why each Wave 1.1 phase mattered (closing the prior fallthroughs
+        // that this catch-all used to absorb):
+        //
+        //   * Phase-1 identifier-binding   — bare ident → load_field
+        //                                    (3ef77e0, 2026-04-27).
+        //   * Phase-2 variable-binding     — `$__loc__` magic var
+        //                                    (8f34cf0, 2026-04-27).
+        //   * Phase-3 regex-validation +   — test/match/scan/sub/gsub
+        //              regex-dynamic         arity + dynamic comma-pat
+        //                                    (b0dd3f7, 2026-04-27).
+        //   * Phase-4 format-builtin       — `@fmt` codegen for unknown
+        //                                    format names
+        //                                    (da33639, 2026-04-27).
+        //   * Phase-5 builtin-classifier + — extended classifyBuiltin
+        //              builtin-dispatch      coverage / nameToBuiltinId
+        //                                    (140cc0c, 2026-04-27).
+        //   * Phase-6 destructure alt_bind — alt_bind in object/array
+        //                                    destructure strict context
+        //                                    (f48ebcf, 2026-04-27).
+        //
+        // RUNTIME RAISES STILL PRESENT (out of scope for the catch-all
+        // closure — they are explicit, exhaustive arms, not fallthroughs):
+        //
+        //   * `lowerBuiltinCall` `.not_implemented` arm
+        //     (`lower.zig` `BuiltinClass` exhaustive switch) — known
+        //     builtin name/arity pairs that route through legacy.
+        //   * `emit.zig:725 / :1839 / :2002` — pattern-strict alt_bind /
+        //     unknown @fmt at emit / `nameToBuiltinId` fallback. Each is
+        //     a named arm of an exhaustive switch, not a catch-all.
+        //
+        // Those four sites are tracked by Wave-3-mini buckets in
+        // `research/phase-2r-coverage-gap.md` and stay live as SKIP
+        // markers for the harness; the dispatcher falls back to legacy
+        // when they fire. The invariant for THIS arm — "if all explicit
+        // AST-tag arms are non-fallthrough, the catch-all is unreachable"
+        // — holds independently of those.
+        else => unreachable,
     }
 }
 
