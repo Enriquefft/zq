@@ -1816,6 +1816,13 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // form `error` flows through `zero_arg` instead.
         .error_arg1 => return emitErrorArg1(em, node),
         .del_path => return emitDelPath(em, node),
+        // P5 — `map(f)` / `select(f)` 1-arity. Both have dedicated
+        // bytecode shapes that don't reduce to a flat `call_builtin`,
+        // so they bypass `nameToBuiltinId` (`map` has no bid; `select`
+        // doesn't either — its name reaches the IR but emits no
+        // `call_builtin` runtime call).
+        .map_arg1 => return emitMap(em, node),
+        .select_arg1 => return emitSelect(em, node),
         else => {},
     }
 
@@ -1927,7 +1934,7 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // Cat-13 / cat-17 / cat-16 classes already handled by the
         // early-out switch above — reaching them here would mean
         // the early-out fell through.
-        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply, .error_arg1, .del_path => unreachable,
+        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply, .error_arg1, .del_path, .map_arg1, .select_arg1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -2307,6 +2314,104 @@ fn emitDelPath(em: *Emitter, node: ir.Node) EmitError!void {
         .{ .index = @intFromEnum(types_mod.BuiltinId.delpaths) },
         node,
     );
+}
+
+// ── P5 — `map(f)` / `select(f)` 1-arity emission ────────────────────
+//
+// Two desugars share this category. Neither reduces to a flat
+// `call_builtin`, so both bypass `nameToBuiltinId` and emit their
+// legacy bytecode shape inline.
+//
+//   * `map(f)`   — `array_collect_start <end_ip> ; each ; <f> ;
+//                   yield_output ; array_collect_end`. No leading
+//                   `save_input` and no trailing `call_builtin` —
+//                   `map` is purely a comprehension over the input
+//                   array; the array-collect bracket alone produces
+//                   the result. Mirrors `compileMap`
+//                   (`src/query/src/compiler.zig:3338`) byte-for-byte.
+//                   Distinct from `filter_arg1` (`sort_by`/`group_by`/
+//                   etc.) which DOES emit `save_input`+trailing
+//                   `call_builtin(bid)` because those builtins pair
+//                   the collected keys with the original array.
+//
+//   * `select(f)`— `save_input ; <f> ; jump_if_false skip ;
+//                   restore_input ; jump done ; skip: restore_input ;
+//                   backtrack ; done:`. Mirrors `compileSelect`
+//                   (`src/query/src/compiler.zig:3376`) byte-for-byte.
+//                   The `backtrack` opcode replaces the legacy
+//                   `call_builtin(empty)` reference in the doc-comment;
+//                   they're observationally identical (both consume
+//                   the current branch without emitting), and the
+//                   actual legacy emission at line 3405 is
+//                   `ctx.emit(.backtrack, ...)`.
+
+/// Emit `map(f)` 1-arity. Mirrors legacy `compileMap`
+/// (`src/query/src/compiler.zig:3338`):
+///
+/// ```
+/// array_collect_start <end_ip>     ; placeholder, backpatched
+///   each                           ; iterate over current
+///   <f>                            ; per-element body
+///   yield_output                   ; collect each element
+/// array_collect_end                ; <end_ip> = this position
+/// ```
+fn emitMap(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    const start_pos = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+
+    try emitNode(em, body_idx);
+
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    const end_pos: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Emit `select(f)` 1-arity. Mirrors legacy `compileSelect`
+/// (`src/query/src/compiler.zig:3376`):
+///
+/// ```
+/// save_input                       ; preserve original for output
+/// <f>                              ; predicate result on value stack
+/// jump_if_false -> skip
+/// restore_input                    ; truthy: original becomes output
+/// jump -> done
+/// skip:
+/// restore_input                    ; falsy: pop save_input frame
+/// backtrack                        ; produce no output for this branch
+/// done:
+/// ```
+///
+/// The closing label `done:` is materialized by backpatching the
+/// `jump` operand to the post-`backtrack` IP; no instruction is
+/// emitted there (legacy ends `compileSelect` the same way — the
+/// next outer instruction occupies the `done` IP).
+fn emitSelect(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try emitNode(em, body_idx);
+
+    const jif_pos = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+
+    const jmp_pos = em.instructions.items.len;
+    try em.pushInstr(.jump, .{ .index = 0 }, node);
+
+    const skip_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jif_pos].operand = .{ .index = skip_ip };
+    try em.pushInstr(.restore_input, .{ .none = {} }, node);
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const done_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jmp_pos].operand = .{ .index = done_ip };
 }
 
 /// Emit `computed_index` (cat-18 / Phase 27). Mirrors legacy
