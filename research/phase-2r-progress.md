@@ -719,3 +719,56 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Next: Cluster B+ continuation (cat-14+) per §3.5 replan.
 
+## Phase 26 — cat-17 format builtins (`@text`/`@json`/`@csv`/`@tsv`/`@html`/`@sh`/`@uri`/`@urid`/`@base64`/`@base64d`) — Wave 2 (first to merge)
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `f3d4c6b` on `redesign/compiler` (ff-merged from `phase-26-cat-17`)
+**Commits this phase**: 1 (squashed via amend; amend folded 1 multi-interp snapshot + 1 vm-equiv fixture for snapshot-validator coverage gap)
+
+**Files changed**: 11 (+163/-3)
+- `src/compiler/lower.zig` (+50 lines): added `BuiltinClass.format_apply` variant; classifier branch in `classifyBuiltin` (gated on arity==0 + `isFormatApplyName`); `isFormatApplyName` recognizer (length-checked before indexing for empty-name UB safety); lowering arm reusing `call_builtin` SemOp
+- `src/compiler/emit.zig` (+28 lines): early-out switch handles `format_apply` by calling new `emitFormatApply` helper which strips leading `@` and dispatches via existing `formatBuiltinId` table to a single `call_builtin(format_bid)` instr (mirrors legacy `compiler.zig:6227-6232`)
+- `tests/compiler/snapshots_test.zig` (+7 lines): 7 fixture registrations
+- `tests/compiler/vm_equiv.zig` (+~58 lines): 16 cat-17 fixtures (15 initial + 1 multi-interp followup)
+- 7 new snapshot files: `tests/compiler/snapshots/lower/cat-17-{standalone-base64,standalone-json,standalone-uri,fmt-string-uri,fmt-string-html,pipe-json,fmt-string-multi-interp}.txt`
+
+**AST shapes covered**: 3 IR-shape variants (standalone @fmt as BuiltinCall, format_string single-literal-part, format_string multi-part interpolation).
+
+**No new SemOps**: matches §3.5 prediction (0.7× sizing). `format_apply` reuses existing `call_builtin` SemOp; the leading `@` in the interned name is the dispatch key.
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all fixtures):
+- Standalone @fmt: byte-for-byte (mirrors `compiler.zig:6228-6231`)
+- Interpolation path: byte-for-byte (flows through pre-existing `.format` arm at `emit.zig:549` into `emitInterpLadder` with format_bid arg)
+- Pipe shape `expr | @fmt`: byte-for-byte (falls through generic `.pipe` lowering)
+- Unknown `@bogus` name: routes to `.not_implemented` → fallback to legacy → legacy syntax error (same observable error class)
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 215 MATCH / 0 FAIL / 3 SKIP (was 199/0/3; +16 fixtures all MATCH; 0 new mismatch; 0 new compile_err) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 1028 pass / 111 fail (identical to base; no P26 regressions) |
+| Spot-check (fallback disabled in throwaway worktree) | cat-17 MATCH delta = +15 (entire surface routes through new compiler with zero fallback reliance; multi-interp followup also lands genuinely) |
+
+**Hard rules verified** (mechanical-verifier PASS 10/10, including parent-checkout-clean check):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact
+- `src/query/src/compiler.zig` legacy compiler untouched
+- `src/ast/*` untouched
+- `src/compiler/ir.zig` untouched (no SemOps added)
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
+- Single commit on phase branch, conventional message format, single author, no GPG bypass markers
+- Parent checkout clean (only `?? memory/`, HEAD unchanged before merge)
+
+**Reviewer outcome**: 3 PASS + 1 BLOCK round 1 → BLOCK was snapshot-validator missing multi-part interp variant → 1 snapshot + 1 fixture amended → all gates met.
+
+**Followups for orchestrator**:
+1. Comment at `lower.zig:962-966` claims `format_string.format` carries leading `@` but parser actually uses `internName` (no `@`). Defensive strip in `emit.zig:557` makes this a no-op so behavior is correct; comment is misleading. Out of scope for P26; can be cleaned in any future phase touching that area.
+2. All 10 format names already worked through existing `format_string` arm + `formatBuiltinId` — zero bug fixes needed for interpolation path. The 0.7× sizing in §3.5 was accurate: 100% of P26 work was the standalone form.
+
+**Cross-phase notes**: P26 added `BuiltinClass.format_apply` variant to the BuiltinClass enum at lower.zig — concurrent Wave 2 phases (P24, P27) extending the same enum will need to rebase onto `f3d4c6b` before ff-merge. Conflicts expected to be additive (stack new variants), not semantic.
+
+**Carried forward to next phase / P21-redux**:
+1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/`.
+
+**Phase status**: COMPLETE. Next: Cluster B+ continuation (cat-14+, remaining Wave 2 phases) per §3.5 replan.
+
