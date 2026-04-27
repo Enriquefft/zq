@@ -526,8 +526,19 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                         .src_len = sp.len,
                     });
                 }
-                // Fall-through: unknown ident, defer to legacy.
-                return error.NewCompilerNotImplemented;
+                // 4. Plain identifier → field access. Mirrors legacy
+                //    fall-through at `src/query/src/compiler.zig:6128-6131`:
+                //    after binding/UDF/builtin lookup misses, a bare
+                //    identifier compiles to `load_key <name>`, equivalent
+                //    to writing `.<name>` against the current input. Same
+                //    IR shape as the dot-field branch below.
+                const extra_idx_id = try ctx.internString(fa.name);
+                return ctx.pushNode(.{
+                    .op = .load_field,
+                    .extra = extra_idx_id,
+                    .src_start = sp.start,
+                    .src_len = sp.len,
+                });
             }
             const extra_idx = try ctx.internString(fa.name);
             return ctx.pushNode(.{
