@@ -559,6 +559,16 @@ const FIXTURES = [_]Fixture{
     // — proving the fix doesn't regress when as-pattern lives
     // inside a reduce update.
     .{ .name = "cat14_reduce_with_as_body", .filter = "reduce .[] as $x (0; \"x\" as $u | . + $x)", .input = "[1,2,3]", .expected_output = "6" },
+    // ── $__loc__ magic var (Phase 2 P2 — variable-binding) ───────
+    // `$__loc__` is jq's synthetic compile-time location object
+    // (`{"file":"<top-level>","line":1}`). Legacy expands it inline
+    // via `emitLocObject` (`src/query/src/compiler.zig:6461`); the
+    // new compiler now mirrors that with a synthesised `obj_ctor`
+    // IR node so the bytecode shape matches the legacy backend.
+    .{ .name = "p2_loc_bare", .filter = "$__loc__", .input = "null", .expected_output = "{\"file\":\"<top-level>\",\"line\":1}" },
+    .{ .name = "p2_loc_in_obj_merge", .filter = "{ a, $__loc__, c }", .input = "{\"a\":[1,2,3],\"c\":{\"hi\":\"hey\"}}", .expected_output = "{\"a\":[1,2,3],\"__loc__\":{\"file\":\"<top-level>\",\"line\":1},\"c\":{\"hi\":\"hey\"}}" },
+    .{ .name = "p2_loc_pipe_field", .filter = "$__loc__ | .file", .input = "null", .expected_output = "\"<top-level>\"" },
+    .{ .name = "p2_loc_pipe_line", .filter = "$__loc__.line", .input = "null", .expected_output = "1" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

@@ -1112,14 +1112,40 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // Resolve the name to a var_id at lower-time so emit can stamp
         // the `load_variable` operand directly. Legacy emits the same
         // shape via `parseVariableReference`
-        // (`src/query/src/compiler.zig:6442`); the `$__loc__` magic
-        // var routes through legacy fallback today (cat-4 owns plain
-        // user vars only).
+        // (`src/query/src/compiler.zig:6442`).
+        //
+        // Magic var `$__loc__` is jq's compile-time location object —
+        // legacy `emitLocObject` (`src/query/src/compiler.zig:6461`)
+        // expands it inline as `{"file":"<top-level>","line":1}`. Mirror
+        // that here by synthesising an `obj_ctor` IR node with two
+        // (key, value) pairs of `load_const` literals — emit then
+        // produces the same `object_construct_start ... object_key ...
+        // object_construct_end` ladder as a hand-written object literal.
+        // No new bytecode shape introduced; reuses cat-7 obj-ctor emit.
         .variable_ref => |vr| {
             if (std.mem.eql(u8, vr.name, "__loc__")) {
-                // `$__loc__` is a synthetic compile-time object literal.
-                // Cat-4 doesn't own that lowering; fall back to legacy.
-                return error.NewCompilerNotImplemented;
+                const alloc = ctx.arena.allocator();
+                // (k0, v0) = ("file", "<top-level>")
+                const k0_idx = try synthLoadConstString(ctx, "file", sp.start, sp.len);
+                const v0_idx = try synthLoadConstString(ctx, "<top-level>", sp.start, sp.len);
+                // (k1, v1) = ("line", 1)
+                const k1_idx = try synthLoadConstString(ctx, "line", sp.start, sp.len);
+                const v1_idx = try synthLoadConstInt(ctx, 1, sp.start, sp.len);
+                // Pairs land in `extra_children` interleaved (k, v, k, v)
+                // — same invariant as the `.object_construct` arm so
+                // emit's existing obj_ctor walker picks them up.
+                const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+                try ctx.out.extra_children.append(alloc, k0_idx);
+                try ctx.out.extra_children.append(alloc, v0_idx);
+                try ctx.out.extra_children.append(alloc, k1_idx);
+                try ctx.out.extra_children.append(alloc, v1_idx);
+                return ctx.pushNode(.{
+                    .op = .obj_ctor,
+                    .span_start = span_start,
+                    .span_len = 4,
+                    .src_start = sp.start,
+                    .src_len = sp.len,
+                });
             }
             const var_id = ctx.lookupVar(vr.name) orelse {
                 ctx.compile_err = .{
@@ -2511,6 +2537,30 @@ fn synthLoadConstString(
     try ctx.out.string_buf.appendSlice(alloc, bytes);
     try ctx.out.extra_data.append(alloc, offset);
     try ctx.out.extra_data.append(alloc, @intCast(bytes.len));
+    return ctx.pushNode(.{
+        .op = .load_const,
+        .extra = extra_idx,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
+}
+
+/// Synthesize a `load_const(int)` IR node carrying the i64 `n`. Mirrors
+/// the literal-arm encoding in `lowerNode` (extra slot 0 = LiteralKind,
+/// 1 = lo32, 2 = hi32). Used by the `$__loc__` magic-var lowering to
+/// stamp the `"line": 1` value.
+fn synthLoadConstInt(
+    ctx: *Lowerer,
+    n: i64,
+    src_start: u32,
+    src_len: u32,
+) error{OutOfMemory}!u32 {
+    const alloc = ctx.arena.allocator();
+    const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.int));
+    const u: u64 = @bitCast(n);
+    try ctx.out.extra_data.append(alloc, @truncate(u));
+    try ctx.out.extra_data.append(alloc, @truncate(u >> 32));
     return ctx.pushNode(.{
         .op = .load_const,
         .extra = extra_idx,
