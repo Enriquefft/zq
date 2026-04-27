@@ -163,6 +163,16 @@ pub const Op = enum(u8) {
     /// layout. Maps to legacy `Instruction.Op.slice` (operand
     /// `slice_args`). Plan §1.3 row 5.
     slice,
+    /// Computed-key array/object access (`base[expr]` / `.[expr]`).
+    /// `children[0]` lowers the key expression; the base flows from
+    /// the surrounding `pipe` left-side (or the caller's input for
+    /// standalone `.[expr]`). Mirrors legacy `compileComputedBracket`
+    /// (`src/query/src/compiler.zig:7040`) — the two-var capture
+    /// pattern (base + key) is synthesized at emit time so the bracket
+    /// expression's fork/backtrack iteration over generator keys
+    /// re-runs the per-iteration `load_computed` for every yielded
+    /// key. Plan §3.5 row P27 / cat-18.
+    computed_index,
 
     pipe,
     comma,
@@ -667,6 +677,19 @@ fn dumpAst(
                 try dumpAst(ir_obj, bc.args[1], source, depth + 1, writer);
                 return;
             }
+            // `__computed_access(expr)` is the parser's synthesized form
+            // for standalone `.[expr]`. Lowers to the cat-18
+            // `computed_index` SemOp; render the dump in the same shape
+            // so suffixed (`expr[$x]`) and standalone (`.[$x]`) forms
+            // both surface as `computed_index` with the key expression
+            // as the only child. Plan §3.5 row P27.
+            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "__computed_access")) {
+                try writer.writeAll("computed_index");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
+                return;
+            }
             // Generic builtin call: rendered as `call_builtin("name")`.
             // For regex builtins with a literal pattern arg, also
             // render the pool ref annotation per spec §6 "Regex pool
@@ -1085,7 +1108,19 @@ fn renderSuffixChain(
         try writeSpan(writer, span);
         try writer.writeAll("\n");
     }
-    try dumpSuffixOp(sf.ops[rh_end - 1], depth + 1 + try_wrap_count, span, writer);
+    // `bracket_expr` carries an AST sub-tree (the key expression);
+    // render `computed_index` and recurse into the key. All other
+    // suffix ops are inline-payload only — `dumpSuffixOp` covers them.
+    const tail_op = sf.ops[rh_end - 1];
+    if (tail_op == .bracket_expr) {
+        try writeIndent(writer, depth + 1 + try_wrap_count);
+        try writer.writeAll("computed_index");
+        try writeSpan(writer, span);
+        try writer.writeAll("\n");
+        try dumpAst(ir_obj, tail_op.bracket_expr, source, depth + 2 + try_wrap_count, writer);
+        return;
+    }
+    try dumpSuffixOp(tail_op, depth + 1 + try_wrap_count, span, writer);
 }
 
 /// Render a single SuffixOp as the IR node it lowers to. Used by
@@ -1119,7 +1154,19 @@ fn dumpSuffixOp(
             try writer.writeAll(")");
         },
         .optional => unreachable, // handled by renderSuffixChain wrap
-        .bracket_expr => try writer.writeAll("# unimplemented(bracket_expr)"),
+        // Invariant: `bracket_expr` always reaches `renderSuffixChain`
+        // as the rightmost (post-trailing-`optional`-skip) op of some
+        // sub-chain. The chain renderer recursively peels the rightmost
+        // op into the right child of a `pipe` and recurses into the
+        // shorter left chain; at every recursion the rightmost is
+        // explicitly checked for `bracket_expr` BEFORE delegating to
+        // this `dumpSuffixOp` (see `renderSuffixChain` tail special-case
+        // ~line 998). The standalone `.[expr]` form never reaches here
+        // either — it parses as `BuiltinCall{__computed_access, [expr]}`
+        // and is rendered by the dedicated arm in `dumpAst`. Lock-in
+        // snapshot: `cat-18-bracket-mid-chain.txt` exercises a chain
+        // with `bracket_expr` in the middle position.
+        .bracket_expr => unreachable,
     }
     try writeSpan(writer, span);
     try writer.writeAll("\n");
@@ -1576,6 +1623,7 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
         },
         .pipe => try writer.writeAll("pipe"),
         .comma => try writer.writeAll("comma"),
+        .computed_index => try writer.writeAll("computed_index"),
         .iterate => try writer.writeAll("iterate"),
         .recurse => try writer.writeAll("recurse"),
         .try_ => try writer.writeAll("try"),
@@ -1733,7 +1781,7 @@ fn dumpIRChildren(
         // Binary
         .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_ => .{ 0, 2 },
         // Unary
-        .try_, .neg, .path_begin, .label => .{ 0, 1 },
+        .try_, .neg, .path_begin, .label, .computed_index => .{ 0, 1 },
         .update_assign => blk: {
             const kind: UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
             break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 };

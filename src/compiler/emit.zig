@@ -278,6 +278,15 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
 
         .iterate => try em.pushInstr(.each, .{ .none = {} }, node),
 
+        // Cat-18 (P27): computed bracket access. Two-var capture
+        // pattern around the lowered key expression mirrors legacy
+        // `compileComputedBracket` (`src/query/src/compiler.zig:7040`)
+        // byte-for-byte: $base captures the input before key eval so
+        // it survives generator-form key fork/backtrack iteration; the
+        // per-iteration block re-saves the base and runs `load_computed`
+        // for every yielded key.
+        .computed_index => try emitComputedIndex(em, node),
+
         .slice => {
             const slots = em.ir_obj.extra_data.items;
             const from_u: u32 = slots[node.extra];
@@ -2170,6 +2179,51 @@ fn emitFormatApply(em: *Emitter, node: ir.Node, name: []const u8) EmitError!void
         .{ .index = @intFromEnum(bid) },
         node,
     );
+}
+
+/// Emit `computed_index` (cat-18 / Phase 27). Mirrors legacy
+/// `compileComputedBracket` (`src/query/src/compiler.zig:7040`)
+/// byte-for-byte:
+///
+/// ```
+/// push_current               ; preserve input as the lookup base
+/// capture_variable($base)
+/// <key expression>           ; may be a generator (fork/backtrack)
+/// capture_variable($key)     ; per-iteration: capture each yielded key
+/// load_variable($base)       ; restore base value
+/// pipe                       ; advance to lookup phase
+/// save_input                 ; bracket the load_computed
+/// load_variable($key)
+/// load_computed              ; .[$key] on the base
+/// ```
+///
+/// The two var_ids are allocated from the emitter (above the
+/// `next_var_id_seed` watermark) so the captures don't collide with
+/// any outer cat-9 / cat-13 frame variables. No SemOp `pop_variable`
+/// is emitted: legacy uses `popScope` here, which is a compile-time
+/// bookkeeping op with no runtime opcode — same divergence rationale
+/// as `emitLimitSkipNth`'s comment.
+fn emitComputedIndex(em: *Emitter, node: ir.Node) EmitError!void {
+    const base_var: i64 = @intCast(em.allocVar());
+    const key_var: i64 = @intCast(em.allocVar());
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+
+    // The key expression's lowered IR is the only child. Generator
+    // forms (`(0,2)`, `range(N)`, etc.) emit fork instructions inside
+    // here; the per-iteration block below re-runs for every yielded
+    // value because the value-stack capture/restore pair surrounds
+    // each fork output. Legacy at compiler.zig:7054 calls
+    // `parsePipe(ctx)` here — same effect.
+    try emitNode(em, node.children[0]);
+
+    try em.pushInstr(.capture_variable, .{ .index = key_var }, node);
+    try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = key_var }, node);
+    try em.pushInstr(.load_computed, .{ .none = {} }, node);
 }
 
 /// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single

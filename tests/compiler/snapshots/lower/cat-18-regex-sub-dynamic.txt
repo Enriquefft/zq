@@ -1,0 +1,13 @@
+# source: "-" as $p | ":" as $r | sub($p; $r)
+# SemOp
+pipe @0..35
+  load_const("-") @0..3
+  pipe @0..35
+    destructure(as, "p") @0..35
+    pipe @12..35
+      load_const(":") @12..15
+      pipe @12..35
+        destructure(as, "r") @12..35
+        call_builtin("sub") @24..35
+          load_var("p") @28..30
+          load_var("r") @32..34

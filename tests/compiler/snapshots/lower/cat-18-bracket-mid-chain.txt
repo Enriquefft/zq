@@ -1,0 +1,12 @@
+# source: 1 as $i | .arr[$i].name
+# SemOp
+pipe @0..23
+  load_const(1) @0..1
+  pipe @0..23
+    destructure(as, "i") @0..23
+    pipe @10..23
+      pipe @10..23
+        load_field("arr") @10..14
+        computed_index @10..23
+          load_var("i") @15..17
+      load_field("name") @10..23

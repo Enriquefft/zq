@@ -424,6 +424,57 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat15_label_break_in_limit", .filter = "[label $out | limit(10; range(100) | if . == 4 then ., (. | break $out) else . end)]", .input = "null", .expected_output = "[0,1,2,3,4]" },
     // break unknown label — both backends surface a compile error.
     .{ .name = "cat15_break_undefined", .filter = "break $undefined", .input = "null", .expected_output = "", .expects_compile_err = true },
+    // ── Cat-18 (P27) — dynamic regex + computed bracket access ──
+    // Control: literal regex still works after dynamic guard removal.
+    .{ .name = "cat18_regex_test_lit_control", .filter = "test(\"h.*\")", .input = "\"hello\"", .expected_output = "true" },
+    // Dynamic 1-arg: pattern reaches value stack via REGEX_POOL_DYNAMIC.
+    .{ .name = "cat18_regex_test_dyn_var", .filter = "\"abc123\" as $pat | \"test abc123\" | test($pat)", .input = "null", .expected_output = "true" },
+    // Dynamic match($p) returning a single match — accesses .offset.
+    .{ .name = "cat18_regex_match_dyn_offset", .filter = "\"o+\" as $p | \"foobar\" | match($p) | .offset", .input = "null", .expected_output = "1" },
+    // Dynamic 2-arg sub($p; $r) — both args reach the value stack.
+    .{ .name = "cat18_regex_sub_dyn", .filter = "\"-\" as $p | \":\" as $r | \"a-b\" | sub($p; $r)", .input = "null", .expected_output = "\"a:b\"" },
+    // Dynamic gsub via the same path.
+    .{ .name = "cat18_regex_gsub_dyn", .filter = "\"o\" as $p | \"X\" as $r | \"foobar\" | gsub($p; $r)", .input = "null", .expected_output = "\"fXXbar\"" },
+    // Dynamic scan($pat) collected.
+    .{ .name = "cat18_regex_scan_dyn", .filter = "\"[a-z]+\" as $p | \"a1b2c\" | [scan($p)]", .input = "null", .expected_output = "[\"a\",\"b\",\"c\"]" },
+    // Dynamic capture using a $-bound pattern.
+    .{ .name = "cat18_regex_capture_dyn", .filter = "\"(?<n>[a-z]+)\" as $p | \"abc\" | capture($p) | .n", .input = "null", .expected_output = "\"abc\"" },
+    // Bracket control: literal index unaffected.
+    .{ .name = "cat18_bracket_lit_control", .filter = "[10,20,30] | .[1]", .input = "null", .expected_output = "20" },
+    // Standalone .[$x] — `__computed_access` AST shape via parser.zig:680-684.
+    .{ .name = "cat18_bracket_standalone_var", .filter = "[10,20,30] as $arr | 1 as $i | $arr[$i]", .input = "null", .expected_output = "20" },
+    // Object key lookup via $-bound key.
+    .{ .name = "cat18_bracket_object_key_var", .filter = "{\"a\":1, \"b\":2} as $o | \"a\" as $k | $o[$k]", .input = "null", .expected_output = "1" },
+    // Generator-form key — fork backtracks per yielded key, base survives
+    // via the two-var capture pattern.
+    .{ .name = "cat18_bracket_generator_key", .filter = "[10,20,30] | [.[(0,2)]]", .input = "null", .expected_output = "[10,30]" },
+    // Negative index works — passthrough to legacy load_computed semantics.
+    .{ .name = "cat18_bracket_negative_idx", .filter = "[10,20,30] as $arr | -1 as $i | $arr[$i]", .input = "null", .expected_output = "30" },
+    // Computed expression key — exercises the `computed_index` shape
+    // with a non-trivial key. Pipe-prepares the indexable array as
+    // current; uses captured vars to compute the index (1 + 2 = 3 →
+    // [10,20,30,40,50][3] = 40).
+    .{ .name = "cat18_bracket_arith_key", .filter = "[10,20,30,40,50] as $arr | 1 as $a | 2 as $b | $arr[($a + $b)]", .input = "null", .expected_output = "40" },
+    // Standalone `.[<lit>]` — exercises the parser's
+    // `__computed_access(BuiltinCall)` AST shape with a literal key
+    // arg. Confirms the new lower/emit path agrees with legacy's
+    // `compileComputedBracket` for the literal-key case.
+    .{ .name = "cat18_bracket_standalone_obj_lit", .filter = ".[\"foo\"]", .input = "{\"foo\":42}", .expected_output = "42" },
+    // Standalone `.[<expr>]` where the expression yields a literal
+    // index — exercises the `__computed_access` arm with a non-trivial
+    // key (a paren-grouped int).
+    .{ .name = "cat18_bracket_standalone_paren", .filter = ".[(0)]", .input = "[10,20,30]", .expected_output = "10" },
+    // Standalone `.[(generator)]` — fork-backtrack over the key
+    // generator yields multiple outputs from a single input lookup.
+    .{ .name = "cat18_bracket_standalone_gen", .filter = "[.[(0,2)]]", .input = "[10,20,30]", .expected_output = "[10,30]" },
+    // ── Cat-18 negative-case fixtures (runtime error parity) ──
+    // Indexing an array with a non-numeric key raises TypeError on
+    // both backends — `expected_output` left empty so the harness
+    // only checks legacy↔new err.kind parity (no absolute pin).
+    .{ .name = "cat18_bracket_index_type_error", .filter = "[1,2,3] as $arr | \"x\" as $i | $arr[$i]", .input = "null" },
+    // Calling `test` with a non-string pattern raises TypeError on
+    // both backends. Same legacy↔new parity check.
+    .{ .name = "cat18_regex_pattern_type_error", .filter = "123 as $p | \"abc\" | test($p)", .input = "null" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

@@ -1,0 +1,13 @@
+# source: 1 as $i | [10,20,30][$i]
+# SemOp
+pipe @0..24
+  load_const(1) @0..1
+  pipe @0..24
+    destructure(as, "i") @0..24
+    pipe @10..24
+      arr_ctor @10..20
+        load_const(10) @11..13
+        load_const(20) @14..16
+        load_const(30) @17..19
+      computed_index @10..24
+        load_var("i") @21..23

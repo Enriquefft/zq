@@ -143,6 +143,21 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-15-label-nested", .expected = @embedFile("snapshots/lower/cat-15-label-nested.txt") },
     .{ .name = "cat-15-until", .expected = @embedFile("snapshots/lower/cat-15-until.txt") },
     .{ .name = "cat-15-while", .expected = @embedFile("snapshots/lower/cat-15-while.txt") },
+    // ── Cat-18 (P27) — dynamic regex + computed bracket access ──
+    .{ .name = "cat-18-regex-test-dynamic", .expected = @embedFile("snapshots/lower/cat-18-regex-test-dynamic.txt") },
+    .{ .name = "cat-18-regex-sub-dynamic", .expected = @embedFile("snapshots/lower/cat-18-regex-sub-dynamic.txt") },
+    .{ .name = "cat-18-bracket-standalone", .expected = @embedFile("snapshots/lower/cat-18-bracket-standalone.txt") },
+    // Standalone generator-form key — exercises the `dumpAst` arm
+    // for `__computed_access(BuiltinCall)` (distinct code path from
+    // the suffix-form renderer).
+    .{ .name = "cat-18-bracket-standalone-gen", .expected = @embedFile("snapshots/lower/cat-18-bracket-standalone-gen.txt") },
+    // Lock-in for the `unreachable` invariant in `dumpSuffixOp` —
+    // exercises a suffix chain with `bracket_expr` in non-tail
+    // position (`.arr[$i].name`); the renderer recursion handles it
+    // via the tail-special-case at every depth.
+    .{ .name = "cat-18-bracket-mid-chain", .expected = @embedFile("snapshots/lower/cat-18-bracket-mid-chain.txt") },
+    .{ .name = "cat-18-bracket-array-base", .expected = @embedFile("snapshots/lower/cat-18-bracket-array-base.txt") },
+    .{ .name = "cat-18-bracket-expr-key", .expected = @embedFile("snapshots/lower/cat-18-bracket-expr-key.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

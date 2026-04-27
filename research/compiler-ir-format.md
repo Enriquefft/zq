@@ -501,6 +501,32 @@ parens, two indented children). The dumped op tag strips the trailing
 underscore from the IR enum (`while_` → `while`, `until_` → `until`)
 per the §3 op-name convention.
 
+### Computed bracket access: `.[($x)]` (cat-18 / Phase 27)
+
+The `computed_index` SemOp wraps a single child IR node — the key
+expression. Emit synthesizes the legacy two-var capture pattern
+(`push_current ; capture_variable($base) ; <key> ;
+capture_variable($key) ; load_variable($base) ; pipe ; save_input ;
+load_variable($key) ; load_computed`) so generator-form keys
+(e.g. `(0,2)`) replay the per-iteration `load_computed` for every
+yielded value. Both AST entry points share this op:
+
+* Suffix-form (`expr[$x]`) lowers from the `SuffixOp.bracket_expr`
+  variant — the base is the surrounding pipe's left side.
+* Standalone (`.[$x]`) parses as the synthesized
+  `BuiltinCall{name="__computed_access", args=[expr]}` shape (see
+  `src/ast/parser.zig:680-684`); lower routes both to the same SemOp.
+
+```
+# source: .[(.a + .b)]
+# SemOp
+computed_index @0..12
+  arith(add) @3..10
+    load_field("a") @3..5
+    load_field("b") @8..10
+```
+
+
 ---
 
 ## 11. Out-of-scope

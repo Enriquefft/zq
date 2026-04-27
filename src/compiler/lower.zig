@@ -654,7 +654,10 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                         const op_idx = try lowerSuffixSlice(ctx, sl, sf.base.span);
                         cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
                     },
-                    .bracket_expr => return error.NewCompilerNotImplemented,
+                    .bracket_expr => |key_node| {
+                        const op_idx = try lowerSuffixBracketExpr(ctx, key_node, sf.base.span);
+                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                    },
                 }
             }
             return cur;
@@ -869,6 +872,15 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             }
             if (ctx.lookupFunction(bc.name, arity)) |fn_id| {
                 return inlineUserCall(ctx, fn_id, bc.args, sp.start, sp.len);
+            }
+            // `__computed_access(expr)` is the parser's synthesized
+            // shape for a standalone `.[expr]` (no preceding suffix
+            // chain — see `src/ast/parser.zig:680-684`). Route to the
+            // same `computed_index` SemOp the SuffixOp.bracket_expr
+            // arm produces so emit's two-var capture pattern is the
+            // single source of truth for both shapes. Plan §3.5 row P27.
+            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "__computed_access")) {
+                return lowerSuffixBracketExpr(ctx, bc.args[0], .{ .start = sp.start, .end = sp.start + sp.len });
             }
             // 2. Fall through to cat-10's builtin classifier (handles
             //    `not`/`type`/`path` plus the wider alphabet).
@@ -2017,16 +2029,14 @@ fn lowerRegexBuiltinCommon(
     }
 
     // Pattern classification: literal → intern into pool; dynamic →
-    // route to legacy. The dynamic path requires the legacy
-    // input-preservation semantics around `as`-bindings (see
-    // `as_pattern` cat-4 lowering — the new pipeline pipes expr's
-    // result, which would surface a different value-stack regime
-    // than legacy expects). Cat-11 owns the literal-pattern fast
-    // path only; dynamic patterns fall back so the splits/scan/
-    // match($var) idioms preserve VM-equivalence with legacy
-    // through the production dispatcher.
+    // push the lowered key onto the value stack and use the
+    // `REGEX_POOL_DYNAMIC` sentinel so the VM reads the pattern off
+    // the stack at runtime. Mirrors legacy `compileRegexBuiltin1`
+    // fast/slow split (`src/query/src/compiler.zig:3056-3097`) and
+    // `compileRegexBuiltin2` (`:3742`). Cat-18 reaches both arms;
+    // emit's `regex1`/`regex2` handlers consume the pattern from the
+    // span when `pool_idx == REGEX_POOL_DYNAMIC`.
     const pat_literal = extractStringLiteral(pat_node);
-    if (pat_literal == null) return error.NewCompilerNotImplemented;
     var pool_idx: u32 = types_mod.REGEX_POOL_DYNAMIC;
     if (pat_literal) |lit| {
         // Build the final key: optional `(?<flags>)` prefix + decoded
@@ -2198,6 +2208,23 @@ fn lowerSuffixIterate(ctx: *Lowerer, span: ast.Span) error{OutOfMemory}!u32 {
     const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
     return ctx.pushNode(.{
         .op = .iterate,
+        .src_start = sp.start,
+        .src_len = sp.len,
+    });
+}
+
+/// Append a `computed_index` node for a SuffixOp `.bracket_expr`. The
+/// key expression is lowered first; the parent SemOp carries it as
+/// `children[0]`. Emit synthesizes the legacy two-var capture pattern
+/// (base + key) around the key emission so generator-form keys
+/// (`[1,2,3] | .[(0,2)]`) re-run the per-iteration `load_computed` for
+/// every yielded key. Plan §3.5 row P27 / cat-18.
+fn lowerSuffixBracketExpr(ctx: *Lowerer, key_node: *Node, span: ast.Span) LowerError!u32 {
+    const key_idx = try lowerNode(ctx, key_node);
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return ctx.pushNode(.{
+        .op = .computed_index,
+        .children = .{ key_idx, 0 },
         .src_start = sp.start,
         .src_len = sp.len,
     });
