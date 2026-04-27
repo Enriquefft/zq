@@ -1062,3 +1062,17 @@ vm-equiv: 277/0/5 (was 268/0/3 from prior phase; +9 MATCH, +2 SKIP)
 rg NewCompilerNotImplemented in lower.zig: 7 remaining (down from 12)
 
 Wave 1.2 ready to begin (format-builtin, builtin-classifier+dispatch, destructure alt_bind).
+
+## Coverage Gate: PASS (2026-04-27)
+
+All 12 coverage-gap sites from Wave-3-mini closed:
+- Wave 1.1: Phases 1–3 (identifier-binding, variable-binding, regex-validation/dynamic)
+- Wave 1.2: Phases 4–6 (format-builtin, builtin-classifier/dispatch, destructure alt_bind)
+- Wave 2: Phase 7 (catch-all-ast verification + annotation)
+
+Final metrics:
+- vm-equiv: 279 MATCH / 0 mismatch / 6 SKIP (net +11 MATCH, +3 SKIP vs Wave-3-mini entry 268/0/3)
+- NewCompilerNotImplemented runtime raises: 0 (100% closure)
+- Test suite: 1028/1166 passed, 111 pre-existing failures, 27 skipped (no regressions)
+
+State: current_phase=P21-redux-ready. Ready for P21-redux gate measurement and full cutover.
