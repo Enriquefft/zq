@@ -672,3 +672,50 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: ESCALATED — replanning required before further dispatch. New orchestration plan must enumerate the 12+ missing categories, group them into implementation waves, and define the eventual P21-redux gate set.
 
+## Phase 22 — cat-13 (range/limit/skip/nth/first/last) — Cluster B+ continuation per §3.5
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `f101054` on `redesign/compiler` (ff-merged from `phase-22-cat-13`)
+**Commits this phase**: 1 (squashed via amend; amend folded 6 review followup fixtures + 1 design comment)
+
+**Files changed**: 14 (+394/-1)
+- `src/compiler/lower.zig` (+73 lines): 6 new BuiltinClass arms (`range_gen{1,2,3}`, `limit_skip_nth`, `first_arg1`, `last_arg1`); helper `isLimitSkipNthBuiltin`; classifier rows in `classifyBuiltin`
+- `src/compiler/emit.zig` (+214 lines): early-out switch + helpers `emitRange` / `emitLimitSkipNth` / `emitFirst` / `emitLast` / `emitArgToArray`; intentional design divergence documented inline at the trailing `pop_variable` (legacy `popScope` is compile-time only and emits no runtime opcode; new compiler emits runtime pop to clean captured input var — vm-equiv confirms output parity)
+- `tests/compiler/snapshots_test.zig` (+11 lines): 10 new fixture registrations
+- `tests/compiler/vm_equiv.zig` (+~50 lines): 21 fixtures (15 initial + 6 followup: `cat13_nth_negative`, `cat13_skip_negative`, `cat13_limit_negative`, `cat13_range_zero_step`, `cat13_last_empty`, `cat13_nth_gen_form_n`)
+- 10 new snapshot files: `tests/compiler/snapshots/lower/cat-13-{range-1,range-2,range-3,limit,first-0,first-1,last-0,last-1,nth,skip}.txt`
+
+**AST shapes covered**: 6 builtins × arities = 10 IR shape variants (range 1/2/3-arity; limit; first 0/1-arity; last 0/1-arity; nth; skip). Bare 0-arity `first`/`last` correctly desugar to `load_index 0`/`-1` per legacy `compileFirst`/`compileLast` (`compiler.zig:5930-5937`).
+
+**No new SemOps**: matches §3.5 prediction (`call_builtin` SemOp + `extra_data` span accommodates all six).
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all fixtures):
+- `range` / `first` / `last`: byte-for-byte match
+- `limit` / `skip` / `nth`: one extra trailing `pop_variable` in new (intentional improvement; legacy `popScope` is compile-time only)
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 199 MATCH / 0 FAIL / 3 SKIP (was 178/0/3 baseline; +21 fixtures all MATCH; 0 new mismatch; 0 new compile_err) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 451/569 pass (111 fails identical to base — pre-existing ZQ-DEFER markers from commit `52f3200`; not P22 regressions) |
+| Spot-check (fallback disabled in throwaway worktree) | all 21 cat-13 fixtures route through new compiler directly with zero fallback reliance |
+
+**Hard rules verified** (mechanical-verifier PASS 9/9):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact (zero diff vs base)
+- `src/query/src/compiler.zig` legacy compiler untouched (zero diff)
+- `src/ast/*` untouched (zero diff)
+- `src/compiler/ir.zig` untouched (zero diff — no SemOps added)
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator (commit `5824806`) intact
+- Single commit on phase branch, conventional message format, single author, no GPG bypass markers
+
+**Reviewer outcome**: APPROVE-WITH-FOLLOWUP round 1 → all 4 followups folded via amend → second-round informational review skipped (change scope: 1 comment + 6 test fixtures, mechanical/scope rules already locked).
+
+**Reusable pattern established**: classifier `isLimitSkipNthBuiltin` + emit-time name re-read for shape+name shared dispatch — reusable for future multi-name shape clusters in cat-14+.
+
+**Carried forward to next phase / P21-redux**:
+1. Three reviewer-suggested edge cases not covered in P22 (acceptable close-out; can revisit in future categories): `nth(0;range(5))` gen-form, `skip`/`limit` gen-form n, error-format parity for non-`UserError` types.
+2. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/`.
+
+**Phase status**: COMPLETE. Next: Cluster B+ continuation (cat-14+) per §3.5 replan.
+
