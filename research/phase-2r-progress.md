@@ -772,3 +772,61 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Next: Cluster B+ continuation (cat-14+, remaining Wave 2 phases) per §3.5 replan.
 
+## Phase 24 — cat-15 (label_expr, break_expr, until, while; recurse builtin-call form deferred per legacy-parity check) — Wave 2 (second to merge, after P26)
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `c7132d7` on `redesign/compiler` (ff-merged from `phase-24-cat-15`)
+**Commits this phase**: 1 (squashed via amend; amend folded ir-format.md docs for the 4 new SemOps after snapshot validator BLOCKed on missing docs)
+
+**Files changed**: 12 (+630/-8)
+- `src/compiler/lower.zig` (+145 lines): `.label_expr`/`.break_expr` arms in `lowerNode`; `while_until_2arg` BuiltinClass + `isWhileUntilBuiltin` helper + dispatch in `lowerBuiltinCall`; label_var_ids tracking via `declareLabelVar`/`lookupLabelVar` (var_table snapshot/restore for popScope semantics)
+- `src/compiler/emit.zig` (+174 lines): `emitLabel`, `emitBreak`, `emitWhile`, `emitUntil` mirroring legacy `compileLabel`/parsePipe-`break_kw`/`compileWhile`/`compileUntil` byte-for-byte
+- `src/compiler/ir.zig` (+120 lines): 4 new SemOps (`label`, `break_`, `while_`, `until_`); AST + IR dumpers (dumpAst arms for AST-side label/break/while/until; renderNodePayload for IR-side)
+- `src/compiler/fuse.zig` (+9 lines): childArity wired (label unary; while_/until_ binary; break_ leaf default)
+- `research/compiler-ir-format.md` (+130 lines): §10 (Examples) entries for label/break_ paired construct + while_/until_ sibling loop forms; cites legacy compiler.zig:3628/6245/3428/3495; covers AST source + extra_data layout + emit semantics + lower-time invariants
+- `tests/compiler/snapshots_test.zig` (+6 lines): 5 fixture registrations
+- `tests/compiler/vm_equiv.zig` (+24 lines): 9 fixtures (8 MATCH + 1 expected-compile-err SKIP for `break $undefined`)
+- 5 new snapshot files: `tests/compiler/snapshots/lower/cat-15-{label,label-break,label-nested,until,while}.txt`
+
+**AST shapes covered**: 5 control-flow constructs × shape variants (label-only, label+break, nested labels, until 2-arg, while 2-arg). recurse(f) and recurse(f;cond) builtin-call forms NOT implemented — primary reviewer independently verified legacy rejects all 3 test forms (`recurse(.+1)`, `[recurse(.+1)] | length`, `recurse(.; .<3)`) at parse time with "query syntax error" exit=3.
+
+**4 new SemOps** (`label`, `break_`, `while_`, `until_`): justified per §3.5 template — label has var_id+exit_ip backpatch; break_ has var_id+break_op pair; while_/until_ have multi-jump patch tables. None reduce to flat `call_builtin + extra_data`. All documented in `research/compiler-ir-format.md`.
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all positive fixtures + primary reviewer code-path comparison):
+- label: byte-identical to `compiler.zig:3628` (label_begin patch + capture_variable + body + backpatch exit_ip)
+- break: byte-identical to `compiler.zig:6262-6263` (load_variable + break_op)
+- until: byte-identical to `compiler.zig:3495-3548`
+- while: byte-identical to `compiler.zig:3428-3476`
+- label_var_ids threading: monotonic-append (mirrors legacy compiler.zig:3641; never popped — confirmed via vm-equiv `cat15_label_nested_outer`)
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 224 MATCH / 0 FAIL / 4 SKIP (was 215/0/3; +9 MATCH + 1 expected SKIP for `cat15_break_undefined`) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base; no P24 regressions |
+| Spot-check (fallback disabled in throwaway) | cat-15 MATCH count = 9 (same as fallback-on; harness uses compileNew directly) |
+
+**Hard rules verified** (mechanical-verifier PASS 10/10 incl. parent-checkout-clean):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact
+- `src/query/src/compiler.zig` legacy compiler untouched
+- `src/ast/*` untouched
+- `src/compiler/ir.zig` additive only (no opcode removed/renamed)
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
+- Single commit on phase branch, conventional message format, single author, no GPG bypass markers
+
+**Reviewer outcome**: 4 verifiers ran. mechanical PASS 10/10; equiv PASS Δ+9; snapshot BLOCK round 1 on missing ir-format.md docs (resolved via amend); primary APPROVE-WITH-FOLLOWUP (recurse deferral verified correct + 2 doc-only followups: §3.5 amend [LANDED IN THIS COMMIT] + this progress entry note about recurse parity).
+
+**Cross-phase notes**: P24 added 4 SemOps to ir.zig Op enum + `while_until_2arg` BuiltinClass to lower.zig — concurrent Wave 2 phase P27 (cat-18) was rebased onto post-P26 tip; will need additional rebase onto post-P24 tip before its merge. All conflicts expected to be additive (stack new variants), not semantic.
+
+**recurse(f) builtin-call deferral**: legacy parity-correct, NOT a missing feature. Legacy parser rejects `recurse(.+1)` / `[recurse(.+1)] | length` / `recurse(.; .<3)` with `query syntax error at line 1, col N` (exit=3). Implementing the named-builtin form in the new compiler would be net-new functionality — not in scope for redesign-parity work. Per primary reviewer's followup recommendation (and amended in §3.5 P24 row in this same commit), `recurse` is now explicitly noted as deferred-by-parity in the plan.
+
+**Followups for P21-redux / future phases**:
+- P27 implementer flagged a latent cat-4 `as`-pattern bug uncovered while writing cat-18 fixtures: new compiler emits `pipe(expr, pipe(destructure, body))` where the outer `pipe` clobbers `current` with LHS literal. Affects patterns like `"foo" as $k | .[$k]` where the body needs original input. Pre-existing code path; should be addressed in P23 (cat-14, which §3.5 lists `as`-pattern body holes).
+
+**Carried forward to next phase / P21-redux**:
+1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/`.
+2. Three additional deferrals from P22 (nth gen-form, skip/limit gen-form n, error-format parity for non-UserError types) — unchanged.
+
+**Phase status**: COMPLETE. Next: Cluster B+ continuation (remaining Wave 2 phase P27, then P23/P25) per §3.5 replan.
+
