@@ -1,0 +1,4 @@
+# source: index("o")
+# SemOp
+call_builtin("index") @0..10
+  load_const("o") @6..9

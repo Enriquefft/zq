@@ -1,0 +1,3 @@
+# source: error
+# SemOp
+call_builtin("error") @0..5

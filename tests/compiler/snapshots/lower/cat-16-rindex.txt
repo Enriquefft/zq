@@ -1,0 +1,4 @@
+# source: rindex("o")
+# SemOp
+call_builtin("rindex") @0..11
+  load_const("o") @7..10

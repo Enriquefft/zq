@@ -1478,6 +1478,41 @@ pub const BuiltinClass = enum {
     /// `call_builtin` because the bytecode shape carries
     /// patch-table jumps that don't reduce to a flat builtin call.
     while_until_2arg,
+    /// Cat-16 — `error(msg)` 1-arity. Legacy `compileErrorArg`
+    /// (`compiler.zig:3956`) emits `<msg> ; pipe ; call_builtin(error_)`.
+    /// The pipe is required because legacy first evaluates `msg` onto
+    /// the value stack, then transfers it to current via `pipe`, so
+    /// the VM's `error_` handler reads the message from the current
+    /// value (not the value stack). Mirrors that legacy shape exactly.
+    /// Distinct from `value_arg1` because value_arg1 emits no pipe.
+    error_arg1,
+    /// Cat-16 — `index(s)` / `rindex(s)` / `indices(s)` 1-arity. Same
+    /// IR shape as `value_arg1` (single arg child + `call_builtin`),
+    /// but classified separately because legacy
+    /// `compileValueArgBuiltin1Collecting` accepts comma-arg generator
+    /// forms (`indices("a", "b")`) — the new compiler relies on the
+    /// `comma` SemOp's natural fork/jump emission to produce
+    /// per-iteration calls when the arg is a comma-chain. The
+    /// dedicated class lets `nameToBuiltinId` map these names to
+    /// their bids in the 1-arity branch without growing
+    /// `isValueArg1Builtin` (which would also expose them to other
+    /// classifier consumers that aren't ready for generator args).
+    /// Mirrors legacy `compileIndices` / `compileIndex` / `compileRindex`
+    /// (`compiler.zig:4456-4468`).
+    value_arg1_gen,
+    /// Cat-16 — `del(path_expr)` 1-arity. Lowers as a single-child
+    /// `call_builtin` IR node; the path-collect pipeline is
+    /// synthesized at emit time. Mirrors legacy `compileDel`
+    /// (`compiler.zig:5529`) byte-for-byte: `push_current ;
+    /// capture_variable($orig) ; array_collect_start ; path_begin ;
+    /// <body> ; path_end ; yield_output ; array_collect_end ;
+    /// capture_variable($paths) ; load_variable($orig) ; pipe ;
+    /// load_variable($paths) ; call_builtin(delpaths)`. No new SemOp
+    /// required — every primitive in this sequence already has an
+    /// IR-side counterpart, and emit-time hidden-var allocation via
+    /// `Emitter.allocVar` matches legacy's `next_var_id` allocation
+    /// order (orig before paths).
+    del_path,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1528,6 +1563,16 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // name. Routed before the generic arity tables because `while`
     // and `until` are not in any of the math/value/filter buckets.
     if (arity == 2 and isWhileUntilBuiltin(name)) return .while_until_2arg;
+    // Cat-16 — `error(msg)` 1-arity, `index/rindex/indices(s)`
+    // 1-arity, `del(path_expr)` 1-arity. Each has a dedicated emit
+    // shape (pipe-before-call for error; comma-tolerant value-arg
+    // for index family; path-collect pipeline for del). Routed
+    // before the generic arity tables because the 0-arity `error`
+    // is owned by `zero_arg` (added to `isZeroArgBuiltin`), and
+    // del/index are not in any other bucket.
+    if (arity == 1 and std.mem.eql(u8, name, "error")) return .error_arg1;
+    if (arity == 1 and isIndexFamilyBuiltin(name)) return .value_arg1_gen;
+    if (arity == 1 and std.mem.eql(u8, name, "del")) return .del_path;
     // 0-arity `first` / `last` desugar to `.[0]` / `.[-1]` — see
     // legacy `compiler.zig:5930-5937`. They reach AST as a
     // `BuiltinCall` because the AST parser lists both names in
@@ -1587,6 +1632,20 @@ pub fn isWhileUntilBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "until");
 }
 
+/// Recognize `index` / `rindex` / `indices` (cat-16). All three are
+/// 1-arity value-arg builtins legacy compiles via
+/// `compileValueArgBuiltin1` (`compiler.zig:4456-4468`). The new
+/// compiler routes them through `value_arg1_gen` so the comma-arg
+/// generator form works through the natural `comma` SemOp emission
+/// (FORK left | JUMP | right; call_builtin runs once per yielded arg
+/// after the comma's pipe). Each bid is mapped in
+/// `nameToBuiltinId` (1-arity branch).
+pub fn isIndexFamilyBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "index") or
+        std.mem.eql(u8, name, "rindex") or
+        std.mem.eql(u8, name, "indices");
+}
+
 /// Recognize 1-arg regex builtin names (cat-11). The internal
 /// generator variant `match__g` is recognized as well so the IR's
 /// synthesized name from `match("pat";"g")` flows through the same
@@ -1622,6 +1681,11 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "empty") or
         std.mem.eql(u8, name, "tostring") or
         std.mem.eql(u8, name, "tonumber") or
+        // Cat-16 — `error` 0-arity. Legacy maps it through
+        // `zeroArgBuiltinId` (`compiler.zig:2758`) → `BuiltinId.error_`.
+        // The 1-arity form `error(msg)` is owned by `error_arg1` because
+        // it requires a value-pipe before `call_builtin(error_)`.
+        std.mem.eql(u8, name, "error") or
         std.mem.eql(u8, name, "add") or
         std.mem.eql(u8, name, "sort") or
         std.mem.eql(u8, name, "reverse") or
@@ -1810,7 +1874,7 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
-        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1 => {
+        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path => {
             // Lower every arg first into a scratch buffer — recursive
             // lowering of nested calls (or ctors) writes to
             // `extra_children`, so building our span via direct append
@@ -1823,6 +1887,12 @@ fn lowerBuiltinCall(
             // bracketing opcode pattern (array_collect, save_input,
             // limit_start, ...) is synthesized at emit time from the
             // (name, arity) tuple via `classifyBuiltin`.
+            //
+            // Cat-16 (error_arg1, value_arg1_gen, del_path) share the
+            // same single-`call_builtin`-with-children IR shape; emit
+            // dispatches the legacy bytecode pattern from the
+            // classifier-rediscovered class (pipe-before-call,
+            // arg-then-call, or path-collect synthesis respectively).
             const alloc = ctx.arena.allocator();
             var arg_idxs: std.ArrayListUnmanaged(u32) = .{};
             defer arg_idxs.deinit(alloc);

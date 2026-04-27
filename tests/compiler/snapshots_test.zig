@@ -143,6 +143,23 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-15-label-nested", .expected = @embedFile("snapshots/lower/cat-15-label-nested.txt") },
     .{ .name = "cat-15-until", .expected = @embedFile("snapshots/lower/cat-15-until.txt") },
     .{ .name = "cat-15-while", .expected = @embedFile("snapshots/lower/cat-15-while.txt") },
+    // ── Cat-16 (P25) — error 0/1-arity, index/rindex/indices, del general forms ──
+    .{ .name = "cat-16-error-0arg", .expected = @embedFile("snapshots/lower/cat-16-error-0arg.txt") },
+    .{ .name = "cat-16-error-1arg", .expected = @embedFile("snapshots/lower/cat-16-error-1arg.txt") },
+    .{ .name = "cat-16-index", .expected = @embedFile("snapshots/lower/cat-16-index.txt") },
+    .{ .name = "cat-16-rindex", .expected = @embedFile("snapshots/lower/cat-16-rindex.txt") },
+    .{ .name = "cat-16-indices", .expected = @embedFile("snapshots/lower/cat-16-indices.txt") },
+    // Generator-arg form — `comma` SemOp child captures the
+    // alternation; emit's `value_arg1_gen` arm dispatches per
+    // fork branch via the natural `comma` fork/jump bytecode.
+    .{ .name = "cat-16-indices-gen", .expected = @embedFile("snapshots/lower/cat-16-indices-gen.txt") },
+    .{ .name = "cat-16-del-simple", .expected = @embedFile("snapshots/lower/cat-16-del-simple.txt") },
+    // Multi-path `del(.a, .b)` — comma generates two paths, both
+    // collected by emit-time path_begin/path_end pipeline.
+    .{ .name = "cat-16-del-multi", .expected = @embedFile("snapshots/lower/cat-16-del-multi.txt") },
+    // Array-slice path — exercises `slice` SemOp inside del's
+    // path expression child.
+    .{ .name = "cat-16-del-array-slice", .expected = @embedFile("snapshots/lower/cat-16-del-array-slice.txt") },
     // ── Cat-18 (P27) — dynamic regex + computed bracket access ──
     .{ .name = "cat-18-regex-test-dynamic", .expected = @embedFile("snapshots/lower/cat-18-regex-test-dynamic.txt") },
     .{ .name = "cat-18-regex-sub-dynamic", .expected = @embedFile("snapshots/lower/cat-18-regex-sub-dynamic.txt") },

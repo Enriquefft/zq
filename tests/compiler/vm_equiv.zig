@@ -475,6 +475,53 @@ const FIXTURES = [_]Fixture{
     // Calling `test` with a non-string pattern raises TypeError on
     // both backends. Same legacy↔new parity check.
     .{ .name = "cat18_regex_pattern_type_error", .filter = "123 as $p | \"abc\" | test($p)", .input = "null" },
+    // ── Cat-16 (P25) — error 0/1-arity, index/rindex/indices, del general ──
+    // 0-arity `error` routes through the `zero_arg` class (added to
+    // `isZeroArgBuiltin`); legacy maps it through `zeroArgBuiltinId`
+    // → `BuiltinId.error_`. Caught by `try` so the user sees the
+    // input value back; without `try` both backends raise UserError.
+    .{ .name = "cat16_error_0arg_caught", .filter = "try error catch .", .input = "\"oops\"", .expected_output = "\"oops\"" },
+    // 0-arity `error` on null — caught error returns null.
+    .{ .name = "cat16_error_0arg_null", .filter = "try error catch .", .input = "null", .expected_output = "null" },
+    // 1-arity `error("msg")` — pipe + call_builtin(error_) shape.
+    // The message reaches current via the pipe; try-catch surfaces it.
+    .{ .name = "cat16_error_1arg_msg", .filter = "try error(\"oops\") catch .", .input = "null", .expected_output = "\"oops\"" },
+    // 1-arity `error(.)` — pass-through input as the error message.
+    .{ .name = "cat16_error_1arg_input", .filter = "try error(.) catch .", .input = "{\"k\":1}", .expected_output = "{\"k\":1}" },
+    // index — substring start position. Legacy `compileIndex` →
+    // `compileValueArgBuiltin1(.index_)`.
+    .{ .name = "cat16_index_string", .filter = "index(\"ll\")", .input = "\"hello\"", .expected_output = "2" },
+    // rindex — substring last position. Legacy `compileRindex` →
+    // `compileValueArgBuiltin1(.rindex)`.
+    .{ .name = "cat16_rindex_string", .filter = "rindex(\"l\")", .input = "\"hello\"", .expected_output = "3" },
+    // indices — all substring positions as an array.
+    .{ .name = "cat16_indices_string", .filter = "indices(\"l\")", .input = "\"hello\"", .expected_output = "[2,3]" },
+    // indices generator-arg form — `comma` SemOp child causes the
+    // VM to fork per branch; each yield calls `call_builtin(indices)`
+    // separately. Wrapped in `[...]` so the two outputs collect.
+    .{ .name = "cat16_indices_generator", .filter = "[indices(\"a\", \"b\")]", .input = "\"abab\"", .expected_output = "[[0,2],[1,3]]" },
+    // del simple — single field deletion. Mirrors legacy
+    // `compileDel`'s path-collect + delpaths pipeline.
+    .{ .name = "cat16_del_field", .filter = "del(.a)", .input = "{\"a\":1,\"b\":2}", .expected_output = "{\"b\":2}" },
+    // del comma-arg — `del(.a, .c)` lowers to a `comma` body;
+    // path_begin/path_end collects both paths into the same array,
+    // then a single `delpaths` deletes them atomically.
+    .{ .name = "cat16_del_multi_field", .filter = "del(.a, .c)", .input = "{\"a\":1,\"b\":2,\"c\":3}", .expected_output = "{\"b\":2}" },
+    // del array slice — exercises the `slice` SemOp inside the
+    // path expression child; legacy `delpaths` expands slice
+    // components into normalized indices before deletion.
+    .{ .name = "cat16_del_array_slice", .filter = "del(.[1:3])", .input = "[1,2,3,4,5]", .expected_output = "[1,4,5]" },
+    // del with empty body — `empty` yields nothing, so the path
+    // array is empty and `delpaths` is a no-op. Verifies the
+    // emit-time scaffold doesn't crash on a zero-yield body.
+    .{ .name = "cat16_del_empty", .filter = "del(empty)", .input = "{\"a\":1}", .expected_output = "{\"a\":1}" },
+    // del with invalid path expression — legacy raises a structured
+    // path error mid-evaluation; both backends surface the same
+    // error class through try-catch.
+    .{ .name = "cat16_del_invalid_path_caught", .filter = "try del(.a + 1) catch \"caught\"", .input = "{\"a\":1}", .expected_output = "\"caught\"" },
+    // del nested path — multi-level path expression survives the
+    // path-collect pipeline.
+    .{ .name = "cat16_del_nested", .filter = "del(.a.b)", .input = "{\"a\":{\"b\":1,\"c\":2}}", .expected_output = "{\"a\":{\"c\":2}}" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.
