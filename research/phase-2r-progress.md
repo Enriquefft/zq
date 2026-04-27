@@ -830,3 +830,63 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE. Next: Cluster B+ continuation (remaining Wave 2 phase P27, then P23/P25) per §3.5 replan.
 
+## Phase 27 — cat-18 (dynamic regex patterns + `bracket_expr` LHS expression-indexed) — Wave 2 (third to merge, completing the wave)
+**Date**: 2026-04-27
+**Plan reference**: §3.5 Cluster B+ continuation
+**Branch tip**: `2170290` on `redesign/compiler` (ff-merged from `phase-27-cat-18`; Wave 2 final merge)
+**Commits this phase**: 1 (squashed via 2 amends; first amend folded 4 review followups; second amend not needed — rebase preserved single commit)
+
+**Rebase history**: branched from `b87cbd2`; rebased onto `b9bbe88` (post-P26) → `eded099`; amended with 4 followups → `8b9ee2c`; rebased onto `60012a8` (post-P24+docs) → `2170290`
+
+**Files changed at final tip**: 14 (+303/-15)
+- `src/compiler/lower.zig`: dropped dynamic regex guard at :1834; added `lowerSuffixBracketExpr` helper; `__computed_access` BuiltinCall shortcut in `lowerNode .builtin_call` arm
+- `src/compiler/emit.zig`: new `emitComputedIndex` helper mirroring legacy `compileComputedBracket` byte-for-byte (push_current + capture_var(base) + key + capture_var(key) + load_var(base) + pipe + save_input + load_var(key) + load_computed)
+- `src/compiler/ir.zig`: 1 new SemOp `computed_index` (between `slice` and `pipe`); AST-side `dumpAst` arms for `.bracket_expr` and `__computed_access`; renderSuffixChain tail special-case at :1006-1018; renderNodePayload arm; dumpIRChildren arity row; +9-line comment at the `.bracket_expr` `unreachable` arm in `dumpSuffixOp` documenting the invariant (lock-in proven by `cat-18-bracket-mid-chain` snapshot — `1 as $i | .arr[$i].name`)
+- `src/compiler/fuse.zig`: `computed_index` arity row added to childArity unary list
+- `research/compiler-ir-format.md` (+25 lines): documents `computed_index` SemOp shape + emit semantics + cites legacy compiler.zig:7040
+- `tests/compiler/snapshots_test.zig`: 7 fixture registrations
+- `tests/compiler/vm_equiv.zig`: 18 cat-18 fixtures (16 initial + 2 negative-case followup: `cat18_bracket_index_type_error`, `cat18_regex_pattern_type_error` — both MATCH legacy TypeError exactly)
+- 7 new snapshot files: `tests/compiler/snapshots/lower/cat-18-{bracket-array-base,bracket-expr-key,bracket-standalone,bracket-standalone-gen,bracket-mid-chain,regex-sub-dynamic,regex-test-dynamic}.txt`
+
+**AST shapes covered**: dynamic regex (1-arg test/match/scan/capture, 2-arg sub/gsub) + bracket_expr (standalone `.[expr]` via `__computed_access` BuiltinCall AST shape, suffix-form `expr[$x]` via SuffixOp.bracket_expr, array-base `[arr][$x]`, object-base `{...}[$k]`, generator-form `.[(0,2)]`, negative index `$arr[-1]`, mid-chain `.arr[$i].name` for invariant lock-in, computed key `.[($a + $b)]`)
+
+**1 new SemOp `computed_index`**: justified per §3.5 template — cannot fold into `call_builtin + extra_data` because the two-var capture (base_var + key_var) wraps a variadic key sub-tree that needs IR child positioning + emit-time var allocation (mirrors legacy compiler.zig:7040). Documented in `research/compiler-ir-format.md`.
+
+**Bytecode parity vs legacy** (verified via vm-equiv MATCH on all positive fixtures + primary reviewer code-path comparison):
+- dynamic regex 1-arg: byte-for-byte vs `compiler.zig:3226` `compileRegexBuiltinSlow`
+- dynamic regex 2-arg: byte-for-byte vs `compiler.zig:3742-3814` `compileRegexBuiltin2`
+- bracket_expr (`emitComputedIndex`): byte-for-byte vs `compiler.zig:7040` `compileComputedBracket` modulo popScope (compile-time only, no runtime opcode — same intentional improvement as cat-13's limit/skip/nth pattern)
+
+**Gates**:
+| Gate | Result |
+|------|--------|
+| vm-equiv | 242 MATCH / 0 FAIL / 4 SKIP (was 224/0/4 at post-P24 baseline; +18 cat-18 fixtures all MATCH; 0 new mismatch; 0 new compile_err) |
+| `zig build` | clean (no warnings, no errors) |
+| `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base; no P27 regressions |
+| Spot-check (fallback disabled in throwaway worktree) | cat-18 MATCH count = 16 at first measurement (eded099); fix-up added 2 more for total +18 (all routed through new compiler with zero fallback reliance) |
+
+**Hard rules verified** (mechanical-verifier PASS 10/10 incl. parent-checkout-clean):
+- `src/query/root.zig` lines 102-109 dispatcher fallback intact
+- `src/query/src/compiler.zig` legacy compiler untouched
+- `src/ast/*` untouched
+- `src/compiler/ir.zig` additive only (`computed_index` added; no opcode removed/renamed)
+- `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
+- Single commit on phase branch, conventional message format (subject 55 chars after fix-up trim), single author, no GPG bypass markers
+
+**Reviewer outcome**: 4 verifiers ran. mechanical PASS 10/10; equiv PASS Δ+16 (then +2 more after fix-up); snapshot PASS (5 snaps initial + 2 followup = 7 total, full coverage matrix incl. bonus computed-key + mid-chain); primary APPROVE-WITH-FOLLOWUP (4 followups: standalone-gen snap + 2 negative-case fixtures + verify `unreachable` invariant + subject-line trim — all addressed via amend).
+
+**`unreachable` invariant verification** (CRITICAL fix-up item): the `unreachable` at `ir.zig:1052` for `.bracket_expr` in `dumpSuffixOp` was flagged by reviewer. Implementer investigation: `renderSuffixChain` recursively peels rightmost suffix into a pipe right child; at every recursion the rightmost is checked for `bracket_expr` BEFORE delegating to `dumpSuffixOp`. Standalone `.[expr]` parses as `BuiltinCall{__computed_access}` and goes through `dumpAst`. Resolution: SAFE-WITH-COMMENT (9-line doc-comment at `ir.zig:1052` documenting WHY) + lock-in snapshot `cat-18-bracket-mid-chain` (`1 as $i | .arr[$i].name`) confirms the invariant holds at runtime.
+
+**Cross-phase notes**:
+- P27 ran in parallel with P24 + P26 in Wave 2; rebased twice (onto post-P26 then post-P24 tips); all 5 stack conflicts on rebase-2 (ir.zig dump arms, ir.zig arity list, fuse.zig arity, snapshots_test, vm_equiv, ir-format.md) merged cleanly with P24's additions placed first then P27's appended.
+- Implementer flagged a latent cat-4 `as`-pattern bug uncovered while writing cat-18 fixtures: new compiler emits `pipe(expr, pipe(destructure, body))` where the outer `pipe` clobbers `current` with LHS literal. Affects patterns like `"foo" as $k | .[$k]` where the body needs original input. NOT a P27 regression (pre-existing code path); should be addressed in P23 (cat-14, which §3.5 lists `as`-pattern body holes). Implementer restructured 5 originally-planned fixtures to sidestep.
+
+**Followups for P21-redux / future phases**:
+- P23 (cat-14) must address the cat-4 `as`-pattern body bug (`pipe(expr, pipe(destructure, body))` clobbers current).
+
+**Carried forward to next phase / P21-redux**:
+1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/`.
+2. Three additional deferrals from P22 (nth gen-form, skip/limit gen-form n, error-format parity for non-UserError types) — unchanged.
+
+**Phase status**: COMPLETE. Wave 2 complete (P26 → P24 → P27). Next: P23/P25 per §3.5 replan.
+
