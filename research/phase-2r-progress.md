@@ -1044,3 +1044,21 @@ Inventory + bucketed Wave-3-mini scope: `research/phase-2r-coverage-gap.md` (com
 Verdict: 5b structured close. Cutover deferred. Wave-3-mini (~5-6 phases) required before P21-redux re-attempt.
 
 Carry-forward unchanged from prior phase close (literal_groups leak, bench artifact noise, 4 ZQ-DEFER markers in tests/compat/).
+
+---
+
+## Wave 1.1 Complete (2026-04-27)
+
+Phases 1, 2, 3 merged to redesign/compiler.
+
+- Phase 1 (identifier-binding): 3ef77e0 merged (fast-forward)
+- Phase 2 (variable-binding): 8f34cf0 merged (standard merge with vm_equiv changes)
+- Phase 3 (regex-validation + regex-dynamic): b0dd3f7 merged (standard merge, 1 conflict resolved in vm_equiv.zig)
+
+**HEAD**: 1a75d4e
+
+vm-equiv: 277/0/5 (was 268/0/3 from prior phase; +9 MATCH, +2 SKIP)
+
+rg NewCompilerNotImplemented in lower.zig: 7 remaining (down from 12)
+
+Wave 1.2 ready to begin (format-builtin, builtin-classifier+dispatch, destructure alt_bind).
