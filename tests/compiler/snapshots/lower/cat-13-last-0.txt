@@ -1,0 +1,3 @@
+# source: last
+# SemOp
+call_builtin("last") @0..4

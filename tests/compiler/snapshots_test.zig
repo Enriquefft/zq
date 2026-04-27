@@ -118,6 +118,17 @@ const FIXTURES = [_]Fixture{
     .{ .name = "udf_value_arg", .expected = @embedFile("snapshots/lower/udf_value_arg.txt") },
     .{ .name = "udf_recursion", .expected = @embedFile("snapshots/lower/udf_recursion.txt") },
     .{ .name = "udf_mutual_recursion", .expected = @embedFile("snapshots/lower/udf_mutual_recursion.txt") },
+    // ── Cat-13 — generator-arg builtins (range/limit/skip/nth/first/last) ──
+    .{ .name = "cat-13-range-1", .expected = @embedFile("snapshots/lower/cat-13-range-1.txt") },
+    .{ .name = "cat-13-range-2", .expected = @embedFile("snapshots/lower/cat-13-range-2.txt") },
+    .{ .name = "cat-13-range-3", .expected = @embedFile("snapshots/lower/cat-13-range-3.txt") },
+    .{ .name = "cat-13-limit", .expected = @embedFile("snapshots/lower/cat-13-limit.txt") },
+    .{ .name = "cat-13-first-0", .expected = @embedFile("snapshots/lower/cat-13-first-0.txt") },
+    .{ .name = "cat-13-first-1", .expected = @embedFile("snapshots/lower/cat-13-first-1.txt") },
+    .{ .name = "cat-13-last-0", .expected = @embedFile("snapshots/lower/cat-13-last-0.txt") },
+    .{ .name = "cat-13-last-1", .expected = @embedFile("snapshots/lower/cat-13-last-1.txt") },
+    .{ .name = "cat-13-nth", .expected = @embedFile("snapshots/lower/cat-13-nth.txt") },
+    .{ .name = "cat-13-skip", .expected = @embedFile("snapshots/lower/cat-13-skip.txt") },
 };
 
 /// Extract the filter source text from a snapshot's `# source:` directive

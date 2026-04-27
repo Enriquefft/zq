@@ -1,0 +1,5 @@
+# source: last(range(5))
+# SemOp
+call_builtin("last") @0..14
+  call_builtin("range") @5..13
+    load_const(5) @11..12

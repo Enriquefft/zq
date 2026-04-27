@@ -1,0 +1,3 @@
+# source: first
+# SemOp
+call_builtin("first") @0..5

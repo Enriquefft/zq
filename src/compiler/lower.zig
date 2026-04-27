@@ -1318,6 +1318,36 @@ pub const BuiltinClass = enum {
     /// 3rd literal flag string. The replacement arg always lowers
     /// to a child IR node.
     regex2,
+    /// Cat-13 — `range(n)` (1-arity). Generator-arg in position 1.
+    /// Emits `[arg] | range1_gen | each` per
+    /// `compileRange` (`compiler.zig:4366-4382`). Single arg lowers
+    /// to a single IR child; the per-iteration array+each bracket
+    /// is synthesized at emit time.
+    range_gen1,
+    /// Cat-13 — `range(from; to)` (2-arity). Generator-args in
+    /// positions 1+2; emits per-arg array_collect with save_input
+    /// bridging the two arrays, then `range2_gen | each`. Mirrors
+    /// `compileRange` (`compiler.zig:4385-4412`).
+    range_gen2,
+    /// Cat-13 — `range(from; to; by)` (3-arity). Generator-args in
+    /// positions 1+2+3. Mirrors `compileRange`
+    /// (`compiler.zig:4413-4434`).
+    range_gen3,
+    /// Cat-13 — `limit(n; f)` / `skip(n; f)` / `nth(n; f)`. All
+    /// share a scope+capture+iterate-over-n shape with a
+    /// streaming `*_start` opcode bracketing the body. The name is
+    /// re-read at emit time to pick `limit_start` /
+    /// `skip_start` / `nth_start`. Mirrors `compileLimit`
+    /// (`compiler.zig:4684`), `compileSkip` (`:4874`),
+    /// `compileNth` (`:4924`).
+    limit_skip_nth,
+    /// Cat-13 — `first(f)` (1-arity). Desugars to `limit(1; f)` —
+    /// no scope/var capture because n is a hardcoded literal.
+    /// Mirrors `compileFirst` (`compiler.zig:4633`).
+    first_arg1,
+    /// Cat-13 — `last(f)` (1-arity). Desugars to `[f] | .[-1]`.
+    /// Mirrors `compileLast` (`compiler.zig:4658`).
+    last_arg1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1340,6 +1370,31 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (isRegex1BuiltinName(name)) return .regex1;
     if (isRegex2BuiltinName(name)) return .regex2;
 
+    // Cat-13 generator-arg builtins. Each shape is name+arity
+    // gated; the legacy compiler hand-writes the bytecode for each,
+    // so the new compiler picks a class per (name, arity) tuple and
+    // re-runs the same selection at emit time. Listed before the
+    // generic arity tables because some names overlap (e.g. `first`
+    // is also in `isZeroArgBuiltin`, but the 1-arity form is owned
+    // here).
+    if (std.mem.eql(u8, name, "range")) {
+        if (arity == 1) return .range_gen1;
+        if (arity == 2) return .range_gen2;
+        if (arity == 3) return .range_gen3;
+        return .not_implemented;
+    }
+    if (arity == 2 and isLimitSkipNthBuiltin(name)) return .limit_skip_nth;
+    if (arity == 1 and std.mem.eql(u8, name, "first")) return .first_arg1;
+    if (arity == 1 and std.mem.eql(u8, name, "last")) return .last_arg1;
+    // 0-arity `first` / `last` desugar to `.[0]` / `.[-1]` — see
+    // legacy `compiler.zig:5930-5937`. They reach AST as a
+    // `BuiltinCall` because the AST parser lists both names in
+    // `isZeroArgBuiltin` (`src/ast/parser.zig:1601`). Lowered
+    // straight into `load_index` so the IR mirrors the runtime
+    // shape exactly.
+    if (arity == 0 and std.mem.eql(u8, name, "first")) return .first_arg1;
+    if (arity == 0 and std.mem.eql(u8, name, "last")) return .last_arg1;
+
     if (arity == 0) {
         if (isZeroArgBuiltin(name)) return .zero_arg;
         return .not_implemented;
@@ -1349,6 +1404,16 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 2 and isMath2Builtin(name)) return .math2;
     if (arity == 3 and isMath3Builtin(name)) return .math3;
     return .not_implemented;
+}
+
+/// Recognize `limit` / `skip` / `nth` (cat-13). All three share the
+/// same `(n; f)` shape — n collected into an array, captured input
+/// re-loaded for the body, streaming `*_start` opcode bracketing the
+/// body. Emit re-reads the name to pick the right opcode.
+pub fn isLimitSkipNthBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "limit") or
+        std.mem.eql(u8, name, "skip") or
+        std.mem.eql(u8, name, "nth");
 }
 
 /// Recognize 1-arg regex builtin names (cat-11). The internal
@@ -1559,13 +1624,19 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
-        .value_arg1, .filter_arg1, .math2, .math3 => {
+        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1 => {
             // Lower every arg first into a scratch buffer — recursive
             // lowering of nested calls (or ctors) writes to
             // `extra_children`, so building our span via direct append
             // would interleave foreign entries. Bulk-append at the end
             // keeps the parent's `(span_start, span_len)` slice
             // contiguous (same pattern as `obj_ctor` / `arr_ctor`).
+            //
+            // Cat-13 (range/limit/skip/nth/first/last) share the same
+            // shape: the IR carries the args verbatim; the
+            // bracketing opcode pattern (array_collect, save_input,
+            // limit_start, ...) is synthesized at emit time from the
+            // (name, arity) tuple via `classifyBuiltin`.
             const alloc = ctx.arena.allocator();
             var arg_idxs: std.ArrayListUnmanaged(u32) = .{};
             defer arg_idxs.deinit(alloc);

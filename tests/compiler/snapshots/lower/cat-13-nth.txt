@@ -1,0 +1,6 @@
+# source: nth(3; range(10))
+# SemOp
+call_builtin("nth") @0..17
+  load_const(3) @4..5
+  call_builtin("range") @7..16
+    load_const(10) @13..15

@@ -316,6 +316,47 @@ const FIXTURES = [_]Fixture{
     // Function call inside an array constructor — generator semantics
     // surface through the filter arg.
     .{ .name = "udf_in_array_ctor", .filter = "def f(g): [g]; f(.[])", .input = "[1,2,3]", .expected_output = "[1,2,3]" },
+
+    // ── Category 13 — generator-arg builtins ──────────────────────
+    // range/limit/skip/nth/first/last share the streaming
+    // save/restore + bounded-yield template; one fixture per
+    // distinct shape covers the lowering+emit dispatch.
+    .{ .name = "cat13_range_1", .filter = "[range(5)]", .input = "null", .expected_output = "[0,1,2,3,4]" },
+    .{ .name = "cat13_range_2", .filter = "[range(2;7)]", .input = "null", .expected_output = "[2,3,4,5,6]" },
+    .{ .name = "cat13_range_3", .filter = "[range(0;10;2)]", .input = "null", .expected_output = "[0,2,4,6,8]" },
+    .{ .name = "cat13_range_neg_step", .filter = "[range(5;0;-1)]", .input = "null", .expected_output = "[5,4,3,2,1]" },
+    .{ .name = "cat13_range_in_arr_len", .filter = "[range(3)] | length", .input = "null", .expected_output = "3" },
+    .{ .name = "cat13_limit_basic", .filter = "[limit(2; range(100))]", .input = "null", .expected_output = "[0,1]" },
+    .{ .name = "cat13_limit_zero", .filter = "[limit(0; range(5))]", .input = "null", .expected_output = "[]" },
+    .{ .name = "cat13_first_arg1", .filter = "first(range(5))", .input = "null", .expected_output = "0" },
+    .{ .name = "cat13_first_zero_arg", .filter = "first", .input = "[10,20,30]", .expected_output = "10" },
+    .{ .name = "cat13_last_arg1", .filter = "last(range(5))", .input = "null", .expected_output = "4" },
+    .{ .name = "cat13_last_zero_arg", .filter = "last", .input = "[10,20,30]", .expected_output = "30" },
+    .{ .name = "cat13_nth_basic", .filter = "nth(3; range(10))", .input = "null", .expected_output = "3" },
+    .{ .name = "cat13_skip_basic", .filter = "[skip(2; range(5))]", .input = "null", .expected_output = "[2,3,4]" },
+    .{ .name = "cat13_skip_overrun", .filter = "[skip(10; range(5))]", .input = "null", .expected_output = "[]" },
+    // Generator-form n: each value triggers a separate frame.
+    .{ .name = "cat13_limit_n_gen", .filter = "[limit(1,2; range(5))]", .input = "null", .expected_output = "[0,0,1]" },
+
+    // Cat-13 — error-case parity. Negative n in nth/skip/limit raises
+    // UserError with the legacy-baked message strings (vm.zig:1719/1766/1768).
+    // expected_output left empty: the harness compares both backends'
+    // pre-error byte streams (both empty here, error fires before any
+    // yield) AND the captured err.kind ("UserError"). 3-way pin would
+    // require pinning a runtime error string the harness doesn't expose.
+    .{ .name = "cat13_nth_negative", .filter = "nth(-1; range(5))", .input = "null", .expected_output = "" },
+    .{ .name = "cat13_skip_negative", .filter = "skip(-1; range(5))", .input = "null", .expected_output = "" },
+    .{ .name = "cat13_limit_negative", .filter = "limit(-1; range(5))", .input = "null", .expected_output = "" },
+
+    // Cat-13 — edge-case parity.
+    // range(from; to; 0) short-circuits in vm.zig:5354/5357 (by==0 →
+    // empty stream); length of [empty] is 0.
+    .{ .name = "cat13_range_zero_step", .filter = "[range(0;10;0)] | length", .input = "null", .expected_output = "0" },
+    // last(empty) collects [] then loads -1 → null per .[-1] on empty array.
+    .{ .name = "cat13_last_empty", .filter = "last(empty)", .input = "null", .expected_output = "null" },
+    // Generator-form n in nth: each n triggers a separate frame, both
+    // outputs concatenate into the surrounding array.
+    .{ .name = "cat13_nth_gen_form_n", .filter = "[nth(0,2; range(5))]", .input = "null", .expected_output = "[0,2]" },
 };
 
 /// One JSON-encoded value per emitted iterator output, separated by '\n'.

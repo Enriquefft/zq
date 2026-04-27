@@ -1766,6 +1766,19 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
     const arity: usize = node.span_len;
     const class = lower_mod.classifyBuiltin(name, arity);
 
+    // Cat-13 generator-arg shapes do not pass through
+    // `nameToBuiltinId` — they synthesize streaming-frame opcodes
+    // (`limit_start`/`skip_start`/`nth_start`) and arity-keyed bids
+    // (`range1_gen`/`range2_gen`/`range3_gen`) inline. The shared
+    // helpers below own the per-name dispatch.
+    switch (class) {
+        .range_gen1, .range_gen2, .range_gen3 => return emitRange(em, node),
+        .limit_skip_nth => return emitLimitSkipNth(em, node, name),
+        .first_arg1 => return emitFirst(em, node),
+        .last_arg1 => return emitLast(em, node),
+        else => {},
+    }
+
     const bid = nameToBuiltinId(name, arity) orelse
         return error.NewCompilerNotImplemented;
 
@@ -1859,6 +1872,9 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // (it routes them to dedicated SemOps), so emit unreachable —
         // hitting them indicates an upstream classifier drift.
         .not, .path => unreachable,
+        // Cat-13 classes already handled by the early-out switch above
+        // — reaching them here would mean the early-out fell through.
+        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -1916,6 +1932,211 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         },
         .not_implemented => return error.NewCompilerNotImplemented,
     }
+}
+
+// ── Cat-13: generator-arg builtin emission ──────────────────────────
+//
+// All six builtins share a "save/restore + bounded-yield" template
+// per §3.5; each shape is a distinct legacy hand-written byte
+// sequence. Helpers here mirror their legacy counterparts byte-for-byte:
+//
+//   * range(1/2/3 args)  → array_collect each arg, save_input
+//                          between, call_builtin(rangeN_gen) | each
+//   * limit/skip/nth     → scope + var-capture wrap; iterate over n
+//                          values, *_start frame around body
+//   * first(f)           → push_int 1, limit_start, body, yield
+//   * last(f)            → array_collect [f] | load_index(-1)
+//
+// Source-of-truth references — `compileRange/Limit/Skip/Nth/First/Last`
+// at `src/query/src/compiler.zig:4317-4974`.
+
+/// Wrap an IR child in `array_collect_start ... array_collect_end`,
+/// emitting a trailing `yield_output` so generator-form children flow
+/// into the array. Mirrors legacy `parseArgToArray`
+/// (`compiler.zig:3320`). Used by `emitRange` and `emitLimitSkipNth` to
+/// flatten a generator argument into a single array value.
+fn emitArgToArray(em: *Emitter, node: ir.Node, child_idx: u32) EmitError!void {
+    const start_pos = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+    try emitNode(em, child_idx);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    const end_pos: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+    em.instructions.items[start_pos].operand = .{ .index = end_pos };
+}
+
+/// Emit `range(...)` for arity 1/2/3. Mirrors `compileRange`
+/// (`compiler.zig:4317`). Each arg is collected to an array via
+/// `parseArgToArray`-equivalent so generator forms (`range(2,5)` etc)
+/// expand correctly. For multi-arity, intermediate arrays are saved
+/// onto the if_stack via `save_input` so the builtin can pop them in
+/// order. Final pattern emits `call_builtin(rangeN_gen) | each` to
+/// flatten the synthesized output array into individual yields.
+fn emitRange(em: *Emitter, node: ir.Node) EmitError!void {
+    const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+
+    // First arg always present (arity ≥ 1).
+    try emitArgToArray(em, node, args[0]);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    if (args.len == 1) {
+        try em.pushInstr(
+            .call_builtin,
+            .{ .index = @intFromEnum(types_mod.BuiltinId.range1_gen) },
+            node,
+        );
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+        try em.pushInstr(.each, .{ .none = {} }, node);
+        return;
+    }
+
+    // 2- or 3-arg: save the from-array on if_stack, emit second arg.
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try emitArgToArray(em, node, args[1]);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    if (args.len == 2) {
+        try em.pushInstr(
+            .call_builtin,
+            .{ .index = @intFromEnum(types_mod.BuiltinId.range2_gen) },
+            node,
+        );
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+        try em.pushInstr(.each, .{ .none = {} }, node);
+        return;
+    }
+
+    // 3-arg form: save the to-array, emit by-array.
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    try emitArgToArray(em, node, args[2]);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    try em.pushInstr(
+        .call_builtin,
+        .{ .index = @intFromEnum(types_mod.BuiltinId.range3_gen) },
+        node,
+    );
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+}
+
+/// Emit `limit(n; f)`, `skip(n; f)`, or `nth(n; f)`. The three share
+/// an identical scaffold — only the streaming-frame opcode differs
+/// (`limit_start` / `skip_start` / `nth_start`), and `nth` further
+/// nests an inner `limit_start` to grab exactly one output post-skip.
+/// Mirrors `compileLimit` (`compiler.zig:4684`), `compileSkip`
+/// (`:4874`), `compileNth` (`:4924`).
+fn emitLimitSkipNth(em: *Emitter, node: ir.Node, name: []const u8) EmitError!void {
+    std.debug.assert(node.span_len == 2);
+    const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    const n_idx = args[0];
+    const body_idx = args[1];
+
+    // Pick the streaming-frame opcode by name.
+    const frame_op: types_mod.Instruction.Op = if (std.mem.eql(u8, name, "limit"))
+        .limit_start
+    else if (std.mem.eql(u8, name, "skip"))
+        .skip_start
+    else if (std.mem.eql(u8, name, "nth"))
+        .nth_start
+    else
+        unreachable;
+
+    const input_var = em.allocVar();
+
+    // $orig = .
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = input_var }, node);
+
+    // [n_arg] | each — iterate over each n value (handles generators).
+    try emitArgToArray(em, node, n_idx);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
+
+    // Push current n onto value_stack, restore original input as current.
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.load_variable, .{ .index = input_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    // Streaming frame opcode — pops n from value_stack, sets up
+    // counter; backpatched with the IP past the body's yield_output.
+    const frame_ip: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(frame_op, .{ .index = 0 }, node);
+
+    // For nth, an inner limit_start(1) wraps the body so post-skip
+    // exactly one output is taken. Mirrors `compileNth`
+    // (`compiler.zig:4954-4957`).
+    var inner_limit_ip: ?u32 = null;
+    if (frame_op == .nth_start) {
+        try em.pushInstr(.push_int, .{ .int = 1 }, node);
+        inner_limit_ip = @intCast(em.instructions.items.len);
+        try em.pushInstr(.limit_start, .{ .index = 0 }, node);
+    }
+
+    // Body.
+    try emitNode(em, body_idx);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+
+    // Backpatch frame exit IPs. For nth, both inner limit and outer
+    // skip frames target the same end-of-body IP — mirrors
+    // `compileNth` (`compiler.zig:4969-4972`).
+    const exit_ip: u32 = @intCast(em.instructions.items.len);
+    if (inner_limit_ip) |ip| {
+        em.instructions.items[ip].operand = .{ .index = exit_ip };
+    }
+    em.instructions.items[frame_ip].operand = .{ .index = exit_ip };
+
+    // Pop the captured input — undoes the push_current at the top.
+    // Intentional divergence from legacy compileLimit/Skip/Nth
+    // (compiler.zig:4684/4874/4924), which call `popScope` at end —
+    // a compile-time bookkeeping op that emits no runtime opcode and
+    // leaves the binding live in the variable table. Our pop_variable
+    // emits the runtime cleanup so the captured input slot doesn't
+    // outlive the builtin call. vm-equiv confirms output parity; no
+    // observable behavior change.
+    try em.pushInstr(.pop_variable, .{ .index = input_var }, node);
+}
+
+/// Emit `first` / `first(f)`. The 0-arg form (bare `first`) lowers
+/// to `.[0]` directly — mirrors legacy
+/// `compiler.zig:5930-5933`. The 1-arg form desugars to
+/// `limit(1; f)`; n is a literal so no scope/var-capture is needed,
+/// matching `compileFirst` (`compiler.zig:4633`).
+fn emitFirst(em: *Emitter, node: ir.Node) EmitError!void {
+    if (node.span_len == 0) {
+        try em.pushInstr(.load_index, .{ .index = 0 }, node);
+        return;
+    }
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    // Push n=1 then start streaming-limit frame.
+    try em.pushInstr(.push_int, .{ .int = 1 }, node);
+    const limit_ip: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.limit_start, .{ .index = 0 }, node);
+
+    try emitNode(em, body_idx);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+
+    const exit_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[limit_ip].operand = .{ .index = exit_ip };
+}
+
+/// Emit `last` / `last(f)`. The 0-arg form lowers to `.[-1]`
+/// directly — mirrors legacy `compiler.zig:5934-5937`. The 1-arg
+/// form desugars to `[f] | .[-1]` per `compileLast`
+/// (`compiler.zig:4658`).
+fn emitLast(em: *Emitter, node: ir.Node) EmitError!void {
+    if (node.span_len == 0) {
+        try em.pushInstr(.load_index, .{ .index = -1 }, node);
+        return;
+    }
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    try emitArgToArray(em, node, body_idx);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.load_index, .{ .index = -1 }, node);
 }
 
 /// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single
