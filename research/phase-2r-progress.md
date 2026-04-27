@@ -1032,3 +1032,15 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Phase status**: COMPLETE — Cluster B+ implementation phases ALL DONE. Wave 3 complete (P25 → P23). Only P21-redux (R4+R5 cutover) remains. P21-redux scope (deferred to next session): re-measure all 5 R4 acceptance gates with dispatcher fallback removed; if all pass, remove fallback at `src/query/root.zig:102-109`, delete legacy compiler at `src/query/src/{vm,prefilter,compiler}.zig`, remove `-Dcompile` flag, dispatch new compiler unconditionally, merge to `main`.
 
+
+---
+
+## Phase 21-redux — BLOCKED (2026-04-27)
+
+Step 1 gate measurement exposed 12 production `NewCompilerNotImplemented` sites in `src/compiler/{lower,emit}.zig`. Removing dispatcher fallback at `src/query/root.zig:102-109` fails to compile.
+
+Inventory + bucketed Wave-3-mini scope: `research/phase-2r-coverage-gap.md` (commit b449e9b).
+
+Verdict: 5b structured close. Cutover deferred. Wave-3-mini (~5-6 phases) required before P21-redux re-attempt.
+
+Carry-forward unchanged from prior phase close (literal_groups leak, bench artifact noise, 4 ZQ-DEFER markers in tests/compat/).
