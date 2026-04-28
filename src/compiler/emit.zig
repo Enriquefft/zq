@@ -516,22 +516,35 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         },
 
         // Array literal `[...]`. Emits the `array_collect_start ... end`
-        // pair around per-element `save_input / <elem> / yield_output /
-        // restore_input` ladders. The start instruction's operand
-        // receives the IP of the matching `array_collect_end` after
-        // backpatching. Matches legacy `parseArrayConstruct`
-        // (`src/query/src/compiler.zig:6410`).
+        // pair around a per-element `fork / <elem> / yield_output`
+        // chain. Each element's `fork` `backtrack_ip` points to the
+        // next element's `fork` (or to `array_collect_end` for the
+        // last element); when an element backtracks (e.g. `empty` or
+        // a failing predicate), the VM lands at the next element's
+        // forkpoint instead of falling through to the collect-frame
+        // floor and prematurely finalizing the array. The start
+        // instruction's operand receives the IP of the matching
+        // `array_collect_end` after backpatching. Matches legacy
+        // `parseArrayConstruct` (`src/query/src/compiler.zig:6410`).
         .arr_ctor => {
             const start_pos = em.instructions.items.len;
             try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
             const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+            var prev_fork_pos: ?usize = null;
             for (span) |elem_idx| {
-                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                const fork_pos: usize = em.instructions.items.len;
+                if (prev_fork_pos) |prev| {
+                    em.instructions.items[prev].operand = .{ .index = @intCast(fork_pos) };
+                }
+                try em.pushInstr(.fork, .{ .index = 0 }, node);
                 try emitNode(em, elem_idx);
                 try em.pushInstr(.yield_output, .{ .none = {} }, node);
-                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                prev_fork_pos = fork_pos;
             }
             const end_pos: u32 = @intCast(em.instructions.items.len);
+            if (prev_fork_pos) |prev| {
+                em.instructions.items[prev].operand = .{ .index = end_pos };
+            }
             try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
             em.instructions.items[start_pos].operand = .{ .index = end_pos };
         },
@@ -1881,21 +1894,40 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
             // sort/group/min/max key set. The leading `save_input`
             // preserves the original array on the if_stack so the
             // builtin can pair keys with elements.
+            //
+            // `add(f)` special case: `add` evaluates `f` once over the
+            // current input (no `each` iteration) and the resulting
+            // array is fed straight to `add`. We emit `pipe` (the new
+            // array becomes the current input) and a trailing
+            // `restore_input` so the original input is restored after
+            // the call returns. Skipping `each` means the fork chain
+            // built by `arr_ctor` inside `f` is the only place
+            // `empty` can backtrack to — the `add` arm itself does
+            // not introduce another forkpoint.
+            const is_add = std.mem.eql(u8, name, "add");
             try em.pushInstr(.save_input, .{ .none = {} }, node);
             const start_pos = em.instructions.items.len;
             try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
-            try em.pushInstr(.each, .{ .none = {} }, node);
+            if (!is_add) {
+                try em.pushInstr(.each, .{ .none = {} }, node);
+            }
             const arg_idx = em.ir_obj.extra_children.items[node.span_start];
             try emitNode(em, arg_idx);
             try em.pushInstr(.yield_output, .{ .none = {} }, node);
             const end_ip: u32 = @intCast(em.instructions.items.len);
             try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
             em.instructions.items[start_pos].operand = .{ .index = end_ip };
+            if (is_add) {
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+            }
             try em.pushInstr(
                 .call_builtin,
                 .{ .index = @intFromEnum(bid) },
                 node,
             );
+            if (is_add) {
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            }
         },
         .math2 => {
             // `save_input ; <a> ; restore_input ; save_input ; <b> ;
@@ -2589,6 +2621,14 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
     }
 
     if (arity == 1) {
+        // `add(f)` 1-arity: the lowerer reclassifies `add` as a
+        // filter_arg1 builtin so `add(empty)` is emitted with the
+        // fork-chain-friendly `array_collect`/`each`/`yield_output`
+        // sequence (see `.filter_arg1` arm in `emitCallBuiltin` —
+        // `add` takes the special path that skips `each` over the
+        // input and emits a `pipe` after `array_collect_end`). The
+        // `add` BID is shared with the 0-arity form.
+        if (std.mem.eql(u8, name, "add")) return .add;
         if (std.mem.eql(u8, name, "split")) return .split_;
         if (std.mem.eql(u8, name, "join")) return .join_;
         if (std.mem.eql(u8, name, "startswith")) return .startswith_;
