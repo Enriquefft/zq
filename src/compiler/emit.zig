@@ -2879,46 +2879,81 @@ fn emitBreak(em: *Emitter, node: ir.Node) error{OutOfMemory}!void {
 
 /// Emit `while(cond; update)`. The IR carries `children[0]=cond` and
 /// `children[1]=update`. Mirrors legacy `compileWhile`
-/// (`compiler.zig:3428`):
-///   loop_top:
+/// (`compiler.zig:3428`).
+///
+/// The naive imperative approach (`yield_output ; jmp → loop_top`) breaks
+/// when `while` is wrapped in an arr_ctor element fork, because `yield_output`
+/// sees an active fork above the enclosing collect frame's `outer_fork_depth`
+/// and takes the generator-backtrack path instead of the imperative-continue
+/// path, causing only the first iteration to be collected.
+///
+/// Fix: establish a dedicated inner `array_collect_start/end` frame around the
+/// imperative loop. Inside that frame, the arr_ctor element fork is AT
+/// `outer_fork_depth` (not above it), so `yield_output` sees
+/// `fork_stack.len == ACE_w.outer_fork_depth` and takes the imperative path.
+/// After the inner frame finalizes (via backtrack when cond is false), `each`
+/// iterates the collected array as a generator, allowing the outer arr_ctor's
+/// fork chain to proceed normally.
+///
+/// Layout:
+///   array_collect_start(ACE_w)   ; inner frame — outer_fork_depth = current fork_stack.len
+///   loop:
 ///     save_input
 ///     <cond>
-///     jump_if_false → loop_exit
-///     restore_input                ; true path: keep current
-///     yield_output                 ; emit current
-///     <update>                     ; transform current
-///     pipe                         ; transfer to current
-///     jump → loop_top
-///   loop_exit:
-///     restore_input                ; false path: balance save
-///     backtrack                    ; produce no output on exit
+///     jump_if_false → L_cond_false
+///     restore_input              ; cond true: restore before yielding
+///     yield_output               ; imperative: fork_stack.len == ACE_w.outer_fork_depth
+///     <update>                   ; advance current value
+///     pipe                       ; transfer updated value to current
+///     jmp → loop
+///   L_cond_false:
+///     restore_input              ; balance save_input
+///     backtrack                  ; signals ACE_w finalization via step() loop
+///   array_collect_end(ACE_w)     ; builds collected [v0, v1, ...]
+///   pipe                         ; current = array
+///   each                         ; iterate as generator for downstream
 fn emitWhile(em: *Emitter, node: ir.Node) EmitError!void {
     const cond_idx = node.children[0];
     const update_idx = node.children[1];
 
-    // loop_top:
-    const loop_top: u32 = @intCast(em.instructions.items.len);
+    // Establish an inner collect frame. Inside this frame, the imperative
+    // while loop runs; yield_output takes the imperative (ip+1) path because
+    // fork_stack.len == ACE_w.outer_fork_depth (any element fork from an
+    // enclosing arr_ctor is counted in outer_fork_depth, not above it).
+    const ace_start_pos = em.instructions.items.len;
+    try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
 
+    const loop_top: u32 = @intCast(em.instructions.items.len);
     try em.pushInstr(.save_input, .{ .none = {} }, node);
     try emitNode(em, cond_idx);
 
-    // jump_if_false → loop_exit (placeholder; backpatched below).
+    // jump_if_false → L_cond_false (placeholder; backpatched below).
     const jif_pos = em.instructions.items.len;
     try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
 
-    // True path: restore current and yield it, then update.
+    // Cond true: restore current, yield it, apply update, transfer to current, loop.
     try em.pushInstr(.restore_input, .{ .none = {} }, node);
     try em.pushInstr(.yield_output, .{ .none = {} }, node);
     try emitNode(em, update_idx);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
     try em.pushInstr(.jump, .{ .index = loop_top }, node);
 
-    // loop_exit:
-    const loop_exit: u32 = @intCast(em.instructions.items.len);
-    em.instructions.items[jif_pos].operand = .{ .index = loop_exit };
-
+    // L_cond_false: cond is false — balance save_input and signal ACE_w
+    // finalization by backtracking. step() will finalize ACE_w and advance
+    // ip to array_collect_end + 1.
+    const l_cond_false: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jif_pos].operand = .{ .index = l_cond_false };
     try em.pushInstr(.restore_input, .{ .none = {} }, node);
     try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    // array_collect_end — ACE_w end. Backpatch start with this IP.
+    const ace_end_pos: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[ace_start_pos].operand = .{ .index = ace_end_pos };
+    try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+
+    // Transfer collected array to current, then expose as generator.
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.each, .{ .none = {} }, node);
 }
 
 /// Emit `until(cond; update)`. The IR carries `children[0]=cond` and
