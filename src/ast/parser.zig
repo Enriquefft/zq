@@ -652,26 +652,59 @@ pub const Parser = struct {
                 return p.parseSliceTail(start, false, 0);
             },
             .int_lit, .minus => {
-                const n = p.tryParseInt() orelse return error.ParseFailed;
-                const after = p.peek() orelse return error.ParseFailed;
-                if (after.tag == .colon) {
-                    _ = p.advance();
-                    if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
-                        return p.makeError("index out of range", Span.from(start, p.lex.pos));
+                // Fast-path only for exact `.[<int>]` and `.[<int>:]` shapes.
+                // For anything else (e.g. `.[1,2]` with a comma following the
+                // int), restore position and route through parsePipe so the
+                // comma and any other binops are handled by their canonical parser.
+                const saved_pos = p.lex.pos;
+                if (p.tryParseInt()) |n| {
+                    const after = p.peek() orelse return error.ParseFailed;
+                    if (after.tag == .colon) {
+                        _ = p.advance();
+                        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
+                            return p.makeError("index out of range", Span.from(start, p.lex.pos));
+                        }
+                        return p.parseSliceTail(start, true, @intCast(n));
                     }
-                    return p.parseSliceTail(start, true, @intCast(n));
+                    if (after.tag == .rbracket) {
+                        _ = p.advance();
+                        return p.createNode(.{ .index_access = .{ .index = n } }, Span.from(start, after.offset + after.len));
+                    }
+                    // Not `]` or `:` — unwind and fall through to parsePipe.
+                    p.lex.pos = saved_pos;
+                } else {
+                    p.lex.pos = saved_pos;
+                    return error.ParseFailed;
                 }
-                const close = p.expectOrError(.rbracket, "expected ']'");
-                const end_pos = if (close) |c| c.offset + c.len else p.lex.pos;
-                return p.createNode(.{ .index_access = .{ .index = n } }, Span.from(start, end_pos));
+                // Fall through to computed bracket access via parsePipe.
+                const expr = p.parsePipe() catch return error.ParseFailed;
+                _ = p.expectOrError(.rbracket, "expected ']'");
+                return p.createNode(.{ .builtin_call = .{
+                    .name = "__computed_access",
+                    .args = p.allocSlice(*Node, &[_]*Node{expr}),
+                } }, Span.from(start, p.lex.pos));
             },
             .string_lit => {
+                // Fast-path only for exact `["<string>"]` shape. If the token
+                // after the string literal is not `]`, restore and use parsePipe.
+                const saved_pos = p.lex.pos;
                 const str_tok = p.advance().?;
-                const raw = p.tokenSlice(str_tok);
-                const content = raw[1 .. raw.len - 1];
+                const after = p.peek();
+                if (after != null and after.?.tag == .rbracket) {
+                    _ = p.advance();
+                    const raw = p.tokenSlice(str_tok);
+                    const content = raw[1 .. raw.len - 1];
+                    return p.createNode(.{ .field_access = .{
+                        .name = p.internName(content),
+                    } }, Span.from(start, p.lex.pos));
+                }
+                // Not an exact `["string"]` shape — unwind and use parsePipe.
+                p.lex.pos = saved_pos;
+                const expr = p.parsePipe() catch return error.ParseFailed;
                 _ = p.expectOrError(.rbracket, "expected ']'");
-                return p.createNode(.{ .field_access = .{
-                    .name = p.internName(content),
+                return p.createNode(.{ .builtin_call = .{
+                    .name = "__computed_access",
+                    .args = p.allocSlice(*Node, &[_]*Node{expr}),
                 } }, Span.from(start, p.lex.pos));
             },
             else => {
