@@ -167,6 +167,18 @@ pub fn compile(
     // filter still runs correctly without it.
     const prefilter = @import("prefilter");
     var literal_groups: std.ArrayList(harvest_mod.LiteralGroup) = .{};
+    // The harvest output owns per-literal []u8 dupes plus the outer slice.
+    // `prefilter.PrefilterSet.ownFrom` deep-copies everything into its own
+    // allocations, so once that returns (or after a harvest failure) we own
+    // the staging arrays and must release them — otherwise both the per-
+    // literal dupes and the ArrayList backing storage leak on every compile.
+    defer {
+        for (literal_groups.items) |g| {
+            for (g.literals) |lit| allocator.free(lit);
+            allocator.free(g.literals);
+        }
+        literal_groups.deinit(allocator);
+    }
     const harvest_result = harvest_mod.harvestFromIr(
         allocator,
         &fused,
@@ -176,8 +188,11 @@ pub fn compile(
     if (harvest_result) |_| {
         // Transfer ownership into compiled.prefilter.
         if (literal_groups.items.len > 0) {
-            // Convert to the legacy PrefilterSet format.
+            // Convert to the legacy PrefilterSet format. `ownFrom` deep-
+            // copies, so this staging ArrayList is throwaway — defer its
+            // deinit so we don't leak the backing storage on any path.
             var legacy_groups = std.ArrayList(prefilter.LiteralGroup){};
+            defer legacy_groups.deinit(allocator);
             try legacy_groups.ensureTotalCapacity(allocator, literal_groups.items.len);
             for (literal_groups.items) |g| {
                 legacy_groups.appendAssumeCapacity(.{
@@ -191,14 +206,9 @@ pub fn compile(
             );
         }
     } else |err| switch (err) {
-        error.OutOfMemory => {
-            // OOM during harvest: fall back to no prefilter. Clean up
-            // any partial groups in the list.
-            for (literal_groups.items) |g| {
-                for (g.literals) |lit| allocator.free(lit);
-                allocator.free(g.literals);
-            }
-        },
+        // OOM during harvest: fall back to no prefilter. The outer defer
+        // releases any partial groups already pushed into `literal_groups`.
+        error.OutOfMemory => {},
     }
 
     compiled_consumed = true;
