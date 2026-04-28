@@ -1,12 +1,10 @@
 //! AST → IR lowering — Phase 2R / R3.
 //!
-//! Categories landed: 1 (literals, identity, recurse, unary), 2
-//! (field/index/iterate/slice + postfix `?`, including Suffix chains),
-//! and 7 (object/array constructors, string interpolation, @format
-//! application). AST shapes outside these categories return
-//! `error.NewCompilerNotImplemented` (caught by the harness as
-//! SKIP-NotImplemented at vm-equiv time; the dispatcher falls back
-//! to legacy at runtime).
+//! Post-cutover: every AST shape produced by a successful parse has an
+//! explicit lowering arm; there is no SKIP fallback to legacy. Internal
+//! invariant violations (a new AST variant added without a lowerer, or
+//! a `BuiltinClass.not_implemented` reaching dispatch) are encoded as
+//! `unreachable` rather than recoverable errors.
 //!
 //! Plan §3 R3 step 6 enumerates the operator categories; plan §1.3
 //! freezes the IR variable-arity contract; spec
@@ -43,12 +41,11 @@ pub const LowerOpts = struct {
 };
 
 /// Errors surfaced by lowering. `OutOfMemory` propagates from arena
-/// allocs; `NewCompilerNotImplemented` is the SKIP marker for AST shapes
-/// that later categories own. `CompileError` encodes user-facing
-/// diagnostics (kind, offset, len) without an unstructured zig error.
+/// allocs. `LowerDiagnostic` encodes user-facing structured diagnostics
+/// (kind, offset, len). Post-cutover every AST category lowers, so there
+/// is no SKIP marker — invariant violations are `unreachable`.
 pub const LowerError = error{
     OutOfMemory,
-    NewCompilerNotImplemented,
     /// Surfaces a structured compile diagnostic via `Lowerer.diag`.
     /// Inspect the `Lowerer.compile_err` field on the catch site.
     LowerDiagnostic,
@@ -870,11 +867,11 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         //
         // Cat-10 owns the wider alphabet; cat-1 + cat-6 already own
         // `not`/`type`/`path` and route through the same classifier.
-        // The classifier dispatches by (name, arity) to one of five
-        // call-shape buckets: 0-arg / 1-arg-value / 1-arg-filter
-        // / 2-arg-math / 3-arg-math. Names outside the five buckets
-        // surface `NewCompilerNotImplemented` for the harness to SKIP
-        // (regex, generator-arg shapes, complex desugars).
+        // The classifier dispatches by (name, arity) to one of the
+        // call-shape buckets registered in `BuiltinClass`. Post-cutover
+        // every builtin recognised by the AST parser routes to a real
+        // class; an unrecognised (name, arity) tuple is a parser bug,
+        // not a user-facing error.
         .builtin_call => |bc| {
             const arity: u32 = @intCast(bc.args.len);
             // 1. User-defined function lookup first. Recursive self-call
@@ -1476,8 +1473,7 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // can emit on a successful (`!hasErrors()`) parse has an explicit
         // arm above. Reaching this `else =>` would mean the AST surface
         // grew a new variant without a corresponding lowering — that is a
-        // compiler bug, not a runtime SKIP condition, so we mark it
-        // `unreachable` rather than raising `NewCompilerNotImplemented`.
+        // compiler bug, so we mark it `unreachable`.
         //
         // Coverage proof — explicit arms above cover every variant of
         // `ast.Node.Kind` (`src/ast/nodes.zig:22-92`):
@@ -1569,15 +1565,11 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
 //   * `Node.span_start/span_len` indexes into `extra_children`: each slot
 //     is the IR-node index of one positional argument, in source order.
 //
-// Builtins outside the call-shape buckets above (regex, generators with
-// commas, the desugar set: map/select/range/walk/INDEX/IN/JOIN/del/pick/
-// reduce/foreach/while/until/repeat/limit/first/last/with_entries/any/all/
-// isempty/in/contains/inside/indices/index/rindex/error/halt_error/debug/
-// skip/nth) surface `error.NewCompilerNotImplemented` for the harness to
-// SKIP and route through legacy at runtime. Those shapes use save/restore
-// bracketing patterns, per-arg fork trees, or hidden-var allocation that
-// don't reduce to a flat `call_builtin` SemOp; later phases will land
-// them as additional categories.
+// Post-cutover every builtin the AST parser accepts has a dedicated
+// class arm in `classifyBuiltin`. The legacy SKIP path is gone; the
+// `not_implemented` enum tag remains only as an invariant sentinel —
+// reaching it from dispatch is a parser/lower-table desync and is
+// treated as `unreachable` at the call sites.
 pub const BuiltinClass = enum {
     /// AST → unary `not` SemOp (cat-1).
     not,
@@ -2003,13 +1995,21 @@ fn isValueArg1Builtin(name: []const u8) bool {
 
 /// Names accepted as 1-arg filter-arg builtins. Mirrors legacy
 /// `compileFilterArgBuiltin` callers and `compileMapValues`.
+///
+/// `add` is overloaded: the 0-arity form (`[1,2] | add`) lives in
+/// `isZeroArgBuiltin` and dispatches as a flat `call_builtin(add)`; the
+/// 1-arity form `add(f)` collects the filter's outputs into an array
+/// (filter-arg shape) and folds via `+`, so it routes through the
+/// filter_arg1 emit path with a dedicated special-case (see
+/// `emit.zig` filter_arg1 arm).
 fn isFilterArg1Builtin(name: []const u8) bool {
     return std.mem.eql(u8, name, "sort_by") or
         std.mem.eql(u8, name, "group_by") or
         std.mem.eql(u8, name, "min_by") or
         std.mem.eql(u8, name, "max_by") or
         std.mem.eql(u8, name, "unique_by") or
-        std.mem.eql(u8, name, "map_values");
+        std.mem.eql(u8, name, "map_values") or
+        std.mem.eql(u8, name, "add");
 }
 
 /// Names accepted as 2-arg math/path builtins (legacy
@@ -2161,7 +2161,12 @@ fn lowerBuiltinCall(
         },
         .regex1 => return lowerRegexBuiltin1(ctx, bc, src_start, src_len),
         .regex2 => return lowerRegexBuiltin2(ctx, bc, src_start, src_len),
-        .not_implemented => return error.NewCompilerNotImplemented,
+        // Post-cutover: every builtin name the AST parser accepts has
+        // a real class arm above. `.not_implemented` only escapes
+        // `classifyBuiltin` for an unknown (name, arity) tuple, which
+        // is a parser/lower-table desync — a compiler bug, not a
+        // runtime SKIP.
+        .not_implemented => unreachable,
     }
 }
 

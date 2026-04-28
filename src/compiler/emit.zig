@@ -2,9 +2,9 @@
 //!
 //! The emitter walks the IR tree recursively from the root. Op
 //! handlers decide the relative order of child visits and own
-//! instruction emission. AST shapes outside the supported category
-//! surface as `error.NewCompilerNotImplemented`; the harness reports
-//! SKIP for them.
+//! instruction emission. Post-cutover every IR op produced by
+//! lowering has a dedicated arm; reaching the exhaustiveness sink
+//! is a compiler bug and is `unreachable`.
 //!
 //! The output `Compiled` matches the legacy compiler's shape exactly
 //! (plan §1.3 row 7). The instructions list is owned by the supplied
@@ -21,11 +21,11 @@ const ctypes = @import("types.zig");
 const lower_mod = @import("lower.zig");
 
 /// Errors surfaced by emission. `OutOfMemory` from arena/instruction
-/// allocs; `NewCompilerNotImplemented` for ops outside the supported
-/// category set.
+/// allocs is the only recoverable failure. Post-cutover every IR op
+/// has an emit arm, so unknown ops are `unreachable` rather than
+/// recoverable errors.
 pub const EmitError = error{
     OutOfMemory,
-    NewCompilerNotImplemented,
 };
 
 /// Per-function body-IP cache entry. Recursive user-functions emit
@@ -735,7 +735,12 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         .reduce => try emitReduce(em, node),
         .foreach => try emitForeach(em, node),
 
-        else => return error.NewCompilerNotImplemented,
+        // Post-cutover invariant: every `ir.Op` lowering emits has an
+        // explicit arm above. The remaining tags (`path_end`) are
+        // emitted only as inline children inside their parent ops
+        // (`path_begin`), never as standalone roots in `emitNode`.
+        // Reaching this branch is a compiler bug.
+        else => unreachable,
     }
 }
 
@@ -1848,8 +1853,11 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         else => {},
     }
 
-    const bid = nameToBuiltinId(name, arity) orelse
-        return error.NewCompilerNotImplemented;
+    // Post-cutover: every (name, arity) tuple that reaches this lookup
+    // is registered in `nameToBuiltinId`'s 0/1/2/3-arity branches. A
+    // miss here is a name-table desync between lower and emit — a
+    // compiler bug rather than a runtime SKIP.
+    const bid = nameToBuiltinId(name, arity) orelse unreachable;
 
     switch (class) {
         .zero_arg => {
@@ -2031,7 +2039,11 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
                 node,
             );
         },
-        .not_implemented => return error.NewCompilerNotImplemented,
+        // Post-cutover: lowering never produces a `.not_implemented`
+        // class for an emitted IR node — the same exhaustiveness
+        // invariant that holds in lower's `lowerBuiltinCall` switch
+        // applies here. A name-table desync is a compiler bug.
+        .not_implemented => unreachable,
     }
 }
 
