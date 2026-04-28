@@ -1625,7 +1625,7 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         "nearbyint",  "trunc",        "significand",   "logb",           "j0",
         "j1",         "lgamma",       "tgamma",        "ascii_downcase", "ascii_upcase",
         "ascii",      "explode",      "implode",       "tojson",         "fromjson",
-        "transpose",  "first",        "last",          "not",
+        "transpose",  "first",        "last",          "not",            "recurse",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;

@@ -110,6 +110,15 @@ pub const FunctionEntry = struct {
     /// the first `call_user` emit site triggers the lowering.
     body_ir_root: u32,
     func_table_snapshot: u32,
+    /// Set true when the entry's lex scope ends (parent's body re-walk
+    /// completes). The entry stays in `function_table` so emit's
+    /// fn_id-indexed lookups remain valid for any IR `call_user` node
+    /// already synthesized, but lookups skip it as if popped. Replaces
+    /// the previous truncate-on-defer which broke emit when inner-def
+    /// IR survived past the parent's body re-walk (e.g. recursive
+    /// outer-def whose body inlines an inner-def call_user that emit
+    /// resolves AFTER the defer pops).
+    out_of_scope: bool = false,
 };
 
 /// Sentinel for `FunctionEntry.body_ir_root` meaning "not yet
@@ -339,10 +348,11 @@ pub const Lowerer = struct {
         var i: u32 = @intCast(self.function_table.items.len);
         while (i > 0) {
             i -= 1;
+            const entry = self.function_table.items[i];
+            if (entry.out_of_scope) continue;
             if (self.func_hidden_start) |start| if (self.func_hidden_end) |end| {
                 if (i >= start and i < end) continue;
             };
-            const entry = self.function_table.items[i];
             if (entry.params.len == arity and std.mem.eql(u8, entry.name, name)) {
                 return i;
             }
@@ -1963,7 +1973,8 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "todate") or
         std.mem.eql(u8, name, "fromdate") or
         std.mem.eql(u8, name, "todateiso8601") or
-        std.mem.eql(u8, name, "fromdateiso8601");
+        std.mem.eql(u8, name, "fromdateiso8601") or
+        std.mem.eql(u8, name, "recurse");
 }
 
 /// Names accepted as 1-arg value-arg builtins. Mirrors the
@@ -3429,9 +3440,18 @@ fn inlineUserCall(
         ctx.function_table.items[fn_id].body_ir_root = body_idx;
     }
 
-    // Cleanup state.
-    while (ctx.function_table.items.len > func_table_save) {
-        _ = ctx.function_table.pop();
+    // Cleanup state. Mark inner-def entries as out_of_scope rather
+    // than popping — IR `call_user` nodes synthesized inside this
+    // body re-walk reference these fn_ids and emit resolves them
+    // later via `function_table[fn_id]`. Truncating would invalidate
+    // those indices. `lookupFunction` skips oos entries so subsequent
+    // lex lookups behave as if popped.
+    {
+        var k: u32 = func_table_save;
+        const cur_len: u32 = @intCast(ctx.function_table.items.len);
+        while (k < cur_len) : (k += 1) {
+            ctx.function_table.items[k].out_of_scope = true;
+        }
     }
     _ = ctx.expanding_stack.pop();
     ctx.var_table.deinit(alloc);
@@ -3650,12 +3670,30 @@ fn reLowerFilterArg(ctx: *Lowerer, binding_idx: u32) LowerError!u32 {
 /// `lookupFunction` (which respects hiding).
 fn lookupRecursiveSelf(ctx: *const Lowerer, name: []const u8, arity: u32) ?u32 {
     var i: usize = ctx.expanding_stack.items.len;
+    const tlen: u32 = @intCast(ctx.function_table.items.len);
     while (i > 0) {
         i -= 1;
         const fn_id = ctx.expanding_stack.items[i];
+        if (fn_id >= tlen) continue;
         const entry = ctx.function_table.items[fn_id];
         if (entry.params.len == arity and std.mem.eql(u8, entry.name, name)) {
-            return fn_id;
+            // Shadow guard: an inner def with the same (name, arity)
+            // registered AFTER this expanding entry shadows it lex-
+            // ically. Without this check, a recursive outer def whose
+            // body contains `def <same-name>: …;` would incorrectly
+            // self-call from inside the inner body. Skip oos so a
+            // sibling inner-def already torn down doesn't shadow.
+            var j: u32 = fn_id + 1;
+            var shadowed = false;
+            while (j < tlen) : (j += 1) {
+                const e2 = ctx.function_table.items[j];
+                if (e2.out_of_scope) continue;
+                if (e2.params.len == arity and std.mem.eql(u8, e2.name, name)) {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if (!shadowed) return fn_id;
         }
     }
     return null;

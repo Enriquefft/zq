@@ -2514,6 +2514,7 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         if (std.mem.eql(u8, name, "unique")) return .unique;
         if (std.mem.eql(u8, name, "paths")) return .paths;
         if (std.mem.eql(u8, name, "leaf_paths")) return .leaf_paths;
+        if (std.mem.eql(u8, name, "recurse")) return .recurse;
         if (std.mem.eql(u8, name, "tojson")) return .tojson;
         if (std.mem.eql(u8, name, "fromjson")) return .fromjson;
         if (std.mem.eql(u8, name, "transpose")) return .transpose_;
