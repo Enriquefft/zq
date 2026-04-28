@@ -2987,7 +2987,17 @@ fn lowerPatternKey(
         0;
     switch (key) {
         .static => |name| return synthLoadConstString(ctx, name, sp_start, sp_len),
-        .computed => |expr| return lowerNode(ctx, expr),
+        .computed => |expr| {
+            if (isProvablyNonStringKey(expr)) {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = expr.span.start,
+                    .len = if (expr.span.end >= expr.span.start) expr.span.end - expr.span.start else 0,
+                };
+                return error.LowerDiagnostic;
+            }
+            return lowerNode(ctx, expr);
+        },
     }
 }
 
