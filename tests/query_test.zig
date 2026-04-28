@@ -3786,24 +3786,21 @@ test "builtin: add on input array sums elements" {
     try std.testing.expectEqual(@as(i64, 60), vals.items[0].int);
 }
 
-test "builtin: add(.) with value argument" {
-    var q = try compile("add(.)");
+test "builtin: add(f) with multi-yield generator argument" {
+    // jq semantics: add(f) == reduce f as $x (null; . + $x).
+    // For f = range(3) on null input, the generator yields 0, 1, 2, so
+    // reduce produces null + 0 + 1 + 2 = 3 (null + n = n on first step).
+    var q = try compile("add(range(3))");
     defer q.deinit();
 
-    const entries = [_]Entry{
-        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
-        .{ .tag = .int, .payload = .{ .int = 5 } },
-        .{ .tag = .int, .payload = .{ .int = 10 } },
-        .{ .tag = .int, .payload = .{ .int = 15 } },
-        .{ .tag = .array_end, .payload = .{ .none = {} } },
-    };
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
     const t = tape(&entries, "");
 
     var vals = try collectAll(&q, t);
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqual(@as(i64, 30), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[0].int);
 }
 
 test "path(f): path(paths) on nested object yields descent paths" {
