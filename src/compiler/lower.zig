@@ -3354,7 +3354,20 @@ fn lowerFuncDef(
     // the entirety of `rest` (legacy lex pos progresses past `;` and
     // continues parsing the same input — the def's scope reaches the
     // end of its enclosing scope).
-    return try lowerNode(ctx, fd.rest);
+    const rest_idx = try lowerNode(ctx, fd.rest);
+
+    // Close the def's lexical scope. Mirrors inlineUserCall:3464-3469
+    // for the analogous inner-def case: the def is visible only within
+    // `rest`, so on return the def itself plus any siblings registered
+    // during rest's lowering are out of scope for the enclosing expr.
+    {
+        var k: usize = func_table_snapshot;
+        while (k < ctx.function_table.items.len) : (k += 1) {
+            ctx.function_table.items[k].out_of_scope = true;
+        }
+    }
+
+    return rest_idx;
 }
 
 /// Inline-expand a non-recursive user-function call at the call site.
@@ -3703,6 +3716,12 @@ fn lookupRecursiveSelf(ctx: *const Lowerer, name: []const u8, arity: u32) ?u32 {
             while (j < tlen) : (j += 1) {
                 const e2 = ctx.function_table.items[j];
                 if (e2.out_of_scope) continue;
+                // Mirror lookupFunction:350-352: defs inside the active
+                // hidden range are not lex-visible at this lookup, so
+                // they cannot shadow.
+                if (ctx.func_hidden_start) |hs|
+                    if (ctx.func_hidden_end) |he|
+                        if (j >= hs and j < he) continue;
                 if (e2.params.len == arity and std.mem.eql(u8, e2.name, name)) {
                     shadowed = true;
                     break;
