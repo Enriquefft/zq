@@ -2,7 +2,7 @@
 
 # Phase 2 — AST-walk Compile Pipeline
 
-Goal: replace the recursive-descent-on-tokens compile path in `src/query/src/compiler.zig` with an AST walker in a new `src/ast/compiler.zig`. The AST produced by `src/ast/parser.zig` becomes the canonical representation of a zq filter. The bytecode (`RawInstr` stream and then fused `Instruction` stream) produced by the new path must be byte-for-byte equal to the current path for every in-tree fixture, after which the old path is deleted in one commit.
+Goal: replace the recursive-descent-on-tokens compile path in `legacy@22cd23c compiler.zig` with an AST walker in a new `src/ast/compiler.zig`. The AST produced by `src/ast/parser.zig` becomes the canonical representation of a zq filter. The bytecode (`RawInstr` stream and then fused `Instruction` stream) produced by the new path must be byte-for-byte equal to the current path for every in-tree fixture, after which the old path is deleted in one commit.
 
 No permanent dual-pipeline. Dual-compile is a verification bridge with an explicit delete commit.
 
@@ -11,9 +11,9 @@ Absolute file paths used below:
 - `/home/hybridz/Projects/zq/src/ast/parser.zig`
 - `/home/hybridz/Projects/zq/src/ast/root.zig`
 - `/home/hybridz/Projects/zq/src/query/root.zig`
-- `/home/hybridz/Projects/zq/src/query/src/compiler.zig`
-- `/home/hybridz/Projects/zq/src/query/src/lexer.zig`
-- `/home/hybridz/Projects/zq/src/query/src/prefilter.zig`
+- `/home/hybridz/Projects/zq/legacy@22cd23c compiler.zig`
+- `/home/hybridz/Projects/zq/legacy@22cd23c lexer.zig`
+- `/home/hybridz/Projects/zq/legacy@22cd23c prefilter.zig`
 - `/home/hybridz/Projects/zq/src/types.zig`
 - `/home/hybridz/Projects/zq/tests/compat/`
 - `/home/hybridz/Projects/zq/tests/query_test.zig`
@@ -24,10 +24,10 @@ Absolute file paths used below:
 
 ## 1. Inventory: non-grammar work the current compile path does
 
-The current `compile()` at `src/query/src/compiler.zig:1304` is not a pure grammar walker. It carries cross-cutting state. Each behavior below must be either preserved, moved, or proven redundant by the AST.
+The current `compile()` at `legacy@22cd23c compiler.zig:1304` is not a pure grammar walker. It carries cross-cutting state. Each behavior below must be either preserved, moved, or proven redundant by the AST.
 
 ### 1.1 Prefilter harvester
-Location: `src/query/src/compiler.zig:1370` (invocation) and `:1520-1607` (body).
+Location: `legacy@22cd23c compiler.zig:1370` (invocation) and `:1520-1607` (body).
 Status: already AST-backed since `f01eeed`. `harvestPrefilterFromAst()` calls `ast.parse()` and matches `select( <pure-accessor> | test|scan("lit" [;"flags"]))`. The literal gating and flag handling live there.
 Migration: keep the function; the new AST-walk compiler owns the same AST parse, so fold prefilter harvesting into a single AST pass — no second `ast.parse()` call.
 AST sufficiency: sufficient. `BuiltinCall`, `Pipe`, `Suffix`, `literal.string` all resolve statically.
@@ -55,7 +55,7 @@ AST sufficiency: sufficient. `ObjectConstruct.fields` is `[]const ObjectField`; 
 Caveat: the compiler emits the **key-producing instructions** to compute the key value, then replays them between `save_input` / `load_computed`. The walker must do the same by compiling the key subtree twice or saving the emitted range. Straightforward.
 
 ### 1.5 `path()` validation state
-Locations referenced by TODO: VM-side (`src/query/src/vm.zig:815-821`, `:1682-1689`); compile-time `breaksPath`/`clearsPathBroken` tables at `src/types.zig:943-1028` / `:1040-1057`; compilePath at `src/query/src/compiler.zig:4858`.
+Locations referenced by TODO: VM-side (`legacy@22cd23c vm.zig:815-821`, `:1682-1689`); compile-time `breaksPath`/`clearsPathBroken` tables at `src/types.zig:943-1028` / `:1040-1057`; compilePath at `legacy@22cd23c compiler.zig:4858`.
 State: compile-time this is purely opcode-classification; there is **no** per-compile state in the token walker for this. Validation fires at runtime via the Op predicates.
 Migration: no work. The walker emits the same `path_begin` / `path_end` brackets, and the opcodes remain classified at `types.zig`.
 
@@ -181,7 +181,7 @@ Each stage:
 - Uses `-Dast-compile-enabled=<scope>` (build flag) to choose which AST features the AST-walker handles; unhandled nodes defer to the legacy compiler via a shim. By the end of Stage 11, the shim accepts every node.
 
 ### Stage 0 — Scaffolding
-Scope: create `src/ast/compiler.zig` with a `Walker` struct; it produces the same `RawInstr` type as `compiler.zig` does internally. Implement only `yield_output` for the root (empty filter `. `). Add the equivalence harness (§3) with one fixture: `"."`. Wire `-Dcompile-via-ast=false` default.
+Scope: create `src/ast/compiler.zig` with a `Walker` struct; it produces the same `RawInstr` type as `compiler.zig` does internally. Implement only `yield_output` for the root (empty filter `. `). Add the equivalence harness (§3) with one fixture: `"."`. Wire `-compile-flag-pre-cutover-via-ast=false` default.
 Predecessor deps: none; the harness can call `compiler.compile` and a placeholder `ast_compiler.compile`.
 Coverage: the trivial `.` filter.
 Risk: none; pure plumbing.
@@ -278,29 +278,29 @@ Scope: see §5 below.
 ## 5. Swap strategy
 
 ### 5.1 Dual-compile mode
-Behind `-Dcompile-dual=true`:
+Behind `-compile-flag-pre-cutover-dual=true`:
 - `CompiledQuery.compile` calls both compilers, `std.debug.assert`s equivalence (`RawInstr[]` pre-fuse, `Instruction[]` post-fuse, `source_map`, `function_table`, `external_var_ids`).
 - On mismatch, panic with a diff dump.
 
 When to run:
 - **Not the default CI run** — it doubles compile time.
-- Enabled on the `zig build test -Dcompile-dual=true` invocation in a dedicated nightly CI job.
+- Enabled on the `zig build test -compile-flag-pre-cutover-dual=true` invocation in a dedicated nightly CI job.
 - Enabled as the default for `zig build ast-compile-equiv`.
 - Every developer running the equivalence harness locally sees both compilers execute per fixture.
 
 ### 5.2 Cutover commit
 Preconditions (must all hold on `main`):
 1. Equivalence harness green on every fixture (`zig build ast-compile-equiv` exit 0).
-2. `zig build test` green with `-Dcompile-dual=true`.
+2. `zig build test` green with `-compile-flag-pre-cutover-dual=true`.
 3. Nightly dual-compile CI green for 3 consecutive runs.
 4. No open bug marked `dual-compile-diff`.
 
 The cutover commit:
 - Switches `src/query/root.zig:compile` to call `compiler_ast.compile` only.
-- Deletes `src/query/src/compiler.zig` and its file-level tests.
-- Renames `src/ast/compiler.zig` → `src/query/src/compiler.zig` if preferred layout is keep-the-path. Alternative: leave the walker at `src/ast/compiler.zig` per the TODO text — but the filter-bytecode compiler's natural home is under `query/`. Decide once.
-- Deletes the `-Dcompile-dual` build option and the dual-call path.
-- Deletes `src/query/src/lexer.zig` **only if** no one else imports it. Audit: the AST parser imports `lexer` (`src/ast/parser.zig:3`), so it stays. If the lexer module already lives at `src/lexer/` (yes, per `src/ast/INTERFACE.md:189`), `src/query/src/lexer.zig` may or may not exist as its own file; verify before deleting.
+- Deletes `legacy@22cd23c compiler.zig` and its file-level tests.
+- Renames `src/ast/compiler.zig` → `legacy@22cd23c compiler.zig` if preferred layout is keep-the-path. Alternative: leave the walker at `src/ast/compiler.zig` per the TODO text — but the filter-bytecode compiler's natural home is under `query/`. Decide once.
+- Deletes the `-compile-flag-pre-cutover-dual` build option and the dual-call path.
+- Deletes `legacy@22cd23c lexer.zig` **only if** no one else imports it. Audit: the AST parser imports `lexer` (`src/ast/parser.zig:3`), so it stays. If the lexer module already lives at `src/lexer/` (yes, per `src/ast/INTERFACE.md:189`), `legacy@22cd23c lexer.zig` may or may not exist as its own file; verify before deleting.
 - Removes `zig build ast-compile-equiv` (the target's purpose is gone).
 
 Verification:
@@ -362,7 +362,7 @@ Once the legacy compiler is deleted (Stage 13), a regression surfaces only as a 
 
 Mitigation:
 - Keep the equivalence harness as a build target even after deletion (it degenerates to legacy-vs-itself but serves as a fixture-driven compile smoke test). OR: delete the harness but keep the extracted fixture list as a dedicated compile-smoke test.
-- The first week post-cutover, run `zig build test` under `-Dcompile-dual=true` in CI by resurrecting the legacy compiler temporarily. Only do this if the rollback plan needs teeth — otherwise it undermines the single-source-of-truth principle.
+- The first week post-cutover, run `zig build test` under `-compile-flag-pre-cutover-dual=true` in CI by resurrecting the legacy compiler temporarily. Only do this if the rollback plan needs teeth — otherwise it undermines the single-source-of-truth principle.
 
 ### 6.6 AST gaps for uncommon jq syntax
 Some jq corner cases the token compiler handles by fallback (e.g. `def if: 1; if`) may or may not be faithfully represented by the AST. Audit:
@@ -391,9 +391,9 @@ Numbers refer to the stages in §4.
 | 10 | — | `src/ast/compiler.zig` | — | reduce/foreach/label/break fixtures |
 | 11 | — | `src/ast/compiler.zig` | — | regex/datetime fixtures |
 | 12 | — | `src/ast/compiler.zig` (fold harvest) | — | prefilter equivalence |
-| 13 | — | `src/query/root.zig` (swap), `build.zig` (remove steps) | `src/query/src/compiler.zig`, `tests/ast_compile_equiv.zig`, `tests/ast_compile_equiv_fixtures.zig` | — |
+| 13 | — | `src/query/root.zig` (swap), `build.zig` (remove steps) | `legacy@22cd23c compiler.zig`, `tests/ast_compile_equiv.zig`, `tests/ast_compile_equiv_fixtures.zig` | — |
 
-After Stage 13 the AST walker is the only compiler. A post-cutover cleanup commit may rename `src/ast/compiler.zig` → `src/query/src/compiler.zig` for locality; weigh against import churn.
+After Stage 13 the AST walker is the only compiler. A post-cutover cleanup commit may rename `src/ast/compiler.zig` → `legacy@22cd23c compiler.zig` for locality; weigh against import churn.
 
 ---
 
@@ -409,7 +409,7 @@ runs via `zig build ast-compile-equiv` and confirms byte-identical
 with the one Stage-1 unsupported fixture (`. | .`) asserting the scaffold
 boundary. No production code changed.
 
-1. **File placement** after cutover: keep walker at `src/ast/compiler.zig` (reflects source-of-truth) or move it under `src/query/src/compiler.zig` (reflects consumer). The TODO text reads "src/ast/compiler.zig does not yet exist", suggesting the former.
+1. **File placement** after cutover: keep walker at `src/ast/compiler.zig` (reflects source-of-truth) or move it under `legacy@22cd23c compiler.zig` (reflects consumer). The TODO text reads "src/ast/compiler.zig does not yet exist", suggesting the former.
 2. **AST-node additions**: is it acceptable to extend `Node.Kind` with `assign_general` and to add `op_span` fields to `Comparison`/`Arithmetic`/`UpdateAssign`, or must the walker be purely consumer-side? LSP and the compiler both benefit from op_span; recommend yes.
 3. **Diagnostic-offset policy**: byte-identical-or-bust, or publish a small allowlist of drifted cases? Affects Stage 5 and Stage 8 scope.
 4. **Legacy-compiler deletion commit authority**: auto-delete once equivalence harness is green, or require human sign-off on the benchmark-parity run? The zero-workarounds principle argues for delete-the-moment-it's-safe; operational hygiene argues for one explicit review.

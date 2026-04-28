@@ -19,7 +19,7 @@
 //! compile-error site will fail this test at CI time.
 //!
 //! Coverage — one filter per distinct error class in
-//! `src/query/src/compiler.zig` + `src/query/src/lexer.zig`:
+//! `legacy@22cd23c compiler.zig` + `legacy@22cd23c lexer.zig`:
 //!
 //!   - unexpected top-level token      `"1 2 3"`
 //!   - trailing comma in object lit    `"{ ,"`

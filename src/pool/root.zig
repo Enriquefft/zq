@@ -685,7 +685,7 @@ fn process_line(
     // Raw-byte literal scan. When present AND the record's bytes fail the
     // scan, skip straight to an empty outcome — the select(...|regex(lit))
     // idiom would have produced no output for this record anyway. The cost
-    // we save is a full JSON parse + regex engine run. See src/query/src/prefilter.zig.
+    // we save is a full JSON parse + regex engine run. See legacy@22cd23c prefilter.zig.
     if (!raw_input) {
         if (query.prefilter) |pf| {
             _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);

@@ -261,7 +261,7 @@ The prefilter MUST NEVER produce false negatives. Two guarantees make this safe:
 
 The net effect on low-selectivity queries like `select(.message | test("CRITICAL"))` is that the slow paths (JSON parse, regex engine) only run on candidate records. End-to-end `test()` speedups reach ~47x vs jq on workloads where most records lack the literal.
 
-Implementation: `src/query/src/prefilter.zig` (literal set, harvesting, acceptance check). Pool integration: `src/pool/root.zig` (`prefilter_stats` counters and the per-chunk acceptance loop).
+Implementation: `src/prefilter/root.zig` (literal set, harvesting, acceptance check). Pool integration: `src/pool/root.zig` (`prefilter_stats` counters and the per-chunk acceptance loop).
 
 ### Arena-per-chunk with atomic deallocation
 

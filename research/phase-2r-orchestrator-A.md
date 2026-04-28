@@ -17,7 +17,7 @@ locked). You never read it directly — `plan-section-loader` does.
 Cluster goal: supersession bookkeeping → bench harness + legacy
 baseline → IR-format spec → compiler scaffold + dispatch flag →
 vm-equiv harness green. End state: new compiler skeleton exists,
-harness sanity-checked under `-Dcompile=legacy`, baselines locked.
+harness sanity-checked under `pre-cutover compile-flag legacy`, baselines locked.
 
 Correctness only; time and tokens unlimited. CLAUDE.md applies (SSOT,
 zero workarounds, agents-first).
@@ -47,7 +47,7 @@ zero workarounds, agents-first).
 | `explorer` | Explore | opus | Locate files / search | 20 |
 | `implementer` | general-purpose | opus | Implement one change | 10 |
 | `verifier` | general-purpose | opus | Build/test/diff PASS/FAIL | 10 |
-| `equiv-runner` | general-purpose | opus | `vm-equiv -Dcompile=legacy` (Phase 6 sanity) | 10 |
+| `equiv-runner` | general-purpose | opus | `vm-equiv pre-cutover compile-flag legacy` (Phase 6 sanity) | 10 |
 | `test-runner` | general-purpose | opus | `zig build test` counts | 5 |
 | `bench-runner` | general-purpose | opus | `bench-compile` legacy baseline (Phase 3) | 15 |
 | `code-reviewer` | general-purpose | opus | Bugs, leaks, edges | 30 |
@@ -90,9 +90,9 @@ zero workarounds, agents-first).
   diffable indented-tree.
 - **Phase 5** — `src/compiler/{root,lower,ir,fuse,emit,bench}.zig`
   skeletons + `ir.zig` Op enum + Node ≤32B + dispatch on
-  `-Dcompile=` (new path returns `error.NewCompilerNotImplemented`).
+  `pre-cutover compile-flag ` (new path returns `error.NotImpl-pre-cutover`).
 - **Phase 6** — `tests/vm_equiv.zig` + `tests/vm_equiv_errpos.zig`
-  + `zig build vm-equiv`. Harness green under `-Dcompile=legacy`
+  + `zig build vm-equiv`. Harness green under `pre-cutover compile-flag legacy`
   (sanity).
 
 ### Escalation
@@ -105,7 +105,7 @@ options + recommendation. Wait. Do not act.
 
 - Phases 2–6 committed.
 - `zig build` green.
-- `zig build vm-equiv -Dcompile=legacy` 100% green (sanity).
+- `zig build vm-equiv pre-cutover compile-flag legacy` 100% green (sanity).
 - Legacy baselines logged in `compiler-baselines.md`.
 - IR contract document committed.
 

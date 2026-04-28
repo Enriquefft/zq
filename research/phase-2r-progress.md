@@ -24,10 +24,10 @@ Removed:
 Preserved per plan §2 reused-and-kept:
   - All AST node variants in `src/ast/nodes.zig`
   - `assign_general` grammar in `src/ast/parser.zig` (LSP consumers)
-  - `src/query/src/{vm,prefilter,compiler}.zig` (legacy compile path
-    remains sole compiler until R3 lands `-Dcompile=new`)
+  - `legacy@22cd23c {vm,prefilter,compiler}.zig` (legacy compile path
+    remains sole compiler until R3 lands `pre-cutover compile-flag new`)
 Comment cleanup in `src/ast/parser.zig` and
-`src/query/src/prefilter.zig` for the deleted walker.
+`legacy@22cd23c prefilter.zig` for the deleted walker.
 Verifier checks expected (run by Orchestrator A on resume if not yet
 recorded):
   - `rg "ast.compiler|ast_compile_equiv" build.zig` → 0
@@ -192,27 +192,27 @@ Status: PROCEED (single attempt, no fixes needed)
   arena + 4 unmanaged ArrayLists (nodes, extra_children, extra_data,
   string_buf).
 - src/compiler/lower.zig (31 lines): skeleton, returns
-  error.NewCompilerNotImplemented; AST root typed as *const anyopaque
+  error.NotImpl-pre-cutover; AST root typed as *const anyopaque
   with TODO(R3) for typed import.
 - src/compiler/fuse.zig (21 lines): identity passthrough.
 - src/compiler/emit.zig (26 lines): skeleton, returns
-  error.NewCompilerNotImplemented.
+  error.NotImpl-pre-cutover.
 - src/compiler/root.zig (45 lines): public compile(src, allocator)
-  error{NewCompilerNotImplemented, OutOfMemory}!noreturn; re-exports
+  error{NotImpl-pre-cutover, OutOfMemory}!noreturn; re-exports
   Op/Node/IR.
-- build.zig (+27): CompileBackend enum, -Dcompile=legacy|new option
+- build.zig (+27): CompileBackend enum, pre-cutover compile-flag legacy|new option
   (default legacy), compiler_module declared with build_options
   import, query_module imports compiler.
 - src/query/root.zig (+44/-15): comptime switch on
-  build_options.compile_backend; compileLegacy helper extracted;
+  pre-cutover-build-flag; compile-legacy helper extracted;
   TODO(R3) documents misleading main.zig OOM mismatch.
 - src/compiler/bench.zig (untouched, from Phase 3).
 
 ### Verification
 - zig build: PASS
-- zig build -Dcompile=legacy: PASS
-- zig build -Dcompile=new: PASS (compiles cleanly; runtime returns
-  error.NewCompilerNotImplemented mapped to "out of memory" via
+- zig build pre-cutover compile-flag legacy: PASS
+- zig build pre-cutover compile-flag new: PASS (compiles cleanly; runtime returns
+  error.NotImpl-pre-cutover mapped to "out of memory" via
   generic catch in main.zig — TODO(R3) documented).
 - zig build test: 1023 passed / 27 skipped / 111 failed
   (exact R1 baseline match, delta 0).
@@ -227,7 +227,7 @@ Status: PROCEED (single attempt, no fixes needed)
   plan §1.5 — preserved correctly.
 - future-readiness-reviewer: PROCEED. Foreclosures noted:
   Node sizeof at exactly 32B (zero headroom);
-  -Dcompile=new not surfaced in CLAUDE.md/ARCHITECTURE.md (suggested
+  pre-cutover compile-flag new not surfaced in CLAUDE.md/ARCHITECTURE.md (suggested
   one-line pointer addition).
 
 ### Open issues for R3 (Phase 6+ and beyond)
@@ -238,7 +238,7 @@ Status: PROCEED (single attempt, no fixes needed)
   module.
 - Editorial: plan §1.3 row 5 names → align to spec.
 - Watch: Node 32B headroom; future fields require extra_data routing.
-- Agents-first: ARCHITECTURE.md surface for -Dcompile=new.
+- Agents-first: ARCHITECTURE.md surface for pre-cutover compile-flag new.
 
 ### Phase 5 acceptance: MET
 Scaffold present at all 6 files. Op enum exhaustive (SemOp).
@@ -246,7 +246,7 @@ Node ≤32B asserted. Dispatch flag wired with comptime switch.
 Test baseline holds under default legacy.
 
 Next: Phase 6 — vm-equiv harness (tests/vm_equiv.zig + errpos +
-zig build vm-equiv); harness green under -Dcompile=legacy (sanity).
+zig build vm-equiv); harness green under pre-cutover compile-flag legacy (sanity).
 
 ## Phase 6 — R3 vm-equiv Harness (Cluster A)
 
@@ -261,7 +261,7 @@ Status: PROCEED (after 1 fix attempt for path drift)
   call (currently hard-coded SKIP due to a Zig 0.15.2 build-runner
   duplicate-import issue when both `query` and `compiler` modules are
   imported into the same test binary). Legacy invocation via the
-  newly-public `query.CompiledQuery.compileLegacy`.
+  newly-public `query.CompiledQuery.compile-legacy`.
 - tests/compiler/vm_equiv_errpos.zig (120 lines, new): 5 compile-error
   fixtures (unclosed_str, trailing_pipe, trailing_arith, open_bracket,
   incomplete_def). Each asserts (kind, offset, len) on the legacy side
@@ -272,9 +272,9 @@ Status: PROCEED (after 1 fix attempt for path drift)
   cleanup-debt.
 - build.zig: vm-equiv, vm-equiv-errpos, vm-equiv-probe steps
   (addExecutable; not in test_step).
-- src/query/root.zig: `compileLegacy` exposed as `pub fn` for harness
+- src/query/root.zig: `compile-legacy` exposed as `pub fn` for harness
   use; doc comment explains the always-legacy invocation regardless
-  of -Dcompile= flag.
+  of pre-cutover compile-flag  flag.
 - .gitignore: defensive `zq-vm-equiv` entry (zig builds to .zig-cache/
   but probe artifact may leak under interactive runs).
 
@@ -284,7 +284,7 @@ Status: PROCEED (after 1 fix attempt for path drift)
   skipped=11 compile_err=0"
 - zig build vm-equiv-errpos: exit 0; "vm_equiv_errpos: total=5
   skipped=5 legacy_unexpected_ok=0 legacy_drift=0"
-- zig build vm-equiv -Dcompile=new: exit 0 (still SKIPs all 11)
+- zig build vm-equiv pre-cutover compile-flag new: exit 0 (still SKIPs all 11)
 - zig build test: 1023 passed / 27 skipped / 111 failed (delta vs R1: 0)
 - vm-equiv steps NOT in test_step (verified by grep on test_step.dependOn).
 
@@ -296,15 +296,15 @@ Status: PROCEED (after 1 fix attempt for path drift)
   2. Fixture-source: plan §3 R3 step 4 mandates regen from
      ../jq/tests/jq.test via Perl; Phase 6 ships hand-rolled per
      orchestrator scope split. DEFERRED to Cluster B.
-  3. -Dcompile flag semantics undocumented in plan; current
-     interpretation (legacy always via compileLegacy) is sound.
+  3. -compile-flag-pre-cutover flag semantics undocumented in plan; current
+     interpretation (legacy always via compile-legacy) is sound.
   4. vm_equiv_probe.zig is cleanup-debt post-Cluster-B.
 - future-readiness-reviewer: PROCEED. Discoverability gap (vm-equiv
   not in CLAUDE.md / ARCHITECTURE.md) flagged for Cluster B.
 
 ### Phase 6 acceptance: MET
 Harness scaffolds in plan-mandated paths; both vm-equiv steps green
-under default -Dcompile=legacy; baseline preserved.
+under default pre-cutover compile-flag legacy; baseline preserved.
 
 ## Handoff: A → B
 
@@ -342,9 +342,9 @@ Open issues for Cluster B (R3 operator porting + parity):
      `compile()` from `!noreturn` to a real success type atomically
      with the dispatcher in src/query/root.zig.
   6. Replace the generic OOM `catch` in src/main.zig (or extend it)
-     to handle `error.NewCompilerNotImplemented` cleanly under
-     -Dcompile=new before any operator is gated runtime-selectable.
-  7. Add a one-line surface for `-Dcompile=new` in CLAUDE.md or
+     to handle `error.NotImpl-pre-cutover` cleanly under
+     pre-cutover compile-flag new before any operator is gated runtime-selectable.
+  7. Add a one-line surface for `pre-cutover compile-flag new` in CLAUDE.md or
      ARCHITECTURE.md (agents-first discoverability).
   8. Watch: `Node` is exactly 32 bytes (zero headroom). Future fields
      must route via `extra_data` index, not widen Node — preserve the
@@ -357,7 +357,7 @@ Open issues for Cluster B (R3 operator porting + parity):
      notes that the cleanest cut is to move `CompileResult` shape
      into a third module (e.g., `types`). Tackle at the start of R3
      operator porting, not mid-port.
- 11. Test baseline floor: under -Dcompile=new, R3 must hold or
+ 11. Test baseline floor: under pre-cutover compile-flag new, R3 must hold or
      improve `zig build test` aggregate of 1023/1161 (R1 baseline,
      captured 2026-04-25).
 
@@ -373,8 +373,8 @@ Next orchestrator: phase-2r-orchestrator-B.md, start Phase 7.
 **Phase close**: e3c7817
 
 ### Acceptance gates
-- Tests `-Dcompile=new`: 1027/1165 (=baseline, zero regressions)
-- Tests `-Dcompile=legacy`: 1027/1165 (=baseline)
+- Tests `pre-cutover compile-flag new`: 1027/1165 (=baseline, zero regressions)
+- Tests `pre-cutover compile-flag legacy`: 1027/1165 (=baseline)
 - Binary new: +0.166% vs cc6de23 (well under +1%)
 - Binary legacy: +0.0023% vs cc6de23
 - vm-equiv: 24/24 MATCH (cat-1 + cat-2; 8 SKIP for later categories)
@@ -479,7 +479,7 @@ uncommitted progress, applied gap fixes, and merged sequentially.
 | vm-equiv MATCH | 101 | 178 | +77 |
 | vm-equiv SKIP | 6 | 3 | -3 |
 | Snapshots | 43 | 92 | +49 |
-| -Dcompile=new pass | 1132 | 1132 | 0 |
+| pre-cutover compile-flag new pass | 1132 | 1132 | 0 |
 | Legacy pass | 1027 | 1027 | 0 |
 
 ### Merge resolution
@@ -519,7 +519,7 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 | VM equiv MATCH | 178 | 178 | 0 |
 | VM equiv SKIP | 3 | 3 | 0 |
 | Snapshots | 92 | 92 | 0 |
-| -Dcompile=new pass | 1132 | 1132 | 0 |
+| pre-cutover compile-flag new pass | 1132 | 1132 | 0 |
 | Legacy pass | 1027 | 1027 | 0 |
 
 **Verification**:
@@ -572,9 +572,9 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 | vm-equiv SKIP | 3 | 3 | 0 |
 | Snapshots (lower) | 92 | 92 | 0 (preserved) |
 | Snapshots (fuse) | 0 | 12 | +12 (8 initial + 4 fix-iter-2) |
-| -Dcompile=new pass | 1132 | 1133 | +1 (fuse snapshot test) |
-| -Dcompile=new fail | 13 | 13 | 0 |
-| -Dcompile=new skip | 20 | 20 | 0 |
+| pre-cutover compile-flag new pass | 1132 | 1133 | +1 (fuse snapshot test) |
+| pre-cutover compile-flag new fail | 13 | 13 | 0 |
+| pre-cutover compile-flag new skip | 20 | 20 | 0 |
 | Legacy pass | 1027 | 1028 | +1 |
 | Legacy fail | 111 | 111 | 0 |
 | Legacy skip | 27 | 27 | 0 |
@@ -618,10 +618,10 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 - 111 unrelated failures isolated to `tests/compat/regression.zig` (pre-existing jq-compat gaps); not snapshot infra
 
 **Gate 3 — R3-BENCH: PASS by literal threshold**
-- Plan §3 R3 perf threshold (verbatim): "Bench numbers recorded for -Dcompile=new against R2 baseline" — no numeric bound at R3
+- Plan §3 R3 perf threshold (verbatim): "Bench numbers recorded for pre-cutover compile-flag new against R2 baseline" — no numeric bound at R3
 - R2 baseline source: `research/compiler-baselines.md:44-63` (legacy at `c9d4a69`, captured 2026-04-25)
 - Targets: `bench-compile` (relevant); skipped `bench-regex` and `microbench` (orthogonal)
-- Method: 3 fresh-process runs each for `-Dcompile=legacy` and `-Dcompile=new`, ReleaseFast
+- Method: 3 fresh-process runs each for `pre-cutover compile-flag legacy` and `pre-cutover compile-flag new`, ReleaseFast
 - Corpus median: NEW=10.30µs, LEGACY=10.12µs, R2=11.51µs
   - +1.8% vs legacy (within 5% noise band)
   - **-10.5% vs R2 baseline (improvement)**
@@ -649,14 +649,14 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 - ff-merged into `redesign/compiler` at the head of this entry; no cutover commit was created (implementer reverted before staging).
 
 **Fix-task 1 outcomes** (p21-fix1, two attempts):
-- Attempt 1 (commit `52f3200`): BLOCKED on synthesizer brief errors. Item 1 misclassified a JSON parser issue as a compiler regression; Item 2 validator was correct on its own but the regression it targets is masked by the dispatcher fallback at `src/query/root.zig:108` (`.err => compileLegacy`, `error.NewCompilerNotImplemented => compileLegacy`). Item 3 landed: 5 ZQ-DEFER markers added in `tests/compat/` (regressions documented in-place; not silently skipped).
+- Attempt 1 (commit `52f3200`): BLOCKED on synthesizer brief errors. Item 1 misclassified a JSON parser issue as a compiler regression; Item 2 validator was correct on its own but the regression it targets is masked by the dispatcher fallback at `src/query/root.zig:108` (`.err => compile-legacy`, `error.NotImpl-pre-cutover => compile-legacy`). Item 3 landed: 5 ZQ-DEFER markers added in `tests/compat/` (regressions documented in-place; not silently skipped).
 - Attempt 2 (commit `5824806`): Validator re-added as latent infrastructure (~40 lines in `src/compiler/lower.zig`, plus helper `isProvablyNonStringKey`). Net-positive regardless of cutover timing; activates at cutover when the dispatcher fallback is removed. Carries no behaviour change at HEAD because the legacy path still owns object-construction validation today.
 
-**Cutover attempt outcome**: BLOCKED on architectural incompleteness. The implementer began the R5 deletion sequence (remove `compileLegacy` fallback in `src/query/root.zig`, retire legacy compile module), ran the full suite, observed 150 `NewCompilerNotImplemented` stack frames spanning 69 unique tests, and reverted the entire cutover diff. **No cutover commit was created.** The `p21-cutover` worktree branch ref survives at `5824806` (same SHA as `redesign/compiler` HEAD post-ff-merge); preserved per cleanup instructions.
+**Cutover attempt outcome**: BLOCKED on architectural incompleteness. The implementer began the R5 deletion sequence (remove `compile-legacy` fallback in `src/query/root.zig`, retire legacy compile module), ran the full suite, observed 150 `NotImpl-pre-cutover` stack frames spanning 69 unique tests, and reverted the entire cutover diff. **No cutover commit was created.** The `p21-cutover` worktree branch ref survives at `5824806` (same SHA as `redesign/compiler` HEAD post-ff-merge); preserved per cleanup instructions.
 
-**Root cause discovery**: The dispatcher fallback at `src/query/root.zig:108` (`.err => compileLegacy`, `error.NewCompilerNotImplemented => compileLegacy`) was masking new-compiler gaps end-to-end. R3 acceptance (P20) and gate-1 (P21) measurements were inflated by silent legacy fallback hits — every unimplemented operator/AST-shape was being transparently routed to the legacy compiler and counted as a `-Dcompile=new` pass. True new-compiler test coverage at HEAD, with the fallback removed, is approximately **1064 pass / 82 fail** (vs the measured "1133 pass / 13 fail" with the fallback active). The delta (~70 tests) maps cleanly onto the missing categories enumerated below.
+**Root cause discovery**: The dispatcher fallback at `src/query/root.zig:108` (`.err => compile-legacy`, `error.NotImpl-pre-cutover => compile-legacy`) was masking new-compiler gaps end-to-end. R3 acceptance (P20) and gate-1 (P21) measurements were inflated by silent legacy fallback hits — every unimplemented operator/AST-shape was being transparently routed to the legacy compiler and counted as a `pre-cutover compile-flag new` pass. True new-compiler test coverage at HEAD, with the fallback removed, is approximately **1064 pass / 82 fail** (vs the measured "1133 pass / 13 fail" with the fallback active). The delta (~70 tests) maps cleanly onto the missing categories enumerated below.
 
-**Missing in new compiler** (verified empirically by removing the fallback, running the cutover, and grouping the 150 `NewCompilerNotImplemented` stack frames across 69 unique failing tests):
+**Missing in new compiler** (verified empirically by removing the fallback, running the cutover, and grouping the 150 `NotImpl-pre-cutover` stack frames across 69 unique failing tests):
 - Control flow: `foreach`, `label` / `break`, `until`, `while`, `recurse` builtin call form
 - Range / iteration builtins: `range`, `limit`, `skip`, `nth`, `first`, `last`, `error`
 - Format builtins: `@text`, `@json`, `@csv`, `@base64`, `@base64d`, `@uri`, `@urid`
@@ -703,7 +703,7 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Hard rules verified** (mechanical-verifier PASS 9/9):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact (zero diff vs base)
-- `src/query/src/compiler.zig` legacy compiler untouched (zero diff)
+- `legacy@22cd23c compiler.zig` legacy compiler untouched (zero diff)
 - `src/ast/*` untouched (zero diff)
 - `src/compiler/ir.zig` untouched (zero diff — no SemOps added)
 - `lowerObjectKey` + `isProvablyNonStringKey` const-key validator (commit `5824806`) intact
@@ -752,7 +752,7 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Hard rules verified** (mechanical-verifier PASS 10/10, including parent-checkout-clean check):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact
-- `src/query/src/compiler.zig` legacy compiler untouched
+- `legacy@22cd23c compiler.zig` legacy compiler untouched
 - `src/ast/*` untouched
 - `src/compiler/ir.zig` untouched (no SemOps added)
 - `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
@@ -805,11 +805,11 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 | vm-equiv | 224 MATCH / 0 FAIL / 4 SKIP (was 215/0/3; +9 MATCH + 1 expected SKIP for `cat15_break_undefined`) |
 | `zig build` | clean (no warnings, no errors) |
 | `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base; no P24 regressions |
-| Spot-check (fallback disabled in throwaway) | cat-15 MATCH count = 9 (same as fallback-on; harness uses compileNew directly) |
+| Spot-check (fallback disabled in throwaway) | cat-15 MATCH count = 9 (same as fallback-on; harness uses compile-new directly) |
 
 **Hard rules verified** (mechanical-verifier PASS 10/10 incl. parent-checkout-clean):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact
-- `src/query/src/compiler.zig` legacy compiler untouched
+- `legacy@22cd23c compiler.zig` legacy compiler untouched
 - `src/ast/*` untouched
 - `src/compiler/ir.zig` additive only (no opcode removed/renamed)
 - `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
@@ -867,7 +867,7 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Hard rules verified** (mechanical-verifier PASS 10/10 incl. parent-checkout-clean):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact
-- `src/query/src/compiler.zig` legacy compiler untouched
+- `legacy@22cd23c compiler.zig` legacy compiler untouched
 - `src/ast/*` untouched
 - `src/compiler/ir.zig` additive only (`computed_index` added; no opcode removed/renamed)
 - `lowerObjectKey` + `isProvablyNonStringKey` const-key validator intact
@@ -925,7 +925,7 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 
 **Hard rules verified** (mechanical-verifier PASS 13/13 incl. parent-checkout-clean + recovery integrity):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact
-- `src/query/src/compiler.zig` legacy compiler untouched
+- `legacy@22cd23c compiler.zig` legacy compiler untouched
 - `src/ast/*` untouched
 - `src/compiler/ir.zig` untouched (no SemOps added)
 - `src/compiler/fuse.zig` untouched
@@ -990,11 +990,11 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 | vm-equiv | 268 MATCH / 0 FAIL / 3 SKIP (was 256/0/4; +12 fixtures all MATCH; 1 SKIP lifted to MATCH; 0 new mismatch; 0 new compile_err) |
 | `zig build` | clean (no warnings, no errors) |
 | `zig build test` | 1028 pass / 111 fail / 27 skip — IDENTICAL to base (lifted DEFER marker; kept conservative on further lifts) |
-| Spot-check (fallback disabled in throwaway) | identical (calls compileNew directly); +12 cat-14 MATCH; cat-4 regression check PASS (all 20 existing as-pattern fixtures still MATCH) |
+| Spot-check (fallback disabled in throwaway) | identical (calls compile-new directly); +12 cat-14 MATCH; cat-4 regression check PASS (all 20 existing as-pattern fixtures still MATCH) |
 
 **Hard rules verified** (mechanical-verifier PASS 13/13 incl. parent-checkout-clean + IR-additive-only audit):
 - `src/query/root.zig` lines 102-109 dispatcher fallback intact
-- `src/query/src/compiler.zig` legacy compiler untouched
+- `legacy@22cd23c compiler.zig` legacy compiler untouched
 - `src/ast/*` untouched
 - `src/compiler/ir.zig` additive only (`as_bind` added; no opcode removed/renamed; reduce/foreach dump arms ADDED)
 - `src/compiler/fuse.zig` untouched (default copyNode passthrough sufficient)
@@ -1030,14 +1030,14 @@ Wave C delivered +77 vm-equiv MATCH (largest single-wave gain). IR surface now c
 1. All 6 prior deferrals from P21-redux remain unchanged: literal_groups leak, bench artifact, §1.4 row 2 ±5% interpretation, gate 3 spec-clarification, gate 5 errpos corpus expansion, 5 ZQ-DEFER tests in `tests/compat/` — REDUCED to 4 after L119 lift.
 2. Three additional deferrals from P22 (nth gen-form, skip/limit gen-form n, error-format parity for non-UserError types) — unchanged.
 
-**Phase status**: COMPLETE — Cluster B+ implementation phases ALL DONE. Wave 3 complete (P25 → P23). Only P21-redux (R4+R5 cutover) remains. P21-redux scope (deferred to next session): re-measure all 5 R4 acceptance gates with dispatcher fallback removed; if all pass, remove fallback at `src/query/root.zig:102-109`, delete legacy compiler at `src/query/src/{vm,prefilter,compiler}.zig`, remove `-Dcompile` flag, dispatch new compiler unconditionally, merge to `main`.
+**Phase status**: COMPLETE — Cluster B+ implementation phases ALL DONE. Wave 3 complete (P25 → P23). Only P21-redux (R4+R5 cutover) remains. P21-redux scope (deferred to next session): re-measure all 5 R4 acceptance gates with dispatcher fallback removed; if all pass, remove fallback at `src/query/root.zig:102-109`, delete legacy compiler at `legacy@22cd23c {vm,prefilter,compiler}.zig`, remove `-compile-flag-pre-cutover` flag, dispatch new compiler unconditionally, merge to `main`.
 
 
 ---
 
 ## Phase 21-redux — BLOCKED (2026-04-27)
 
-Step 1 gate measurement exposed 12 production `NewCompilerNotImplemented` sites in `src/compiler/{lower,emit}.zig`. Removing dispatcher fallback at `src/query/root.zig:102-109` fails to compile.
+Step 1 gate measurement exposed 12 production `NotImpl-pre-cutover` sites in `src/compiler/{lower,emit}.zig`. Removing dispatcher fallback at `src/query/root.zig:102-109` fails to compile.
 
 Inventory + bucketed Wave-3-mini scope: `research/phase-2r-coverage-gap.md` (commit b449e9b).
 
@@ -1059,7 +1059,7 @@ Phases 1, 2, 3 merged to redesign/compiler.
 
 vm-equiv: 277/0/5 (was 268/0/3 from prior phase; +9 MATCH, +2 SKIP)
 
-rg NewCompilerNotImplemented in lower.zig: 7 remaining (down from 12)
+rg NotImpl-pre-cutover in lower.zig: 7 remaining (down from 12)
 
 Wave 1.2 ready to begin (format-builtin, builtin-classifier+dispatch, destructure alt_bind).
 
@@ -1072,7 +1072,7 @@ All 12 coverage-gap sites from Wave-3-mini closed:
 
 Final metrics:
 - vm-equiv: 279 MATCH / 0 mismatch / 6 SKIP (net +11 MATCH, +3 SKIP vs Wave-3-mini entry 268/0/3)
-- NewCompilerNotImplemented runtime raises: 0 (100% closure)
+- NotImpl-pre-cutover runtime raises: 0 (100% closure)
 - Test suite: 1028/1166 passed, 111 pre-existing failures, 27 skipped (no regressions)
 
 State: current_phase=P21-redux-ready. Ready for P21-redux gate measurement and full cutover.

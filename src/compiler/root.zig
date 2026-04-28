@@ -1,6 +1,6 @@
-//! Phase 2R compiler — public entry point. Wired into the production
-//! `query.CompiledQuery.compile` dispatcher; only invoked when the
-//! build is configured with `-Dcompile=new`.
+//! Phase 2R compiler — public entry point. Sole compile path post
+//! Phase 2R cutover; `query.CompiledQuery.compile` dispatches here
+//! unconditionally.
 //!
 //! Pipeline shape (plan §1.1):
 //!
@@ -11,9 +11,8 @@
 //! cat-4 (vars/destructure/alt-bind), cat-5 (arith/cmp/logical/alt),
 //! cat-6 (try/catch/if/path), cat-7 (obj/arr/interp/format), cat-8
 //! (update_assign), cat-10 (general builtins) and cat-11 (regex /
-//! datetime / extended arg-builtins). Other AST shapes surface as
-//! `error.NewCompilerNotImplemented`; the harness reports SKIP and
-//! the production dispatcher falls back to legacy.
+//! datetime / extended arg-builtins). Every category lowers; gaps
+//! panic.
 const std = @import("std");
 
 const ast = @import("ast");
@@ -55,18 +54,17 @@ pub const Compiled = ctypes.Compiled;
 pub const CompileResult = ctypes.CompileResult;
 pub const ExternalVarDecl = ctypes.ExternalVarDecl;
 
-/// Compile a filter source string with the new VM-semantics compiler.
+/// Compile a filter source string with the VM-semantics compiler.
 ///
 /// On success, returns `.ok` carrying owned bytecode + auxiliary
 /// tables (see `Compiled`). On compile error, returns `.err` with
-/// `(kind, offset, len)` matching the legacy compiler's diagnostic
-/// shape. AST shapes outside the supported categories surface as
-/// `error.NewCompilerNotImplemented`.
+/// `(kind, offset, len)`. Post Phase 2R cutover every supported
+/// category lowers; lower/emit gaps are panics, not soft errors.
 pub fn compile(
     src: []const u8,
     external_vars: []const ExternalVarDecl,
     allocator: std.mem.Allocator,
-) error{ OutOfMemory, NewCompilerNotImplemented }!CompileResult {
+) error{OutOfMemory}!CompileResult {
     // Stage 1: parse. Always succeeds; errors live in `parse_result.errors`.
     var parse_result = ast.parse(src, allocator);
     defer parse_result.deinit();
@@ -105,7 +103,7 @@ pub fn compile(
 
     // Pre-declare external variables in the root scope (var ids 0..N-1).
     // Mirrors legacy `compile`'s seeding at
-    // `src/query/src/compiler.zig:1390-1406`. Required so cat-4
+    // `legacy@22cd23c compiler.zig:1390-1406`. Required so cat-4
     // `$external_var` references resolve to the same operand index.
     for (external_vars) |ev| {
         _ = lowerer.declareVar(ev.name) catch |e| switch (e) {
@@ -114,10 +112,8 @@ pub fn compile(
     }
     _ = lower_mod.lowerNode(&lowerer, parse_result.root) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.NewCompilerNotImplemented => return error.NewCompilerNotImplemented,
         // Lowering diagnostic (e.g. invalid `\v` string escape, regex
-        // compile failure). Surface as `.err` matching legacy's
-        // diagnostic shape.
+        // compile failure). Surface as `.err` with diagnostic shape.
         error.LowerDiagnostic => return .{ .err = lowerer.compile_err },
     };
     const lowered = lowerer.out;
@@ -152,17 +148,14 @@ pub fn compile(
         var p = pool;
         p.deinit();
     };
-    var compiled = emit_mod.emit(
+    var compiled = try emit_mod.emit(
         fused,
         external_vars.len,
         lowerer.function_table.items,
         lowerer.next_var_id,
         pool,
         allocator,
-    ) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.NewCompilerNotImplemented => return error.NewCompilerNotImplemented,
-    };
+    );
     pool_consumed = true; // emit owns the pool now (transferred into `compiled`).
     var compiled_consumed = false;
     defer if (!compiled_consumed) compiled.deinit(allocator);

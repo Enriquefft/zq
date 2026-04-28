@@ -2,24 +2,24 @@
 
 **Status:** BLOCKED. Cutover deferred pending Wave-3-mini.
 **Discovered:** 2026-04-27 during P21-redux Step 1 gate measurement.
-**Gate measurement:** removing dispatcher fallback at `src/query/root.zig:102-109` fails to compile under `-Dcompile=new` because `compileNew` still raises `error.NewCompilerNotImplemented` from 12 production sites.
+**Gate measurement:** removing dispatcher fallback at `src/query/root.zig:102-109` fails to compile under `pre-cutover compile-flag new` because `compile-new` still raises `error.NotImpl-pre-cutover` from 12 production sites.
 
 ## Inventory
 
 | bucket | site | ast_tag/op | surface | complexity | legacy_ref |
 |--------|------|------------|---------|------------|------------|
-| identifier-binding | src/compiler/lower.zig:530 | field_access (unknown ident) | `.foo` where foo is not a builtin, udf, or function binding | trivial | src/query/src/compiler.zig:6445-6450 |
-| variable-binding | src/compiler/lower.zig:1122 | variable_ref ($__loc__) | `$__loc__` magic variable | moderate | src/query/src/compiler.zig:6460-6480 |
+| identifier-binding | src/compiler/lower.zig:530 | field_access (unknown ident) | `.foo` where foo is not a builtin, udf, or function binding | trivial | legacy@22cd23c compiler.zig:6445-6450 |
+| variable-binding | src/compiler/lower.zig:1122 | variable_ref ($__loc__) | `$__loc__` magic variable | moderate | legacy@22cd23c compiler.zig:6460-6480 |
 | catch-all-ast | src/compiler/lower.zig:1403 | catch-all (else arm) | any AST kind not explicitly lowered | hard (deferred §3.5 P24-P27) | varies |
 | builtin-classifier | src/compiler/lower.zig:1978 | .not_implemented builtin class | builtin calls outside classifyBuiltin arms | hard (deferred §3.5 P24-P27) | varies |
-| regex-validation | src/compiler/lower.zig:2025 | regex1 arity check | test/match/capture/scan/splits arg count != 1-2 | trivial | src/query/src/compiler.zig:3059-3147 |
-| regex-validation | src/compiler/lower.zig:2054 | regex2 arity check | sub/gsub arg count != 2-3 | trivial | src/query/src/compiler.zig:3742-3864 |
-| regex-dynamic | src/compiler/lower.zig:2067 | regex2 comma-replacement | sub/gsub with comma-generating replacement arg | moderate | src/query/src/compiler.zig:3821-3825 |
-| regex-dynamic | src/compiler/lower.zig:2192 | dynamic-regex-comma | dynamic pattern arg to regex1 that is itself a comma expr | hard (deferred §3.5 P27) | src/query/src/compiler.zig:3104-3110 |
-| format-builtin | src/compiler/emit.zig:567 | format_string (unknown format) | @unknown_fmt or unregistered @fmt variant | hard (deferred §3.5 P26) | src/query/src/compiler.zig:5605-5620 |
-| destructure-pattern | src/compiler/emit.zig:721 | alt_bind in destructure | pattern matching with `or` in strict context (nested) | hard | src/query/src/compiler.zig:594-754 |
-| pattern-strict | src/compiler/emit.zig:1027 | alt_bind in pattern_strict | alt_bind at object destructure strict recursion (legacy never produces) | hard | src/query/src/compiler.zig:594-754 |
-| builtin-dispatch | src/compiler/emit.zig:1819 | nameToBuiltinId fallback | builtin name/arity pair not in nameToBuiltinId table | hard (deferred §3.5 P24-P27) | src/query/src/compiler.zig:6185-6195 |
+| regex-validation | src/compiler/lower.zig:2025 | regex1 arity check | test/match/capture/scan/splits arg count != 1-2 | trivial | legacy@22cd23c compiler.zig:3059-3147 |
+| regex-validation | src/compiler/lower.zig:2054 | regex2 arity check | sub/gsub arg count != 2-3 | trivial | legacy@22cd23c compiler.zig:3742-3864 |
+| regex-dynamic | src/compiler/lower.zig:2067 | regex2 comma-replacement | sub/gsub with comma-generating replacement arg | moderate | legacy@22cd23c compiler.zig:3821-3825 |
+| regex-dynamic | src/compiler/lower.zig:2192 | dynamic-regex-comma | dynamic pattern arg to regex1 that is itself a comma expr | hard (deferred §3.5 P27) | legacy@22cd23c compiler.zig:3104-3110 |
+| format-builtin | src/compiler/emit.zig:567 | format_string (unknown format) | @unknown_fmt or unregistered @fmt variant | hard (deferred §3.5 P26) | legacy@22cd23c compiler.zig:5605-5620 |
+| destructure-pattern | src/compiler/emit.zig:721 | alt_bind in destructure | pattern matching with `or` in strict context (nested) | hard | legacy@22cd23c compiler.zig:594-754 |
+| pattern-strict | src/compiler/emit.zig:1027 | alt_bind in pattern_strict | alt_bind at object destructure strict recursion (legacy never produces) | hard | legacy@22cd23c compiler.zig:594-754 |
+| builtin-dispatch | src/compiler/emit.zig:1819 | nameToBuiltinId fallback | builtin name/arity pair not in nameToBuiltinId table | hard (deferred §3.5 P24-P27) | legacy@22cd23c compiler.zig:6185-6195 |
 
 ## Summary
 
@@ -42,9 +42,9 @@ Estimate: **5-6 phases** under Wave-3-mini. Re-enter P21-redux Step 1 gate measu
 
 ## Re-entry criteria
 
-- `rg "NewCompilerNotImplemented" src/compiler/` returns zero (or only at the dispatcher edge for safety).
+- `rg "NotImpl-pre-cutover" src/compiler/` returns zero (or only at the dispatcher edge for safety).
 - vm-equiv stays 268/0/3 or improves.
-- `-Dcompile=new` test count moves toward legacy baseline 1028/111 (current 1131/15 fallback-active is non-comparable).
+- `pre-cutover compile-flag new` test count moves toward legacy baseline 1028/111 (current 1131/15 fallback-active is non-comparable).
 
 ## Worktree disposition
 

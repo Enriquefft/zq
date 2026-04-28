@@ -16,3 +16,4 @@ zq-vm-equiv
 benchmarks/data/huge.jsonl
 .claude/
 .strategy/
+memory/

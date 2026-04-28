@@ -3,7 +3,7 @@
 **Status**: Design — approved, Phase A starting.
 **Date**: 2026-04-22.
 **Revision**: 3 (size/speed/parity tuning + build gate).
-**Scope**: Implements jq regex builtins (`test`, `match`, `capture`, `scan`, `sub`, `gsub`) in zq. Replaces current substring-based stubs in `src/query/src/vm.zig:7038-7174`.
+**Scope**: Implements jq regex builtins (`test`, `match`, `capture`, `scan`, `sub`, `gsub`) in zq. Replaces current substring-based stubs in `legacy@22cd23c vm.zig:7038-7174`.
 
 ## Revision 3 deltas
 - Profile: `opt-level = 3` (not `z`). Speed > 200 KB. LTO+1cgu already gives 80% of size reduction.
@@ -193,8 +193,8 @@ A panic does NOT abort the zq process, does NOT kill worker threads, does NOT co
 - `build.zig` — cargo step + static link.
 - `build.zig.zon` — pins shim source (it lives in-tree under `third_party/` conceptually; path dep).
 - `src/types.zig` — add `capture_`, `scan_` opcodes.
-- `src/query/src/compiler.zig` — dispatch new builtins.
-- `src/query/src/vm.zig` — rewrite `builtinTest/Match/Sub/Gsub`, add `builtinCapture/Scan`.
+- `legacy@22cd23c compiler.zig` — dispatch new builtins.
+- `legacy@22cd23c vm.zig` — rewrite `builtinTest/Match/Sub/Gsub`, add `builtinCapture/Scan`.
 - `src/lsp/builtins.zig` — doc table entries.
 
 ### Zig API (`src/regex/root.zig`)
@@ -262,7 +262,7 @@ Only named groups. Unnamed groups skipped. Unmatched optional named group emits 
 
 ### `scan` VM integration
 
-zq's VM uses a **fork stack** for generator builtins (`range`, `.[]`, `path`, `..`). Pattern in `src/query/src/vm.zig:4561` (`builtinRange1`):
+zq's VM uses a **fork stack** for generator builtins (`range`, `.[]`, `path`, `..`). Pattern in `legacy@22cd23c vm.zig:4561` (`builtinRange1`):
 
 1. Push a fork frame with `aux = .range = RangeState { current, end, step, ... }`.
 2. Set `current` value to first iteration result.
@@ -285,7 +285,7 @@ const ScanState = struct {
 4. Advance `ip` past `scan_` opcode.
 5. On backtrack: `doBacktrack` sees `.scan` aux, calls `iterNext` again with saved cursor. If false → pop frame, continue backtrack.
 
-Add `.scan` to `ForkType` enum (`src/query/src/vm.zig:33`) and `FrameAux` union (`src/query/src/vm.zig:100`). Add backtrack case alongside `.range`. ~80 LoC addition, follows exact existing pattern. Zero new VM infrastructure.
+Add `.scan` to `ForkType` enum (`legacy@22cd23c vm.zig:33`) and `FrameAux` union (`legacy@22cd23c vm.zig:100`). Add backtrack case alongside `.range`. ~80 LoC addition, follows exact existing pattern. Zero new VM infrastructure.
 
 ## Sparser-style raw-byte prefilter
 
@@ -398,7 +398,7 @@ Measured via the phase-0 microbench tool (`research/phase-0-design.md` §4). Reg
 
 **Phase C — opcodes + compiler wiring** (1 day):
 - `src/types.zig` add `capture_`, `scan_`.
-- `src/query/src/compiler.zig` name table (2770-2773) + emit path (5307-5313) for `capture`, `scan`.
+- `legacy@22cd23c compiler.zig` name table (2770-2773) + emit path (5307-5313) for `capture`, `scan`.
 - Filter-compile-time regex pool: walk AST, intern literal-string regex args, emit opcode with `regex_index`.
 - `src/lsp/builtins.zig` doc entries.
 

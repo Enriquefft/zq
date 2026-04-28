@@ -3,7 +3,7 @@
 //! module without depending on each other.
 //!
 //! `CompileResult` exposes the same field set the legacy compiler does so
-//! `src/query/root.zig` can plug either backend behind `-Dcompile=` without
+//! `src/query/root.zig` can plug either backend behind `the legacy `compile=` flag (` without
 //! touching its `CompiledQuery` field set.
 
 const std = @import("std");
@@ -14,7 +14,7 @@ const prefilter_mod = @import("prefilter");
 
 /// Caller-owned compiled bytecode + auxiliary tables. Field-for-field
 /// identical to the legacy compiler's `Compiled` struct in
-/// `src/query/src/compiler.zig:21`. The lifetime contract matches: every
+/// `legacy@22cd23c compiler.zig:21`. The lifetime contract matches: every
 /// slice and pool here is freed by `deinit(allocator)`, where `allocator`
 /// is the same one passed to `compile`.
 pub const Compiled = struct {

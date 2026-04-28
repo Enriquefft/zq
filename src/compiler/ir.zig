@@ -167,7 +167,7 @@ pub const Op = enum(u8) {
     /// `children[0]` lowers the key expression; the base flows from
     /// the surrounding `pipe` left-side (or the caller's input for
     /// standalone `.[expr]`). Mirrors legacy `compileComputedBracket`
-    /// (`src/query/src/compiler.zig:7040`) — the two-var capture
+    /// (`legacy@22cd23c compiler.zig:7040`) — the two-var capture
     /// pattern (base + key) is synthesized at emit time so the bracket
     /// expression's fork/backtrack iteration over generator keys
     /// re-runs the per-iteration `load_computed` for every yielded
@@ -229,7 +229,7 @@ pub const Op = enum(u8) {
     /// time, registers it as a label binding, lowers the body with
     /// `$name` visible. `extra_data[node.extra]` carries the var_id;
     /// `children[0]` is the body IR-node index. Maps to legacy
-    /// `compileLabel` (`src/query/src/compiler.zig:3628`):
+    /// `compileLabel` (`legacy@22cd23c compiler.zig:3628`):
     ///   label_begin(exit_ip)         — backpatched to instr after body
     ///   capture_variable($name)
     ///   pipe
@@ -848,7 +848,7 @@ fn dumpAst(
         // then2, else))`). The dumper mirrors that: each elif slot
         // produces a nested `if` child in the else position. Implicit
         // else (no `else` clause) materializes as `identity` — matches
-        // legacy `parseIfBody` (`src/query/src/compiler.zig:6390`).
+        // legacy `parseIfBody` (`legacy@22cd23c compiler.zig:6390`).
         .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, source, depth, writer),
         // ── Variable load `$name` (category 4) ──────────────────────
         // Mirrors `lowerVariable` — the IR is a leaf `load_var` whose

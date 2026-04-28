@@ -45,10 +45,10 @@ Correctness only; time and tokens unlimited. CLAUDE.md applies.
 | `explorer` | Explore | opus | Locate files / search | 20 |
 | `implementer` | general-purpose | opus | Implement one category (worktree) | 10 |
 | `verifier` | general-purpose | opus | Build/test/diff PASS/FAIL | 10 |
-| `equiv-runner` | general-purpose | opus | `vm-equiv -Dcompile=new` per category | 10 |
+| `equiv-runner` | general-purpose | opus | `vm-equiv pre-cutover compile-flag new` per category | 10 |
 | `snapshot-validator` | general-purpose | opus | Snapshot diffs (lower/fuse) | 10 |
 | `test-runner` | general-purpose | opus | `zig build test` counts | 5 |
-| `bench-runner` | general-purpose | opus | `bench-compile -Dcompile=new` (background) | 15 |
+| `bench-runner` | general-purpose | opus | `bench-compile pre-cutover compile-flag new` (background) | 15 |
 | `code-reviewer` | general-purpose | opus | Bugs, leaks, edges | 30 |
 | `architect-reviewer` | general-purpose | opus | Plan §1 invariants, no virtual dispatch | 30 |
 | `future-readiness-reviewer` | general-purpose | opus | Const-fold / extended-fuse / pushdown seams | 30 |
@@ -126,8 +126,8 @@ Same triggers as cluster A. Always second-opinion before user.
 ### Cluster B stop condition (verifier-confirmed)
 
 - Phases 7–19 committed.
-- `zig build vm-equiv -Dcompile=new` 100% green on full corpus.
-- `zig build test -Dcompile=new` no regressions vs Phase 5
+- `zig build vm-equiv pre-cutover compile-flag new` 100% green on full corpus.
+- `zig build test pre-cutover compile-flag new` no regressions vs Phase 5
   baseline.
 - All snapshots committed and current.
 - Per-category bench rows in `compiler-baselines.md`.
@@ -137,8 +137,8 @@ On stop: `progress-logger` appends handoff under `## Handoff: B → C`:
 ```
 ## Handoff: B → C
 Last commit: <hash>
-vm-equiv full corpus (-Dcompile=new): <pass/fail>
-zig build test (-Dcompile=new): <pass>/<fail>/<skip>
+vm-equiv full corpus (pre-cutover compile-flag new): <pass/fail>
+zig build test (pre-cutover compile-flag new): <pass>/<fail>/<skip>
 Per-category bench deltas: <see baselines doc, rows N..M>
 Snapshots: <count> files current
 Open blockers: <list or "none">

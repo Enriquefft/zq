@@ -20,23 +20,11 @@ pub fn build(b: *std.Build) void {
     // packaging so `nix build` stays hermetic (no cargo/rustc at build time).
     const shim_archive_opt = b.option([]const u8, "shim-archive", "Path to prebuilt libzq_regex_shim.a (skips cargo)");
     const strip_opt = b.option(bool, "strip", "Strip symbols from release binary (default: true in release, false in debug)");
-    // Compiler backend selector — Phase 2R. `legacy` (default) uses the
-    // production compiler at `src/query/src/compiler.zig`; `new` routes to
-    // the Phase 2R scaffold at `src/compiler/`. The new path returns
-    // `error.NewCompilerNotImplemented` until R3 (Phase 6+) lands real
-    // operator lowering. Default MUST stay `legacy` so production builds
-    // and the test suite are unaffected.
-    const compile_backend = b.option(
-        CompileBackend,
-        "compile",
-        "Compiler backend: legacy (default, prod) or new (Phase 2R, scaffold)",
-    ) orelse CompileBackend.legacy;
     const options = b.addOptions();
     options.addOption([]const u8, "version", ver);
     options.addOption(bool, "regex_enabled", regex_enabled);
     options.addOption(bool, "lsp_enabled", lsp_enabled);
     options.addOption(bool, "profile_enabled", profile_enabled);
-    options.addOption(CompileBackend, "compile_backend", compile_backend);
     // One concrete options module, imported everywhere via addImport. Using
     // `addOptions(...)` on each consumer module would create *separate*
     // modules backed by the same generated source file — that collides when
@@ -149,7 +137,7 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("types", types_module);
 
     const lexer_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/lexer.zig"),
+        .root_source_file = b.path("src/lexer/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -169,31 +157,43 @@ pub fn build(b: *std.Build) void {
     // module root. The AST-idiom matcher lives here so the eventual new
     // compiler can share it without re-rooting the file.
     const prefilter_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/prefilter.zig"),
+        .root_source_file = b.path("src/prefilter/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     prefilter_module.addImport("regex", regex_module);
     prefilter_module.addImport("ast", ast_module);
 
-    // Phase 2R compiler. Wired into every module that imports `query`
-    // so the `-Dcompile=new` dispatcher in `src/query/root.zig` can
-    // call `compiler.compile` without re-rooting the module graph.
-    // Imports `ast` so the typed AST root flows in (plan §1.3 row 4 —
-    // no virtual dispatch, switch on tag); imports `types`, `error`,
-    // `regex`, and `prefilter` so the emit-side `Compiled` matches the
-    // legacy shape exactly (plan §1.3 row 7).
+    // Phase 2R compiler — production. Wired into every module that imports
+    // `query` so `src/query/root.zig` dispatches directly to it. Imports
+    // `ast` so the typed AST root flows in (plan §1.3 row 4 — no virtual
+    // dispatch, switch on tag); imports `types`, `error`, `regex`, and
+    // `prefilter` so the emit-side `Compiled` matches the bytecode shape
+    // the VM consumes (plan §1.3 row 7).
     const compiler_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    compiler_module.addImport("build_options", build_options_module);
     compiler_module.addImport("ast", ast_module);
     compiler_module.addImport("types", types_module);
     compiler_module.addImport("error", error_module);
     compiler_module.addImport("regex", regex_module);
     compiler_module.addImport("prefilter", prefilter_module);
+
+    // VM (runtime executor) — consumes the bytecode produced by the
+    // compiler and produces `ResultIterator`. Phase 2R cutover: relocated
+    // from the legacy `query/src/vm.zig` to `src/vm/root.zig` so the query module
+    // imports it through the named-module graph (single root per file
+    // under Zig 0.15.2's duplicate-module constraint).
+    const vm_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_module.addImport("error", error_module);
+    vm_module.addImport("types", types_module);
+    vm_module.addImport("regex", regex_module);
 
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
@@ -204,12 +204,12 @@ pub fn build(b: *std.Build) void {
     query_module.addImport("types", types_module);
     query_module.addImport("lexer", lexer_module);
     query_module.addImport("regex", regex_module);
+    query_module.addImport("vm", vm_module);
     // Prefilter harvest walks the AST from src/ast/. Single source of truth:
     // the same parser the LSP uses — no second source-byte scanner.
     query_module.addImport("ast", ast_module);
     query_module.addImport("prefilter", prefilter_module);
     query_module.addImport("compiler", compiler_module);
-    query_module.addImport("build_options", build_options_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding
@@ -350,7 +350,6 @@ pub fn build(b: *std.Build) void {
     query_test_mod.addImport("types", types_module);
     query_test_mod.addImport("regex", regex_module);
     query_test_mod.addImport("error", error_module);
-    query_test_mod.addImport("build_options", build_options_module);
 
     const query_tests = b.addTest(.{ .root_module = query_test_mod });
     if (shim_build_step) |step| query_tests.step.dependOn(&step.step);
@@ -523,10 +522,10 @@ pub fn build(b: *std.Build) void {
     bench_regex_step.dependOn(&b.addRunArtifact(bench_regex_tests).step);
 
     // ── bench-compile (NOT in test_step) ──────────────────────────────────
-    // Compile-only throughput baseline for the legacy compiler (Phase 2R / Phase 3).
+    // Compile-only throughput baseline (Phase 2R / Phase 3).
     // Always built with ReleaseFast — perf bench requires it.
     // Invocation: `zig build bench-compile`
-    const bench_compile_step = b.step("bench-compile", "Compile-only throughput baseline (legacy)");
+    const bench_compile_step = b.step("bench-compile", "Compile-only throughput baseline");
     const bench_compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compiler/bench.zig"),
         .target = target,
@@ -608,78 +607,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| snapshots_update_run.addArgs(args);
     snapshots_update_step.dependOn(&snapshots_update_run.step);
 
-    // ── vm-equiv (NOT in test_step) ───────────────────────────────────────
-    // VM-equivalence harness for Phase 2R Cluster A R3 (scaffold).
-    // Compiles each fixture via legacy AND new backends; Phase 6 SKIPs all
-    // because the new backend returns `NewCompilerNotImplemented`. Cluster B
-    // retrofits VM-execution + output-stream diff. Always built against
-    // -Dcompile=legacy by default (the harness calls compileLegacy directly,
-    // bypassing the dispatcher, so it works under any -Dcompile= setting).
-    // Invocation: `zig build vm-equiv`.
-    const vm_equiv_step = b.step("vm-equiv", "VM-equivalence harness (legacy vs new)");
-    const vm_equiv_mod = b.createModule(.{
-        .root_source_file = b.path("tests/compiler/vm_equiv.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    vm_equiv_mod.addImport("query", query_module);
-    vm_equiv_mod.addImport("parser", parser_module);
-    vm_equiv_mod.addImport("output", output_module);
-    vm_equiv_mod.addImport("types", types_module);
-    const vm_equiv_exe = b.addExecutable(.{
-        .name = "zq-vm-equiv",
-        .root_module = vm_equiv_mod,
-    });
-    if (shim_build_step) |step| vm_equiv_exe.step.dependOn(&step.step);
-    const vm_equiv_run = b.addRunArtifact(vm_equiv_exe);
-    if (b.args) |args| vm_equiv_run.addArgs(args);
-    vm_equiv_step.dependOn(&vm_equiv_run.step);
-
-    // ── vm-equiv-errpos (NOT in test_step) ────────────────────────────────
-    // Source-position parity guardrail (plan §1.4 row 5). Curated list of
-    // compile-error fixtures; legacy and new must agree on `kind/offset/len`.
-    // Phase 6 SKIPs all (new returns NotImplemented). Invocation:
-    // `zig build vm-equiv-errpos`.
-    const vm_equiv_errpos_step = b.step("vm-equiv-errpos", "Compile-error source-position parity harness");
-    const vm_equiv_errpos_mod = b.createModule(.{
-        .root_source_file = b.path("tests/compiler/vm_equiv_errpos.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    // Same dep-graph constraint as `vm-equiv` above.
-    vm_equiv_errpos_mod.addImport("query", query_module);
-    const vm_equiv_errpos_exe = b.addExecutable(.{
-        .name = "zq-vm-equiv-errpos",
-        .root_module = vm_equiv_errpos_mod,
-    });
-    if (shim_build_step) |step| vm_equiv_errpos_exe.step.dependOn(&step.step);
-    const vm_equiv_errpos_run = b.addRunArtifact(vm_equiv_errpos_exe);
-    vm_equiv_errpos_run.stdio = .inherit;
-    if (b.args) |args| vm_equiv_errpos_run.addArgs(args);
-    vm_equiv_errpos_step.dependOn(&vm_equiv_errpos_run.step);
-
-    // ── vm-equiv-probe (NOT in test_step) ─────────────────────────────────
-    // Throwaway helper used while authoring the errpos fixture list. Prints
-    // the legacy compiler's exact `kind/offset/len` for each candidate
-    // filter so they can be transcribed into `tests/compiler/vm_equiv_errpos.zig`.
-    // Removed once Cluster B+ stabilizes the corpus.
-    const vm_equiv_probe_step = b.step("vm-equiv-probe", "Probe legacy compile-error positions for vm-equiv-errpos");
-    const vm_equiv_probe_mod = b.createModule(.{
-        .root_source_file = b.path("tests/compiler/vm_equiv_probe.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    vm_equiv_probe_mod.addImport("query", query_module);
-    const vm_equiv_probe_exe = b.addExecutable(.{
-        .name = "zq-vm-equiv-probe",
-        .root_module = vm_equiv_probe_mod,
-    });
-    if (shim_build_step) |step| vm_equiv_probe_exe.step.dependOn(&step.step);
-    const vm_equiv_probe_run = b.addRunArtifact(vm_equiv_probe_exe);
-    vm_equiv_probe_run.stdio = .inherit;
-    if (b.args) |args| vm_equiv_probe_run.addArgs(args);
-    vm_equiv_probe_step.dependOn(&vm_equiv_probe_run.step);
-
     // ── Microbench (NOT in test_step) ─────────────────────────────────────
     // Per-stage latency harness — Phase 0 of the research roadmap. Drives
     // production modules (parser/query/output) directly and emits NDJSON
@@ -742,12 +669,6 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| regex_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(regex_tests).step);
 }
-
-/// Phase 2R compiler-backend selector. Defaults to `legacy` (production);
-/// `new` opts into the scaffold at `src/compiler/` (errors at runtime until
-/// R3). Surfaced via `-Dcompile=legacy|new` and read by `src/query/root.zig`
-/// via `build_options.compile_backend`.
-const CompileBackend = enum { legacy, new };
 
 /// Map a zig target to the rust target triple the Cargo crate is built against.
 ///

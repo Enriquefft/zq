@@ -15,7 +15,7 @@ Canonical plan: `research/phase-2r-compiler-redesign-plan.md` (rev 3,
 locked). You never read it directly — `plan-section-loader` does.
 
 Cluster goal: full-repo review of `src/compiler/` → measure five
-guardrails → delete legacy + `-Dcompile` flag → merge to `main`.
+guardrails → delete legacy + `-compile-flag-pre-cutover` flag → merge to `main`.
 End state: Phase 2R complete; legacy compiler gone; new compiler is
 the only path.
 
@@ -79,7 +79,7 @@ Same as A/B. On boot: `progress-reader` reads handoff under
   list to `code-reviewer` chunked if needed (cap one reviewer's
   diff exposure to ≤500 lines per call; spawn parallel reviewers
   per chunk and synthesize per-chunk verdicts before final trio).
-  Re-run vm-equiv full corpus + `zig build test -Dcompile=new`.
+  Re-run vm-equiv full corpus + `zig build test pre-cutover compile-flag new`.
 
 - **Phase 21** — Guardrail measurement. `guardrail-measurer` writes
   final pre-cutover row to `compiler-baselines.md`:
@@ -93,20 +93,20 @@ Same as A/B. On boot: `progress-reader` reads handoff under
   only).
 
 - **Phase 22** — Cutover commit. Single `implementer`:
-  - Delete `src/query/src/compiler.zig`.
-  - Remove `-Dcompile` from `build.zig` entirely.
+  - Delete `legacy@22cd23c compiler.zig`.
+  - Remove `-compile-flag-pre-cutover` from `build.zig` entirely.
   - `src/query/root.zig` dispatches new compiler unconditionally.
   - `TODO.md` compiler track closed.
   - `ROADMAP.md` "the compiler" pointers → `src/compiler/`.
   Then `verifier` confirms:
-  - `rg "src/query/src/compiler" src/ tests/ build.zig` → 0
-  - `rg "Dcompile" build.zig` → 0
+  - `rg "legacy@22cd23c compiler" src/ tests/ build.zig` → 0
+  - `rg "compile-flag-pre-cutover" build.zig` → 0
   - `zig build test` Debug/ReleaseSafe/ReleaseFast all green
   `bench-runner` re-measures throughput + binary size post-flag
   removal → final-final row in baselines doc. Reviewer trio
   (correctness, full repo). Single commit:
   `refactor(compiler): cutover to VM-semantics compiler; delete
-  legacy + -Dcompile flag`.
+  legacy + -compile-flag-pre-cutover flag`.
 
 - **Phase 23** — Merge to main.
   - Verify `redesign/compiler` up-to-date with `main` (rebase if
@@ -125,8 +125,8 @@ attempts' diffs (via verifier digest), root-cause hypothesis.
 ### Stop condition (Phase 2R complete)
 
 - `redesign/compiler` merged to `main`.
-- `rg "src/query/src/compiler" src/ tests/ build.zig` → 0.
-- `rg "Dcompile" build.zig` → 0.
+- `rg "legacy@22cd23c compiler" src/ tests/ build.zig` → 0.
+- `rg "compile-flag-pre-cutover" build.zig` → 0.
 - `zig build test` green on `main`.
 - 5 guardrail rows in `research/compiler-baselines.md`.
 

@@ -177,7 +177,7 @@ claims completion, spawn a `verifier` subagent with:
 - Original task description.
 - Claimed completion + files changed list.
 - Required commands (e.g. `git diff --stat`, `zig build`,
-  `zig build test -Dcompile=<flag>`, `zig build vm-equiv -Dcompile=new`).
+  `zig build test pre-cutover compile-flag <flag>`, `zig build vm-equiv pre-cutover compile-flag new`).
 - Expected outcomes (e.g. "build passes", "tests match Phase N
   baseline ±0", "category fixtures 100% green").
 
@@ -319,7 +319,7 @@ identifier. The plan controls.
 - **Phase 21** — Guardrail measurement (§3 R4+R5 step 1). Bench in
   background.
 - **Phase 22** — Cutover commit (§3 R4+R5 step 3). Delete
-  `src/query/src/compiler.zig`, remove `-Dcompile`, dispatch
+  `legacy@22cd23c compiler.zig`, remove `-compile-flag-pre-cutover`, dispatch
   unconditionally.
 - **Phase 23** — Merge to main. No force-push.
 
@@ -363,7 +363,7 @@ Implementation/plan:
   escalation).
 - Spawning agents with shared transcripts.
 - Using legacy compiler features in the new compiler (no copy-paste
-  from `src/query/src/compiler.zig`).
+  from `legacy@22cd23c compiler.zig`).
 - Reproducing legacy quirks (e.g. `compileRange` lookahead) —
   VM-semantics is the bar.
 - Force-pushing, history rewriting, `--no-verify`.
@@ -382,8 +382,8 @@ Context discipline (orchestrator-specific):
 ### Stop condition
 
 - `redesign/compiler` merged to `main`.
-- `verifier` confirms `rg "src/query/src/compiler" src/ tests/ build.zig` returns zero.
-- `verifier` confirms `rg "Dcompile" build.zig` returns zero.
+- `verifier` confirms `rg "legacy@22cd23c compiler" src/ tests/ build.zig` returns zero.
+- `verifier` confirms `rg "compile-flag-pre-cutover" build.zig` returns zero.
 - `verifier` confirms `zig build test` fully green on `main`.
 - All five guardrails final numbers in
   `research/compiler-baselines.md` (confirmed by `guardrail-measurer`).

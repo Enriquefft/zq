@@ -397,7 +397,7 @@ returns. `extra_data[node.extra]` holds the var_id; `children[0]` is
 the body IR-node index.
 
 Emit (`emit.zig:emitLabel`) mirrors legacy `compileLabel`
-(`src/query/src/compiler.zig:3628`) byte-for-byte:
+(`legacy@22cd23c compiler.zig:3628`) byte-for-byte:
 `label_begin(exit_ip) ; capture_variable($var_id) ; pipe ; <body>` then
 backpatches `exit_ip` to one past the body. No `label_end` /
 `pop_variable` are emitted — iterate-loops would re-execute them on
@@ -455,7 +455,7 @@ fork, in-loop yield/pipe sequence) that don't reduce to a flat
 patches without re-decoding.
 
 Emit (`emit.zig:emitWhile`) mirrors legacy `compileWhile`
-(`src/query/src/compiler.zig:3428`):
+(`legacy@22cd23c compiler.zig:3428`):
 
 ```
 loop_top:
@@ -467,7 +467,7 @@ loop_exit:
 ```
 
 Emit (`emit.zig:emitUntil`) mirrors legacy `compileUntil`
-(`src/query/src/compiler.zig:3495`):
+(`legacy@22cd23c compiler.zig:3495`):
 
 ```
 loop_top:

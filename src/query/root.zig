@@ -1,14 +1,12 @@
 const std = @import("std");
 const err_mod = @import("error");
 const types = @import("types");
-const compiler = @import("src/compiler.zig");
-const vm = @import("src/vm.zig");
+const vm = @import("vm");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
-const build_options = @import("build_options");
-// Phase 2R scaffold. Imported unconditionally so the symbol is reachable
-// when `-Dcompile=new` is selected. Today the new path always returns
-// `error.NewCompilerNotImplemented`; R3 fills it in.
+// Phase 2R cutover: the new compiler at `src/compiler/` is the only
+// backend. The pre-cutover backend dispatcher and build flag are gone;
+// `compile()` is a thin wrapper over `new_compiler.compile`.
 const new_compiler = @import("compiler");
 
 pub const PrefilterSet = prefilter_mod.PrefilterSet;
@@ -21,7 +19,7 @@ pub const Value = types.Value;
 pub const ResultIterator = vm.ResultIterator;
 
 // Re-export types needed for external variable support.
-pub const ExternalVarDecl = compiler.ExternalVarDecl;
+pub const ExternalVarDecl = new_compiler.ExternalVarDecl;
 pub const ExternalVarBinding = vm.ExternalVarBinding;
 pub const StackValue = vm.StackValue;
 
@@ -65,62 +63,20 @@ pub const CompiledQuery = struct {
     /// Sparser raw-byte prefilter — populated at compile time when the
     /// source matches the exact shape `select(PATH | regex_builtin("lit"))`.
     /// `null` otherwise. The parallel chunk worker consults this before
-    /// parsing each record; see `src/query/src/prefilter.zig`.
+    /// parsing each record.
     prefilter: ?prefilter_mod.PrefilterSet,
 
     /// Compile `src` into bytecode. Returns a CompileResult union:
     /// `.ok` on success, `.err` with source location on compile error.
     ///
-    /// Backend dispatch is comptime-keyed off `-Dcompile=`. Default
-    /// (`legacy`) hits the production compiler at `src/query/src/compiler.zig`.
-    /// `new` (Phase 2R) routes to `src/compiler/` and falls back to
-    /// legacy on `NewCompilerNotImplemented`. The fallback is the
-    /// transitional contract for R3: the new compiler progressively
-    /// absorbs operator categories; tests stay green throughout
-    /// because legacy handles every uncovered category. R5 deletes
-    /// the fallback (and the `-Dcompile` flag entirely) once category
-    /// 12 lands and parity is proven.
+    /// Phase 2R cutover: dispatches unconditionally to the new compiler
+    /// at `src/compiler/`. The pre-cutover backend dispatcher and build
+    /// flag are gone.
     pub fn compile(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!CompileResult {
-        switch (comptime build_options.compile_backend) {
-            .legacy => return compileLegacy(src, opts, allocator),
-            .new => {
-                // Transitional dispatch for R3:
-                //   - new + .ok  → use new compiler's bytecode
-                //   - new + .err → fall back to legacy. The two
-                //     parsers diverge on a handful of edge cases
-                //     (e.g. comma-in-index-position) the AST parser
-                //     surfaces as parse errors before lowering even
-                //     runs; legacy is the source of truth until R5
-                //     consolidates the parser.
-                //   - new + NewCompilerNotImplemented → fall back
-                //     to legacy. New owns operator categories
-                //     incrementally; legacy covers the rest.
-                const result = compileNew(src, opts, allocator) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.NewCompilerNotImplemented => return compileLegacy(src, opts, allocator),
-                };
-                switch (result) {
-                    .ok => return result,
-                    .err => return compileLegacy(src, opts, allocator),
-                }
-            },
-        }
-    }
-
-    /// Always-new compile path. Re-exported so test binaries — the
-    /// vm-equiv harness in particular — invoke the new backend through
-    /// the `query` module without importing `compiler` directly, which
-    /// keeps the dispatch surface single-rooted under the Zig 0.15.2
-    /// build-runner's duplicate-module constraint.
-    pub fn compileNew(
-        src: []const u8,
-        opts: Opts,
-        allocator: std.mem.Allocator,
-    ) error{ OutOfMemory, NewCompilerNotImplemented }!CompileResult {
         // Translate the query-module's `ExternalVarDecl` slice into the
         // compiler-module's shape. They are field-equivalent today; an
         // explicit copy keeps the cross-module contract crisp.
@@ -133,35 +89,9 @@ pub const CompiledQuery = struct {
         }
         defer if (ext_decls.len > 0) allocator.free(ext_decls);
 
+        // Phase 2R cutover: the compiler covers every operator category;
+        // unhandled cases panic inside the compiler. Only OOM propagates.
         const result = try new_compiler.compile(src, ext_decls, allocator);
-        switch (result) {
-            .ok => |compiled| return .{ .ok = CompiledQuery{
-                .allocator = allocator,
-                .instructions = compiled.instructions,
-                .function_table = compiled.function_table,
-                .string_buf = compiled.string_buf,
-                .external_var_ids = compiled.external_var_ids,
-                .source_map = compiled.source_map,
-                .opts = opts,
-                .regex_pool = compiled.regex_pool,
-                .prefilter = compiled.prefilter,
-            } },
-            .err => |ce| return .{ .err = ce },
-        }
-    }
-
-    /// Production compile path — extracted so the dispatcher above stays
-    /// trivial. Body is the original (legacy) implementation.
-    ///
-    /// Always invokes the legacy compiler regardless of `-Dcompile=` setting;
-    /// used by `tests/compiler/vm_equiv.zig` for dual-dispatch (legacy + new)
-    /// so the harness can compare both backends in a single binary.
-    pub fn compileLegacy(
-        src: []const u8,
-        opts: Opts,
-        allocator: std.mem.Allocator,
-    ) error{OutOfMemory}!CompileResult {
-        const result = try compiler.compile(src, opts.external_vars, allocator);
         switch (result) {
             .ok => |compiled| return .{ .ok = CompiledQuery{
                 .allocator = allocator,

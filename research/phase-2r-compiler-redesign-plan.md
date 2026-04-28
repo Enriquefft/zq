@@ -19,7 +19,7 @@ Locked decisions (this revision):
 - IR text format: indented tree.
 - Source-position parity: exact match on curated set.
 - `parse_plan` field: NOT reserved. Add when research work needs it.
-- `-Dcompile=experimental` slot: NOT reserved. Add when first
+- `pre-cutover compile-flag experimental` slot: NOT reserved. Add when first
   experimental pass arrives.
 - Commit cadence: one commit per operator category in R3 (12 commits).
 - Snapshot regen: `zig build snapshots-update`.
@@ -38,7 +38,7 @@ Governed by `CLAUDE.md` principles (project + `~/.claude/CLAUDE.md`):
   because it was easy to diff. VM-semantics is the right contract;
   pick it even though it is more expensive to test.
 - **§3 Single source of truth.** Two parsers today (legacy at
-  `src/query/src/compiler.zig`, AST at `src/ast/parser.zig`). Grammar
+  `legacy@22cd23c compiler.zig`, AST at `src/ast/parser.zig`). Grammar
   decisions duplicate and drift. Proven twice in the last 48 h
   (commits `83f0212`, `c1ef970`).
 - **§4 Zero workarounds.** The byte-identical bar forces the new
@@ -168,7 +168,7 @@ intermediate allocations.
 
 | # | Metric | Bar vs legacy | Measurement |
 |---|---|---|---|
-| 1 | VM-semantics test pass rate | 100% on extracted fixtures + every existing `tests/query_test.zig` test green under `-Dcompile=new` | `zig build test -Dcompile=new` + new `vm-equiv` step |
+| 1 | VM-semantics test pass rate | 100% on extracted fixtures + every existing `tests/query_test.zig` test green under `pre-cutover compile-flag new` | `zig build test pre-cutover compile-flag new` + new `vm-equiv` step |
 | 2 | Compile throughput median | within 5% AND within 2σ of legacy median | `zig build bench-compile`; ≥3 fresh-process runs; σ recorded |
 | 3 | Release binary size | within 1% of legacy total [recast in §3.5 per P20 deferral resolution; effective bound: within 10% absolute OR within 1% per added pass file] | `size zig-out/bin/zq`; strip + debug-info flags held constant between legacy and new measurements; baseline numbers in `research/compiler-baselines.md` |
 | 4 | Compile peak RSS | within 5% of legacy | `/usr/bin/time -v` over fixture corpus, median across 3 runs |
@@ -201,24 +201,24 @@ src/ast/nodes.zig     -- shared (no removals; walker-only consumers removed)
 
 src/query/
   root.zig            -- public query API; dispatches compile backend
-                         via `-Dcompile=` build flag
+                         via `pre-cutover compile-flag ` build flag
   src/vm.zig          -- unchanged
   src/prefilter.zig   -- unchanged
   src/compiler.zig    -- legacy; deleted in R5
 ```
 
-### 1.6 Build flag — `-Dcompile`
+### 1.6 Build flag — `-compile-flag-pre-cutover`
 
 | Value | Meaning | Phase |
 |---|---|---|
-| `legacy` | Legacy compiler (`src/query/src/compiler.zig`) | R1–R3 default; removed at R5 |
+| `legacy` | Legacy compiler (`legacy@22cd23c compiler.zig`) | R1–R3 default; removed at R5 |
 | `new` | New compiler (`src/compiler/`) under construction | R3 opt-in |
 
 At R4 cutover: default flips from `legacy` to `new`. At R5 (same
-sitting): the `-Dcompile` flag is removed entirely; the new compiler
+sitting): the `-compile-flag-pre-cutover` flag is removed entirely; the new compiler
 is unconditional. No `canonical`/`experimental` aliases reserved
 upfront — when an experimental pass first arrives, that's when
-`-Dcompile=experimental` gets added.
+`pre-cutover compile-flag experimental` gets added.
 
 ---
 
@@ -235,8 +235,8 @@ upfront — when an experimental pass first arrives, that's when
 - `src/ast/nodes.zig` — no removals; verify no walker-only variants
   remain (none currently identified beyond `assign_general`, which is
   shared).
-- `src/query/src/vm.zig` — unchanged.
-- `src/query/src/prefilter.zig` — unchanged (already module-scoped).
+- `legacy@22cd23c vm.zig` — unchanged.
+- `legacy@22cd23c prefilter.zig` — unchanged (already module-scoped).
 - BUG-005 d1 fix in legacy `parseObjectFieldValue`, BUG-006 in
   `vm.zig`, regex n-flag operand packing, microbench
   (`src/microbench/`), pool `user_error_msg` plumbing — all from
@@ -372,9 +372,9 @@ selects new; only legacy when flag is `legacy`.
    struct (fixed-arity children + span + extra), `IR` container
    (nodes, extra_children, extra_data, arena, source map, string buf
    ref, regex pool ref). Comptime assert `@sizeOf(Node) <= 32`.
-3. Wire `src/query/root.zig` to dispatch based on `-Dcompile=`:
+3. Wire `src/query/root.zig` to dispatch based on `pre-cutover compile-flag `:
    - `legacy` → existing path.
-   - `new` → new path. Today returns `error.NewCompilerNotImplemented`
+   - `new` → new path. Today returns `error.NotImpl-pre-cutover`
      until R3 lands the first category.
 4. Build VM-semantics harness `tests/vm_equiv.zig`:
    - **Compat fixtures**: regenerate from upstream `../jq/tests/jq.test`
@@ -382,7 +382,7 @@ selects new; only legacy when flag is `legacy`.
      test = `{ filter, input, expected_output_or_error }`. ~533 cases.
    - **Hand-rolled tests**: `tests/query_test.zig` (210 cases) does
      **not** extract — it builds tapes directly. Instead, add a
-     `-Dcompile=` dispatch at the test-binary level so every existing
+     `pre-cutover compile-flag ` dispatch at the test-binary level so every existing
      hand-rolled test runs once under each compiler. Compare full
      output stream + error kind + (R3 close) source position.
    - Output: NDJSON `MISMATCH filter=... input=... legacy=... new=...`
@@ -403,7 +403,7 @@ selects new; only legacy when flag is `legacy`.
    11. Regex + datetime + extended arg-builtin surface
    12. Prefilter harvest off the IR (no second `ast.parse`) — ✓ COMPLETE (7454b6f)
 7. After each category, harness must be 100% green on that category's
-   fixtures + zero new regressions in `zig build test -Dcompile=new`.
+   fixtures + zero new regressions in `zig build test pre-cutover compile-flag new`.
 8. Fuse pass: port legacy's `.a | .b | .c` → `load_path` fold into
    `fuse.zig` as one IR→IR pass. Other fuse opportunities deferred.
 9. Snapshot tests:
@@ -420,7 +420,7 @@ selects new; only legacy when flag is `legacy`.
 10. Commit cadence: one atomic commit per operator category (12
     commits across R3). Each commit must leave the harness 100% green
     on its category, no new regressions in `zig build test
-    -Dcompile=new`. Bisectable.
+    pre-cutover compile-flag new`. Bisectable.
 11. Acknowledge `ROADMAP.md § Deliberate Deviations` (large-int,
     division-by-zero, input-EOF, duplicate-keys, etc.) in R3
     acceptance: VM-semantics harness must pass on the deviation
@@ -429,9 +429,9 @@ selects new; only legacy when flag is `legacy`.
     check, not a code path.
 
 **Acceptance.**
-- `zig build vm-equiv -Dcompile=new` green on all extracted fixtures.
-- `zig build test -Dcompile=new` matches the R2 R1-baseline pass/fail/skip.
-- Bench numbers recorded for `-Dcompile=new` against R2 baseline.
+- `zig build vm-equiv pre-cutover compile-flag new` green on all extracted fixtures.
+- `zig build test pre-cutover compile-flag new` matches the R2 R1-baseline pass/fail/skip.
+- Bench numbers recorded for `pre-cutover compile-flag new` against R2 baseline.
 - Snapshot tests cover every IR op + every fuse rewrite.
 
 ### R4+R5 — Guardrail close, flag flip, legacy delete (one sitting, no soak)
@@ -447,8 +447,8 @@ window.
 2. Any gate miss → root-cause investigation in `bugs.md`, fix in
    `src/compiler/`, re-measure. Do not relax thresholds.
 3. Once all five gates pass: cutover commit:
-   - Delete `src/query/src/compiler.zig`.
-   - Remove `-Dcompile` build flag from `build.zig` entirely.
+   - Delete `legacy@22cd23c compiler.zig`.
+   - Remove `-compile-flag-pre-cutover` build flag from `build.zig` entirely.
    - Update `src/query/root.zig` to dispatch the new compiler
      unconditionally.
    - Remove legacy-specific imports, helpers, test hooks.
@@ -461,13 +461,13 @@ window.
    numbers slightly).
 6. Single commit:
    `refactor(compiler): cutover to VM-semantics compiler; delete
-   legacy + -Dcompile flag`.
+   legacy + -compile-flag-pre-cutover flag`.
 7. Merge `redesign/compiler` to `main` (fast-forward or merge commit
    per repo convention).
 
 **Acceptance.**
-- `rg "src/query/src/compiler" src/ tests/ build.zig` returns zero.
-- `rg "Dcompile" build.zig` returns zero.
+- `rg "legacy@22cd23c compiler" src/ tests/ build.zig` returns zero.
+- `rg "compile-flag-pre-cutover" build.zig` returns zero.
 - `zig build test` fully green.
 - All five guardrails final numbers in `research/compiler-baselines.md`.
 
@@ -479,8 +479,8 @@ window.
 
 The R5 cutover attempt at the original P21 (HEAD `2b9706a`) failed silently
 on runtime: 12+ AST shapes and builtin names dispatch through the
-`NewCompilerNotImplemented` arm at `src/query/root.zig:104` and route to
-legacy via `compileLegacy`. P20 gate 1 measured 178 vm-equiv MATCH but did
+`NotImpl-pre-cutover` arm at `src/query/root.zig:104` and route to
+legacy via `compile-legacy`. P20 gate 1 measured 178 vm-equiv MATCH but did
 not measure the dispatcher-fallback rate. The fallback masked
 incompleteness: true new-compiler test coverage was ~1064 pass / ~82 fail
 (measured empirically by P21 cutover implementer with fallback removed),
@@ -514,12 +514,12 @@ Mirrors P15-P18 with one explicit addition for the dispatcher-fallback lesson.
 5. Add lower snapshots in `tests/compiler/snapshots/lower/cat-N-*.txt` — one per distinct IR shape introduced.
 6. Add fuse snapshots only if new shapes interact with `load_path` folding (most cat-13–18 don't).
 7. Add vm-equiv fixtures explicitly exercising new operators. Mandatory: ≥ 8 fixtures per phase covering positive + error + edge-case inputs.
-8. **Fallback-disabled spot-check (informational)**: in a throwaway worktree, comment out the dispatcher fallback at `src/query/root.zig:102-109`; run `zig build vm-equiv` + `zig build test -Dcompile=new`; record failure delta in implementer brief notes. **The dispatcher fallback stays in the actual commit** — informational only, surfaces incompleteness early.
+8. **Fallback-disabled spot-check (informational)**: in a throwaway worktree, comment out the dispatcher fallback at `src/query/root.zig:102-109`; run `zig build vm-equiv` + `zig build test pre-cutover compile-flag new`; record failure delta in implementer brief notes. **The dispatcher fallback stays in the actual commit** — informational only, surfaces incompleteness early.
 9. Run `zig build snapshots-update`; commit only if diff is bounded to cat-N additions.
 
 **Verifier trio (parallel, all opus):**
 - `mechanical-verifier`: legacy untouched; opcode integrity; no scope creep; vm-equiv MATCH delta ≥ +8.
-- `equiv-runner`: full vm-equiv + `-Dcompile=new` + `-Dcompile=legacy`; no regressions.
+- `equiv-runner`: full vm-equiv + `pre-cutover compile-flag new` + `pre-cutover compile-flag legacy`; no regressions.
 - `snapshot-validator`: every new SemOp/IR shape has ≥ 1 lower snapshot; deterministic regen; ≤ 200-line snapshots (CONCERN bound from P20).
 
 **Reviewer (single, opus):** BLOCK loop max 2 attempts; on round-3 BLOCK, escalate.
@@ -563,7 +563,7 @@ P27 (cat-18)                     (independent — anywhere)
 After P27 closes, P21-redux re-runs original §3 R4+R5 procedure:
 1. Re-measure all five §1.4 gates at the cat-18 HEAD.
 2. Run the fallback-disabled gate (§3.5 acceptance step 2).
-3. Once green: cutover commit removes the dispatcher fallback, `src/query/src/compiler.zig`, the `-Dcompile` build flag, and vm-equiv harnesses (Option B per P21 cutover implementer's selection) in one atomic step.
+3. Once green: cutover commit removes the dispatcher fallback, `legacy@22cd23c compiler.zig`, the `-compile-flag-pre-cutover` build flag, and vm-equiv harnesses (Option B per P21 cutover implementer's selection) in one atomic step.
 
 #### Estimated session count to P21-redux
 

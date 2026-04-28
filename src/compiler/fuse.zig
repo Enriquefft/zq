@@ -6,7 +6,7 @@
 //! .c` → `load_path` fold into `fuse.zig` as one IR→IR pass. Other
 //! fuse opportunities deferred."
 //!
-//! Legacy fuse (`src/query/src/compiler.zig:7186`) walks the
+//! Legacy fuse (`legacy@22cd23c compiler.zig:7186`) walks the
 //! linearized bytecode stream and folds every maximal run of
 //! consecutive `load_key`s separated only by `pipe` instructions —
 //! including runs that appear AFTER a chain-breaker like `each` /
@@ -150,7 +150,7 @@ fn copyAndFold(ctx: *WalkCtx, src_idx: u32) error{OutOfMemory}!u32 {
 /// maximal run of consecutive `load_field` leaves into a single
 /// `load_path` EmitOp, then rebuild a left-deep pipe tree from the
 /// resulting sequence. Mirrors legacy fuse's bytecode-stream walk
-/// (`src/query/src/compiler.zig:7186`) on the IR-tree shape.
+/// (`legacy@22cd23c compiler.zig:7186`) on the IR-tree shape.
 ///
 /// Non-`load_field` leaves recurse through `copyAndFold` themselves —
 /// e.g. an `obj_ctor` value containing its own pipe-chain still folds.
