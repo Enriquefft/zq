@@ -886,6 +886,23 @@ pub const Instruction = extern struct {
         /// End of walk(f) scope. The VM jumps here after executing the body.
         walk_end,
 
+        /// Begin a repeat(f) scope — jq's `def repeat(exp): def _r: exp, _r; _r;`.
+        /// operand.index = exit_ip (IP of the matching repeat_end + 1).
+        /// Pushes a RepeatFrame fork that captures the current input. On
+        /// backtrack into the frame (i.e. when the body's generator chain
+        /// exhausts), the saved input is restored as `current` and execution
+        /// resumes at body_start_ip — yielding the body's outputs again, ad
+        /// infinitum. Termination is delegated to an enclosing `limit_start`
+        /// counter (matching jq's `limit(N; repeat(f))` idiom); without one
+        /// the loop runs forever, matching jq.
+        repeat_start,
+        /// End of repeat(f) scope. Reachable only when an enclosing scope
+        /// (typically `limit_start`) has truncated the fork stack and shifts
+        /// `ip` past the repeat frame; otherwise the body's trailing
+        /// `backtrack` re-enters the body via the RepeatFrame instead.
+        /// Pops any matching RepeatFrame still on the fork stack.
+        repeat_end,
+
         // Fork stack opcodes (unified backtracking)
         /// Push a forkpoint for backtracking. operand.index = backtrack target IP.
         fork,
@@ -927,6 +944,7 @@ pub const Instruction = extern struct {
                 .skip_start,
                 .nth_start,
                 .walk_start,
+                .repeat_start,
                 .path_begin,
                 .fork,
                 .call_function,
@@ -1003,6 +1021,8 @@ pub const Instruction = extern struct {
                 .skip_end,
                 .walk_start,
                 .walk_end,
+                .repeat_start,
+                .repeat_end,
                 .fork,
                 .backtrack,
                 .each,

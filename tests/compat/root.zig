@@ -24,4 +24,5 @@ comptime {
     _ = @import("object_merge.zig");
     _ = @import("regression.zig");
     _ = @import("regex.zig");
+    _ = @import("repeat_builtin.zig");
 }

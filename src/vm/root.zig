@@ -31,7 +31,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, path_scope, scan, match_g, splits };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, path_scope, scan, match_g, splits };
 
 const EachState = struct {
     pos: u32,
@@ -124,6 +124,22 @@ const SkipState = struct {
     saved_collect_len: u32,
 };
 
+/// State for `repeat(f)` — jq's infinite generator
+/// `def repeat(exp): def _r: exp, _r; _r;`. Each backtrack into the
+/// frame restores the captured input as `current` and re-enters the
+/// body at `body_start_ip`, producing the body's outputs ad infinitum.
+/// Termination is delegated to an enclosing `limit_start` whose
+/// counter, decremented at each `yield_output` inside the body's IP
+/// range, will truncate the fork stack past us once it hits zero.
+/// `saved_collect_len` lets the backtrack handler tear down any
+/// collect frames the body opened mid-iteration so the next iteration
+/// starts clean.
+const RepeatState = struct {
+    body_start_ip: u32,
+    exit_ip: u32,
+    saved_collect_len: u32,
+};
+
 /// State for one active `scan(pattern)` generator iteration. The fork frame
 /// owns the `slots` slice (allocated at push, freed at pop).
 ///
@@ -209,6 +225,12 @@ const ForkAux = union(ForkType) {
     label: LabelState,
     limit: LimitState,
     skip: SkipState,
+    /// State for `repeat(f)` — see `RepeatState` doc-comment. Backtrack
+    /// into this frame restores the saved input and re-enters the body
+    /// at `body_start_ip`; the frame is popped only when an enclosing
+    /// `limit` truncates the fork stack past us, or when `repeat_end`
+    /// runs (only reachable via that truncation).
+    repeat: RepeatState,
     /// Sentinel forkpoint pushed by `path_begin`. Holds no extra state — its
     /// sole purpose is to pop the matching path frame when execution
     /// backtracks past the path() expression scope.
@@ -1745,6 +1767,52 @@ pub const ResultIterator = struct {
                 while (idx > 0) {
                     idx -= 1;
                     if (it.fork_stack.items[idx].aux == .limit) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
+                }
+                it.ip += 1;
+                return null;
+            },
+
+            .repeat_start => {
+                // Push a RepeatFrame fork capturing the current input. On
+                // backtrack into the frame (when the body's generator chain
+                // exhausts), the saved input is restored as `current` and
+                // execution resumes at body_start_ip — yielding the body's
+                // outputs ad infinitum. Termination is delegated to an
+                // enclosing `limit_start` whose counter, decremented at each
+                // `yield_output` inside the body's IP range, will truncate
+                // the fork stack past us once it hits zero. backtrack_ip is
+                // unused (the .repeat backtrack arm always re-enters at
+                // body_start_ip), so we set it to the exit_ip operand for
+                // diagnostic symmetry with `limit_start`.
+                const exit_ip: u32 = @intCast(instr.operand.index);
+                const body_start_ip: u32 = it.ip + 1;
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = exit_ip,
+                    .aux = .{ .repeat = .{
+                        .body_start_ip = body_start_ip,
+                        .exit_ip = exit_ip,
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    } },
+                    .saved_path = it.snapshotPathState(),
+                });
+                it.ip = body_start_ip;
+                return null;
+            },
+            .repeat_end => {
+                // Symmetric counterpart to `limit_end`. Reachable only if an
+                // enclosing scope shifts ip past us without truncating the
+                // RepeatFrame; the body's trailing `backtrack` normally
+                // re-enters via the .repeat backtrack arm instead. Pop the
+                // matching frame for safety so it can't outlive its scope.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].aux == .repeat) {
                         _ = it.fork_stack.orderedRemove(idx);
                         break;
                     }
@@ -6868,6 +6936,37 @@ pub const ResultIterator = struct {
                     if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
+                },
+                .repeat => |state| {
+                    // Body's generator chain exhausted — restore the captured
+                    // input and re-enter the body at body_start_ip. The frame
+                    // stays on the stack: `repeat(f)` is infinite, so it's
+                    // popped only by an enclosing scope (typically `limit`
+                    // truncating via `truncateForkStack`, or `repeat_end`).
+                    //
+                    // Tear down any collect frames the body opened mid-
+                    // iteration so the next iteration starts with the same
+                    // collect-stack depth as the first. Without this, an
+                    // unbalanced `[ ... ]` inside the body would leak buffers
+                    // across iterations.
+                    while (it.collect_stack.items.len > state.saved_collect_len) {
+                        var cf = it.collect_stack.pop().?;
+                        cf.buffer.deinit(it.alloc);
+                    }
+                    if (fp.saved_stack) |snap| {
+                        it.restoreValueStackFromSnapshot(snap);
+                        fp.saved_stack = try it.snapshotValueStackForFork();
+                    } else {
+                        it.value_stack.items.len = fp.saved_value_stack_len;
+                    }
+                    it.current = fp.saved_current;
+                    it.restorePathState(fp.saved_path);
+                    if (fp.saved_object) |snap| {
+                        it.restoreObjectConstructState(snap);
+                        fp.saved_object = try it.snapshotObjectConstructState();
+                    }
+                    it.ip = state.body_start_ip;
+                    return true;
                 },
                 .path_scope => {
                     // Path() scope is exiting due to backtrack from outside —

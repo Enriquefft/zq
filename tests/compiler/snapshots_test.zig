@@ -129,6 +129,7 @@ const FIXTURES = [_]Fixture{
     .{ .name = "cat-13-last-1", .expected = @embedFile("snapshots/lower/cat-13-last-1.txt") },
     .{ .name = "cat-13-nth", .expected = @embedFile("snapshots/lower/cat-13-nth.txt") },
     .{ .name = "cat-13-skip", .expected = @embedFile("snapshots/lower/cat-13-skip.txt") },
+    .{ .name = "cat-13-repeat", .expected = @embedFile("snapshots/lower/cat-13-repeat.txt") },
     // ── Cat-17 — format builtins (@text/@json/@csv/@tsv/@html/@sh/@uri/@urid/@base64/@base64d) ──
     .{ .name = "cat-17-standalone-base64", .expected = @embedFile("snapshots/lower/cat-17-standalone-base64.txt") },
     .{ .name = "cat-17-standalone-json", .expected = @embedFile("snapshots/lower/cat-17-standalone-json.txt") },

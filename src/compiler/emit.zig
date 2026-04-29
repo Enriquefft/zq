@@ -1396,6 +1396,7 @@ fn rebaseInstrs(buf: []types_mod.Instruction, offset: i64) void {
             .fork_alt,
             .array_collect_start,
             .limit_start,
+            .repeat_start,
             .label_begin,
             => {
                 if (offset != 0) {
@@ -1835,6 +1836,7 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         .limit_skip_nth => return emitLimitSkipNth(em, node, name),
         .first_arg1 => return emitFirst(em, node),
         .last_arg1 => return emitLast(em, node),
+        .repeat_arg1 => return emitRepeat(em, node),
         .format_apply => return emitFormatApply(em, node, name),
         // Cat-16 — `error(msg)` (1-arity), `del(path_expr)` (1-arity).
         // Both have a name that doesn't appear in `nameToBuiltinId`
@@ -1983,7 +1985,7 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // Cat-13 / cat-17 / cat-16 classes already handled by the
         // early-out switch above — reaching them here would mean
         // the early-out fell through.
-        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply, .error_arg1, .del_path, .map_arg1, .select_arg1 => unreachable,
+        .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply, .error_arg1, .del_path, .map_arg1, .select_arg1, .repeat_arg1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -2233,6 +2235,46 @@ fn emitFirst(em: *Emitter, node: ir.Node) EmitError!void {
 
     const exit_ip: u32 = @intCast(em.instructions.items.len);
     em.instructions.items[limit_ip].operand = .{ .index = exit_ip };
+}
+
+/// Emit `repeat(f)` — jq's infinite generator
+/// `def repeat(exp): def _r: exp, _r; _r;`. The body re-runs against
+/// the original input each iteration, yielding every value the body
+/// produces, indefinitely. Termination is delegated to an enclosing
+/// `limit_start` counter (matching jq's `limit(N; repeat(f))` idiom);
+/// without one the loop runs forever — matching jq's bare-`repeat`
+/// semantics.
+///
+/// Layout (mirrors the streaming-frame shape of `limit_start`):
+///   ip0: repeat_start exit_ip   ; pushes RepeatFrame fork; saves current
+///   body_start = ip0+1:
+///     <f>                       ; produces value(s)
+///     yield_output              ; yields each (counts against any
+///                               ; enclosing `limit` frame)
+///     backtrack                 ; pops inner generator forks first;
+///                               ; on reaching the RepeatFrame, restores
+///                               ; the saved input and re-enters body
+///   exit_ip:
+///     repeat_end                ; only reached if an enclosing scope
+///                               ; truncates the fork stack past us
+///
+/// No explicit save/restore_input needed: the RepeatFrame's
+/// `saved_current` is the canonical input source, restored every
+/// time `backtrack` falls through to the frame.
+fn emitRepeat(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    const repeat_ip: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.repeat_start, .{ .index = 0 }, node);
+
+    try emitNode(em, body_idx);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const exit_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[repeat_ip].operand = .{ .index = exit_ip };
+    try em.pushInstr(.repeat_end, .{ .none = {} }, node);
 }
 
 /// Emit `last` / `last(f)`. The 0-arg form lowers to `.[-1]`

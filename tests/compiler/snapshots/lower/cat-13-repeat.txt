@@ -1,0 +1,8 @@
+# source: limit(3; repeat(.+1))
+# SemOp
+call_builtin("limit") @0..21
+  load_const(3) @6..7
+  call_builtin("repeat") @9..20
+    arith(add) @16..19
+      identity @16..17
+      load_const(1) @18..19
