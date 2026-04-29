@@ -31,11 +31,11 @@ visible in `src/pool/root.zig:process_line_serialized`.
 
 | Phase       | What it measures                                                   | Production analog                                          |
 |-------------|--------------------------------------------------------------------|------------------------------------------------------------|
-| `parse`     | `parser.feed(line, true)` — bytes → Tape                           | `src/pool/root.zig:779-801` (Parse block)                  |
+| `parse`     | `parser.feed(line, true)` — bytes → Tape                           | `src/pool/root.zig:780-801` (Parse block)                  |
 | `lookup`    | `query.execute(tape, …)` — bind tape, allocate eval stack          | `src/pool/root.zig:804-820` (Bind/rebind ResultIterator)   |
 | `predicate` | `iterator.next()` — run VM to first/next result                    | `src/pool/root.zig:826` (inside serialize loop)            |
 | `serialize` | `output.serialize(sink, value, …)` — Value → JSON bytes            | `src/pool/root.zig:840` (serialize call)                   |
-| `coord`     | Full per-record loop: parse+lookup+predicate+serialize+reset       | `src/pool/root.zig:process_line_serialized` (whole body)   |
+| `coord`     | Full per-record loop: parse+lookup+predicate+serialize+reset       | `src/pool/root.zig:744` (whole body of `process_line_serialized`) |
 
 `coord` minus the sum of the first four is the per-record
 coordination/reset/teardown overhead.
