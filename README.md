@@ -126,7 +126,7 @@ Requires [Zig 0.15.2](https://ziglang.org/download/). Full build also requires `
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for milestone tracking. Current status: ~80% jq compat-suite coverage.
+See [ROADMAP.md](ROADMAP.md) for milestone tracking. Current status: 96% jq compat-suite coverage (557/579 passing, 22 known-fail tracked).
 
 ---
 
