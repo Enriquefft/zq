@@ -500,7 +500,11 @@ pub const Parser = struct {
                 return p.createNode(.recurse, span);
             },
             .lparen => {
-                const inner = p.parsePipe() catch {
+                // Use parseFilter (not parsePipe) so that a leading `def` inside
+                // a paren group (e.g. `(def x: f; x = 10)`) is accepted.
+                // parseFilter dispatches def_kw to parseFunctionDef and otherwise
+                // falls through to parsePipe — no change for normal expressions.
+                const inner = p.parseFilter() catch {
                     p.syncToNextStatement();
                     return p.makeError("expected expression in parentheses", span);
                 };

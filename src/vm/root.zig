@@ -113,6 +113,11 @@ const PathFrame = struct {
 fn callBuiltinIsPathEmittingInFrame(bid: types.BuiltinId) bool {
     return switch (bid) {
         .paths, .leaf_paths, .recurse => true,
+        // getpath(P) in a path(f) context: the path IS the argument P.
+        // builtinGetpath populates frame.components directly from P so that
+        // path_end can build the path array via buildPathArray(components).
+        // Marking it here prevents path_broken from being set before dispatch.
+        .getpath => true,
         else => false,
     };
 }
@@ -5528,6 +5533,11 @@ pub const ResultIterator = struct {
 
     /// `getpath(PATH)`: walk the current value by path components, return result.
     /// Path is an array of strings (object keys) and ints (array indices).
+    ///
+    /// When called inside a `path(f)` frame (e.g. `path(getpath(P))` or
+    /// `getpath(P) |= V`), the frame's components are populated from `P` so
+    /// that `path_end` can reconstruct the path array correctly. This allows
+    /// autovivification via setpath on null/missing intermediate nodes.
     fn builtinGetpath(it: *ResultIterator) ZqError!?StackValue {
         const path_sv = try it.popValue();
         const path_val = try stackValueToValue(path_sv);
@@ -5538,6 +5548,36 @@ pub const ResultIterator = struct {
             .array => |s| s,
             else => return error.TypeError,
         };
+
+        // If inside a path(f) frame, record the path elements as components
+        // so path_end builds the correct path array (enabling |= autovivify).
+        if (it.path_stack.items.len > 0) {
+            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+            frame.components.clearRetainingCapacity();
+            var scan_pos = span.start + 1;
+            const scan_end = span.end - 1;
+            while (scan_pos < scan_end) {
+                const entry = span.tape.entries[scan_pos];
+                switch (entry.tag) {
+                    .string => {
+                        // getString returns a slice into tape.string_buf which
+                        // remains valid for the lifetime of this query execution.
+                        const key_str = span.tape.getString(entry.payload.string);
+                        try frame.components.append(it.alloc, .{ .string = key_str });
+                    },
+                    .int => {
+                        try frame.components.append(it.alloc, .{ .int = entry.payload.int });
+                    },
+                    else => {},
+                }
+                scan_pos = skipEntry(span.tape.*, scan_pos);
+            }
+            // Clear path_broken: the argument expression (e.g. array literal)
+            // may have set it while being evaluated. Since getpath(P)'s path IS
+            // P (not a navigation trace), once we have the components the prior
+            // broken state is superseded. path_end will use frame.components.
+            frame.path_broken = false;
+        }
 
         var current = it.current;
         var pos = span.start + 1;
@@ -5641,7 +5681,10 @@ pub const ResultIterator = struct {
                         }
                     },
                     .null_val => {},
-                    else => {},
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_string = key });
+                        return error.TypeError;
+                    },
                 }
 
                 if (!found) {
@@ -5736,7 +5779,10 @@ pub const ResultIterator = struct {
                         const replaced = try it.setpathRecursive(.null_val, path, depth + 1, new_val);
                         try writeValueToTape(&tmp_tape, it.alloc, replaced);
                     },
-                    else => return error.TypeError,
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_number_val = idx });
+                        return error.TypeError;
+                    },
                 }
 
                 const arr_end_idx = try tmp_tape.appendEntry(it.alloc, .{
@@ -7956,6 +8002,9 @@ pub const ResultIterator = struct {
         /// `.[n]` / `.[n] = v` numeric index on a non-array/null.
         /// Produces: "Cannot index <type> with number"
         index_number,
+        /// Numeric index with the actual index value included.
+        /// Produces: "Cannot index <type> with number (<n>)"
+        index_number_val: i64,
         /// `.[]` iteration on a non-array/object/null.
         /// Produces: "Cannot iterate over <type> (<compact-json>)"
         iterate,
@@ -7990,6 +8039,15 @@ pub const ResultIterator = struct {
                 buf.appendSlice(it.alloc, "Cannot index ") catch return null;
                 buf.appendSlice(it.alloc, type_name) catch return null;
                 buf.appendSlice(it.alloc, " with number") catch return null;
+            },
+            .index_number_val => |n| {
+                buf.appendSlice(it.alloc, "Cannot index ") catch return null;
+                buf.appendSlice(it.alloc, type_name) catch return null;
+                buf.appendSlice(it.alloc, " with number (") catch return null;
+                var num_buf: [32]u8 = undefined;
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return null;
+                buf.appendSlice(it.alloc, num_str) catch return null;
+                buf.appendSlice(it.alloc, ")") catch return null;
             },
             .iterate => {
                 buf.appendSlice(it.alloc, "Cannot iterate over ") catch return null;
