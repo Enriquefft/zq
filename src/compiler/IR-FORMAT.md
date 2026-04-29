@@ -283,7 +283,7 @@ Plan §3 R3 step 9 (verbatim):
 > - For each fuse rewrite: `tests/compiler/snapshots/fuse/<name>.txt`
 >   (IR before → IR after).
 > - IR text format: indented tree, one node per line, child indent +2 spaces,
->   payload after node tag. Spec: `research/compiler-ir-format.md`.
+>   payload after node tag. Spec: `src/compiler/IR-FORMAT.md`.
 > - Regeneration: `zig build snapshots-update` rewrites every snapshot from
 >   current new-compiler output. Intended for deliberate IR changes only; CI
 >   fails on any uncommitted snapshot diff.
