@@ -144,7 +144,7 @@ pub const ResultIterator = struct {
 
 | Function                 | Signature                                                                                           | Description                                                                                            |
 |--------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `CompiledQuery.compile`  | `[]const u8, Opts, Allocator → OOM!CompileResult`                                                   | Lex, parse, optimize the filter. Success → `.ok`; compile failure → `.err` with source location.       |
+| `CompiledQuery.compile`  | `[]const u8, Opts, Allocator → OOM!CompileResult`                                                   | Run the Phase-2R pipeline: `ast.parse → lower → IR → fuse → emit`. Success → `.ok`; compile failure → `.err` with source location. |
 | `CompiledQuery.deinit`   | `*CompiledQuery → void`                                                                             | Free bytecode, string-intern table, regex pool, and prefilter.                                         |
 | `CompiledQuery.execute`  | `*const CompiledQuery, Tape, []const ExternalVarBinding, Allocator → OOM!ResultIterator`            | Allocate eval stack and bind external variables. No execution yet.                                     |
 | `ResultIterator.deinit`  | `*ResultIterator → void`                                                                            | Free the eval stack. Idempotent.                                                                       |

@@ -18,15 +18,44 @@ launched with `--lsp`.
 
 ## Public Interface
 
+### Build-flag gate (`-Dlsp`)
+
+All submodule re-exports and the `run` entry point are conditional on the
+`-Dlsp` build flag (Zig build option `lsp_enabled`):
+
+```zig
+/// Comptime flag mirroring `-Dlsp`. When false, all sub-modules below
+/// collapse into empty structs and `run` returns `error.LspDisabled`.
+pub const enabled: bool = build_options.lsp_enabled;
+
+/// Returned by `run` (and transitively by any public entry point) when
+/// the binary was built with `-Dlsp=false`.
+pub const Error = error{LspDisabled};
+```
+
+When `enabled` is `false`:
+- Every sub-module (`server`, `transport`, `protocol`, `analysis`,
+  `builtins`, `features`) is an empty `struct {}` — none of the LSP
+  implementation is compiled into the binary.
+- `Server` is an empty `struct {}`.
+- `run` returns `error.LspDisabled` immediately without touching stdin/stdout.
+
+Callers that need to branch at runtime should check `lsp.enabled` at
+comptime, or handle `error.LspDisabled` from `run`.
+
+---
+
 ### Top-level
 
 ```zig
 const std = @import("std");
 
 /// Start the LSP server on the process's stdin/stdout and loop until shutdown.
+/// Returns `error.LspDisabled` when compiled with `-Dlsp=false`.
 pub fn run(alloc: std.mem.Allocator) !void;
 
-/// Re-exported submodules.
+/// Re-exported submodules. Each collapses to an empty struct{} when
+/// `enabled` is false (see Build-flag gate section above).
 pub const server:    @import("server.zig");
 pub const transport: @import("transport.zig");
 pub const protocol:  @import("protocol.zig");

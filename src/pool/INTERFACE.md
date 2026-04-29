@@ -164,6 +164,8 @@ pub const Pool = struct {
 | `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → void`      | Attach stream; IO thread reads lines and feeds workers in pipeline mode. |
 | `Pool.collect`        | `*Pool → ZqError!?Result`                                                        | Return next in-order result; null when exhausted; error on per-record failure.          |
 | `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                                   | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
+| `record_meta_size_for_test` | `usize` (comptime constant)                                                | `@sizeOf(RecordMeta)` — exported so the regression test in `tests/pool_test.zig` can pin the layout. Any new per-record field changes this value and fails the test intentionally. |
+| `readCgroupFile`      | `[]const u8 → ?u64`                                                              | Read a cgroup memory-limit file at `path`. Returns `null` if the file is absent, contains `"max"`, or cannot be parsed. Stack-allocated; no heap allocation. |
 
 ### Errors
 
