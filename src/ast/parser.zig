@@ -1,6 +1,7 @@
 const std = @import("std");
 const nodes = @import("nodes.zig");
 const lx = @import("lexer");
+const types = @import("types");
 
 const Node = nodes.Node;
 const Span = nodes.Span;
@@ -469,9 +470,19 @@ pub const Parser = struct {
                 return p.createNode(.{ .literal = .{ .int = n } }, span);
             },
             .float_lit => {
-                const f = std.fmt.parseFloat(f64, p.tokenSlice(tok)) catch {
+                const raw = p.tokenSlice(tok);
+                const f = std.fmt.parseFloat(f64, raw) catch {
                     return p.makeError("invalid float", span);
                 };
+                // When the literal overflows (→ ±inf) or underflows to zero
+                // but has a non-zero mantissa, preserve the canonical normalized
+                // form so it can be echoed back exactly (jq big-number support).
+                if (std.math.isInf(f) or (f == 0.0 and hasMantissa(raw))) {
+                    const normalized = types.normalizeBigNumber(raw);
+                    const owned = p.arena.allocator().dupe(u8, normalized.slice()) catch
+                        return p.makeError("out of memory", span);
+                    return p.createNode(.{ .literal = .{ .big_number = owned } }, span);
+                }
                 return p.createNode(.{ .literal = .{ .float = f } }, span);
             },
             .minus => {
@@ -881,13 +892,17 @@ pub const Parser = struct {
 
         // No `:` — synthesize the shorthand value. Legacy's per-shape logic
         // (`src/query/src/compiler.zig:6880-6894`):
-        //   ident   `{a}`      → value = `.a`   (field_access)
-        //   string  `{"a"}`    → value = `."a"` (field_access on decoded name)
-        //   (expr)  `{(expr)}` → DYNAMIC shorthand (save_input / replay /
-        //                        load_computed) — walker rejects until the
-        //                        shorthand-expr path is plumbed through
-        //                        (Stage 7 does not need this path; fixtures
-        //                        cover only colon-separated computed keys).
+        //   ident   `{a}`            → value = `.a`       (field_access)
+        //   string  `{"a"}`          → value = `."a"`     (field_access on decoded name)
+        //   expr    `{"a\(expr)"}`   → value = `.["a\(expr)"]` (bracket_expr suffix)
+        //           `{(expr)}`       → same bracket_expr pattern (dynamic shorthand)
+        //
+        // For expr keys the value is `.[key_expr]`: identity suffixed with
+        // `bracket_expr: key_expr`. The key expression is evaluated twice —
+        // once to produce the key name, once as the bracket index — which is
+        // safe because `object_key` restores `.` to the object snapshot, so
+        // the second evaluation sees the same input as the first. This
+        // matches jq's `{(expr)}` / `{"a\(expr)"}` shorthand semantics.
         const value: *Node = switch (key) {
             .ident => |name| p.createNode(.{ .field_access = .{
                 .name = p.internName(name),
@@ -895,7 +910,13 @@ pub const Parser = struct {
             .string => |name| p.createNode(.{ .field_access = .{
                 .name = p.internName(name),
             } }, Span.from(key_start, p.lex.pos)),
-            .expr => |expr| expr,
+            .expr => |expr| blk: {
+                // Synthesize `.[key_expr]` — identity suffixed with bracket_expr.
+                const id = p.createNode(.identity, Span.from(key_start, p.lex.pos));
+                const ops = p.arena.allocator().alloc(Node.SuffixOp, 1) catch break :blk expr;
+                ops[0] = .{ .bracket_expr = expr };
+                break :blk p.createNode(.{ .suffix = .{ .base = id, .ops = ops } }, Span.from(key_start, p.lex.pos));
+            },
         };
 
         return .{
@@ -960,6 +981,17 @@ pub const Parser = struct {
             const raw = p.tokenSlice(tok);
             const content = raw[1 .. raw.len - 1];
             return .{ .string = p.internName(content) };
+        }
+        // Interpolated string key: `"a\(expr)"` — the lexer emits
+        // a `string_part` token for the leading literal fragment before `\(`.
+        // Parse the full interpolation and surface it as an `expr` key so
+        // the emitter evaluates it as a dynamic expression (matches jq
+        // semantics for interpolated key shorthand: `{"a\(1+1)"}` extracts
+        // the field whose name is `"a2"` from the input — test L122).
+        if (tok.tag == .string_part) {
+            _ = p.advance();
+            const interp = try p.parseStringInterp(tok, null, null);
+            return .{ .expr = interp };
         }
         if (isVarNameToken(tok.tag) or tok.tag == .int_lit or tok.tag == .float_lit) {
             _ = p.advance();
@@ -1724,6 +1756,17 @@ fn isBuiltinName(name: []const u8) bool {
     };
     for (arg_builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
+}
+
+/// Return true if the numeric literal has at least one non-zero digit in the
+/// mantissa (before any 'E'/'e').  Used to distinguish genuine underflow from
+/// a literal that is truly zero (e.g. "0.0").
+fn hasMantissa(s: []const u8) bool {
+    for (s) |c| {
+        if (c == 'e' or c == 'E') break;
+        if (c >= '1' and c <= '9') return true;
     }
     return false;
 }

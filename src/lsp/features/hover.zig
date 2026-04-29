@@ -90,6 +90,7 @@ fn hoverLiteral(node: *const ast.Node, source: []const u8) ?protocol.Hover {
         .literal => |lit| switch (lit) {
             .int => "**integer literal**",
             .float => "**float literal**",
+            .big_number => "**out-of-range number literal**",
             .string => "**string literal**",
             .bool_val => "**boolean literal**",
             .null_val => "**null**",

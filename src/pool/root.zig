@@ -131,6 +131,9 @@ const OwnedValue = union(enum) {
     bool_val: bool,
     int: i64,
     float: f64,
+    /// Out-of-range numeric literal (overflow/underflow for f64).
+    /// Backed by the per-chunk arena; dupe of Value.big_number.
+    big_number: []u8,
     string: []u8,
     tape_value: OwnedTapeValue,
 };
@@ -907,6 +910,7 @@ fn own_value(val: types.Value, aa: std.mem.Allocator) error{OutOfMemory}!OwnedVa
         .bool_val => |b| .{ .bool_val = b },
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
+        .big_number => |bn| .{ .big_number = try aa.dupe(u8, bn) },
         .string => |s| .{ .string = try aa.dupe(u8, s) },
         .object => |span| blk: {
             const entries = try aa.dupe(types.Tape.Entry, span.tape.entries);
@@ -1784,6 +1788,7 @@ fn owned_to_value(ov: *const OwnedValue) types.Value {
         .bool_val => |b| .{ .bool_val = b },
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
+        .big_number => |bn| .{ .big_number = bn },
         .string => |s| .{ .string = s },
         .tape_value => blk: {
             const tv = &ov.tape_value;

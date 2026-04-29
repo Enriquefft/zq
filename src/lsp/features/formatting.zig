@@ -53,6 +53,7 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
                 },
                 .bool_val => |b| buf.appendSlice(alloc, if (b) "true" else "false") catch {},
                 .null_val => buf.appendSlice(alloc, "null") catch {},
+                .big_number => |bn| buf.appendSlice(alloc, bn) catch {},
             }
         },
         .variable_ref => |vr| {

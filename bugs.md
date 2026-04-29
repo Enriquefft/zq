@@ -3,26 +3,66 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-29.
+Last verified: 2026-04-29 (post G4 land — any/all desugar + BOM + interp-key + big_number).
 
 ---
 
-## L798-unmasked bugs (post phase-2R cutover)
+## Active compat failures (8 of original L798-unmasked + 6 newly revealed)
 
-These pre-existing failures became visible once `lower.zig` L798's
-`expanding_stack` push got gated on `is_recursive` (ec21f78). They are
-NOT regressions from phase-2R — they were masked by the prior over-push.
+Post-G4 baseline: `zig build test` → 1144/1177 pass, 13 fail, 20 skipped.
 
-| Tag | Symptom | Repro | Category |
-|-----|---------|-------|----------|
-| L873 | parser rejects def-after-binding | `def id(x):x; 2000 as $x \| def f(x):...` | Parser |
-| L878 | VM TypeError on filter-param binding | `def x(a;b): a as $a \| ...` | VM |
-| L884 | parser rejects multi-index before def | `[20,10][1,0] as $x \| def f: ...` | Parser |
-| L915 | VM TypeError on reduce with division | `[reduce .[] / .[] as $i ...]` | VM |
-| L933 | parser rejects nested destructure pattern | `. as {$a, $b:[$c, $d]}\|...` | Parser |
-| L1045 | `unreachable` in `lowerBuiltinCall` — `any/2` builtin missing from `classifyBuiltin` (src/compiler/lower.zig:2169) | `. as $dot \| any($dot[];not)` | Compiler |
+### Originally-listed, still failing (8)
 
-Total: 6 distinct test-tag failures (the commit message phrases this as "5 + L1045").
+These are the survivors from the L798-unmasked set after the G4 landing
+fixed L48, L122, L1045, L661, L674. Categorisation refined by Phase 1
+investigators: several were misfiled as VM but are emit-side input-scope
+bugs.
+
+| Tag | Symptom | Repro | Real category | Fix shape (validated by Phase 1) |
+|-----|---------|-------|---------------|----------------------------------|
+| L200 | `each` else-branch raises bare `error.TypeError`; catch payload reads `"TypeError"` not `"Cannot iterate over number (123)"` | `map(try .a[] catch .)` on `[{a:[1,2]},{a:123}]` | VM (error message) | Set `type_error_detail` via existing `buildTypeErrorMsg` helper at `src/vm/root.zig:2077` (each else). |
+| L353 | `.arith` arm emits `<lhs>;<rhs>;op` without protecting LHS across RHS fork-replays | `[foreach .[] / .[] as $i (0; . + $i)]` | Compiler emit | `src/compiler/emit.zig:396` — capture LHS into `allocVar()` temp; idiom already at :1270/1303/1677/1737. Apply to `.cmp` (:411) and `.logical` (:431) too. |
+| L401 | `emitFirst`/`emitLast` desugar yields stale `null` when inner stream is empty | `[first(range(.)), last(range(.))]` on `0` → `[null]` (want `[]`) | Compiler emit | `src/compiler/emit.zig:2220-2300` — empty-stream → no contribution semantics. |
+| L478 | `setpathRecursive` lacks slice path-component arm | `.[2:4] = ([], ["a","b"], ["a","b","c"])` on `[0..7]` | VM | `src/vm/root.zig:5556-5717` — add `.object` slice arm with start/end resolution + array splice. |
+| L725 | `emitAsBind` does not save/restore `it.current` around `<expr>` | `.[] as $x \| [$x == .[]]` | Compiler emit | `src/compiler/emit.zig:3069` — wrap with `save_input`/`restore_input` (mirror `emitDestructAlt:891-896`). Same root as L878. |
+| L775 | `.obj_ctor` computed key emitted with no save_input wrapper | `add({(.[]):1})` | Compiler emit | `src/compiler/emit.zig:504-516` — bracket computed key expr. |
+| L878 | filter-param binding leaks generator's `it.current` into body | `def x(a;b): a as $a \| b as $b \| $a + $b; def y($a;$b): $a + $b; ...` | Compiler emit | Same site as L725. |
+| L915 | reduce/division: `.arith` LHS popped by RHS each-fork backtrack | `[reduce .[] / .[] as $i (0; . + $i)]` | Compiler emit | Same site as L353. |
+
+These cluster into TWO emit-side fixes (`save_input` bracketing + lhs-temp
+capture) plus one VM detail-string fix (L200) plus two structural VM
+arms (L478 slice, L401 empty-stream). Phase 2 G1 worktree
+(`worktree-agent-a69ca2341b0fcaf22`) attempted the emit cluster — it
+introduced regressions (L118, L689) and is **not safe to land**; the
+diff is preserved on its branch for reference but should be re-driven
+from a fresh investigator pass.
+
+### Newly revealed — masked previously by L1045 signal-6 abort (6)
+
+Once G4 fixed L1045 (`any/all` desugar in `classifyBuiltin`), the test
+runner stopped aborting at `user_functions.test.jq:L1045` and reached
+`paths.test.jq`, exposing six pre-existing failures.
+
+| Tag | Symptom | Repro |
+|-----|---------|-------|
+| L1127 | `path(...)` over filter chain yields wrong shape | `try path(.a \| map(select(.b == 0)) \| .[0]) catch .` |
+| L1131 | same family, with `.c` tail | `try path(.a \| map(select(.b == 0)) \| .c) catch .` |
+| L1135 | same family, with `.[]` tail | `try path(.a \| map(select(.b == 0)) \| .[]) catch .` |
+| L1139 | nested `path()` not composing | `path(.a[path(.b)[0]])` |
+| L1173 | `delpaths(0)` wrong error message | `try delpaths(0) catch .` |
+| L1201 | `pick(.a.b.c)` triggers `signal 6` (assertion / unreachable) | `pick(.a.b.c)` |
+
+These were never listed in the prior "13 failure" baseline because the
+test runner aborted before reaching them. They are pre-existing,
+non-regressions.
+
+### Bug residuals from prior orchestration (not in current scope)
+
+| Tag | Status |
+|-----|--------|
+| L873 | Parser: def-after-binding — fixed in a370bcd / merge 99580b9. Confirmed PASS. |
+| L884 | Parser: multi-index before def — fixed in a370bcd. Confirmed PASS. |
+| L933 | Parser: nested destructure — fixed in a370bcd. Confirmed PASS. |
 
 ---
 

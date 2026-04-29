@@ -33,6 +33,9 @@ pub const Tape = struct {
         true_val, // true
         false_val, // false
         null_val, // null
+        /// Out-of-range numeric literal (overflow/underflow for f64).
+        /// payload.string = canonical normalized text in string_buf, e.g. "9E+999999999".
+        big_number,
     };
 
     pub const Payload = extern union {
@@ -68,6 +71,10 @@ pub const Value = union(enum) {
     float: f64,
     /// Slice into the Tape's string_buf.
     string: []const u8,
+    /// Out-of-range numeric literal (overflow or underflow for f64).
+    /// Stores the normalized canonical form, e.g. "9E+999999999".
+    /// Backed by the VM's compiled string_buf; never owned by Value.
+    big_number: []const u8,
     /// A sub-range of Tape entries representing an object or array.
     /// Consumer can iterate or re-encode from these bounds.
     object: TapeSpan,
@@ -177,7 +184,7 @@ pub const RuntimeTape = struct {
         while (pos < end) {
             const entry = tape.entries[pos];
             switch (entry.tag) {
-                .key, .string => {
+                .key, .string, .big_number => {
                     const str = tape.getString(entry.payload.string);
                     const new_ref = try self.internString(allocator, str);
                     _ = try self.appendEntry(allocator, .{
@@ -801,6 +808,8 @@ pub const Instruction = extern struct {
         push_null,
         /// Push string value to stack. operand.string = string value.
         push_string,
+        /// Push out-of-range numeric literal. operand.str_ref = canonical text.
+        push_big_number,
         /// Push current value to stack.
         push_current,
 
@@ -1041,6 +1050,7 @@ pub const Instruction = extern struct {
                 .push_float,
                 .push_null,
                 .push_string,
+                .push_big_number,
                 // Arithmetic / comparison / logic produce derived values.
                 .add,
                 .sub,
@@ -1309,4 +1319,238 @@ pub fn formatJqFloat(f: f64) FormattedFloat {
 
     result.len = b;
     return result;
+}
+
+/// Buffer large enough to hold any normalized big-number literal.
+/// Format: optional '-', up to 20 significant digits, 'E', optional '+'/'-',
+/// up to 19 exponent digits → 2 + 20 + 1 + 1 + 19 = 43 chars max.
+pub const BigNumberBuf = struct {
+    buf: [64]u8,
+    len: usize,
+    pub fn slice(self: *const BigNumberBuf) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Normalize a decimal numeric literal that is out of range for f64 (overflow
+/// or underflow) into jq's canonical big-number format:
+///   ['-'] significant_digit ['.' fractional_digits] 'E' ['+'/'-'] exponent
+///
+/// The input is a raw lexer token like "9E999999999", "0.000000001E-999999990",
+/// or "9999999999E999999990".  Both 'E' and 'e' are accepted.
+/// Trailing zeros in the fractional part are stripped.
+/// Returns a BigNumberBuf with the normalized text.
+///
+/// This is the single source of truth for big-number formatting; all callers
+/// (parser, output) must go through here.
+pub fn normalizeBigNumber(input: []const u8) BigNumberBuf {
+    var result: BigNumberBuf = .{ .buf = undefined, .len = 0 };
+    var b: usize = 0;
+
+    const src = input;
+    var pos: usize = 0;
+
+    // Optional sign
+    const is_neg = pos < src.len and src[pos] == '-';
+    if (is_neg) pos += 1;
+
+    // Collect all significant digits (integer part then fractional part).
+    // Track the position of the decimal point within the digit string.
+    var all_digits: [64]u8 = undefined;
+    var nd: usize = 0; // total digit count
+    var dec_pos: i64 = 0; // position of decimal point from left (= count of integer digits)
+    var seen_dot = false;
+
+    while (pos < src.len and src[pos] != 'e' and src[pos] != 'E') {
+        const c = src[pos];
+        pos += 1;
+        if (c == '.') {
+            seen_dot = true;
+            dec_pos = @intCast(nd);
+        } else if (c >= '0' and c <= '9') {
+            if (nd < all_digits.len) {
+                all_digits[nd] = c;
+                nd += 1;
+            }
+        }
+    }
+    if (!seen_dot) dec_pos = @intCast(nd);
+
+    // Parse explicit exponent (after 'E'/'e')
+    var exp_val: i64 = 0;
+    var exp_neg = false;
+    if (pos < src.len and (src[pos] == 'e' or src[pos] == 'E')) {
+        pos += 1;
+        if (pos < src.len and src[pos] == '-') {
+            exp_neg = true;
+            pos += 1;
+        } else if (pos < src.len and src[pos] == '+') {
+            pos += 1;
+        }
+        while (pos < src.len and src[pos] >= '0' and src[pos] <= '9') {
+            exp_val = exp_val * 10 + @as(i64, src[pos] - '0');
+            pos += 1;
+        }
+        if (exp_neg) exp_val = -exp_val;
+    }
+
+    // Find the first non-zero digit index.
+    var first_sig: usize = 0;
+    while (first_sig < nd and all_digits[first_sig] == '0') {
+        first_sig += 1;
+    }
+
+    // Completely zero mantissa → result is 0 (but jq outputs "0E<exponent>" for
+    // big-number underflow; however since we only call this for actual literals
+    // that cannot be represented as f64, we return "0" for zero mantissa).
+    if (first_sig == nd) {
+        result.buf[0] = '0';
+        result.len = 1;
+        return result;
+    }
+
+    // Strip trailing zeros from the significant digit window [first_sig, nd).
+    var last_sig: usize = nd;
+    while (last_sig > first_sig + 1 and all_digits[last_sig - 1] == '0') {
+        last_sig -= 1;
+    }
+
+    // Effective decimal exponent of the first significant digit:
+    //   dec_pos is the number of integer digits, so the first integer digit has
+    //   value × 10^(dec_pos - 1 + exp_val).
+    //   first_sig shifts that further: first_sig digits from position 0 were
+    //   zero, each shifting the exponent by -1.
+    //   Result: first_sig_digit × 10^(dec_pos - 1 - first_sig + exp_val)
+    const effective_exp: i64 = @as(i64, @intCast(dec_pos)) - 1 -
+        @as(i64, @intCast(first_sig)) + exp_val;
+
+    // Build output
+    if (is_neg) {
+        result.buf[b] = '-';
+        b += 1;
+    }
+
+    const sig_count = last_sig - first_sig;
+    result.buf[b] = all_digits[first_sig];
+    b += 1;
+    if (sig_count > 1) {
+        result.buf[b] = '.';
+        b += 1;
+        @memcpy(result.buf[b .. b + sig_count - 1], all_digits[first_sig + 1 .. last_sig]);
+        b += sig_count - 1;
+    }
+
+    result.buf[b] = 'E';
+    b += 1;
+
+    var e = effective_exp;
+    if (e < 0) {
+        result.buf[b] = '-';
+        b += 1;
+        e = -e;
+    } else {
+        result.buf[b] = '+';
+        b += 1;
+    }
+
+    // Write exponent digits (at least one digit).
+    const exp_start = b;
+    var tmp_e = e;
+    if (tmp_e == 0) {
+        result.buf[b] = '0';
+        b += 1;
+    } else {
+        while (tmp_e > 0) {
+            result.buf[b] = @intCast(@mod(tmp_e, 10) + '0');
+            b += 1;
+            tmp_e = @divTrunc(tmp_e, 10);
+        }
+        // Digits were written in reverse; reverse them.
+        var lo = exp_start;
+        var hi = b - 1;
+        while (lo < hi) {
+            const tmp = result.buf[lo];
+            result.buf[lo] = result.buf[hi];
+            result.buf[hi] = tmp;
+            lo += 1;
+            hi -= 1;
+        }
+    }
+
+    result.len = b;
+    return result;
+}
+
+/// Compare two big-number canonical strings (sign + significand + E + exponent).
+/// Returns .lt, .eq, or .gt.  Both inputs must be the output of normalizeBigNumber.
+pub fn compareBigNumbers(a: []const u8, b_str: []const u8) std.math.Order {
+    if (a.len == 0 or b_str.len == 0) return .eq;
+
+    const a_neg = a[0] == '-';
+    const b_neg = b_str[0] == '-';
+
+    // Different signs
+    if (a_neg and !b_neg) return .lt;
+    if (!a_neg and b_neg) return .gt;
+
+    // Same sign: compare magnitudes, then flip for negatives
+    const order = compareBigMagnitudes(a, b_str);
+    return if (a_neg) flipOrder(order) else order;
+}
+
+fn flipOrder(o: std.math.Order) std.math.Order {
+    return switch (o) {
+        .lt => .gt,
+        .gt => .lt,
+        .eq => .eq,
+    };
+}
+
+/// Compare magnitudes of two normalized big-number strings.
+fn compareBigMagnitudes(a: []const u8, b_str: []const u8) std.math.Order {
+    // Extract exponent from "NE+EXP" or "NE-EXP" form.
+    // The exponent is everything after the 'E'.
+    const a_exp = parseBigExp(a);
+    const b_exp = parseBigExp(b_str);
+
+    if (a_exp != b_exp) {
+        return if (a_exp < b_exp) .lt else .gt;
+    }
+
+    // Same exponent: compare significands digit by digit.
+    const a_sig = bigSigPart(a);
+    const b_sig = bigSigPart(b_str);
+    return std.mem.order(u8, a_sig, b_sig);
+}
+
+/// Parse the signed exponent from a normalized big-number string.
+fn parseBigExp(s: []const u8) i64 {
+    var i: usize = 0;
+    if (i < s.len and (s[i] == '-' or s[i] == '+')) i += 1;
+    // Skip significand digits and optional '.'
+    while (i < s.len and s[i] != 'E') i += 1;
+    if (i >= s.len) return 0;
+    i += 1; // skip 'E'
+    var neg = false;
+    if (i < s.len and s[i] == '-') {
+        neg = true;
+        i += 1;
+    } else if (i < s.len and s[i] == '+') {
+        i += 1;
+    }
+    var e: i64 = 0;
+    while (i < s.len) {
+        e = e * 10 + @as(i64, s[i] - '0');
+        i += 1;
+    }
+    return if (neg) -e else e;
+}
+
+/// Return the slice of the significant part (sign stripped, up to 'E').
+fn bigSigPart(s: []const u8) []const u8 {
+    var start: usize = 0;
+    if (start < s.len and (s[start] == '-' or s[start] == '+')) start += 1;
+    var end = start;
+    while (end < s.len and s[end] != 'E') end += 1;
+    return s[start..end];
 }

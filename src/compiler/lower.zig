@@ -455,6 +455,13 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                     try ctx.out.extra_data.append(alloc, offset);
                     try ctx.out.extra_data.append(alloc, @intCast(s.len));
                 },
+                .big_number => |bn| {
+                    try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LiteralKind.big_number));
+                    const offset: u32 = @intCast(ctx.out.string_buf.items.len);
+                    try ctx.out.string_buf.appendSlice(alloc, bn);
+                    try ctx.out.extra_data.append(alloc, offset);
+                    try ctx.out.extra_data.append(alloc, @intCast(bn.len));
+                },
             }
             return ctx.pushNode(.{
                 .op = .load_const,
@@ -1714,6 +1721,20 @@ pub const BuiltinClass = enum {
     /// jump_if_false skip ; restore_input ; jump done ;
     /// skip: restore_input ; backtrack ; done:`.
     select_arg1,
+    /// Cat-18 — `any(f)` (1-arity). Desugars to
+    ///   [first(.[] | if f then true else empty end)] | if . == [] then false else .[0] end
+    /// Array-wrap ensures limit's exit via `ip=instructions.len` lands
+    /// inside an array_collect frame rather than triggering `fork_alt` RHS.
+    any_desugar1,
+    /// Cat-18 — `any(g;f)` (2-arity). Desugars to
+    ///   [first(g | if f then true else empty end)] | if . == [] then false else .[0] end
+    any_desugar2,
+    /// Cat-18 — `all(f)` (1-arity). Desugars to
+    ///   [first(.[] | if f then empty else false end)] | if . == [] then true else .[0] end
+    all_desugar1,
+    /// Cat-18 — `all(g;f)` (2-arity). Desugars to
+    ///   [first(g | if f then empty else false end)] | if . == [] then true else .[0] end
+    all_desugar2,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1790,6 +1811,19 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // shape exactly.
     if (arity == 0 and std.mem.eql(u8, name, "first")) return .first_arg1;
     if (arity == 0 and std.mem.eql(u8, name, "last")) return .last_arg1;
+
+    // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
+    // Dispatched before the generic 0-arity table because the 0-arity
+    // `any`/`all` on arrays are VM native builtins (`zero_arg`), while
+    // the 1-arity and 2-arity forms must desugar via `lowerAnyAllDesugar`.
+    if (std.mem.eql(u8, name, "any")) {
+        if (arity == 1) return .any_desugar1;
+        if (arity == 2) return .any_desugar2;
+    }
+    if (std.mem.eql(u8, name, "all")) {
+        if (arity == 1) return .all_desugar1;
+        if (arity == 2) return .all_desugar2;
+    }
 
     if (arity == 0) {
         if (isZeroArgBuiltin(name)) return .zero_arg;
@@ -1987,7 +2021,12 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "fromdate") or
         std.mem.eql(u8, name, "todateiso8601") or
         std.mem.eql(u8, name, "fromdateiso8601") or
-        std.mem.eql(u8, name, "recurse");
+        std.mem.eql(u8, name, "recurse") or
+        // 0-arity `any`/`all` — VM native builtins (root.zig:4111-4140).
+        // The 1-arity and 2-arity forms desugar via `lowerAnyAllDesugar`
+        // and never reach `isZeroArgBuiltin`.
+        std.mem.eql(u8, name, "any") or
+        std.mem.eql(u8, name, "all");
 }
 
 /// Names accepted as 1-arg value-arg builtins. Mirrors the
@@ -2182,6 +2221,11 @@ fn lowerBuiltinCall(
         },
         .regex1 => return lowerRegexBuiltin1(ctx, bc, src_start, src_len),
         .regex2 => return lowerRegexBuiltin2(ctx, bc, src_start, src_len),
+        // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
+        // Desugared via AST synthesis + recursive lowerNode call.
+        .any_desugar1, .any_desugar2, .all_desugar1, .all_desugar2 => |cls| {
+            return lowerAnyAllDesugar(ctx, bc, cls, src_start, src_len);
+        },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
         // `classifyBuiltin` for an unknown (name, arity) tuple, which
@@ -2729,7 +2773,7 @@ fn isProvablyNonStringKey(node: *const Node) bool {
     return switch (node.kind) {
         .literal => |lit| switch (lit) {
             .string => false,
-            .int, .float, .bool_val, .null_val => true,
+            .int, .float, .bool_val, .null_val, .big_number => true,
         },
         .paren => |p| isProvablyNonStringKey(p.operand),
         // Arithmetic on numbers yields numbers; unary negate on a number
@@ -3020,6 +3064,155 @@ fn lowerPatternKey(
             return lowerNode(ctx, expr);
         },
     }
+}
+
+// ── Cat-18 — `any` / `all` desugar ──────────────────────────────────
+//
+// `any(f)` and `all(f)` desugar to a canonical short-circuit form that
+// avoids the `first(...) // fallback` anti-pattern. When `limit_start`
+// exits via `ip = instructions.len` (the exhaustion path), any `fork_alt`
+// frame on the fork stack fires its RHS spuriously. Wrapping `first()`
+// inside `[...]` (array_collect) redirects `yield_output` into the
+// collect frame so the limit truncation never reaches `fork_alt`.
+//
+// any(f)    → [first(.[] | if f then true  else empty end)] | if . == [] then false else .[0] end
+// any(g;f)  → [first(g   | if f then true  else empty end)] | if . == [] then false else .[0] end
+// all(f)    → [first(.[] | if f then empty else false end)] | if . == [] then true  else .[0] end
+// all(g;f)  → [first(g   | if f then empty else false end)] | if . == [] then true  else .[0] end
+
+fn lowerAnyAllDesugar(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    cls: BuiltinClass,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const is_any = (cls == .any_desugar1 or cls == .any_desugar2);
+    // gen_node: generator expression
+    //   1-arity: `.[]` (iterate)
+    //   2-arity: bc.args[0]
+    const gen_node: *ast.Node = switch (cls) {
+        .any_desugar1, .all_desugar1 => blk: {
+            const n = try alloc.create(ast.Node);
+            n.* = .{ .kind = .iterate, .span = ast.Span.empty() };
+            break :blk n;
+        },
+        .any_desugar2, .all_desugar2 => bc.args[0],
+        else => unreachable,
+    };
+
+    // pred_node: predicate filter
+    //   1-arity: bc.args[0]
+    //   2-arity: bc.args[1]
+    const pred_node: *ast.Node = switch (cls) {
+        .any_desugar1, .all_desugar1 => bc.args[0],
+        .any_desugar2, .all_desugar2 => bc.args[1],
+        else => unreachable,
+    };
+
+    // true_lit / false_lit / empty_call
+    const true_lit = try alloc.create(ast.Node);
+    true_lit.* = .{ .kind = .{ .literal = .{ .bool_val = true } }, .span = ast.Span.empty() };
+    const false_lit = try alloc.create(ast.Node);
+    false_lit.* = .{ .kind = .{ .literal = .{ .bool_val = false } }, .span = ast.Span.empty() };
+    const empty_call = try alloc.create(ast.Node);
+    empty_call.* = .{ .kind = .{ .builtin_call = .{ .name = "empty", .args = &.{} } }, .span = ast.Span.empty() };
+
+    // inner_if:
+    //   any: if pred then true  else empty end
+    //   all: if pred then empty else false end
+    const inner_then: *ast.Node = if (is_any) true_lit else empty_call;
+    const inner_else: *ast.Node = if (is_any) empty_call else false_lit;
+    const inner_if = try alloc.create(ast.Node);
+    inner_if.* = .{
+        .kind = .{ .if_expr = .{
+            .cond = pred_node,
+            .then_body = inner_then,
+            .elif_chains = &.{},
+            .else_body = inner_else,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // pipe_node: gen | inner_if
+    const pipe_node = try alloc.create(ast.Node);
+    pipe_node.* = .{
+        .kind = .{ .pipe = .{ .left = gen_node, .right = inner_if } },
+        .span = ast.Span.empty(),
+    };
+
+    // first_node: builtin_call "first" [pipe_node]
+    const first_args = try alloc.alloc(*ast.Node, 1);
+    first_args[0] = pipe_node;
+    const first_node = try alloc.create(ast.Node);
+    first_node.* = .{
+        .kind = .{ .builtin_call = .{ .name = "first", .args = first_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // arr_node: [first_node]  (array_construct)
+    const arr_node = try alloc.create(ast.Node);
+    arr_node.* = .{
+        .kind = .{ .array_construct = .{ .expr = first_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // outer_if condition: . == []
+    const identity_node = try alloc.create(ast.Node);
+    identity_node.* = .{ .kind = .identity, .span = ast.Span.empty() };
+    const empty_arr = try alloc.create(ast.Node);
+    empty_arr.* = .{ .kind = .{ .array_construct = .{ .expr = null } }, .span = ast.Span.empty() };
+    const cmp_node = try alloc.create(ast.Node);
+    cmp_node.* = .{
+        .kind = .{ .comparison = .{ .op = .eq, .left = identity_node, .right = empty_arr } },
+        .span = ast.Span.empty(),
+    };
+
+    // .[0] for the else branch
+    const idx_node = try alloc.create(ast.Node);
+    idx_node.* = .{
+        .kind = .{ .suffix = .{
+            .base = blk: {
+                const id = try alloc.create(ast.Node);
+                id.* = .{ .kind = .identity, .span = ast.Span.empty() };
+                break :blk id;
+            },
+            .ops = blk: {
+                const ops = try alloc.alloc(ast.Node.SuffixOp, 1);
+                ops[0] = .{ .index = 0 };
+                break :blk ops;
+            },
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // fallback: false (any) or true (all)
+    const fallback: *ast.Node = if (is_any) false_lit else true_lit;
+
+    // outer_if: if . == [] then fallback else .[0] end
+    const outer_if = try alloc.create(ast.Node);
+    outer_if.* = .{
+        .kind = .{ .if_expr = .{
+            .cond = cmp_node,
+            .then_body = fallback,
+            .elif_chains = &.{},
+            .else_body = idx_node,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // root: arr_node | outer_if
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .pipe = .{ .left = arr_node, .right = outer_if } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────

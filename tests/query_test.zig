@@ -84,6 +84,10 @@ const OwnedValues = struct {
 fn materializeValue(v: Value, owned: *types.RuntimeTape, allocator: std.mem.Allocator) !Value {
     return switch (v) {
         .null_val, .bool_val, .int, .float => v,
+        .big_number => |bn| blk: {
+            const ref = try owned.internString(allocator, bn);
+            break :blk .{ .big_number = owned.view.string_buf[ref.offset..][0..ref.len] };
+        },
         .string => |s| blk: {
             const ref = try owned.internString(allocator, s);
             // Resolve against the *owned* view so the returned slice points
@@ -3467,6 +3471,7 @@ fn dumpCompact(buf: *std.ArrayList(u8), val: Value) !void {
             const formatted = types.formatJqFloat(f);
             try buf.appendSlice(alloc, formatted.slice());
         },
+        .big_number => |bn| try buf.appendSlice(alloc, bn),
         .string => |s| {
             try buf.append(alloc, '"');
             try buf.appendSlice(alloc, s);

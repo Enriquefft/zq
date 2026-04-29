@@ -196,6 +196,16 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                         node,
                     );
                 },
+                .big_number => {
+                    const slots = em.ir_obj.extra_data.items;
+                    const offset: u32 = slots[node.extra + 1];
+                    const len: u32 = slots[node.extra + 2];
+                    try em.pushInstr(
+                        .push_big_number,
+                        .{ .str_ref = .{ .offset = offset, .len = len } },
+                        node,
+                    );
+                },
             }
         },
 
@@ -1986,6 +1996,14 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // early-out switch above — reaching them here would mean
         // the early-out fell through.
         .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .format_apply, .error_arg1, .del_path, .map_arg1, .select_arg1, .repeat_arg1 => unreachable,
+        // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
+        // These are fully desugared at lower time via `lowerAnyAllDesugar`
+        // into standard AST + recursive lowerNode. They never produce a
+        // `call_builtin` IR node with these class tags — the synthesized
+        // subtree produces only `pipe`, `if_expr`, `builtin_call("first")`,
+        // `array_construct`, and `comparison` nodes. Reaching here means
+        // a classifier drift between lower.zig and emit.zig.
+        .any_desugar1, .any_desugar2, .all_desugar1, .all_desugar2 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -2671,6 +2689,10 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         if (std.mem.eql(u8, name, "fromdate")) return .fromdate_;
         if (std.mem.eql(u8, name, "todateiso8601")) return .todateiso8601_;
         if (std.mem.eql(u8, name, "fromdateiso8601")) return .fromdateiso8601_;
+        // 0-arity `any`/`all` — VM native builtins (root.zig:4111-4140).
+        // The 1/2-arity forms are desugared in lowering and never reach here.
+        if (std.mem.eql(u8, name, "any")) return .any;
+        if (std.mem.eql(u8, name, "all")) return .all;
         return null;
     }
 

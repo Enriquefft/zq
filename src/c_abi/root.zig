@@ -69,6 +69,7 @@ fn writeValueCompact(
             const formatted = types.formatJqFloat(f);
             try buf.appendSlice(allocator, formatted.slice());
         },
+        .big_number => |bn| try buf.appendSlice(allocator, bn),
         .string => |s| {
             try buf.append(allocator, '"');
             try writeEscaped(buf, allocator, s);
@@ -123,6 +124,7 @@ fn entryToValue(tape: *const types.Tape, idx: u32, entry: types.Tape.Entry) Valu
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
         .string => .{ .string = tape.getString(entry.payload.string) },
+        .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{
             .tape = tape,
             .start = idx,

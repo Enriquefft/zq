@@ -171,6 +171,9 @@ pub const Node = struct {
     pub const Literal = union(enum) {
         int: i64,
         float: f64,
+        /// Canonical normalized form of an out-of-range numeric literal,
+        /// e.g. "9E+999999999".  Backed by the AST arena allocator.
+        big_number: []const u8,
         string: []const u8,
         bool_val: bool,
         null_val,

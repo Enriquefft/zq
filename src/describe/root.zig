@@ -92,7 +92,7 @@ pub const SchemaInferrer = struct {
                 schema.types.boolean = true;
                 return idx + 1;
             },
-            .int, .float => {
+            .int, .float, .big_number => {
                 schema.types.number = true;
                 return idx + 1;
             },

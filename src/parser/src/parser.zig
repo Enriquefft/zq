@@ -159,6 +159,17 @@ pub const Parser = struct {
         is_eof: bool,
     ) (ZqError || error{OutOfMemory})!FeedResult {
         var i: usize = 0;
+        // Strip a UTF-8 BOM (U+FEFF → 0xEF 0xBB 0xBF) that appears at the
+        // very beginning of a JSON stream.  jq silently discards BOM-prefixed
+        // input (jq test L48); we mirror that behaviour.  Only strip once —
+        // when the tape is still empty (first feed call for this value).
+        if (p.tape_buf.items.len == 0 and p.stack.items.len == 0 and
+            p.state == .want_value and
+            i + 3 <= input.len and
+            input[i] == 0xEF and input[i + 1] == 0xBB and input[i + 2] == 0xBF)
+        {
+            i += 3;
+        }
         while (i < input.len) {
             // ── SIMD fast paths ──────────────────────────────
             switch (p.state) {

@@ -474,6 +474,7 @@ pub fn main() !u8 {
         const rt_entry = argjson_tape_view.entries[ref.rt_start];
         ext_bindings_buf[ref.idx].value = switch (rt_entry.tag) {
             .string => .{ .tape_value = .{ .string = argjson_tape_view.getString(rt_entry.payload.string) } },
+            .big_number => .{ .big_number = argjson_tape_view.getString(rt_entry.payload.string) },
             .array_start => .{ .tape_value = .{ .array = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
             .object_start => .{ .tape_value = .{ .object = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
             else => .null_val,

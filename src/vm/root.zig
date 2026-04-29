@@ -332,6 +332,9 @@ pub const StackValue = union(enum) {
     bool_val: bool,
     int: i64,
     float: f64,
+    /// Out-of-range numeric literal in canonical normalized form, e.g. "9E+999999999".
+    /// Backed by the compiled string_buf; never owned by StackValue.
+    big_number: []const u8,
     /// A view into the Tape for objects/arrays/strings.
     tape_value: Value,
 };
@@ -734,9 +737,16 @@ pub const ResultIterator = struct {
     /// slots and `yield_output` pops it, leaving stale bits for the next
     /// branch/iteration to trip over.
     fn snapshotValueStackForFork(it: *ResultIterator) error{OutOfMemory}!?[]StackValue {
-        const inside_object = it.object_construct_depth.items.len > 0;
+        // Always snapshot any live stack slots so that on backtrack the
+        // second generator branch sees the same left-operand values as the
+        // first.  Previously the snapshot was skipped when not inside a
+        // collect frame or object literal, but that left stale values at
+        // slots [0..saved_value_stack_len) after the first branch consumed
+        // and overwrote them (e.g. `a > (b, c)` at top level: first `gt`
+        // consumed slot[0]=a and pushed the result there; backtrack restored
+        // len to 1, exposing the stale result as the left operand for the
+        // second branch).
         const inside_collect = it.collect_stack.items.len > 0;
-        if (!inside_object and !inside_collect) return null;
         const outer: usize = if (inside_collect)
             it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
         else
@@ -1253,6 +1263,14 @@ pub const ResultIterator = struct {
                 const str_ref = instr.operand.str_ref;
                 const str = it.string_buf[str_ref.offset..][0..str_ref.len];
                 it.pushValue(.{ .tape_value = .{ .string = str } });
+                it.ip += 1;
+                return null;
+            },
+
+            .push_big_number => {
+                const str_ref = instr.operand.str_ref;
+                const text = it.string_buf[str_ref.offset..][0..str_ref.len];
+                it.pushValue(.{ .big_number = text });
                 it.ip += 1;
                 return null;
             },
@@ -2515,6 +2533,7 @@ pub const ResultIterator = struct {
                 .null_val => left,
                 else => error.TypeError,
             },
+            .big_number => return error.TypeError,
             .null_val => switch (right) {
                 .null_val => .null_val,
                 else => right,
@@ -2811,6 +2830,13 @@ pub const ResultIterator = struct {
                     .payload = .{ .float = f },
                 });
             },
+            .big_number => |bn| {
+                const str_ref = try it.runtime_tape.internString(it.alloc, bn);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .big_number,
+                    .payload = .{ .string = str_ref },
+                });
+            },
             .tape_value => |tv| switch (tv) {
                 .string => |s| {
                     // Intern the string
@@ -2852,6 +2878,13 @@ pub const ResultIterator = struct {
                         .payload = .{ .float = f },
                     });
                 },
+                .big_number => |bn| {
+                    const str_ref = try it.runtime_tape.internString(it.alloc, bn);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .big_number,
+                        .payload = .{ .string = str_ref },
+                    });
+                },
             },
         }
     }
@@ -2871,7 +2904,7 @@ pub const ResultIterator = struct {
         var n_string_bytes: usize = 0;
         for (span.tape.entries[span.start..span.end]) |e| {
             switch (e.tag) {
-                .key, .string => n_string_bytes += e.payload.string.len,
+                .key, .string, .big_number => n_string_bytes += e.payload.string.len,
                 else => {},
             }
         }
@@ -2890,7 +2923,7 @@ pub const ResultIterator = struct {
         while (pos < span.end) {
             const entry = span.tape.entries[pos];
             switch (entry.tag) {
-                .key, .string => {
+                .key, .string, .big_number => {
                     const str = span.tape.getString(entry.payload.string);
                     const new_ref = try it.runtime_tape.internString(it.alloc, str);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -3462,6 +3495,7 @@ pub const ResultIterator = struct {
             .bool_val => return error.TypeError,
             .int => |i| .{ .int = if (i < 0) -i else i },
             .float => |f| .{ .float = @abs(f) },
+            .big_number => return error.TypeError,
             .string => |s| blk: {
                 // Count Unicode codepoints, not bytes.
                 var count: i64 = 0;
@@ -3655,7 +3689,7 @@ pub const ResultIterator = struct {
         const type_str: []const u8 = switch (it.current) {
             .null_val => "null",
             .bool_val => "boolean",
-            .int, .float => "number",
+            .int, .float, .big_number => "number",
             .string => "string",
             .array => "array",
             .object => "object",
@@ -3679,6 +3713,10 @@ pub const ResultIterator = struct {
                 const str_ref = try it.runtime_tape.internString(it.alloc, formatted.slice());
                 return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
+            .big_number => |bn| {
+                const str_ref = try it.runtime_tape.internString(it.alloc, bn);
+                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+            },
             .array, .object => {
                 // Compact JSON serialization into runtime_tape string_buf
                 var json_buf = std.ArrayList(u8){};
@@ -3694,6 +3732,7 @@ pub const ResultIterator = struct {
         switch (it.current) {
             .int => |n| return .{ .int = n },
             .float => |f| return .{ .float = f },
+            .big_number => |bn| return .{ .big_number = bn },
             .string => |s| {
                 // Try integer parse first; fall back to float.
                 // jq raises an error for null-byte strings or invalid number strings.
@@ -6672,6 +6711,7 @@ pub const ResultIterator = struct {
             .null_val => false,
             .int => |i| i != 0,
             .float => |f| f != 0.0,
+            .big_number => true, // out-of-range numbers are always non-zero
             .tape_value => |tv| switch (tv) {
                 .array, .object => true, // Non-empty containers are truthy
                 .string => |s| s.len > 0, // Non-empty string is truthy
@@ -7786,6 +7826,7 @@ pub const ResultIterator = struct {
                     try buf.appendSlice(it.alloc, formatted.slice());
                 },
                 .bool_val => |b| try buf.appendSlice(it.alloc, if (b) "true" else "false"),
+                .big_number => |bn| try buf.appendSlice(it.alloc, bn),
                 .array, .object => {
                     // jq raises "string (...) and TYPE (...) cannot be added"
                     var msg_buf = std.ArrayList(u8){};
@@ -7819,6 +7860,7 @@ pub const ResultIterator = struct {
             .bool_val => |b| if (b) "boolean (true)" else "boolean (false)",
             .int => "number",
             .float => "number",
+            .big_number => "number",
             .string => "string",
             .array => "array",
             .object => "object",
@@ -8874,6 +8916,11 @@ pub const ResultIterator = struct {
                         try msg_buf.appendSlice(it.alloc, formatted.slice());
                         try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
                     },
+                    .big_number => |bn| {
+                        try msg_buf.appendSlice(it.alloc, "number (");
+                        try msg_buf.appendSlice(it.alloc, bn);
+                        try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
+                    },
                     .object => try msg_buf.appendSlice(it.alloc, "object cannot be searched from"),
                     .array => unreachable,
                 }
@@ -9412,6 +9459,10 @@ fn stackValuesEqual(a: StackValue, b: StackValue) bool {
             .int => |bi| af == @as(f64, @floatFromInt(bi)),
             else => false,
         },
+        .big_number => |abn| switch (b) {
+            .big_number => |bbn| std.mem.eql(u8, abn, bbn),
+            else => false,
+        },
         .tape_value => |atv| switch (b) {
             .tape_value => |btv| tapeValuesEqual(atv, btv),
             else => false,
@@ -9458,6 +9509,10 @@ fn tapeValuesEqual(a: Value, b: Value) bool {
             },
             else => false,
         },
+        .big_number => |abn| switch (b) {
+            .big_number => |bbn| std.mem.eql(u8, abn, bbn),
+            else => false,
+        },
         .object => false, // Simplified; object equality not needed for array subtraction
     };
 }
@@ -9469,7 +9524,7 @@ fn jqTypeOrder(v: Value) u8 {
     return switch (v) {
         .null_val => 0,
         .bool_val => |b| if (b) @as(u8, 2) else 1,
-        .int, .float => 3,
+        .int, .float, .big_number => 3,
         .string => 4,
         .array => 5,
         .object => 6,
@@ -9489,11 +9544,21 @@ fn jqCompareValues(a: Value, b: Value) std.math.Order {
         .int => |ai| switch (b) {
             .int => |bi| std.math.order(ai, bi),
             .float => |bf| floatOrder(@as(f64, @floatFromInt(ai)), bf),
+            // big_number is always out-of-range; positive > any i64, negative < any i64
+            .big_number => |bn| if (bn.len > 0 and bn[0] == '-') .gt else .lt,
             else => unreachable,
         },
         .float => |af| switch (b) {
             .int => |bi| floatOrder(af, @as(f64, @floatFromInt(bi))),
             .float => |bf| floatOrder(af, bf),
+            // big_number is always out-of-range; positive > any finite f64, negative < any finite f64
+            .big_number => |bn| if (bn.len > 0 and bn[0] == '-') .gt else .lt,
+            else => unreachable,
+        },
+        .big_number => |abn| switch (b) {
+            .big_number => |bbn| types.compareBigNumbers(abn, bbn),
+            .int => if (abn.len > 0 and abn[0] == '-') .lt else .gt,
+            .float => if (abn.len > 0 and abn[0] == '-') .lt else .gt,
             else => unreachable,
         },
         .string => |as_str| switch (b) {
@@ -9690,6 +9755,10 @@ fn jqContains(a: Value, b: Value) bool {
             },
             else => false,
         },
+        .big_number => |bbn| return switch (a) {
+            .big_number => |abn| std.mem.eql(u8, abn, bbn),
+            else => false,
+        },
         .object => |bspan| return switch (a) {
             .object => |aspan| {
                 // For every key in b, a must have that key and a[key] contains b[key]
@@ -9778,6 +9847,7 @@ fn serializeValueCompact(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val:
             const formatted = types.formatJqFloat(f);
             try buf.appendSlice(alloc, formatted.slice());
         },
+        .big_number => |bn| try buf.appendSlice(alloc, bn),
         .string => |s| {
             try appendJsonString(buf, alloc, s);
         },
@@ -9819,7 +9889,7 @@ fn appendTypeName(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value)
     const name: []const u8 = switch (val) {
         .null_val => "null",
         .bool_val => "boolean",
-        .int, .float => "number",
+        .int, .float, .big_number => "number",
         .string => "string",
         .array => "array",
         .object => "object",
@@ -9847,6 +9917,7 @@ fn stackValueToValue(sv: StackValue) ZqError!Value {
         .bool_val => |b| .{ .bool_val = b },
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
+        .big_number => |bn| .{ .big_number = bn },
         .tape_value => |tv| tv,
     };
 }
@@ -9858,6 +9929,7 @@ fn valueToStackValue(v: Value) ZqError!StackValue {
         .bool_val => |b| .{ .bool_val = b },
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
+        .big_number => |bn| .{ .big_number = bn },
         .string => |s| .{ .tape_value = .{ .string = s } },
         .object => |o| .{ .tape_value = .{ .object = o } },
         .array => |a| .{ .tape_value = .{ .array = a } },
@@ -9875,6 +9947,7 @@ fn tapeEntryToValue(tape: *const Tape, pos: u32) Value {
         .int => .{ .int = e.payload.int },
         .float => .{ .float = e.payload.float },
         .string => .{ .string = tape.getString(e.payload.string) },
+        .big_number => .{ .big_number = tape.getString(e.payload.string) },
         .object_start => .{ .object = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
         .array_start => .{ .array = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
         // These tags are never returned as values.
@@ -9984,6 +10057,13 @@ fn writeValueToTape(tape: *types.RuntimeTape, alloc: std.mem.Allocator, val: Val
         },
         .array => |span| {
             try tape.copySpan(span.tape.*, span.start, span.end, alloc);
+        },
+        .big_number => |bn| {
+            const str_ref = try tape.internString(alloc, bn);
+            _ = try tape.appendEntry(alloc, .{
+                .tag = .big_number,
+                .payload = .{ .string = str_ref },
+            });
         },
     }
 }

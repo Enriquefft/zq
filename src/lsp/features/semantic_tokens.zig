@@ -86,7 +86,7 @@ fn collectTokens(node: *const ast.Node, source: []const u8, tokens: *std.ArrayLi
         .literal => |lit| {
             const tt: u32 = switch (lit) {
                 .string => protocol.SemanticTokenTypes.string,
-                .int, .float => protocol.SemanticTokenTypes.number,
+                .int, .float, .big_number => protocol.SemanticTokenTypes.number,
                 .bool_val, .null_val => protocol.SemanticTokenTypes.keyword,
             };
             addToken(tokens, source, node.span, tt, 0, alloc);

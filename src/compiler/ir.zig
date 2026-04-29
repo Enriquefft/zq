@@ -37,6 +37,8 @@ pub const LiteralKind = enum(u32) {
     int = 3,
     float = 4,
     string = 5,
+    /// Out-of-range numeric literal; payload encoded like string (offset/len).
+    big_number = 6,
 };
 
 /// Decoded `load_const` payload — single-source-of-truth for emit /
@@ -50,6 +52,8 @@ pub const ConstValue = union(enum) {
     int: i64,
     float: f64,
     string: []const u8,
+    /// Out-of-range numeric literal in normalized form, e.g. "9E+999999999".
+    big_number: []const u8,
 };
 
 /// `arith` op-kind discriminant. Stored as a u32 in `extra_data[node.extra]`.
@@ -392,6 +396,11 @@ pub fn loadConstValue(ir_obj: *const IR, node: Node) ConstValue {
             const len: u32 = slots[node.extra + 2];
             break :blk .{ .string = ir_obj.string_buf.items[offset .. offset + len] };
         },
+        .big_number => blk: {
+            const offset: u32 = slots[node.extra + 1];
+            const len: u32 = slots[node.extra + 2];
+            break :blk .{ .big_number = ir_obj.string_buf.items[offset .. offset + len] };
+        },
     };
 }
 
@@ -499,6 +508,7 @@ fn dumpAst(
                     try writeStringLit(writer, s);
                     try writer.writeAll(")");
                 },
+                .big_number => |bn| try writer.print("load_const(big_number:{s})", .{bn}),
             }
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
@@ -1623,6 +1633,7 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
                     try writeStringLit(writer, s);
                     try writer.writeAll(")");
                 },
+                .big_number => |bn| try writer.print("load_const(big_number({s}))", .{bn}),
             }
         },
         .load_var => {

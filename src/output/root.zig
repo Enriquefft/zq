@@ -104,6 +104,11 @@ fn serializeValueCompact(ctx: anytype, val: Value, color: ?*const Color, opts: S
             try ctx.writeSlice(formatted.slice());
             if (color) |c| try ctx.writeSlice(c.reset);
         },
+        .big_number => |bn| {
+            if (color) |c| try ctx.writeSlice(c.number_color);
+            try ctx.writeSlice(bn);
+            if (color) |c| try ctx.writeSlice(c.reset);
+        },
         .string => |s| {
             if (color) |c| try ctx.writeSlice(c.string_color);
             try ctx.writeByte('"');
@@ -199,7 +204,7 @@ fn serializeObjectCompact(ctx: anytype, span: Value.TapeSpan, color: ?*const Col
 
 fn serializeValuePretty(ctx: anytype, val: Value, depth: u32, color: ?*const Color, opts: SerializeOpts) anyerror!void {
     switch (val) {
-        .null_val, .bool_val, .int, .float, .string => {
+        .null_val, .bool_val, .int, .float, .big_number, .string => {
             try serializeValueCompact(ctx, val, color, opts);
         },
         .array => |span| try serializeArrayPretty(ctx, span, depth, color, opts),
@@ -479,6 +484,7 @@ fn entryToValue(tape: *const types.Tape, idx: u32, entry: types.Tape.Entry) Valu
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
         .string => .{ .string = tape.getString(entry.payload.string) },
+        .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{
             .tape = tape,
             .start = idx,

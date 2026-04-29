@@ -27,6 +27,7 @@ pub fn entryToValue(tape: *const Tape, idx: u32) Value {
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
         .string => .{ .string = tape.getString(entry.payload.string) },
+        .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
         .object_start => .{ .object = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
         else => unreachable,
@@ -56,6 +57,7 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
             const formatted = types.formatJqFloat(f);
             try buf.appendSlice(alloc, formatted.slice());
         },
+        .big_number => |bn| try buf.appendSlice(alloc, bn),
         .string => |s| {
             try buf.append(alloc, '"');
             try writeEscaped(buf, s);
@@ -245,6 +247,10 @@ fn valuesEqual(a: Value, b: Value) bool {
                 if (!valuesEqual(va, vb)) return false;
             }
             return true;
+        },
+        .big_number => |abn| return switch (b) {
+            .big_number => |bbn| std.mem.eql(u8, abn, bbn),
+            else => false,
         },
         // int and float are handled by the numeric fast-path above
         .int => unreachable,
