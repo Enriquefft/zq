@@ -102,9 +102,9 @@ pub fn compile(
     defer lowerer.deinitRegexPool();
 
     // Pre-declare external variables in the root scope (var ids 0..N-1).
-    // Mirrors legacy `compile`'s seeding at
-    // `legacy@22cd23c compiler.zig:1390-1406`. Required so cat-4
-    // `$external_var` references resolve to the same operand index.
+    // Required so cat-4 `$external_var` references resolve to the correct
+    // operand index — var_id assignment order must match the order in which
+    // `external_vars` is passed by the caller (`src/query/root.zig`).
     for (external_vars) |ev| {
         _ = lowerer.declareVar(ev.name) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

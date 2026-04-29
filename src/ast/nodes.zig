@@ -70,10 +70,9 @@ pub const Node = struct {
         // ── Assignment ───────────────────────────────────────────────
         update_assign: UpdateAssign,
         /// Assignment whose LHS is NOT a simple `.path.path[n]` chain.
-        /// Mirrors the legacy compiler's `compilePathExprUpdate` dispatch
-        /// (`legacy@22cd23c compiler.zig:1951`) — the LHS is any path
-        /// expression (parens, comma, pipe, iteration, function call that
-        /// produces paths, ...) and the walker wraps it in
+        /// Emitted by `src/compiler/lower.zig` via the complex-LHS update path
+        /// — the LHS is any path expression (parens, comma, pipe, iteration,
+        /// function call that produces paths, ...) and the emitter wraps it in
         /// `path_begin`/`path_end` at emit time.
         ///
         /// The strict `.path` LHS stays on `update_assign` so the fast-path

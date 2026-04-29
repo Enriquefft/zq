@@ -6,12 +6,12 @@
 //! .c` → `load_path` fold into `fuse.zig` as one IR→IR pass. Other
 //! fuse opportunities deferred."
 //!
-//! Legacy fuse (`legacy@22cd23c compiler.zig:7186`) walks the
-//! linearized bytecode stream and folds every maximal run of
-//! consecutive `load_key`s separated only by `pipe` instructions —
+//! The fuse pass walks the linearized IR pipe-tree and folds every maximal
+//! run of consecutive `load_field` leaves separated only by `pipe` nodes —
 //! including runs that appear AFTER a chain-breaker like `each` /
-//! `load_index`. To match that behavior on the IR-tree shape, this
-//! pass:
+//! `load_index`. This mirrors the behavior of the bytecode-stream fold
+//! that the Phase 2R compiler replaced. To achieve that on the IR-tree
+//! shape, this pass:
 //!
 //!   1. Linearizes a pipe tree's leaves (anything not a `pipe` node)
 //!      into a flat sequence in source order.
@@ -149,8 +149,8 @@ fn copyAndFold(ctx: *WalkCtx, src_idx: u32) error{OutOfMemory}!u32 {
 /// Linearize the pipe tree rooted at `pipe_idx`, collapse every
 /// maximal run of consecutive `load_field` leaves into a single
 /// `load_path` EmitOp, then rebuild a left-deep pipe tree from the
-/// resulting sequence. Mirrors legacy fuse's bytecode-stream walk
-/// (`legacy@22cd23c compiler.zig:7186`) on the IR-tree shape.
+/// resulting sequence. Replicates the bytecode-stream fold behavior
+/// from the pre-Phase-2R pipeline, applied to the IR-tree shape instead.
 ///
 /// Non-`load_field` leaves recurse through `copyAndFold` themselves —
 /// e.g. an `obj_ctor` value containing its own pipe-chain still folds.

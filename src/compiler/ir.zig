@@ -166,12 +166,11 @@ pub const Op = enum(u8) {
     /// Computed-key array/object access (`base[expr]` / `.[expr]`).
     /// `children[0]` lowers the key expression; the base flows from
     /// the surrounding `pipe` left-side (or the caller's input for
-    /// standalone `.[expr]`). Mirrors legacy `compileComputedBracket`
-    /// (`legacy@22cd23c compiler.zig:7040`) — the two-var capture
-    /// pattern (base + key) is synthesized at emit time so the bracket
-    /// expression's fork/backtrack iteration over generator keys
-    /// re-runs the per-iteration `load_computed` for every yielded
-    /// key. Plan §3.5 row P27 / cat-18.
+    /// standalone `.[expr]`). The two-var capture pattern (base + key)
+    /// is synthesized at emit time so the bracket expression's
+    /// fork/backtrack iteration over generator keys re-runs the
+    /// per-iteration `load_computed` for every yielded key.
+    /// Plan §3.5 row P27 / cat-18.
     computed_index,
 
     pipe,
@@ -228,8 +227,7 @@ pub const Op = enum(u8) {
     /// `label $name | <body>`. Allocates a fresh label var_id at lower
     /// time, registers it as a label binding, lowers the body with
     /// `$name` visible. `extra_data[node.extra]` carries the var_id;
-    /// `children[0]` is the body IR-node index. Maps to legacy
-    /// `compileLabel` (`legacy@22cd23c compiler.zig:3628`):
+    /// `children[0]` is the body IR-node index. Emitted as:
     ///   label_begin(exit_ip)         — backpatched to instr after body
     ///   capture_variable($name)
     ///   pipe
@@ -847,8 +845,7 @@ fn dumpAst(
         // (one big AST `if_expr` → nested `if(cond1, then1, if(cond2,
         // then2, else))`). The dumper mirrors that: each elif slot
         // produces a nested `if` child in the else position. Implicit
-        // else (no `else` clause) materializes as `identity` — matches
-        // legacy `parseIfBody` (`legacy@22cd23c compiler.zig:6390`).
+        // else (no `else` clause) materializes as `identity`.
         .if_expr => |ifx| try dumpIfExpr(ir_obj, &ifx, node.span, source, depth, writer),
         // ── Variable load `$name` (category 4) ──────────────────────
         // Mirrors `lowerVariable` — the IR is a leaf `load_var` whose
