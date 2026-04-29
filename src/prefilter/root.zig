@@ -253,12 +253,13 @@ pub fn groupFromRegex(
 // Single source of truth for the prefilter shape match: walks an already-parsed
 // AST root and appends any harvestable `LiteralGroup`s onto the caller's list.
 //
-// Today the legacy token-walk compiler (`legacy@22cd23c compiler.zig`) calls
-// `harvestFromAstRoot` after a dedicated `ast.parse(src)`. The Phase 2R
-// compiler (`src/compiler/`, when it lands) will call the same function with
-// the AST it already parsed for lowering. The harvest logic depends only on
-// the AST shape, not on the caller's state, so both call sites observe
-// identical prefilter output by construction.
+// Post-Phase-2R cutover the compiler pipeline uses `src/compiler/harvest.zig`
+// (`harvestFromIr`) instead of this function — harvesting is now done from
+// the IR after lowering and fuse, avoiding a second AST parse. This function
+// remains available for any caller that has a parsed AST but no IR (e.g.
+// stand-alone tooling or tests). The harvest logic depends only on the AST
+// shape, not on the caller's state, so any such call site observes identical
+// prefilter output by construction.
 //
 // Matches the exact idiom:
 //

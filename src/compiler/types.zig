@@ -12,9 +12,8 @@ const err_mod = @import("error");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
 
-/// Caller-owned compiled bytecode + auxiliary tables. Field-for-field
-/// identical to the legacy compiler's `Compiled` struct in
-/// `legacy@22cd23c compiler.zig:21`. The lifetime contract matches: every
+/// Caller-owned compiled bytecode + auxiliary tables. Produced by
+/// `src/compiler/root.zig:compile`. The lifetime contract: every
 /// slice and pool here is freed by `deinit(allocator)`, where `allocator`
 /// is the same one passed to `compile`.
 pub const Compiled = struct {
