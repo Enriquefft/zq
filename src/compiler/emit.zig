@@ -754,16 +754,28 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         // (`lowerIfElseChain`), so emit only ever sees a 3-child node.
         // Layout mirrors legacy `parseIfBody`
         // (`src/query/src/compiler.zig:6342`):
-        //   save_input
+        //   push_current
+        //   capture_variable($input)
         //   <cond>
         //   jump_if_false L_else
-        //   restore_input
+        //   load_variable($input) ; pipe
         //   <then>
         //   jump L_end
         //   L_else:
-        //   restore_input
+        //   load_variable($input) ; pipe
         //   <else>
         //   L_end:
+        //
+        // Variable-based input capture instead of save_input/restore_input.
+        // save_input/restore_input use the if_stack which is reset to its
+        // snapshot depth on fork-backtrack (root.zig:898,943). When the
+        // condition is a generator (e.g. `1,null,2`) the first fork pushes
+        // a forkpoint BEFORE save_input fires; on backtrack the if_stack
+        // length is restored to the pre-fork snapshot, dropping the
+        // save_input entry. The else-arm's restore_input then fires against
+        // an empty if_stack → VM panic (root.zig:1292).
+        // Variable store is NOT reset on backtrack, so $input survives every
+        // fork leg. Each arm uses emitInputScopeReseed to reload $input.
         .if_ => {
             std.debug.assert(node.span_len == 3);
             const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
@@ -771,7 +783,8 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const then_idx = span[1];
             const else_idx = span[2];
 
-            try em.pushInstr(.save_input, .{ .none = {} }, node);
+            const input_var = em.allocVar();
+            try emitInputScopeBracket(em, node, input_var);
             try emitNode(em, cond_idx);
 
             // jump_if_false → start of the else branch (backpatched once
@@ -779,16 +792,16 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const jif_pos: usize = em.instructions.items.len;
             try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
 
-            // Then-arm: restore the saved input, emit the body, then
+            // Then-arm: reseed the saved input, emit the body, then
             // unconditionally jump past the else-arm.
-            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try emitInputScopeReseed(em, node, input_var);
             try emitNode(em, then_idx);
             const jmp_pos: usize = em.instructions.items.len;
             try em.pushInstr(.jump, .{ .index = 0 }, node);
 
             // Else-arm entry — backpatch jif and emit.
             em.instructions.items[jif_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
-            try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            try emitInputScopeReseed(em, node, input_var);
             try emitNode(em, else_idx);
 
             // End: backpatch the post-then jump.
@@ -2865,6 +2878,8 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         if (std.mem.eql(u8, name, "strflocaltime")) return .strflocaltime_;
         if (std.mem.eql(u8, name, "flatten")) return .flatten_n;
         if (std.mem.eql(u8, name, "has")) return .has;
+        if (std.mem.eql(u8, name, "contains")) return .contains;
+        if (std.mem.eql(u8, name, "inside")) return .inside;
         // Cat-16 — `index/rindex/indices` 1-arity. Mirrors legacy
         // `compileIndex/Rindex/Indices` (`compiler.zig:4456-4468`),
         // which delegate to `compileValueArgBuiltin1(<bid>)`. The new
@@ -2964,21 +2979,63 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
         std.debug.assert(span.len == num_value_args + 1);
         const body_idx = span[span.len - 1];
 
-        // Phase 1 — emit each value arg + capture (no pipe between).
-        for (span[0..num_value_args], value_var_ids.items) |arg_idx, var_id| {
-            try emitNode(em, arg_idx);
-            try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+        // Detect whether any value-arg contains a generator.  When true we
+        // need the input-scope bracket (each arg must see the original `.`)
+        // AND we must NOT emit pop_variable at the end.  pop_variable clears
+        // the slot immediately after the first body execution; if the arg is
+        // a generator the VM backtracks to an IP before the pop and
+        // subsequent load_variable calls find a null slot (root.zig:853).
+        // Omitting pop is safe because the INLINE body is re-lowered fresh
+        // per call site — the canonical var_ids live only within this call's
+        // generator lifecycle.  Non-generator calls retain pop_variable so
+        // sequential calls to the same function don't see stale values.
+        var has_generator_arg = false;
+        for (span[0..num_value_args]) |arg_idx| {
+            if (subtreeHasIterate(em.ir_obj, arg_idx)) {
+                has_generator_arg = true;
+                break;
+            }
         }
 
-        // Phase 2 — body inline (current preserved through the
-        // capture_variable popping from value_stack).
+        // Phase 1 — save input ONCE, then emit each value arg with input
+        // reseeded before every evaluation. Without the bracket, arg_1
+        // would evaluate against `it.current` as mutated by arg_0 (e.g.
+        // when arg_0 is a generator like `.[]`). Each arg must see the
+        // original `.` at the call site. This mirrors the `emitAsBind`
+        // input-scope pattern (`src/compiler/emit.zig:emitAsBind`).
+        if (has_generator_arg) {
+            const input_var = em.allocVar();
+            try emitInputScopeBracket(em, node, input_var);
+            for (span[0..num_value_args], value_var_ids.items) |arg_idx, var_id| {
+                try emitInputScopeReseed(em, node, input_var);
+                try emitNode(em, arg_idx);
+                try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+            }
+            // Restore original input for the body so filter-arg
+            // substitutions (inlined in body_idx) see the correct `.`.
+            try emitInputScopeReseed(em, node, input_var);
+        } else if (num_value_args > 0) {
+            // Non-generator path: emit args sequentially without input
+            // bracket (preserves legacy behaviour for the common case).
+            for (span[0..num_value_args], value_var_ids.items) |arg_idx, var_id| {
+                try emitNode(em, arg_idx);
+                try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+            }
+        }
+
+        // Phase 2 — body inline.
         try emitNode(em, body_idx);
 
-        // Phase 3 — pop value-arg variables in reverse order.
-        var i: usize = num_value_args;
-        while (i > 0) {
-            i -= 1;
-            try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+        // Phase 3 — pop value-arg variables in reverse order, but ONLY when
+        // no arg is a generator.  With generator args the body may be
+        // re-entered via backtrack; the pop would already have cleared the
+        // slot on the first pass, causing load_variable to return null.
+        if (!has_generator_arg) {
+            var i: usize = num_value_args;
+            while (i > 0) {
+                i -= 1;
+                try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+            }
         }
         return;
     }
@@ -2990,9 +3047,19 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
     std.debug.assert(entry.is_recursive);
     std.debug.assert(span.len == num_value_args);
 
-    for (span, value_var_ids.items) |arg_idx, var_id| {
-        try emitNode(em, arg_idx);
-        try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+    // Same input-scope bracket as INLINE: each value-arg evaluates
+    // against the original `.` at the call site, and the body entry
+    // sees the original `.` too.
+    if (num_value_args > 0) {
+        const input_var = em.allocVar();
+        try emitInputScopeBracket(em, node, input_var);
+        for (span, value_var_ids.items) |arg_idx, var_id| {
+            try emitInputScopeReseed(em, node, input_var);
+            try emitNode(em, arg_idx);
+            try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+        }
+        // Restore original input before calling the recursive body.
+        try emitInputScopeReseed(em, node, input_var);
     }
 
     const cache = &em.fn_body_ip[fn_id];
@@ -3477,6 +3544,39 @@ fn collectPatternVarIdsFromIR(
             for (span) |sub| try collectPatternVarIdsFromIR(ir_obj, sub, out, allocator);
         },
     }
+}
+
+// ── Input-scope bracket helpers ──────────────────────────────────────────────
+//
+// These two helpers implement the input-scope bracketing pattern: capture
+// `it.current` (the active `.`) into a fresh variable before an expression
+// that may clobber `.` (e.g. a generator or a multi-arg call), then reseed
+// `it.current` from the saved variable before consuming the captured value.
+//
+// emitInputScopeBracket: emits `push_current ; capture_variable(var_id)`
+//   Call once before the expression. `var_id` must come from `em.allocVar()`.
+//
+// emitInputScopeReseed: emits `load_variable(var_id) ; pipe`
+//   Call before each consumer that must see the original `.`.
+//
+// Together they replace any save_input/restore_input pair that straddles a
+// fork-point (generator, comma, etc.) — `if_stack` is reset on backtrack, so
+// a save_input pushed before a generator cond is popped before the else-arm's
+// restore_input fires, causing a VM panic (root.zig:1292).  Variable store
+// is NOT reset on backtrack, so the variable survives across every fork.
+
+/// Emit `push_current ; capture_variable(var_id)`. Captures the current `.`
+/// into a variable that survives fork/backtrack. Pair with `emitInputScopeReseed`.
+fn emitInputScopeBracket(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void {
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = var_id }, node);
+}
+
+/// Emit `load_variable(var_id) ; pipe`. Restores `it.current` from the
+/// variable captured by `emitInputScopeBracket`. Safe across fork-backtrack.
+fn emitInputScopeReseed(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void {
+    try em.pushInstr(.load_variable, .{ .index = var_id }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
 }
 
 /// Return true if the IR subtree rooted at `node_idx` contains any

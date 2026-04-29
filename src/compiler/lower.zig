@@ -2062,7 +2062,9 @@ fn isValueArg1Builtin(name: []const u8) bool {
         std.mem.eql(u8, name, "strptime") or
         std.mem.eql(u8, name, "strflocaltime") or
         std.mem.eql(u8, name, "flatten") or
-        std.mem.eql(u8, name, "has");
+        std.mem.eql(u8, name, "has") or
+        std.mem.eql(u8, name, "contains") or
+        std.mem.eql(u8, name, "inside");
 }
 
 /// Names accepted as 1-arg filter-arg builtins. Mirrors legacy
