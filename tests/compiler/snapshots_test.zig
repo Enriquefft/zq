@@ -1,6 +1,6 @@
 //! Snapshot tests for `lower.zig`. Each fixture pairs a filter source
 //! with the expected IR text dump. The dumper is in `src/compiler/ir.zig`;
-//! the format spec is `research/compiler-ir-format.md` §10.
+//! the format spec is `src/compiler/IR-FORMAT.md` §10.
 //!
 //! Layout: one fixture per `tests/compiler/snapshots/lower/<name>.txt`.
 //! The `# source: <filter>` line tells the runner which filter to compile;

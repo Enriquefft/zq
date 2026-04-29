@@ -1,7 +1,7 @@
 //! Snapshot tests for `fuse.zig` (Phase 19, plan §3 R3 step 8). Each
 //! fixture pins a filter source, the IR shape produced by lowering
 //! (rendered by the IR-walking dumper), and the IR shape after fuse.
-//! Format spec: `research/compiler-ir-format.md` §3a (file directives)
+//! Format spec: `src/compiler/IR-FORMAT.md` §3a (file directives)
 //! + §8 ("Fuse snapshot").
 //!
 //! Layout: one fixture per `tests/compiler/snapshots/fuse/<name>.txt`.

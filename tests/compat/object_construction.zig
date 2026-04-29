@@ -35,7 +35,7 @@ test "jq:L118 {a,b,(.d):.a,e:.b}" {
 }
 
 // ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26; see research/phase-2r-progress.md P21 close-out)
+//   (filed at 2026-04-26)
 test "jq:L122 {_a_,b,_a$_(1+1)_}" {
     const results = try h.runFilter(
         "{\"a\",b,\"a$\\(1+1)\"}",

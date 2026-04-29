@@ -1,6 +1,6 @@
 //! IR — single-arena tree of `Node`s shared by lowering, fuse, and emission.
 //!
-//! See `research/compiler-ir-format.md` for the canonical text-dump shape that
+//! See `src/compiler/IR-FORMAT.md` for the canonical text-dump shape that
 //! snapshot tests will diff (R3, Phase 6+). This file owns the in-memory
 //! representation; the dumper, lowering rules, fuse rewrites, and emit logic
 //! live in the sibling files.
@@ -15,7 +15,7 @@ const std = @import("std");
 /// `EmitOp` ops are produced by `fuse.zig` for emission shortcuts. The
 /// IR-walking dumper switches the banner (`# SemOp` / `# EmitOp`) on
 /// namespace transitions; emit handles both. Spec
-/// `research/compiler-ir-format.md` §4.
+/// `src/compiler/IR-FORMAT.md` §4.
 pub const Namespace = enum { sem_op, emit_op };
 
 /// Classify an op tag by its namespace. Single source of truth — the
@@ -135,7 +135,7 @@ pub const PatternKind = enum(u32) {
 
 /// Op tag — a single flat namespace covering both `SemOp` (lowered from AST,
 /// produced by `lower.zig`) and `EmitOp` (produced by `fuse.zig`, consumed by
-/// `emit.zig`). The split is documented in `research/compiler-ir-format.md`
+/// `emit.zig`). The split is documented in `src/compiler/IR-FORMAT.md`
 /// §4: tag names are unique across the union, dump banners separate the two
 /// at render time.
 ///
@@ -398,7 +398,7 @@ pub fn loadConstValue(ir_obj: *const IR, node: Node) ConstValue {
 }
 
 // ── Text dumper (used by snapshot tests) ─────────────────────────────────────
-// Spec: research/compiler-ir-format.md §10. Indented-tree, one node per line,
+// Spec: src/compiler/IR-FORMAT.md §10. Indented-tree, one node per line,
 // child indent +2 spaces, `# SemOp` banner once at the top, every line ends
 // with `@<start>..<end>` source bytes. The dumper is callable in any build —
 // the spec promises stable output, so snapshot tests reach for it directly.
@@ -1532,7 +1532,7 @@ fn writeRegexPoolRef(writer: anytype, bc: *const ast.Node.BuiltinCall) !void {
 // The dumper writes the namespace banner (`# SemOp` / `# EmitOp`) on entry
 // and re-emits it at every namespace transition encountered during the
 // walk. Single-namespace IRs see exactly one banner; mixed IRs see one
-// per transition. Spec `research/compiler-ir-format.md` §4.
+// per transition. Spec `src/compiler/IR-FORMAT.md` §4.
 
 /// Dump-time state for namespace banner switching during a recursive
 /// IR walk. The first emitted node always emits its banner; subsequent

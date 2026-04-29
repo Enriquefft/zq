@@ -23,7 +23,7 @@ const build_options = @import("build_options");
 /// When false, every function in this module is a comptime no-op.
 pub const enabled: bool = build_options.profile_enabled;
 
-/// Named phases the harness tracks. Mirrors `research/phase-0-design.md`.
+/// Named phases the harness tracks. Mirrors `src/microbench/DESIGN.md`.
 pub const PhaseTag = enum(u8) {
     parse_begin,
     parse_end,
