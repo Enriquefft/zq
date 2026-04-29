@@ -18,7 +18,7 @@ test "jq:L1390 [10 > 0, 10 > 10, 10 > 20, 10 < 0, 10 < 10, 10 < 20]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false,false,false,false,true]", results[0]);
+    try h.expectJsonEqual("[true,false,false,false,false,true]", results[0]);
 }
 
 test "jq:L1394 [10 >= 0, 10 >= 10, 10 >= 20, 10 <= 0, 10 <= 10, 10 <= 20]" {
@@ -31,7 +31,7 @@ test "jq:L1394 [10 >= 0, 10 >= 10, 10 >= 20, 10 <= 0, 10 <= 10, 10 <= 20]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,false,false,true,true]", results[0]);
+    try h.expectJsonEqual("[true,true,false,false,true,true]", results[0]);
 }
 
 test "jq:L1399 [ 10 == 10, 10 != 10, 10 != 11, 10 == 11]" {
@@ -44,7 +44,7 @@ test "jq:L1399 [ 10 == 10, 10 != 10, 10 != 11, 10 == 11]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false,true,false]", results[0]);
+    try h.expectJsonEqual("[true,false,true,false]", results[0]);
 }
 
 test "jq:L1403 [_hello_ == _hello_, _hello_ != _hello_, _hello_ == _worl..." {
@@ -57,7 +57,7 @@ test "jq:L1403 [_hello_ == _hello_, _hello_ != _hello_, _hello_ == _worl..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false,false,true]", results[0]);
+    try h.expectJsonEqual("[true,false,false,true]", results[0]);
 }
 
 test "jq:L1407 [[1,2,3] == [1,2,3], [1,2,3] != [1,2,3], [1,2,3] == [4,5,..." {
@@ -70,7 +70,7 @@ test "jq:L1407 [[1,2,3] == [1,2,3], [1,2,3] != [1,2,3], [1,2,3] == [4,5,..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false,false,true]", results[0]);
+    try h.expectJsonEqual("[true,false,false,true]", results[0]);
 }
 
 test "jq:L1411 [{_foo_:42} == {_foo_:42},{_foo_:42} != {_foo_:42}, {_foo..." {
@@ -83,7 +83,7 @@ test "jq:L1411 [{_foo_:42} == {_foo_:42},{_foo_:42} != {_foo_:42}, {_foo..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false,true,false]", results[0]);
+    try h.expectJsonEqual("[true,false,true,false]", results[0]);
 }
 
 test "jq:L1416 [{_foo_:[1,2,{_bar_:18},_world_]} == {_foo_:[1,2,{_bar_:1..." {
@@ -96,7 +96,7 @@ test "jq:L1416 [{_foo_:[1,2,{_bar_:18},_world_]} == {_foo_:[1,2,{_bar_:1..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,false]", results[0]);
+    try h.expectJsonEqual("[true,false]", results[0]);
 }
 
 test "jq:L1421 [(_foo_ | contains(_foo_)), (_foobar_ | contains(_foo_)),..." {
@@ -109,7 +109,7 @@ test "jq:L1421 [(_foo_ | contains(_foo_)), (_foobar_ | contains(_foo_)),..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,false]", results[0]);
+    try h.expectJsonEqual("[true,true,false]", results[0]);
 }
 
 test "jq:L1426 [contains(__), contains(__u0000_)]" {
@@ -122,7 +122,7 @@ test "jq:L1426 [contains(__), contains(__u0000_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true]", results[0]);
+    try h.expectJsonEqual("[true,true]", results[0]);
 }
 
 test "jq:L1430 [contains(__), contains(_a_), contains(_ab_), contains(_c..." {
@@ -135,7 +135,7 @@ test "jq:L1430 [contains(__), contains(_a_), contains(_ab_), contains(_c..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,true,true,true]", results[0]);
+    try h.expectJsonEqual("[true,true,true,true,true]", results[0]);
 }
 
 test "jq:L1434 [contains(_cd_), contains(_b_u0000_), contains(_ab_u0000_)]" {
@@ -148,7 +148,7 @@ test "jq:L1434 [contains(_cd_), contains(_b_u0000_), contains(_ab_u0000_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,true]", results[0]);
+    try h.expectJsonEqual("[true,true,true]", results[0]);
 }
 
 test "jq:L1438 [contains(_b_u0000c_), contains(_b_u0000cd_), contains(_b..." {
@@ -161,7 +161,7 @@ test "jq:L1438 [contains(_b_u0000c_), contains(_b_u0000cd_), contains(_b..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,true]", results[0]);
+    try h.expectJsonEqual("[true,true,true]", results[0]);
 }
 
 test "jq:L1442 [contains(_@_), contains(__u0000@_), contains(__u0000what_)]" {
@@ -174,5 +174,5 @@ test "jq:L1442 [contains(_@_), contains(__u0000@_), contains(__u0000what_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[false,false,false]", results[0]);
+    try h.expectJsonEqual("[false,false,false]", results[0]);
 }

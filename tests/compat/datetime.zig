@@ -18,7 +18,7 @@ test "jq:L1886 last(range(365 * 67)|(_1970-03-01T01:02:03Z_|strptime(_%Y..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[2037,1,11,1,2,3,3,41]", results[0]);
+    try h.expectJsonEqual("[2037,1,11,1,2,3,3,41]", results[0]);
 }
 
 test "jq:L1891 import _a_ as foo; import _b_ as bar; def fooa: foo::a; [..." {
@@ -31,7 +31,7 @@ test "jq:L1891 import _a_ as foo; import _b_ as bar; def fooa: foo::a; [..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"a\",\"b\",\"c\",\"a\"]", results[0]);
+    try h.expectJsonEqual("[\"a\",\"b\",\"c\",\"a\"]", results[0]);
 }
 
 test "jq:L1895 import _c_ as foo; [foo::a, foo::c]" {
@@ -44,7 +44,7 @@ test "jq:L1895 import _c_ as foo; [foo::a, foo::c]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,\"acmehbah\"]", results[0]);
+    try h.expectJsonEqual("[0,\"acmehbah\"]", results[0]);
 }
 
 test "jq:L1899 include _c_; [a, c]" {
@@ -57,7 +57,7 @@ test "jq:L1899 include _c_; [a, c]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,\"acmehbah\"]", results[0]);
+    try h.expectJsonEqual("[0,\"acmehbah\"]", results[0]);
 }
 
 test "jq:L1903 import _data_ as $e; import _data_ as $d; [$d[].this,$e[]..." {
@@ -70,7 +70,7 @@ test "jq:L1903 import _data_ as $e; import _data_ as $d; [$d[].this,$e[]..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"is a test;is too;is a test;is too\"", results[0]);
+    try h.expectJsonEqual("\"is a test;is too;is a test;is too\"", results[0]);
 }
 
 test "jq:L1908 import _data_ as $a; import _data_ as $b; def f: {$a, $b}; f" {
@@ -83,7 +83,7 @@ test "jq:L1908 import _data_ as $a; import _data_ as $b; def f: {$a, $b}; f" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":[{\"this\":\"is a test\",\"that\":\"is too\"}],\"b\":[{\"this\":\"is a test\",\"that\":\"is too\"}]}", results[0]);
+    try h.expectJsonEqual("{\"a\":[{\"this\":\"is a test\",\"that\":\"is too\"}],\"b\":[{\"this\":\"is a test\",\"that\":\"is too\"}]}", results[0]);
 }
 
 test "jq:L1912 include _shadow1_; e" {
@@ -96,7 +96,7 @@ test "jq:L1912 include _shadow1_; e" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2", results[0]);
+    try h.expectJsonEqual("2", results[0]);
 }
 
 test "jq:L1916 include _shadow1_; include _shadow2_; e" {
@@ -109,7 +109,7 @@ test "jq:L1916 include _shadow1_; include _shadow2_; e" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("3", results[0]);
+    try h.expectJsonEqual("3", results[0]);
 }
 
 test "jq:L1920 import _shadow1_ as f; import _shadow2_ as f; import _sha..." {
@@ -122,7 +122,7 @@ test "jq:L1920 import _shadow1_ as f; import _shadow2_ as f; import _sha..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[2,3]", results[0]);
+    try h.expectJsonEqual("[2,3]", results[0]);
 }
 
 test "jq:L1924 module (.+1); 0" {
@@ -165,7 +165,7 @@ test "jq:L1960 modulemeta" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"whatever\":null,\"deps\":[{\"as\":\"foo\",\"is_data\":false,\"relpath\":\"a\"},{\"search\":\"./\",\"as\":\"d\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./\",\"as\":\"d2\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./../lib/jq\",\"as\":\"e\",\"is_data\":false,\"relpath\":\"e\"},{\"search\":\"./../lib/jq\",\"as\":\"f\",\"is_data\":false,\"relpath\":\"f\"},{\"as\":\"d\",\"is_data\":true,\"relpath\":\"data\"}],\"defs\":[\"a/0\",\"c/0\"]}", results[0]);
+    try h.expectJsonEqual("{\"whatever\":null,\"deps\":[{\"as\":\"foo\",\"is_data\":false,\"relpath\":\"a\"},{\"search\":\"./\",\"as\":\"d\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./\",\"as\":\"d2\",\"is_data\":false,\"relpath\":\"d\"},{\"search\":\"./../lib/jq\",\"as\":\"e\",\"is_data\":false,\"relpath\":\"e\"},{\"search\":\"./../lib/jq\",\"as\":\"f\",\"is_data\":false,\"relpath\":\"f\"},{\"as\":\"d\",\"is_data\":true,\"relpath\":\"data\"}],\"defs\":[\"a/0\",\"c/0\"]}", results[0]);
 }
 
 test "jq:L1964 modulemeta | .deps | length" {
@@ -178,7 +178,7 @@ test "jq:L1964 modulemeta | .deps | length" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("6", results[0]);
+    try h.expectJsonEqual("6", results[0]);
 }
 
 test "jq:L1968 modulemeta | .defs | length" {
@@ -191,7 +191,7 @@ test "jq:L1968 modulemeta | .defs | length" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2", results[0]);
+    try h.expectJsonEqual("2", results[0]);
 }
 
 test "jq:L1972 import _syntaxerror_ as e; ." {
@@ -214,7 +214,7 @@ test "jq:L1984 import _test_bind_order_ as check; check::check" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L1988 try -. catch ." {
@@ -227,7 +227,7 @@ test "jq:L1988 try -. catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"string (\\\"very-long-long-long-long...\\\") cannot be negated\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"very-long-long-long-long...\\\") cannot be negated\"", results[0]);
 }
 
 test "jq:L1992 try (.-.) catch ." {
@@ -240,7 +240,7 @@ test "jq:L1992 try (.-.) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"string (\\\"very-long-long-long-long...\\\") and string (\\\"very-long-long-long-long...\\\") cannot be subtracted\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"very-long-long-long-long...\\\") and string (\\\"very-long-long-long-long...\\\") cannot be subtracted\"", results[0]);
 }
 
 test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
@@ -253,12 +253,12 @@ test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 6), results.len);
-    try std.testing.expectEqualStrings("\"string (\\\"☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[0]);
-    try std.testing.expectEqualStrings("\"string (\\\"xx☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[1]);
-    try std.testing.expectEqualStrings("\"string (\\\"xxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[2]);
-    try std.testing.expectEqualStrings("\"string (\\\"xxxxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[3]);
-    try std.testing.expectEqualStrings("\"string (\\\"xxxxxxxx☆☆☆☆☆...\\\") cannot be negated\"", results[4]);
-    try std.testing.expectEqualStrings("\"string (\\\"xxxxxxxxxx☆☆☆☆...\\\") cannot be negated\"", results[5]);
+    try h.expectJsonEqual("\"string (\\\"☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"xx☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[1]);
+    try h.expectJsonEqual("\"string (\\\"xxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[2]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[3]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxxxx☆☆☆☆☆...\\\") cannot be negated\"", results[4]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxxxxxx☆☆☆☆...\\\") cannot be negated\"", results[5]);
 }
 
 test "jq:L2005 try (. + _x_) catch . == if have_decnum then _number (123..." {
@@ -271,7 +271,7 @@ test "jq:L2005 try (. + _x_) catch . == if have_decnum then _number (123..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2009 join(_,_)" {
@@ -284,7 +284,7 @@ test "jq:L2009 join(_,_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"1,2,true,false,3.4\"", results[0]);
+    try h.expectJsonEqual("\"1,2,true,false,3.4\"", results[0]);
 }
 
 test "jq:L2013 .[] | join(_,_)" {
@@ -297,10 +297,10 @@ test "jq:L2013 .[] | join(_,_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 4), results.len);
-    try std.testing.expectEqualStrings("\"\"", results[0]);
-    try std.testing.expectEqualStrings("\"\"", results[1]);
-    try std.testing.expectEqualStrings("\",\"", results[2]);
-    try std.testing.expectEqualStrings("\",,\"", results[3]);
+    try h.expectJsonEqual("\"\"", results[0]);
+    try h.expectJsonEqual("\"\"", results[1]);
+    try h.expectJsonEqual("\",\"", results[2]);
+    try h.expectJsonEqual("\",,\"", results[3]);
 }
 
 test "jq:L2020 .[] | join(_,_)" {
@@ -313,8 +313,8 @@ test "jq:L2020 .[] | join(_,_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("\"a,\"", results[0]);
-    try std.testing.expectEqualStrings("\",a\"", results[1]);
+    try h.expectJsonEqual("\"a,\"", results[0]);
+    try h.expectJsonEqual("\",a\"", results[1]);
 }
 
 test "jq:L2025 try join(_,_) catch ." {
@@ -327,7 +327,7 @@ test "jq:L2025 try join(_,_) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"string (\\\"1,2,\\\") and object ({\\\"a\\\":{\\\"b\\\":{\\\"c\\\":33}}}) cannot be added\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"1,2,\\\") and object ({\\\"a\\\":{\\\"b\\\":{\\\"c\\\":33}}}) cannot be added\"", results[0]);
 }
 
 test "jq:L2029 try join(_,_) catch ." {
@@ -340,7 +340,7 @@ test "jq:L2029 try join(_,_) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"string (\\\"1,2,\\\") and array ([3,4,5]) cannot be added\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"1,2,\\\") and array ([3,4,5]) cannot be added\"", results[0]);
 }
 
 test "jq:L2033 {if:0,and:1,or:2,then:3,else:4,elif:5,end:6,as:7,def:8,re..." {
@@ -353,7 +353,7 @@ test "jq:L2033 {if:0,and:1,or:2,then:3,else:4,elif:5,end:6,as:7,def:8,re..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"if\":0,\"and\":1,\"or\":2,\"then\":3,\"else\":4,\"elif\":5,\"end\":6,\"as\":7,\"def\":8,\"reduce\":9,\"foreach\":10,\"try\":11,\"catch\":12,\"label\":13,\"import\":14,\"include\":15,\"module\":16}", results[0]);
+    try h.expectJsonEqual("{\"if\":0,\"and\":1,\"or\":2,\"then\":3,\"else\":4,\"elif\":5,\"end\":6,\"as\":7,\"def\":8,\"reduce\":9,\"foreach\":10,\"try\":11,\"catch\":12,\"label\":13,\"import\":14,\"include\":15,\"module\":16}", results[0]);
 }
 
 test "jq:L2037 try (1/.) catch ." {
@@ -366,7 +366,7 @@ test "jq:L2037 try (1/.) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
+    try h.expectJsonEqual("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
 test "jq:L2041 try (1/0) catch ." {
@@ -379,7 +379,7 @@ test "jq:L2041 try (1/0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
+    try h.expectJsonEqual("\"number (1) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
 test "jq:L2045 try (0/0) catch ." {
@@ -392,7 +392,7 @@ test "jq:L2045 try (0/0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"number (0) and number (0) cannot be divided because the divisor is zero\"", results[0]);
+    try h.expectJsonEqual("\"number (0) and number (0) cannot be divided because the divisor is zero\"", results[0]);
 }
 
 test "jq:L2049 try (1%.) catch ." {
@@ -405,7 +405,7 @@ test "jq:L2049 try (1%.) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
+    try h.expectJsonEqual("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
 }
 
 test "jq:L2053 try (1%0) catch ." {
@@ -418,5 +418,5 @@ test "jq:L2053 try (1%0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
+    try h.expectJsonEqual("\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"", results[0]);
 }

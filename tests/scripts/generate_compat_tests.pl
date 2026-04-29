@@ -251,13 +251,8 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
             try buf.appendSlice(alloc, s);
         },
         .float     => |f| {
-            if (std.math.isNan(f) or std.math.isInf(f)) {
-                try buf.appendSlice(alloc, "null");
-            } else {
-                var tmp: [64]u8 = undefined;
-                const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-                try buf.appendSlice(alloc, s);
-            }
+            const formatted = types.formatJqFloat(f);
+            try buf.appendSlice(alloc, formatted.slice());
         },
         .string    => |s| {
             try buf.append(alloc, '"');
@@ -299,7 +294,9 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
     }
 }
 
-/// jq-compatible escaping.
+/// jq-compatible escaping: uses standard JSON escape sequences (\n, \t, \r, \b, \f)
+/// for common control characters, \uXXXX for other control characters, and outputs
+/// valid multi-byte UTF-8 sequences as literal bytes (matching jq's output format).
 pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
@@ -308,6 +305,11 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
             switch (byte) {
                 '"'          => try buf.appendSlice(alloc, "\\\""),
                 '\\'         => try buf.appendSlice(alloc, "\\\\"),
+                '\n'         => try buf.appendSlice(alloc, "\\n"),
+                '\t'         => try buf.appendSlice(alloc, "\\t"),
+                '\r'         => try buf.appendSlice(alloc, "\\r"),
+                0x08         => try buf.appendSlice(alloc, "\\b"),
+                0x0C         => try buf.appendSlice(alloc, "\\f"),
                 0x20, 0x21,
                 0x23...0x5B,
                 0x5D...0x7E => try buf.append(alloc, byte),
@@ -319,29 +321,161 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
             }
             i += 1;
         } else {
+            // Non-ASCII: output valid UTF-8 sequences as literal bytes (jq behavior).
             const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
                 try buf.appendSlice(alloc, "\\ufffd"); i += 1; continue;
             };
             if (i + seq_len > s.len) {
                 try buf.appendSlice(alloc, "\\ufffd"); i += 1; continue;
             }
-            const cp = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
+            _ = std.unicode.utf8Decode(s[i..][0..seq_len]) catch {
                 try buf.appendSlice(alloc, "\\ufffd"); i += seq_len; continue;
             };
-            if (cp <= 0xFFFF) {
-                var tmp: [6]u8 = undefined;
-                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{cp}) catch unreachable;
-                try buf.appendSlice(alloc, seq);
-            } else {
-                const adjusted = cp - 0x10000;
-                const high: u32 = 0xD800 + (adjusted >> 10);
-                const low:  u32 = 0xDC00 + (adjusted & 0x3FF);
-                var tmp: [12]u8 = undefined;
-                const seq = std.fmt.bufPrint(&tmp, "\\u{x:0>4}\\u{x:0>4}", .{ high, low }) catch unreachable;
-                try buf.appendSlice(alloc, seq);
-            }
+            // Valid UTF-8 sequence: output as literal bytes
+            try buf.appendSlice(alloc, s[i..][0..seq_len]);
             i += seq_len;
         }
+    }
+}
+
+// ── Structural JSON comparison ────────────────────────────────────────────────
+
+/// Return the numeric value of a Value as f64, or null if not numeric.
+fn numericAsF64(v: Value) ?f64 {
+    return switch (v) {
+        .int   => |n| @as(f64, @floatFromInt(n)),
+        .float => |f| f,
+        else   => null,
+    };
+}
+
+/// Count the number of key-value pairs in an object span.
+fn objectLen(span: Value.TapeSpan) usize {
+    var count: usize = 0;
+    var idx = span.start + 1;
+    while (idx < span.end - 1) {
+        count += 1;
+        idx += 1; // skip key
+        idx = skipTapeEntry(span.tape, idx); // skip value
+    }
+    return count;
+}
+
+/// Find the value associated with `key` in an object span.
+/// Returns the Value if found, null otherwise.
+fn objectGet(span: Value.TapeSpan, key: []const u8) ?Value {
+    var idx = span.start + 1;
+    while (idx < span.end - 1) {
+        const key_ref = span.tape.entries[idx].payload.string;
+        const k = span.tape.getString(key_ref);
+        idx += 1;
+        const val = entryToValue(span.tape, idx);
+        idx = skipTapeEntry(span.tape, idx);
+        if (std.mem.eql(u8, k, key)) return val;
+    }
+    return null;
+}
+
+/// Deep structural equality matching jq's == semantics:
+///   - null, bool: exact tag match
+///   - numbers: compare as f64 (so int 2 == float 2.0)
+///   - strings: byte-equal (parser has already decoded all escape sequences)
+///   - arrays: element-wise recursive
+///   - objects: key-order-insensitive (jq's == is unordered for objects)
+fn valuesEqual(a: Value, b: Value) bool {
+    // Both numeric? Compare as f64.
+    if (numericAsF64(a)) |fa| {
+        if (numericAsF64(b)) |fb| {
+            return fa == fb;
+        }
+        return false; // a is numeric, b is not
+    }
+    if (numericAsF64(b) != null) return false; // b is numeric, a is not
+
+    switch (a) {
+        .null_val  => return b == .null_val,
+        .bool_val  => |ba| return switch (b) { .bool_val => |bb| ba == bb, else => false },
+        .string    => |sa| return switch (b) { .string => |sb| std.mem.eql(u8, sa, sb), else => false },
+        .array     => |spa| {
+            const spb = switch (b) { .array => |s| s, else => return false };
+            // Compare element by element
+            var ia = spa.start + 1;
+            var ib = spb.start + 1;
+            while (ia < spa.end - 1 and ib < spb.end - 1) {
+                const va = entryToValue(spa.tape, ia);
+                const vb = entryToValue(spb.tape, ib);
+                if (!valuesEqual(va, vb)) return false;
+                ia = skipTapeEntry(spa.tape, ia);
+                ib = skipTapeEntry(spb.tape, ib);
+            }
+            // Both must be exhausted simultaneously
+            return (ia >= spa.end - 1) and (ib >= spb.end - 1);
+        },
+        .object    => |spa| {
+            const spb = switch (b) { .object => |s| s, else => return false };
+            // Object equality is key-order-insensitive (jq behavior).
+            // Check same number of keys and every key in a exists in b with equal value.
+            if (objectLen(spa) != objectLen(spb)) return false;
+            var ia = spa.start + 1;
+            while (ia < spa.end - 1) {
+                const key_ref = spa.tape.entries[ia].payload.string;
+                const key = spa.tape.getString(key_ref);
+                ia += 1;
+                const va = entryToValue(spa.tape, ia);
+                ia = skipTapeEntry(spa.tape, ia);
+                const vb = objectGet(spb, key) orelse return false;
+                if (!valuesEqual(va, vb)) return false;
+            }
+            return true;
+        },
+        // int and float are handled by the numeric fast-path above
+        .int       => unreachable,
+        .float     => unreachable,
+    }
+}
+
+/// Structural JSON equality assertion.
+/// Parses both `expected_json` and `actual_json` with the zq Parser,
+/// then compares resulting Values structurally (jq == semantics):
+///   - Numbers: compared as f64 (so 2 == 2.0 == 20e-1)
+///   - Strings: compared after escape decoding (all escape sequences decoded by parser)
+///   - Objects: key-order-insensitive (jq == is unordered)
+///   - Arrays: ordered, element-wise recursive
+pub fn expectJsonEqual(expected_json: []const u8, actual_json: []const u8) !void {
+    // Parse both sides, keeping the Tape alive in this frame.
+    // Value.TapeSpan.tape is a non-owning pointer into the Parser's internal
+    // buffers via the Tape struct on the stack — the Tape must outlive the Value.
+    var p_exp = try Parser.init(alloc);
+    defer p_exp.deinit();
+    const tape_exp = switch (p_exp.feed(expected_json, true) catch {
+        std.debug.print("\nexpectJsonEqual: failed to parse expected JSON: {s}\n", .{expected_json});
+        return error.TestExpectedEqual;
+    }) {
+        .done      => |d| d.tape,
+        .need_more => {
+            std.debug.print("\nexpectJsonEqual: expected JSON incomplete: {s}\n", .{expected_json});
+            return error.TestExpectedEqual;
+        },
+    };
+    const exp_val = entryToValue(&tape_exp, 0);
+
+    var p_act = try Parser.init(alloc);
+    defer p_act.deinit();
+    const tape_act = switch (p_act.feed(actual_json, true) catch {
+        std.debug.print("\nexpectJsonEqual: failed to parse actual JSON: {s}\n", .{actual_json});
+        return error.TestExpectedEqual;
+    }) {
+        .done      => |d| d.tape,
+        .need_more => {
+            std.debug.print("\nexpectJsonEqual: actual JSON incomplete: {s}\n", .{actual_json});
+            return error.TestExpectedEqual;
+        },
+    };
+    const act_val = entryToValue(&tape_act, 0);
+
+    if (!valuesEqual(exp_val, act_val)) {
+        std.debug.print("\nexpectJsonEqual mismatch:\n  expected: {s}\n  actual:   {s}\n", .{ expected_json, actual_json });
+        return error.TestExpectedEqual;
     }
 }
 
@@ -358,10 +492,14 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         .need_more => return error.ParseIncomplete,
     };
 
-    var q = try CompiledQuery.compile(filter, .{}, alloc);
+    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    var q = switch (result) {
+        .ok  => |cq| cq,
+        .err => return error.QuerySyntaxError,
+    };
     defer q.deinit();
 
-    var it = try q.execute(tape, alloc);
+    var it = try q.execute(tape, &.{}, alloc);
     defer it.deinit();
 
     var result_list = std.ArrayList([]const u8){};
@@ -370,7 +508,7 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         result_list.deinit(alloc);
     }
 
-    while (try it.next()) |val| {
+    while (it.next() catch return error.QueryRuntimeError) |val| {
         var buf = std.ArrayList(u8){};
         errdefer buf.deinit(alloc);
         try serializeValue(&buf, val);
@@ -380,14 +518,17 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     return result_list.toOwnedSlice(alloc);
 }
 
-/// Verify that compiling `filter` returns QuerySyntaxError (%%FAIL tests).
+/// Verify that compiling `filter` returns a compile error (%%FAIL tests).
 pub fn expectCompileError(filter: []const u8) !void {
-    var q = CompiledQuery.compile(filter, .{}, alloc) catch |e| {
-        if (e == error.QuerySyntaxError) return;
-        return e;
-    };
-    q.deinit();
-    return error.ExpectedCompileError;
+    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    switch (result) {
+        .ok => |cq| {
+            var q = cq;
+            q.deinit();
+            return error.ExpectedCompileError;
+        },
+        .err => return,
+    }
 }
 ZIG
 
@@ -433,11 +574,14 @@ ZIG
             $src .= "        \"${filter}\",\n";
             $src .= "        \"${input}\",\n";
             $src .= "    );\n";
-            $src .= "    defer { for (results) |s| h.alloc.free(s); h.alloc.free(results); }\n";
+            $src .= "    defer {\n";
+            $src .= "        for (results) |s| h.alloc.free(s);\n";
+            $src .= "        h.alloc.free(results);\n";
+            $src .= "    }\n";
             $src .= "    try std.testing.expectEqual(\@as(usize, ${n}), results.len);\n";
             for my $i (0..$#outs) {
                 my $expected = zig_str($outs[$i]);
-                $src .= "    try std.testing.expectEqualStrings(\"${expected}\", results[${i}]);\n";
+                $src .= "    try h.expectJsonEqual(\"${expected}\", results[${i}]);\n";
             }
         }
 
@@ -472,6 +616,9 @@ comptime {
 ZIG
 
 $root .= "    _ = \@import(\"${_}.zig\");\n" for @written_stems;
+# Hand-written project-specific test sections (not generated from jq.test).
+my @extra_stems = ('regex', 'repeat_builtin');
+$root .= "    _ = \@import(\"${_}.zig\");\n" for @extra_stems;
 $root .= "}\n";
 
 open my $fh_r, '>:utf8', "$out_dir/root.zig"

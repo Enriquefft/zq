@@ -18,7 +18,7 @@ test "jq:L498 1 as $x | 2 as $y | [$x,$y,$x]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,1]", results[0]);
+    try h.expectJsonEqual("[1,2,1]", results[0]);
 }
 
 test "jq:L502 [1,2,3][] as $x | [[4,5,6,7][$x]]" {
@@ -31,9 +31,9 @@ test "jq:L502 [1,2,3][] as $x | [[4,5,6,7][$x]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("[5]", results[0]);
-    try std.testing.expectEqualStrings("[6]", results[1]);
-    try std.testing.expectEqualStrings("[7]", results[2]);
+    try h.expectJsonEqual("[5]", results[0]);
+    try h.expectJsonEqual("[6]", results[1]);
+    try h.expectJsonEqual("[7]", results[2]);
 }
 
 test "jq:L508 42 as $x | . | . | . + 432 | $x + 1" {
@@ -46,7 +46,7 @@ test "jq:L508 42 as $x | . | . | . + 432 | $x + 1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("43", results[0]);
+    try h.expectJsonEqual("43", results[0]);
 }
 
 test "jq:L512 1 + 2 as $x | -$x" {
@@ -59,7 +59,7 @@ test "jq:L512 1 + 2 as $x | -$x" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("-3", results[0]);
+    try h.expectJsonEqual("-3", results[0]);
 }
 
 test "jq:L516 _x_ as $x | _a_+_y_ as $y | $x+_,_+$y" {
@@ -72,7 +72,7 @@ test "jq:L516 _x_ as $x | _a_+_y_ as $y | $x+_,_+$y" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"x,ay\"", results[0]);
+    try h.expectJsonEqual("\"x,ay\"", results[0]);
 }
 
 test "jq:L520 1 as $x | [$x,$x,$x as $x | $x]" {
@@ -85,7 +85,7 @@ test "jq:L520 1 as $x | [$x,$x,$x as $x | $x]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,1,1]", results[0]);
+    try h.expectJsonEqual("[1,1,1]", results[0]);
 }
 
 test "jq:L524 [1, {c:3, d:4}] as [$a, {c:$b, b:$c}] | $a, $b, $c" {
@@ -98,9 +98,9 @@ test "jq:L524 [1, {c:3, d:4}] as [$a, {c:$b, b:$c}] | $a, $b, $c" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("3", results[1]);
-    try std.testing.expectEqualStrings("null", results[2]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("3", results[1]);
+    try h.expectJsonEqual("null", results[2]);
 }
 
 test "jq:L530 . as {as: $kw, _str_: $str, (_e_+_x_+_p_): $exp} | [$kw, ..." {
@@ -113,7 +113,7 @@ test "jq:L530 . as {as: $kw, _str_: $str, (_e_+_x_+_p_): $exp} | [$kw, ..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,3]", results[0]);
+    try h.expectJsonEqual("[1,2,3]", results[0]);
 }
 
 test "jq:L534 .[] as [$a, $b] | [$b, $a]" {
@@ -126,8 +126,8 @@ test "jq:L534 .[] as [$a, $b] | [$b, $a]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("[null,1]", results[0]);
-    try std.testing.expectEqualStrings("[2,1]", results[1]);
+    try h.expectJsonEqual("[null,1]", results[0]);
+    try h.expectJsonEqual("[2,1]", results[1]);
 }
 
 test "jq:L539 . as $i | . as [$i] | $i" {
@@ -140,7 +140,7 @@ test "jq:L539 . as $i | . as [$i] | $i" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("0", results[0]);
+    try h.expectJsonEqual("0", results[0]);
 }
 
 test "jq:L543 . as [$i] | . as $i | $i" {
@@ -153,7 +153,7 @@ test "jq:L543 . as [$i] | . as $i | $i" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0]", results[0]);
+    try h.expectJsonEqual("[0]", results[0]);
 }
 
 test "jq:L547 . as [] | null" {

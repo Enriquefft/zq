@@ -18,7 +18,7 @@ test "jq:L114 {a: 1}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1}", results[0]);
+    try h.expectJsonEqual("{\"a\":1}", results[0]);
 }
 
 test "jq:L118 {a,b,(.d):.a,e:.b}" {
@@ -31,11 +31,9 @@ test "jq:L118 {a,b,(.d):.a,e:.b}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2,\"c\":1,\"e\":2}", results[0]);
+    try h.expectJsonEqual("{\"a\":1,\"b\":2,\"c\":1,\"e\":2}", results[0]);
 }
 
-// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26)
 test "jq:L122 {_a_,b,_a$_(1+1)_}" {
     const results = try h.runFilter(
         "{\"a\",b,\"a$\\(1+1)\"}",
@@ -46,7 +44,7 @@ test "jq:L122 {_a_,b,_a$_(1+1)_}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2,\"a$2\":4}", results[0]);
+    try h.expectJsonEqual("{\"a\":1,\"b\":2,\"a$2\":4}", results[0]);
 }
 
 test "jq:L126 {(0):1}" {

@@ -18,9 +18,9 @@ test "jq:L237 .[]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("2", results[1]);
-    try std.testing.expectEqualStrings("3", results[2]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("2", results[1]);
+    try h.expectJsonEqual("3", results[2]);
 }
 
 test "jq:L243 1,1" {
@@ -33,8 +33,8 @@ test "jq:L243 1,1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("1", results[1]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("1", results[1]);
 }
 
 test "jq:L248 1,." {
@@ -47,8 +47,8 @@ test "jq:L248 1,." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("[]", results[1]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("[]", results[1]);
 }
 
 test "jq:L253 [.]" {
@@ -61,7 +61,7 @@ test "jq:L253 [.]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[2]]", results[0]);
+    try h.expectJsonEqual("[[2]]", results[0]);
 }
 
 test "jq:L257 [[2]]" {
@@ -74,7 +74,7 @@ test "jq:L257 [[2]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[2]]", results[0]);
+    try h.expectJsonEqual("[[2]]", results[0]);
 }
 
 test "jq:L261 [{}]" {
@@ -87,7 +87,7 @@ test "jq:L261 [{}]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[{}]", results[0]);
+    try h.expectJsonEqual("[{}]", results[0]);
 }
 
 test "jq:L265 [.[]]" {
@@ -100,7 +100,7 @@ test "jq:L265 [.[]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"a\"]", results[0]);
+    try h.expectJsonEqual("[\"a\"]", results[0]);
 }
 
 test "jq:L269 [(.,1),((.,.[]),(2,3))]" {
@@ -113,7 +113,7 @@ test "jq:L269 [(.,1),((.,.[]),(2,3))]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[\"a\",\"b\"],1,[\"a\",\"b\"],\"a\",\"b\",2,3]", results[0]);
+    try h.expectJsonEqual("[[\"a\",\"b\"],1,[\"a\",\"b\"],\"a\",\"b\",2,3]", results[0]);
 }
 
 test "jq:L273 [([5,5][]),.,.[]]" {
@@ -126,7 +126,7 @@ test "jq:L273 [([5,5][]),.,.[]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[5,5,[1,2,3],1,2,3]", results[0]);
+    try h.expectJsonEqual("[5,5,[1,2,3],1,2,3]", results[0]);
 }
 
 test "jq:L277 {x: (1,2)},{x:3} | .x" {
@@ -139,9 +139,9 @@ test "jq:L277 {x: (1,2)},{x:3} | .x" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("2", results[1]);
-    try std.testing.expectEqualStrings("3", results[2]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("2", results[1]);
+    try h.expectJsonEqual("3", results[2]);
 }
 
 test "jq:L283 [.[-4,-3,-2,-1,0,1,2,3]]" {
@@ -154,7 +154,7 @@ test "jq:L283 [.[-4,-3,-2,-1,0,1,2,3]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[null,1,2,3,1,2,3,null]", results[0]);
+    try h.expectJsonEqual("[null,1,2,3,1,2,3,null]", results[0]);
 }
 
 test "jq:L287 [range(0;10)]" {
@@ -167,7 +167,7 @@ test "jq:L287 [range(0;10)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,4,5,6,7,8,9]", results[0]);
+    try h.expectJsonEqual("[0,1,2,3,4,5,6,7,8,9]", results[0]);
 }
 
 test "jq:L291 [range(0,1;3,4)]" {
@@ -180,7 +180,7 @@ test "jq:L291 [range(0,1;3,4)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,0,1,2,3,1,2,1,2,3]", results[0]);
+    try h.expectJsonEqual("[0,1,2,0,1,2,3,1,2,1,2,3]", results[0]);
 }
 
 test "jq:L295 [range(0;10;3)]" {
@@ -193,7 +193,7 @@ test "jq:L295 [range(0;10;3)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,3,6,9]", results[0]);
+    try h.expectJsonEqual("[0,3,6,9]", results[0]);
 }
 
 test "jq:L299 [range(0;10;-1)]" {
@@ -206,7 +206,7 @@ test "jq:L299 [range(0;10;-1)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[]", results[0]);
+    try h.expectJsonEqual("[]", results[0]);
 }
 
 test "jq:L303 [range(0;-5;-1)]" {
@@ -219,7 +219,7 @@ test "jq:L303 [range(0;-5;-1)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,-1,-2,-3,-4]", results[0]);
+    try h.expectJsonEqual("[0,-1,-2,-3,-4]", results[0]);
 }
 
 test "jq:L307 [range(0,1;4,5;1,2)]" {
@@ -232,7 +232,7 @@ test "jq:L307 [range(0,1;4,5;1,2)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,0,2,0,1,2,3,4,0,2,4,1,2,3,1,3,1,2,3,4,1,3]", results[0]);
+    try h.expectJsonEqual("[0,1,2,3,0,2,0,1,2,3,4,0,2,4,1,2,3,1,3,1,2,3,4,1,3]", results[0]);
 }
 
 test "jq:L311 [while(.<100; .*2)]" {
@@ -245,7 +245,7 @@ test "jq:L311 [while(.<100; .*2)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,4,8,16,32,64]", results[0]);
+    try h.expectJsonEqual("[1,2,4,8,16,32,64]", results[0]);
 }
 
 test "jq:L315 [(label $here | .[] | if .>1 then break $here else . end)..." {
@@ -258,7 +258,7 @@ test "jq:L315 [(label $here | .[] | if .>1 then break $here else . end)..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,\"hi!\"]", results[0]);
+    try h.expectJsonEqual("[0,1,\"hi!\"]", results[0]);
 }
 
 test "jq:L319 [(label $here | .[] | if .>1 then break $here else . end)..." {
@@ -271,7 +271,7 @@ test "jq:L319 [(label $here | .[] | if .>1 then break $here else . end)..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,\"hi!\"]", results[0]);
+    try h.expectJsonEqual("[0,\"hi!\"]", results[0]);
 }
 
 test "jq:L323 . as $foo | break $foo" {
@@ -289,7 +289,7 @@ test "jq:L329 [.[]|[.,1]|until(.[0] < 1; [.[0] - 1, .[1] * .[0]])|.[1]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,6,24,120]", results[0]);
+    try h.expectJsonEqual("[1,2,6,24,120]", results[0]);
 }
 
 test "jq:L333 [label $out | foreach .[] as $item ([3, null]; if .[0] < ..." {
@@ -302,7 +302,7 @@ test "jq:L333 [label $out | foreach .[] as $item ([3, null]; if .[0] < ..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[11,22,33]", results[0]);
+    try h.expectJsonEqual("[11,22,33]", results[0]);
 }
 
 test "jq:L337 [foreach range(5) as $item (0; $item)]" {
@@ -315,7 +315,7 @@ test "jq:L337 [foreach range(5) as $item (0; $item)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,4]", results[0]);
+    try h.expectJsonEqual("[0,1,2,3,4]", results[0]);
 }
 
 test "jq:L341 [foreach .[] as [$i, $j] (0; . + $i - $j)]" {
@@ -328,7 +328,7 @@ test "jq:L341 [foreach .[] as [$i, $j] (0; . + $i - $j)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,3,5]", results[0]);
+    try h.expectJsonEqual("[1,3,5]", results[0]);
 }
 
 test "jq:L345 [foreach .[] as {a:$a} (0; . + $a; -.)]" {
@@ -341,7 +341,7 @@ test "jq:L345 [foreach .[] as {a:$a} (0; . + $a; -.)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[-1,-1,-4]", results[0]);
+    try h.expectJsonEqual("[-1,-1,-4]", results[0]);
 }
 
 test "jq:L349 [-foreach -.[] as $x (0; . + $x)]" {
@@ -354,11 +354,9 @@ test "jq:L349 [-foreach -.[] as $x (0; . + $x)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,3,6]", results[0]);
+    try h.expectJsonEqual("[1,3,6]", results[0]);
 }
 
-// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26)
 test "jq:L353 [foreach .[] / .[] as $i (0; . + $i)]" {
     const results = try h.runFilter(
         "[foreach .[] / .[] as $i (0; . + $i)]",
@@ -369,7 +367,7 @@ test "jq:L353 [foreach .[] / .[] as $i (0; . + $i)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,3,3.5,4.5]", results[0]);
+    try h.expectJsonEqual("[1,3,3.5,4.5]", results[0]);
 }
 
 test "jq:L357 [foreach .[] as $x (0; . + $x) as $x | $x]" {
@@ -382,7 +380,7 @@ test "jq:L357 [foreach .[] as $x (0; . + $x) as $x | $x]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,3,6]", results[0]);
+    try h.expectJsonEqual("[1,3,6]", results[0]);
 }
 
 test "jq:L361 [limit(3; .[])]" {
@@ -395,7 +393,7 @@ test "jq:L361 [limit(3; .[])]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[11,22,33]", results[0]);
+    try h.expectJsonEqual("[11,22,33]", results[0]);
 }
 
 test "jq:L365 [limit(0; error)]" {
@@ -408,7 +406,7 @@ test "jq:L365 [limit(0; error)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[]", results[0]);
+    try h.expectJsonEqual("[]", results[0]);
 }
 
 test "jq:L369 [limit(1; 1, error)]" {
@@ -421,7 +419,7 @@ test "jq:L369 [limit(1; 1, error)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1]", results[0]);
+    try h.expectJsonEqual("[1]", results[0]);
 }
 
 test "jq:L373 try limit(-1; error) catch ." {
@@ -434,7 +432,7 @@ test "jq:L373 try limit(-1; error) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"limit doesn't support negative count\"", results[0]);
+    try h.expectJsonEqual("\"limit doesn't support negative count\"", results[0]);
 }
 
 test "jq:L377 [skip(3; .[])]" {
@@ -447,7 +445,7 @@ test "jq:L377 [skip(3; .[])]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[4,5,6,7,8,9]", results[0]);
+    try h.expectJsonEqual("[4,5,6,7,8,9]", results[0]);
 }
 
 test "jq:L381 [skip(0,2,3,4; .[])]" {
@@ -460,7 +458,7 @@ test "jq:L381 [skip(0,2,3,4; .[])]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,3,3]", results[0]);
+    try h.expectJsonEqual("[1,2,3,3]", results[0]);
 }
 
 test "jq:L385 [skip(3; .[])]" {
@@ -473,7 +471,7 @@ test "jq:L385 [skip(3; .[])]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[]", results[0]);
+    try h.expectJsonEqual("[]", results[0]);
 }
 
 test "jq:L389 try skip(-1; error) catch ." {
@@ -486,7 +484,7 @@ test "jq:L389 try skip(-1; error) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"skip doesn't support negative count\"", results[0]);
+    try h.expectJsonEqual("\"skip doesn't support negative count\"", results[0]);
 }
 
 test "jq:L393 nth(1; 0,1,error(_foo_))" {
@@ -499,7 +497,7 @@ test "jq:L393 nth(1; 0,1,error(_foo_))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
+    try h.expectJsonEqual("1", results[0]);
 }
 
 test "jq:L397 [first(range(.)), last(range(.))]" {
@@ -512,7 +510,7 @@ test "jq:L397 [first(range(.)), last(range(.))]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,9]", results[0]);
+    try h.expectJsonEqual("[0,9]", results[0]);
 }
 
 test "jq:L401 [first(range(.)), last(range(.))]" {
@@ -525,7 +523,7 @@ test "jq:L401 [first(range(.)), last(range(.))]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[]", results[0]);
+    try h.expectJsonEqual("[]", results[0]);
 }
 
 test "jq:L405 [nth(0,5,9,10,15; range(.)), try nth(-1; range(.)) catch .]" {
@@ -538,7 +536,7 @@ test "jq:L405 [nth(0,5,9,10,15; range(.)), try nth(-1; range(.)) catch .]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,5,9,\"nth doesn't support negative indices\"]", results[0]);
+    try h.expectJsonEqual("[0,5,9,\"nth doesn't support negative indices\"]", results[0]);
 }
 
 test "jq:L410 first(1,error(_foo_))" {
@@ -551,7 +549,7 @@ test "jq:L410 first(1,error(_foo_))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
+    try h.expectJsonEqual("1", results[0]);
 }
 
 test "jq:L420 [limit(5,7; range(9))]" {
@@ -564,7 +562,7 @@ test "jq:L420 [limit(5,7; range(9))]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,4,0,1,2,3,4,5,6]", results[0]);
+    try h.expectJsonEqual("[0,1,2,3,4,0,1,2,3,4,5,6]", results[0]);
 }
 
 test "jq:L425 [nth(5,7; range(9;0;-1))]" {
@@ -577,7 +575,7 @@ test "jq:L425 [nth(5,7; range(9;0;-1))]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[4,2]", results[0]);
+    try h.expectJsonEqual("[4,2]", results[0]);
 }
 
 test "jq:L430 [range(0,1,2;4,3,2;2,3)]" {
@@ -590,7 +588,7 @@ test "jq:L430 [range(0,1,2;4,3,2;2,3)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,2,0,3,0,2,0,0,0,1,3,1,1,1,1,1,2,2,2,2]", results[0]);
+    try h.expectJsonEqual("[0,2,0,3,0,2,0,0,0,1,3,1,1,1,1,1,2,2,2,2]", results[0]);
 }
 
 test "jq:L435 [range(3,5)]" {
@@ -603,7 +601,7 @@ test "jq:L435 [range(3,5)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,0,1,2,3,4]", results[0]);
+    try h.expectJsonEqual("[0,1,2,0,1,2,3,4]", results[0]);
 }
 
 test "jq:L440 [(index(_,_,_|_), rindex(_,_,_|_)), indices(_,_,_|_)]" {
@@ -616,7 +614,7 @@ test "jq:L440 [(index(_,_,_|_), rindex(_,_,_|_)), indices(_,_,_|_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,3,22,19,[1,5,7,12,14,16,18,20,22],[3,9,10,17,19]]", results[0]);
+    try h.expectJsonEqual("[1,3,22,19,[1,5,7,12,14,16,18,20,22],[3,9,10,17,19]]", results[0]);
 }
 
 test "jq:L445 join(_,_,_/_)" {
@@ -629,8 +627,8 @@ test "jq:L445 join(_,_,_/_)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("\"a,b,c,d\"", results[0]);
-    try std.testing.expectEqualStrings("\"a/b/c/d\"", results[1]);
+    try h.expectJsonEqual("\"a,b,c,d\"", results[0]);
+    try h.expectJsonEqual("\"a/b/c/d\"", results[1]);
 }
 
 test "jq:L450 [.[]|join(_a_)]" {
@@ -643,7 +641,7 @@ test "jq:L450 [.[]|join(_a_)]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"\",\"\",\"a\",\"aa\"]", results[0]);
+    try h.expectJsonEqual("[\"\",\"\",\"a\",\"aa\"]", results[0]);
 }
 
 test "jq:L455 flatten(3,2,1)" {
@@ -656,9 +654,9 @@ test "jq:L455 flatten(3,2,1)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3]", results[0]);
-    try std.testing.expectEqualStrings("[0,1,2,[3]]", results[1]);
-    try std.testing.expectEqualStrings("[0,1,[2],[[3]]]", results[2]);
+    try h.expectJsonEqual("[0,1,2,3]", results[0]);
+    try h.expectJsonEqual("[0,1,2,[3]]", results[1]);
+    try h.expectJsonEqual("[0,1,[2],[[3]]]", results[2]);
 }
 
 test "jq:L466 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
@@ -671,7 +669,7 @@ test "jq:L466 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[],[2,3],[0,1,2,3,4],[5,6],[],[]]", results[0]);
+    try h.expectJsonEqual("[[],[2,3],[0,1,2,3,4],[5,6],[],[]]", results[0]);
 }
 
 test "jq:L470 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
@@ -684,7 +682,7 @@ test "jq:L470 [.[3:2], .[-5:4], .[:-2], .[-2:], .[3:3][1:], .[10:]]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"\",\"\",\"abcdefg\",\"hi\",\"\",\"\"]", results[0]);
+    try h.expectJsonEqual("[\"\",\"\",\"abcdefg\",\"hi\",\"\",\"\"]", results[0]);
 }
 
 test "jq:L474 del(.[2:4],.[0],.[-2:])" {
@@ -697,11 +695,9 @@ test "jq:L474 del(.[2:4],.[0],.[-2:])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,4,5]", results[0]);
+    try h.expectJsonEqual("[1,4,5]", results[0]);
 }
 
-// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26)
 test "jq:L478 .[2:4] = ([], [_a_,_b_], [_a_,_b_,_c_])" {
     const results = try h.runFilter(
         ".[2:4] = ([], [\"a\",\"b\"], [\"a\",\"b\",\"c\"])",
@@ -712,13 +708,11 @@ test "jq:L478 .[2:4] = ([], [_a_,_b_], [_a_,_b_,_c_])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("[0,1,4,5,6,7]", results[0]);
-    try std.testing.expectEqualStrings("[0,1,\"a\",\"b\",4,5,6,7]", results[1]);
-    try std.testing.expectEqualStrings("[0,1,\"a\",\"b\",\"c\",4,5,6,7]", results[2]);
+    try h.expectJsonEqual("[0,1,4,5,6,7]", results[0]);
+    try h.expectJsonEqual("[0,1,\"a\",\"b\",4,5,6,7]", results[1]);
+    try h.expectJsonEqual("[0,1,\"a\",\"b\",\"c\",4,5,6,7]", results[2]);
 }
 
-// ZQ-DEFER: P21 known regression — to be addressed in post-R5 follow-up
-//   (filed at 2026-04-26)
 test "jq:L490 reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[655..." {
     const results = try h.runFilter(
         "reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[65536:]",
@@ -729,5 +723,5 @@ test "jq:L490 reduce range(65540;65536;-1) as $i ([]; .[$i] = $i)|.[655..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[null,65537,65538,65539,65540]", results[0]);
+    try h.expectJsonEqual("[null,65537,65538,65539,65540]", results[0]);
 }

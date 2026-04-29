@@ -18,7 +18,7 @@ test "jq:L2215 -. | tojson == if have_decnum then _-13911860366432393_ e..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2219 -. | tojson == if have_decnum then _0.1234567890123456789..." {
@@ -31,7 +31,7 @@ test "jq:L2219 -. | tojson == if have_decnum then _0.1234567890123456789..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2223 [1E+1000,-1E+1000 | tojson] == if have_decnum then [_1E+1..." {
@@ -44,7 +44,7 @@ test "jq:L2223 [1E+1000,-1E+1000 | tojson] == if have_decnum then [_1E+1..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2227 . |= try . catch ." {
@@ -57,7 +57,7 @@ test "jq:L2227 . |= try . catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
+    try h.expectJsonEqual("1", results[0]);
 }
 
 test "jq:L2232 .[] as $n | $n+0 | [., tostring, . == $n]" {
@@ -70,11 +70,11 @@ test "jq:L2232 .[] as $n | $n+0 | [., tostring, . == $n]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 5), results.len);
-    try std.testing.expectEqualStrings("[-9007199254740992,\"-9007199254740992\",true]", results[0]);
-    try std.testing.expectEqualStrings("[-9007199254740992,\"-9007199254740992\",true]", results[1]);
-    try std.testing.expectEqualStrings("[9007199254740992,\"9007199254740992\",true]", results[2]);
-    try std.testing.expectEqualStrings("[9007199254740992,\"9007199254740992\",true]", results[3]);
-    try std.testing.expectEqualStrings("[13911860366432392,\"13911860366432392\",true]", results[4]);
+    try h.expectJsonEqual("[-9007199254740992,\"-9007199254740992\",true]", results[0]);
+    try h.expectJsonEqual("[-9007199254740992,\"-9007199254740992\",true]", results[1]);
+    try h.expectJsonEqual("[9007199254740992,\"9007199254740992\",true]", results[2]);
+    try h.expectJsonEqual("[9007199254740992,\"9007199254740992\",true]", results[3]);
+    try h.expectJsonEqual("[13911860366432392,\"13911860366432392\",true]", results[4]);
 }
 
 test "jq:L2241 abs" {
@@ -87,7 +87,7 @@ test "jq:L2241 abs" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"abc\"", results[0]);
+    try h.expectJsonEqual("\"abc\"", results[0]);
 }
 
 test "jq:L2245 map(abs)" {
@@ -100,7 +100,7 @@ test "jq:L2245 map(abs)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,0,10,1.1]", results[0]);
+    try h.expectJsonEqual("[0,0,10,1.1]", results[0]);
 }
 
 test "jq:L2249 map(fabs)" {
@@ -113,7 +113,7 @@ test "jq:L2249 map(fabs)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,0,10,1.1]", results[0]);
+    try h.expectJsonEqual("[0,0,10,1.1]", results[0]);
 }
 
 test "jq:L2253 map(abs == length) | unique" {
@@ -126,7 +126,7 @@ test "jq:L2253 map(abs == length) | unique" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true]", results[0]);
+    try h.expectJsonEqual("[true]", results[0]);
 }
 
 test "jq:L2258 map(abs)" {
@@ -139,7 +139,7 @@ test "jq:L2258 map(abs)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1e-1,1000000000000000002]", results[0]);
+    try h.expectJsonEqual("[1e-1,1000000000000000002]", results[0]);
 }
 
 test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {
@@ -152,7 +152,7 @@ test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2266 [1E+1000,-1E+1000 | length | tojson] | unique == if have_..." {
@@ -165,7 +165,7 @@ test "jq:L2266 [1E+1000,-1E+1000 | length | tojson] | unique == if have_..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2272 123 as $label | $label" {
@@ -178,7 +178,7 @@ test "jq:L2272 123 as $label | $label" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("123", results[0]);
+    try h.expectJsonEqual("123", results[0]);
 }
 
 test "jq:L2276 [ label $if | range(10) | ., (select(. == 5) | break $if) ]" {
@@ -191,7 +191,7 @@ test "jq:L2276 [ label $if | range(10) | ., (select(. == 5) | break $if) ]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,2,3,4,5]", results[0]);
+    try h.expectJsonEqual("[0,1,2,3,4,5]", results[0]);
 }
 
 test "jq:L2280 reduce .[] as $then (4 as $else | $else; . as $elif | . +..." {
@@ -204,7 +204,7 @@ test "jq:L2280 reduce .[] as $then (4 as $else | $else; . as $elif | . +..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("96", results[0]);
+    try h.expectJsonEqual("96", results[0]);
 }
 
 test "jq:L2284 1 as $foreach | 2 as $and | 3 as $or | { $foreach, $and, ..." {
@@ -217,7 +217,7 @@ test "jq:L2284 1 as $foreach | 2 as $and | 3 as $or | { $foreach, $and, ..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"foreach\":1,\"and\":2,\"or\":3,\"a\":4}", results[0]);
+    try h.expectJsonEqual("{\"foreach\":1,\"and\":2,\"or\":3,\"a\":4}", results[0]);
 }
 
 test "jq:L2288 [ foreach .[] as $try (1 as $catch | $catch - 1; . + $try..." {
@@ -230,5 +230,5 @@ test "jq:L2288 [ foreach .[] as $try (1 as $catch | $catch - 1; . + $try..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[10,19,27,34]", results[0]);
+    try h.expectJsonEqual("[10,19,27,34]", results[0]);
 }

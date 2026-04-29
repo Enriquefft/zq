@@ -18,7 +18,7 @@ test "jq:L2058 [range(-52;52;1)] as $powers | [$powers[]|pow(2;.)|log2|r..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2062 [range(-99/2;99/2;1)] as $orig | [$orig[]|pow(2;.)|log2] ..." {
@@ -65,7 +65,7 @@ test "jq:L2080 INDEX(range(5)|[., _foo_(.)_]; .[0])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"0\":[0,\"foo0\"],\"1\":[1,\"foo1\"],\"2\":[2,\"foo2\"],\"3\":[3,\"foo3\"],\"4\":[4,\"foo4\"]}", results[0]);
+    try h.expectJsonEqual("{\"0\":[0,\"foo0\"],\"1\":[1,\"foo1\"],\"2\":[2,\"foo2\"],\"3\":[3,\"foo3\"],\"4\":[4,\"foo4\"]}", results[0]);
 }
 
 test "jq:L2084 JOIN({_0_:[0,_abc_],_1_:[1,_bcd_],_2_:[2,_def_],_3_:[3,_e..." {
@@ -78,7 +78,7 @@ test "jq:L2084 JOIN({_0_:[0,_abc_],_1_:[1,_bcd_],_2_:[2,_def_],_3_:[3,_e..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[[5,\"foo\"],null],[[3,\"bar\"],[3,\"efg\"]],[[1,\"foobar\"],[1,\"bcd\"]]]", results[0]);
+    try h.expectJsonEqual("[[[5,\"foo\"],null],[[3,\"bar\"],[3,\"efg\"]],[[1,\"foobar\"],[1,\"bcd\"]]]", results[0]);
 }
 
 test "jq:L2088 range(5;10)|IN(range(10))" {
@@ -91,11 +91,11 @@ test "jq:L2088 range(5;10)|IN(range(10))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 5), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
-    try std.testing.expectEqualStrings("true", results[1]);
-    try std.testing.expectEqualStrings("true", results[2]);
-    try std.testing.expectEqualStrings("true", results[3]);
-    try std.testing.expectEqualStrings("true", results[4]);
+    try h.expectJsonEqual("true", results[0]);
+    try h.expectJsonEqual("true", results[1]);
+    try h.expectJsonEqual("true", results[2]);
+    try h.expectJsonEqual("true", results[3]);
+    try h.expectJsonEqual("true", results[4]);
 }
 
 test "jq:L2096 range(5;13)|IN(range(0;10;3))" {
@@ -108,14 +108,14 @@ test "jq:L2096 range(5;13)|IN(range(0;10;3))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 8), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
-    try std.testing.expectEqualStrings("true", results[1]);
-    try std.testing.expectEqualStrings("false", results[2]);
-    try std.testing.expectEqualStrings("false", results[3]);
-    try std.testing.expectEqualStrings("true", results[4]);
-    try std.testing.expectEqualStrings("false", results[5]);
-    try std.testing.expectEqualStrings("false", results[6]);
-    try std.testing.expectEqualStrings("false", results[7]);
+    try h.expectJsonEqual("false", results[0]);
+    try h.expectJsonEqual("true", results[1]);
+    try h.expectJsonEqual("false", results[2]);
+    try h.expectJsonEqual("false", results[3]);
+    try h.expectJsonEqual("true", results[4]);
+    try h.expectJsonEqual("false", results[5]);
+    try h.expectJsonEqual("false", results[6]);
+    try h.expectJsonEqual("false", results[7]);
 }
 
 test "jq:L2107 range(10;12)|IN(range(10))" {
@@ -128,8 +128,8 @@ test "jq:L2107 range(10;12)|IN(range(10))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 2), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
-    try std.testing.expectEqualStrings("false", results[1]);
+    try h.expectJsonEqual("false", results[0]);
+    try h.expectJsonEqual("false", results[1]);
 }
 
 test "jq:L2112 IN(range(10;20); range(10))" {
@@ -142,7 +142,7 @@ test "jq:L2112 IN(range(10;20); range(10))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L2116 IN(range(5;20); range(10))" {
@@ -155,7 +155,7 @@ test "jq:L2116 IN(range(5;20); range(10))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2121 (.a as $x | .b) = _b_" {
@@ -168,7 +168,7 @@ test "jq:L2121 (.a as $x | .b) = _b_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":null,\"b\":\"b\"}", results[0]);
+    try h.expectJsonEqual("{\"a\":null,\"b\":\"b\"}", results[0]);
 }
 
 test "jq:L2126 (.. | select(type == _object_ and has(_b_) and (.b | type..." {
@@ -181,7 +181,7 @@ test "jq:L2126 (.. | select(type == _object_ and has(_b_) and (.b | type..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{\"a\":{\"b\":1}}", results[0]);
+    try h.expectJsonEqual("{\"a\":{\"b\":1}}", results[0]);
 }
 
 test "jq:L2130 isempty(empty)" {
@@ -194,7 +194,7 @@ test "jq:L2130 isempty(empty)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2134 isempty(range(3))" {
@@ -207,7 +207,7 @@ test "jq:L2134 isempty(range(3))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L2138 isempty(1,error(_foo_))" {
@@ -220,7 +220,7 @@ test "jq:L2138 isempty(1,error(_foo_))" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L2143 index(__)" {
@@ -233,7 +233,7 @@ test "jq:L2143 index(__)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("null", results[0]);
+    try h.expectJsonEqual("null", results[0]);
 }
 
 test "jq:L2148 builtins|length > 10" {
@@ -246,7 +246,7 @@ test "jq:L2148 builtins|length > 10" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2152 _-1_|IN(builtins[] / _/_|.[1])" {
@@ -259,7 +259,7 @@ test "jq:L2152 _-1_|IN(builtins[] / _/_|.[1])" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L2156 all(builtins[] / _/_; .[1]|tonumber >= 0)" {
@@ -272,7 +272,7 @@ test "jq:L2156 all(builtins[] / _/_; .[1]|tonumber >= 0)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2160 builtins|any(.[:1] == ___)" {
@@ -285,7 +285,7 @@ test "jq:L2160 builtins|any(.[:1] == ___)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L2181 map(. == 1)" {
@@ -298,7 +298,7 @@ test "jq:L2181 map(. == 1)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[true,true,true,true,true,true]", results[0]);
+    try h.expectJsonEqual("[true,true,true,true,true,true]", results[0]);
 }
 
 test "jq:L2187 .[0] | tostring | . == if have_decnum then _1391186036643..." {
@@ -311,7 +311,7 @@ test "jq:L2187 .[0] | tostring | . == if have_decnum then _1391186036643..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2191 .x | tojson | . == if have_decnum then _13911860366432393..." {
@@ -324,7 +324,7 @@ test "jq:L2191 .x | tojson | . == if have_decnum then _13911860366432393..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2195 (13911860366432393 == 13911860366432392) | . == if have_d..." {
@@ -337,7 +337,7 @@ test "jq:L2195 (13911860366432393 == 13911860366432392) | . == if have_d..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L2202 . - 10" {
@@ -350,7 +350,7 @@ test "jq:L2202 . - 10" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("13911860366432382", results[0]);
+    try h.expectJsonEqual("13911860366432382", results[0]);
 }
 
 test "jq:L2206 .[0] - 10" {
@@ -363,7 +363,7 @@ test "jq:L2206 .[0] - 10" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("13911860366432382", results[0]);
+    try h.expectJsonEqual("13911860366432382", results[0]);
 }
 
 test "jq:L2210 .x - 10" {
@@ -376,5 +376,5 @@ test "jq:L2210 .x - 10" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("13911860366432382", results[0]);
+    try h.expectJsonEqual("13911860366432382", results[0]);
 }

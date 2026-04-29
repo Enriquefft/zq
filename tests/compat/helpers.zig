@@ -144,6 +144,159 @@ pub fn writeEscaped(buf: *std.ArrayList(u8), s: []const u8) !void {
     }
 }
 
+// ââ Structural JSON comparison ââââââââââââââââââââââââââââââââââââââââââââââââ
+
+/// Return the numeric value of a Value as f64, or null if not numeric.
+fn numericAsF64(v: Value) ?f64 {
+    return switch (v) {
+        .int => |n| @as(f64, @floatFromInt(n)),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+/// Count the number of key-value pairs in an object span.
+fn objectLen(span: Value.TapeSpan) usize {
+    var count: usize = 0;
+    var idx = span.start + 1;
+    while (idx < span.end - 1) {
+        count += 1;
+        idx += 1; // skip key
+        idx = skipTapeEntry(span.tape, idx); // skip value
+    }
+    return count;
+}
+
+/// Find the value associated with `key` in an object span.
+/// Returns the Value if found, null otherwise.
+fn objectGet(span: Value.TapeSpan, key: []const u8) ?Value {
+    var idx = span.start + 1;
+    while (idx < span.end - 1) {
+        const key_ref = span.tape.entries[idx].payload.string;
+        const k = span.tape.getString(key_ref);
+        idx += 1;
+        const val = entryToValue(span.tape, idx);
+        idx = skipTapeEntry(span.tape, idx);
+        if (std.mem.eql(u8, k, key)) return val;
+    }
+    return null;
+}
+
+/// Deep structural equality matching jq's == semantics:
+///   - null, bool: exact tag match
+///   - numbers: compare as f64 (so int 2 == float 2.0)
+///   - strings: byte-equal (parser has already decoded all escape sequences)
+///   - arrays: element-wise recursive
+///   - objects: key-order-insensitive (jq's == is unordered for objects)
+fn valuesEqual(a: Value, b: Value) bool {
+    // Both numeric? Compare as f64.
+    if (numericAsF64(a)) |fa| {
+        if (numericAsF64(b)) |fb| {
+            return fa == fb;
+        }
+        return false; // a is numeric, b is not
+    }
+    if (numericAsF64(b) != null) return false; // b is numeric, a is not
+
+    switch (a) {
+        .null_val => return b == .null_val,
+        .bool_val => |ba| return switch (b) {
+            .bool_val => |bb| ba == bb,
+            else => false,
+        },
+        .string => |sa| return switch (b) {
+            .string => |sb| std.mem.eql(u8, sa, sb),
+            else => false,
+        },
+        .array => |spa| {
+            const spb = switch (b) {
+                .array => |s| s,
+                else => return false,
+            };
+            // Compare element by element
+            var ia = spa.start + 1;
+            var ib = spb.start + 1;
+            while (ia < spa.end - 1 and ib < spb.end - 1) {
+                const va = entryToValue(spa.tape, ia);
+                const vb = entryToValue(spb.tape, ib);
+                if (!valuesEqual(va, vb)) return false;
+                ia = skipTapeEntry(spa.tape, ia);
+                ib = skipTapeEntry(spb.tape, ib);
+            }
+            // Both must be exhausted simultaneously
+            return (ia >= spa.end - 1) and (ib >= spb.end - 1);
+        },
+        .object => |spa| {
+            const spb = switch (b) {
+                .object => |s| s,
+                else => return false,
+            };
+            // Object equality is key-order-insensitive (jq behavior).
+            // Check same number of keys and every key in a exists in b with equal value.
+            if (objectLen(spa) != objectLen(spb)) return false;
+            var ia = spa.start + 1;
+            while (ia < spa.end - 1) {
+                const key_ref = spa.tape.entries[ia].payload.string;
+                const key = spa.tape.getString(key_ref);
+                ia += 1;
+                const va = entryToValue(spa.tape, ia);
+                ia = skipTapeEntry(spa.tape, ia);
+                const vb = objectGet(spb, key) orelse return false;
+                if (!valuesEqual(va, vb)) return false;
+            }
+            return true;
+        },
+        // int and float are handled by the numeric fast-path above
+        .int => unreachable,
+        .float => unreachable,
+    }
+}
+
+/// Structural JSON equality assertion.
+/// Parses both `expected_json` and `actual_json` with the zq Parser,
+/// then compares resulting Values structurally (jq == semantics):
+///   - Numbers: compared as f64 (so 2 == 2.0 == 20e-1)
+///   - Strings: compared after escape decoding (all escape sequences decoded by parser)
+///   - Objects: key-order-insensitive (jq == is unordered)
+///   - Arrays: ordered, element-wise recursive
+pub fn expectJsonEqual(expected_json: []const u8, actual_json: []const u8) !void {
+    // Parse both sides, keeping the Tape alive in this frame.
+    // Value.TapeSpan.tape is a non-owning pointer into the Parser's internal
+    // buffers via the Tape struct on the stack â the Tape must outlive the Value.
+    var p_exp = try Parser.init(alloc);
+    defer p_exp.deinit();
+    const tape_exp = switch (p_exp.feed(expected_json, true) catch {
+        std.debug.print("\nexpectJsonEqual: failed to parse expected JSON: {s}\n", .{expected_json});
+        return error.TestExpectedEqual;
+    }) {
+        .done => |d| d.tape,
+        .need_more => {
+            std.debug.print("\nexpectJsonEqual: expected JSON incomplete: {s}\n", .{expected_json});
+            return error.TestExpectedEqual;
+        },
+    };
+    const exp_val = entryToValue(&tape_exp, 0);
+
+    var p_act = try Parser.init(alloc);
+    defer p_act.deinit();
+    const tape_act = switch (p_act.feed(actual_json, true) catch {
+        std.debug.print("\nexpectJsonEqual: failed to parse actual JSON: {s}\n", .{actual_json});
+        return error.TestExpectedEqual;
+    }) {
+        .done => |d| d.tape,
+        .need_more => {
+            std.debug.print("\nexpectJsonEqual: actual JSON incomplete: {s}\n", .{actual_json});
+            return error.TestExpectedEqual;
+        },
+    };
+    const act_val = entryToValue(&tape_act, 0);
+
+    if (!valuesEqual(exp_val, act_val)) {
+        std.debug.print("\nexpectJsonEqual mismatch:\n  expected: {s}\n  actual:   {s}\n", .{ expected_json, actual_json });
+        return error.TestExpectedEqual;
+    }
+}
+
 // ââ Core runners ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 /// Parse input JSON, compile filter, execute, collect serialized results.

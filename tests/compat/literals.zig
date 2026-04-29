@@ -18,7 +18,7 @@ test "jq:L8 true" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("true", results[0]);
+    try h.expectJsonEqual("true", results[0]);
 }
 
 test "jq:L12 false" {
@@ -31,7 +31,7 @@ test "jq:L12 false" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("false", results[0]);
+    try h.expectJsonEqual("false", results[0]);
 }
 
 test "jq:L16 null" {
@@ -44,7 +44,7 @@ test "jq:L16 null" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("null", results[0]);
+    try h.expectJsonEqual("null", results[0]);
 }
 
 test "jq:L20 1" {
@@ -57,7 +57,7 @@ test "jq:L20 1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
+    try h.expectJsonEqual("1", results[0]);
 }
 
 test "jq:L25 -1" {
@@ -70,7 +70,7 @@ test "jq:L25 -1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("-1", results[0]);
+    try h.expectJsonEqual("-1", results[0]);
 }
 
 test "jq:L31 {}" {
@@ -83,7 +83,7 @@ test "jq:L31 {}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("{}", results[0]);
+    try h.expectJsonEqual("{}", results[0]);
 }
 
 test "jq:L35 []" {
@@ -96,7 +96,7 @@ test "jq:L35 []" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[]", results[0]);
+    try h.expectJsonEqual("[]", results[0]);
 }
 
 test "jq:L39 {x:-1},{x:-.},{x:-.|abs}" {
@@ -109,9 +109,9 @@ test "jq:L39 {x:-1},{x:-.},{x:-.|abs}" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 3), results.len);
-    try std.testing.expectEqualStrings("{\"x\":-1}", results[0]);
-    try std.testing.expectEqualStrings("{\"x\":-1}", results[1]);
-    try std.testing.expectEqualStrings("{\"x\":1}", results[2]);
+    try h.expectJsonEqual("{\"x\":-1}", results[0]);
+    try h.expectJsonEqual("{\"x\":-1}", results[1]);
+    try h.expectJsonEqual("{\"x\":1}", results[2]);
 }
 
 test "jq:L48 ." {
@@ -124,7 +124,7 @@ test "jq:L48 ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"byte order mark\"", results[0]);
+    try h.expectJsonEqual("\"byte order mark\"", results[0]);
 }
 
 test "jq:L54 _Aa_r_n_t_b_f_u03bc_" {
@@ -137,7 +137,7 @@ test "jq:L54 _Aa_r_n_t_b_f_u03bc_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
+    try h.expectJsonEqual("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
 test "jq:L58 ." {
@@ -150,7 +150,7 @@ test "jq:L58 ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
+    try h.expectJsonEqual("\"Aa\\u000d\\u000a\\u0009\\u0008\\u000c\\u03bc\"", results[0]);
 }
 
 test "jq:L62 _u_vw_" {
@@ -168,7 +168,7 @@ test "jq:L68 _inter_(_pol_ + _ation_)_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"interpolation\"", results[0]);
+    try h.expectJsonEqual("\"interpolation\"", results[0]);
 }
 
 test "jq:L72 @text,@json,([1,.]|@csv,@tsv),@html,(@uri|.,@urid),@sh,(@..." {
@@ -181,16 +181,16 @@ test "jq:L72 @text,@json,([1,.]|@csv,@tsv),@html,(@uri|.,@urid),@sh,(@..." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 10), results.len);
-    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[0]);
-    try std.testing.expectEqualStrings("\"\\\"!()<>&'\\\\\\\"\\\\t\\\"\"", results[1]);
-    try std.testing.expectEqualStrings("\"1,\\\"!()<>&'\\\"\\\"\\t\\\"\"", results[2]);
-    try std.testing.expectEqualStrings("\"1\\t!()<>&'\\\"\\\\t\"", results[3]);
-    try std.testing.expectEqualStrings("\"!()&lt;&gt;&amp;&apos;&quot;\\t\"", results[4]);
-    try std.testing.expectEqualStrings("\"%21%28%29%3C%3E%26%27%22%09\"", results[5]);
-    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[6]);
-    try std.testing.expectEqualStrings("\"'!()<>&'\\\\''\\\"\\t'\"", results[7]);
-    try std.testing.expectEqualStrings("\"ISgpPD4mJyIJ\"", results[8]);
-    try std.testing.expectEqualStrings("\"!()<>&'\\\"\\t\"", results[9]);
+    try h.expectJsonEqual("\"!()<>&'\\\"\\t\"", results[0]);
+    try h.expectJsonEqual("\"\\\"!()<>&'\\\\\\\"\\\\t\\\"\"", results[1]);
+    try h.expectJsonEqual("\"1,\\\"!()<>&'\\\"\\\"\\t\\\"\"", results[2]);
+    try h.expectJsonEqual("\"1\\t!()<>&'\\\"\\\\t\"", results[3]);
+    try h.expectJsonEqual("\"!()&lt;&gt;&amp;&apos;&quot;\\t\"", results[4]);
+    try h.expectJsonEqual("\"%21%28%29%3C%3E%26%27%22%09\"", results[5]);
+    try h.expectJsonEqual("\"!()<>&'\\\"\\t\"", results[6]);
+    try h.expectJsonEqual("\"'!()<>&'\\\\''\\\"\\t'\"", results[7]);
+    try h.expectJsonEqual("\"ISgpPD4mJyIJ\"", results[8]);
+    try h.expectJsonEqual("\"!()<>&'\\\"\\t\"", results[9]);
 }
 
 test "jq:L86 @base64" {
@@ -203,7 +203,7 @@ test "jq:L86 @base64" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Zm/Ds2Jhcgo=\"", results[0]);
+    try h.expectJsonEqual("\"Zm/Ds2Jhcgo=\"", results[0]);
 }
 
 test "jq:L90 @base64d" {
@@ -216,7 +216,7 @@ test "jq:L90 @base64d" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"foóbar\\n\"", results[0]);
+    try h.expectJsonEqual("\"foóbar\\n\"", results[0]);
 }
 
 test "jq:L94 @uri" {
@@ -229,7 +229,7 @@ test "jq:L94 @uri" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"%CE%BC\"", results[0]);
+    try h.expectJsonEqual("\"%CE%BC\"", results[0]);
 }
 
 test "jq:L98 @urid" {
@@ -242,7 +242,7 @@ test "jq:L98 @urid" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"\\u03bc\"", results[0]);
+    try h.expectJsonEqual("\"\\u03bc\"", results[0]);
 }
 
 test "jq:L102 @html _<b>_(.)</b>_" {
@@ -255,7 +255,7 @@ test "jq:L102 @html _<b>_(.)</b>_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"<b>&lt;script&gt;hax&lt;/script&gt;</b>\"", results[0]);
+    try h.expectJsonEqual("\"<b>&lt;script&gt;hax&lt;/script&gt;</b>\"", results[0]);
 }
 
 test "jq:L106 [.[]|tojson|fromjson]" {
@@ -268,5 +268,5 @@ test "jq:L106 [.[]|tojson|fromjson]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"foo\",1,[\"a\",1,\"b\",2,{\"foo\":\"bar\"}]]", results[0]);
+    try h.expectJsonEqual("[\"foo\",1,[\"a\",1,\"b\",2,{\"foo\":\"bar\"}]]", results[0]);
 }

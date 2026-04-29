@@ -18,7 +18,7 @@ test "jq:L148 .foo" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("42", results[0]);
+    try h.expectJsonEqual("42", results[0]);
 }
 
 test "jq:L152 .foo | .bar" {
@@ -31,7 +31,7 @@ test "jq:L152 .foo | .bar" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("42", results[0]);
+    try h.expectJsonEqual("42", results[0]);
 }
 
 test "jq:L156 .foo.bar" {
@@ -44,7 +44,7 @@ test "jq:L156 .foo.bar" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("42", results[0]);
+    try h.expectJsonEqual("42", results[0]);
 }
 
 test "jq:L160 .foo_bar" {
@@ -57,7 +57,7 @@ test "jq:L160 .foo_bar" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("2", results[0]);
+    try h.expectJsonEqual("2", results[0]);
 }
 
 test "jq:L164 .[_foo_].bar" {
@@ -70,7 +70,7 @@ test "jq:L164 .[_foo_].bar" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("42", results[0]);
+    try h.expectJsonEqual("42", results[0]);
 }
 
 test "jq:L168 ._foo_._bar_" {
@@ -83,7 +83,7 @@ test "jq:L168 ._foo_._bar_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("20", results[0]);
+    try h.expectJsonEqual("20", results[0]);
 }
 
 test "jq:L172 .e0, .E1, .E-1, .E+1" {
@@ -96,10 +96,10 @@ test "jq:L172 .e0, .E1, .E-1, .E+1" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 4), results.len);
-    try std.testing.expectEqualStrings("1", results[0]);
-    try std.testing.expectEqualStrings("2", results[1]);
-    try std.testing.expectEqualStrings("2", results[2]);
-    try std.testing.expectEqualStrings("4", results[3]);
+    try h.expectJsonEqual("1", results[0]);
+    try h.expectJsonEqual("2", results[1]);
+    try h.expectJsonEqual("2", results[2]);
+    try h.expectJsonEqual("4", results[3]);
 }
 
 test "jq:L179 [.[]|.foo?]" {
@@ -112,7 +112,7 @@ test "jq:L179 [.[]|.foo?]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[3,null,5]", results[0]);
+    try h.expectJsonEqual("[3,null,5]", results[0]);
 }
 
 test "jq:L183 [.[]|.foo?.bar?]" {
@@ -125,7 +125,7 @@ test "jq:L183 [.[]|.foo?.bar?]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[4,null]", results[0]);
+    try h.expectJsonEqual("[4,null]", results[0]);
 }
 
 test "jq:L187 [..]" {
@@ -138,7 +138,7 @@ test "jq:L187 [..]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[[1,[[2]],{\"a\":[1]}],1,[[2]],[2],2,{\"a\":[1]},[1],1]", results[0]);
+    try h.expectJsonEqual("[[1,[[2]],{\"a\":[1]}],1,[[2]],[2],2,{\"a\":[1]},[1],1]", results[0]);
 }
 
 test "jq:L191 [.[]|.[]?]" {
@@ -151,7 +151,7 @@ test "jq:L191 [.[]|.[]?]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,[2,[[3]]],{},{\"a\":[1,[2]]}]", results[0]);
+    try h.expectJsonEqual("[1,[2,[[3]]],{},{\"a\":[1,[2]]}]", results[0]);
 }
 
 test "jq:L195 [.[]|.[1:3]?]" {
@@ -164,7 +164,7 @@ test "jq:L195 [.[]|.[1:3]?]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[null,\"bc\",[],[2,3],[2]]", results[0]);
+    try h.expectJsonEqual("[null,\"bc\",[],[2,3],[2]]", results[0]);
 }
 
 test "jq:L200 map(try .a[] catch ., try .a.[] catch ., .a[]?, .a.[]?)" {
@@ -177,7 +177,7 @@ test "jq:L200 map(try .a[] catch ., try .a.[] catch ., .a[]?, .a.[]?)" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[1,2,1,2,1,2,1,2,\"Cannot iterate over number (123)\",\"Cannot iterate over number (123)\"]", results[0]);
+    try h.expectJsonEqual("[1,2,1,2,1,2,1,2,\"Cannot iterate over number (123)\",\"Cannot iterate over number (123)\"]", results[0]);
 }
 
 test "jq:L205 try [_OK_, (.[] | error)] catch [_KO_, .]" {
@@ -190,5 +190,5 @@ test "jq:L205 try [_OK_, (.[] | error)] catch [_KO_, .]" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[\"KO\",[\"b\"]]", results[0]);
+    try h.expectJsonEqual("[\"KO\",[\"b\"]]", results[0]);
 }

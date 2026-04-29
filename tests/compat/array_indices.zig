@@ -18,7 +18,7 @@ test "jq:L213 try (.foo[-1] = 0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Out of bounds negative array index\"", results[0]);
+    try h.expectJsonEqual("\"Out of bounds negative array index\"", results[0]);
 }
 
 test "jq:L217 try (.foo[-2] = 0) catch ." {
@@ -31,7 +31,7 @@ test "jq:L217 try (.foo[-2] = 0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Out of bounds negative array index\"", results[0]);
+    try h.expectJsonEqual("\"Out of bounds negative array index\"", results[0]);
 }
 
 test "jq:L221 .[-1] = 5" {
@@ -44,7 +44,7 @@ test "jq:L221 .[-1] = 5" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,1,5]", results[0]);
+    try h.expectJsonEqual("[0,1,5]", results[0]);
 }
 
 test "jq:L225 .[-2] = 5" {
@@ -57,7 +57,7 @@ test "jq:L225 .[-2] = 5" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("[0,5,2]", results[0]);
+    try h.expectJsonEqual("[0,5,2]", results[0]);
 }
 
 test "jq:L229 try (.[999999999] = 0) catch ." {
@@ -70,5 +70,5 @@ test "jq:L229 try (.[999999999] = 0) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqualStrings("\"Array index too large\"", results[0]);
+    try h.expectJsonEqual("\"Array index too large\"", results[0]);
 }
