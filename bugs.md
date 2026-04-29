@@ -3,58 +3,63 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-29 (post G4 land — any/all desugar + BOM + interp-key + big_number).
+Last verified: 2026-04-29 (post G5 land — emit lhs-temp / save_input bracketing, vm slice + iter detail + delpaths msg, pick desugar).
 
 ---
 
-## Active compat failures (8 of original L798-unmasked + 6 newly revealed)
+## Active compat failures (1 emit residual + 4 path-flavor + 6 newly revealed + L1421 signal-6)
 
-Post-G4 baseline: `zig build test` → 1144/1177 pass, 13 fail, 20 skipped.
+Post-G5 baseline: `zig build test` → 1146/1177 pass, 11 fail + 1 signal-6, 20 skipped.
 
-### Originally-listed, still failing (8)
+### Still failing after G5 (5)
 
-These are the survivors from the L798-unmasked set after the G4 landing
-fixed L48, L122, L1045, L661, L674. Categorisation refined by Phase 1
-investigators: several were misfiled as VM but are emit-side input-scope
-bugs.
+| Tag | Symptom | Repro | Category | Notes |
+|-----|---------|-------|----------|-------|
+| L878 | filter-param binding still leaks `it.current` into body — emitAsBind fix in G5 covers value-arg as-binds (L725) but the filter-arg call site uses a different emission path | `def x(a;b): a as $a \| b as $b \| $a + $b; def y($a;$b): $a + $b; ...` | Compiler emit | Sibling of fixed L725. Filter-arg `def` lowers to a different emit shape that needs the same save_input/restore_input bracket; not yet wrapped. |
+| L1127 | `path(.a \| map(select(.b == 0)) \| .[0])` — generic "Invalid path expression with result" message; jq says "near attempt to access element 0 of <v>" | `try path(...) catch .` | VM (error message) | Phase 1 inv-path identified `raisePathExprError` at `src/vm/root.zig:7888` needs op-flavor tag captured in PathFrame at the path-break site (`vm/root.zig:1004`). G5 G2 implementer punted on this (claimed they "already pass" — wrong). |
+| L1131 | same flavor as L1127, tail `.c` | `try path(.a \| map(select(.b == 0)) \| .c) catch .` | VM | Same site as L1127. |
+| L1135 | same flavor, tail `.[]` | `try path(.a \| map(select(.b == 0)) \| .[]) catch .` | VM | Same site as L1127. |
+| L1139 | `path(.a[path(.b)[0]])` returns wrong shape — nested-path heuristic at `vm/root.zig:1960-1962` poisons outer frame even when inner result is consumed as int subscript | `path(.a[path(.b)[0]])` on `{a:{b:42}}` | VM (heuristic) | Refine the heuristic — only mark broken if produced value is consumed as path-array, not scalar. |
 
-| Tag | Symptom | Repro | Real category | Fix shape (validated by Phase 1) |
-|-----|---------|-------|---------------|----------------------------------|
-| L200 | `each` else-branch raises bare `error.TypeError`; catch payload reads `"TypeError"` not `"Cannot iterate over number (123)"` | `map(try .a[] catch .)` on `[{a:[1,2]},{a:123}]` | VM (error message) | Set `type_error_detail` via existing `buildTypeErrorMsg` helper at `src/vm/root.zig:2077` (each else). |
-| L353 | `.arith` arm emits `<lhs>;<rhs>;op` without protecting LHS across RHS fork-replays | `[foreach .[] / .[] as $i (0; . + $i)]` | Compiler emit | `src/compiler/emit.zig:396` — capture LHS into `allocVar()` temp; idiom already at :1270/1303/1677/1737. Apply to `.cmp` (:411) and `.logical` (:431) too. |
-| L401 | `emitFirst`/`emitLast` desugar yields stale `null` when inner stream is empty | `[first(range(.)), last(range(.))]` on `0` → `[null]` (want `[]`) | Compiler emit | `src/compiler/emit.zig:2220-2300` — empty-stream → no contribution semantics. |
-| L478 | `setpathRecursive` lacks slice path-component arm | `.[2:4] = ([], ["a","b"], ["a","b","c"])` on `[0..7]` | VM | `src/vm/root.zig:5556-5717` — add `.object` slice arm with start/end resolution + array splice. |
-| L725 | `emitAsBind` does not save/restore `it.current` around `<expr>` | `.[] as $x \| [$x == .[]]` | Compiler emit | `src/compiler/emit.zig:3069` — wrap with `save_input`/`restore_input` (mirror `emitDestructAlt:891-896`). Same root as L878. |
-| L775 | `.obj_ctor` computed key emitted with no save_input wrapper | `add({(.[]):1})` | Compiler emit | `src/compiler/emit.zig:504-516` — bracket computed key expr. |
-| L878 | filter-param binding leaks generator's `it.current` into body | `def x(a;b): a as $a \| b as $b \| $a + $b; def y($a;$b): $a + $b; ...` | Compiler emit | Same site as L725. |
-| L915 | reduce/division: `.arith` LHS popped by RHS each-fork backtrack | `[reduce .[] / .[] as $i (0; . + $i)]` | Compiler emit | Same site as L353. |
+### Newly revealed by G4+G5 — were masked by signal-6 aborts in baseline (6 + 1 signal-6)
 
-These cluster into TWO emit-side fixes (`save_input` bracketing + lhs-temp
-capture) plus one VM detail-string fix (L200) plus two structural VM
-arms (L478 slice, L401 empty-stream). Phase 2 G1 worktree
-(`worktree-agent-a69ca2341b0fcaf22`) attempted the emit cluster — it
-introduced regressions (L118, L689) and is **not safe to land**; the
-diff is preserved on its branch for reference but should be re-driven
-from a fresh investigator pass.
-
-### Newly revealed — masked previously by L1045 signal-6 abort (6)
-
-Once G4 fixed L1045 (`any/all` desugar in `classifyBuiltin`), the test
-runner stopped aborting at `user_functions.test.jq:L1045` and reached
-`paths.test.jq`, exposing six pre-existing failures.
+Once G4 fixed L1045 (signal-6 in user_functions) and G5 fixed L1201 (signal-6 in pick), the test runner reached compat sections that previously never ran. These are all pre-existing failures.
 
 | Tag | Symptom | Repro |
 |-----|---------|-------|
-| L1127 | `path(...)` over filter chain yields wrong shape | `try path(.a \| map(select(.b == 0)) \| .[0]) catch .` |
-| L1131 | same family, with `.c` tail | `try path(.a \| map(select(.b == 0)) \| .c) catch .` |
-| L1135 | same family, with `.[]` tail | `try path(.a \| map(select(.b == 0)) \| .[]) catch .` |
-| L1139 | nested `path()` not composing | `path(.a[path(.b)[0]])` |
-| L1173 | `delpaths(0)` wrong error message | `try delpaths(0) catch .` |
-| L1201 | `pick(.a.b.c)` triggers `signal 6` (assertion / unreachable) | `pick(.a.b.c)` |
+| L1258 | `getpath([_a_,0,_b_]) \|= 5` mismatched error string | `.[] \| try (getpath([_a_,0,_b_]) \|= 5) catch .` |
+| L1290 | `((map(select(.a == 1))[].b) = 10)` mismatched output | `try ((map(select(.a == 1))[].b) = 10) catch .` |
+| L1294 | `((map(select(.a == 1))[].a) \|= .+1)` mismatched output | `try ((map(select(.a == 1))[].a) \|= .+1) catch .` |
+| L1302 | `def x: reverse; x=10` runtime error path | `try (def x: reverse; x=10) catch .` |
+| L1306 | `.[] = 1` parser bug — onWantValue rejects | `.[] = 1` |
+| L1322 | `[if 1,null,2 then 3 else 4 end]` VM crash at execOneInner:1292 | `[if 1,null,2 then 3 else 4 end]` |
+| L1421 (signal 6) | `[(_foo_ \| contains(_foo_)), ...]` aborts test runner — comparisons.zig:103 | `[("foo" \| contains("foo")), ...]` |
 
-These were never listed in the prior "13 failure" baseline because the
-test runner aborted before reaching them. They are pre-existing,
-non-regressions.
+L1421 is the new test-runner abort point. Once fixed, more pre-existing failures may surface (mirroring what L1045 → L1201 → L1421 chain has revealed).
+
+### Fixed in G5 round (commit pending)
+
+L200 (each iter detail), L353 (.arith lhs-temp), L401 (emitFirst empty-stream), L478 (setpath slice arm), L725 (emitAsBind save/restore), L775 (.obj_ctor computed-key save_input), L915 (.arith reduce), L1173 (delpaths msg), L1201 (pick desugar).
+
+### Fixed in G4 round
+
+L48, L122, L661, L674, L1045.
+
+### Bug residuals from prior orchestration
+
+| Tag | Status |
+|-----|--------|
+| L873 | Parser: def-after-binding — fixed in a370bcd / merge 99580b9. Confirmed PASS. |
+| L884 | Parser: multi-index before def — fixed in a370bcd. Confirmed PASS. |
+| L933 | Parser: nested destructure — fixed in a370bcd. Confirmed PASS. |
+
+---
+
+## Architectural follow-ups (not in current scope)
+
+### `first(...) // fallback` VM bug
+
+`limit_start` exits via `ip = instructions.len`, leaving `fork_alt` frames on the fork stack. G4's `lowerAnyAllDesugar` and G5's `lowerPickDesugar` both work around this by using array-wrap (`[first(...)]`) instead of jq's literal `first(...) // fallback` desugar form. Worth fixing the underlying VM behavior to allow direct `first(...) // fallback` use.
 
 ### Bug residuals from prior orchestration (not in current scope)
 

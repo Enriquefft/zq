@@ -398,14 +398,35 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         },
 
         // ── Category 5 ──────────────────────────────────────────────
-        // Emit lhs (pushes its result on the value stack), then rhs
-        // (pushes another), then the binary op (pops both, pushes the
-        // result). Matches the legacy parser's
-        // `parseAdditive`/`parseMultiplicative` shape at
-        // `src/query/src/compiler.zig:2699-2729`.
+        // Two emission paths depending on whether either operand
+        // contains a generator (.iterate node):
+        //
+        // NON-GENERATOR path (no .iterate in either child):
+        //   <lhs> ; <rhs> ; op
+        //   Matches the legacy `parseAdditive`/`parseMultiplicative`
+        //   shape and is safe for recursive functions: the value_stack
+        //   is saved by call_function frames so LHS values pushed onto
+        //   the stack survive re-entrant calls.
+        //
+        // GENERATOR path (either child contains .iterate):
+        //   lhs-temp idiom — emit RHS (outer generator loop) first,
+        //   capture its result into $rhs_var via variable (survives
+        //   fork backtracking because variable_store is NOT restored
+        //   by fork frames), restore the original input via $input_var,
+        //   emit LHS (inner generator loop), load $rhs_var onto the
+        //   value_stack, then op.  Layout:
+        //     op:  right = $rhs_var (popped), left = current (LHS)
+        //       → result = left op right = lhs op rhs  ✓
+        //   Variables are safe here because .iterate-based generators
+        //   never appear inside recursive function bodies in practice
+        //   (the recursive call is in the RHS via call_function, not
+        //   via backtracking).  Using the value_stack for this case
+        //   would fail because generators set it.current rather than
+        //   pushing to the stack, leaving the stack empty at op time
+        //   (→ TypeError).
+        //
+        //   This mirrors the idiom at :1280/:1303/:1677/:1737.
         .arith => {
-            try emitNode(em, node.children[0]);
-            try emitNode(em, node.children[1]);
             const slots = em.ir_obj.extra_data.items;
             const kind: ir.ArithKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
@@ -415,12 +436,32 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 .div => .div,
                 .mod => .mod,
             };
+            if (subtreeHasIterate(em.ir_obj, node.children[0]) or
+                subtreeHasIterate(em.ir_obj, node.children[1]))
+            {
+                // Generator path.
+                const input_var = em.allocVar();
+                const rhs_var = em.allocVar();
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = input_var }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = rhs_var }, node);
+                try em.pushInstr(.load_variable, .{ .index = input_var }, node);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else {
+                // Non-generator path: preserve value_stack ordering
+                // for recursive functions.
+                try emitNode(em, node.children[0]);
+                try emitNode(em, node.children[1]);
+            }
             try em.pushInstr(op, .{ .none = {} }, node);
         },
 
         .cmp => {
-            try emitNode(em, node.children[0]);
-            try emitNode(em, node.children[1]);
             const slots = em.ir_obj.extra_data.items;
             const kind: ir.CmpKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
@@ -431,22 +472,58 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 .gt => .gt,
                 .ge => .ge,
             };
+            if (subtreeHasIterate(em.ir_obj, node.children[0]) or
+                subtreeHasIterate(em.ir_obj, node.children[1]))
+            {
+                const input_var = em.allocVar();
+                const rhs_var = em.allocVar();
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = input_var }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = rhs_var }, node);
+                try em.pushInstr(.load_variable, .{ .index = input_var }, node);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else {
+                try emitNode(em, node.children[0]);
+                try emitNode(em, node.children[1]);
+            }
             try em.pushInstr(op, .{ .none = {} }, node);
         },
 
-        // Logical: emit lhs + rhs, then `and_op`/`or_op`. Legacy's VM
+        // Logical: same two-path idiom.  Legacy's VM
         // (`src/query/src/vm.zig:6575-6589`) evaluates both operands
         // eagerly and reduces to a boolean — jq does not short-circuit
         // at the bytecode layer.
         .logical => {
-            try emitNode(em, node.children[0]);
-            try emitNode(em, node.children[1]);
             const slots = em.ir_obj.extra_data.items;
             const kind: ir.LogicalKind = @enumFromInt(slots[node.extra]);
             const op: types_mod.Instruction.Op = switch (kind) {
                 .and_ => .and_op,
                 .or_ => .or_op,
             };
+            if (subtreeHasIterate(em.ir_obj, node.children[0]) or
+                subtreeHasIterate(em.ir_obj, node.children[1]))
+            {
+                const input_var = em.allocVar();
+                const rhs_var = em.allocVar();
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = input_var }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = rhs_var }, node);
+                try em.pushInstr(.load_variable, .{ .index = input_var }, node);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else {
+                try emitNode(em, node.children[0]);
+                try emitNode(em, node.children[1]);
+            }
             try em.pushInstr(op, .{ .none = {} }, node);
         },
 
@@ -511,6 +588,23 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         // `object_key`, then close with `object_construct_end`.
         // Matches legacy `parseObjectLiteral`
         // (`src/query/src/compiler.zig:6702`).
+        //
+        // Computed keys require special handling: `object_key` expects
+        // the key on the value_stack (it calls `popValue` for the key),
+        // and the value either on the stack (second entry) or as
+        // `it.current`.  For static `load_const` keys the `push_string`
+        // opcode already lands the key on the stack.  For computed keys
+        // we need to:
+        //   1. Capture the current input in a variable (survives
+        //      generator backtracking, unlike the if_stack).
+        //   2. Emit the key expression — result lands as `it.current`
+        //      (generators) or on the value_stack (literals).
+        //   3. Pipe (normalise stack → current for literal sub-exprs).
+        //   4. push_current  — key value now on value_stack.
+        //   5. load_variable + pipe — reset `it.current` to the saved
+        //      input so the value expression evaluates against the
+        //      same `.` the key did.
+        // This mirrors the lhs-temp idiom at :1280/:1677.
         .obj_ctor => {
             try em.pushInstr(.object_construct_start, .{ .none = {} }, node);
             const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
@@ -518,7 +612,27 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             std.debug.assert(span.len % 2 == 0);
             var pi: usize = 0;
             while (pi < span.len) : (pi += 2) {
-                try emitNode(em, span[pi]);
+                const key_node = em.ir_obj.nodes.items[span[pi]];
+                if (key_node.op == .load_const) {
+                    // Static key: emits push_string → value_stack; no
+                    // save/restore needed.
+                    try emitNode(em, span[pi]);
+                } else {
+                    // Computed key: capture input, emit key, push to
+                    // value_stack, restore input for value expression.
+                    const input_var = em.allocVar();
+                    try em.pushInstr(.push_current, .{ .none = {} }, node);
+                    try em.pushInstr(.capture_variable, .{ .index = input_var }, node);
+                    try emitNode(em, span[pi]);
+                    // Normalise: if key expr was a literal it left its
+                    // result on the stack — pipe moves it to current.
+                    try em.pushInstr(.pipe, .{ .none = {} }, node);
+                    // Key value → value_stack so object_key can pop it.
+                    try em.pushInstr(.push_current, .{ .none = {} }, node);
+                    // Restore original input for value expression.
+                    try em.pushInstr(.load_variable, .{ .index = input_var }, node);
+                    try em.pushInstr(.pipe, .{ .none = {} }, node);
+                }
                 try emitNode(em, span[pi + 1]);
                 try em.pushInstr(.object_key, .{ .none = {} }, node);
             }
@@ -2004,6 +2118,10 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // `array_construct`, and `comparison` nodes. Reaching here means
         // a classifier drift between lower.zig and emit.zig.
         .any_desugar1, .any_desugar2, .all_desugar1, .all_desugar2 => unreachable,
+        // Cat-19 — pick_desugar1 is fully resolved at lower time into
+        // as_pattern + reduce + path + setpath/getpath IR nodes. A
+        // call_builtin node carrying this class must never reach emit.
+        .pick_desugar1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
@@ -2299,6 +2417,17 @@ fn emitRepeat(em: *Emitter, node: ir.Node) EmitError!void {
 /// directly — mirrors legacy `compiler.zig:5934-5937`. The 1-arg
 /// form desugars to `[f] | .[-1]` per `compileLast`
 /// (`compiler.zig:4658`).
+///
+/// Empty-stream guard: `last(empty)` must produce nothing, matching
+/// jq's contract.  The naive `[f] | .[-1]` desugaring would return
+/// `null` for an empty array (VM's load_index on `[]` returns null).
+/// We guard against this by checking the collected array's length:
+///   call_builtin(length) → pushed to value_stack; current=[f] unchanged
+///   push_int 0 ; eq       → value_stack=[(len==0)]
+///   jump_if_false L_ok    → skip if non-empty
+///   backtrack             → empty stream: produce nothing
+/// L_ok:
+///   load_index -1         → last element
 fn emitLast(em: *Emitter, node: ir.Node) EmitError!void {
     if (node.span_len == 0) {
         try em.pushInstr(.load_index, .{ .index = -1 }, node);
@@ -2309,6 +2438,22 @@ fn emitLast(em: *Emitter, node: ir.Node) EmitError!void {
 
     try emitArgToArray(em, node, body_idx);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
+    // current = [f]; check for empty stream.
+    // call_builtin(length) pushes len to value_stack; current unchanged.
+    try em.pushInstr(
+        .call_builtin,
+        .{ .index = @intFromEnum(types_mod.BuiltinId.length) },
+        node,
+    );
+    try em.pushInstr(.push_int, .{ .int = 0 }, node);
+    try em.pushInstr(.eq, .{ .none = {} }, node);
+    const jif_pos: usize = em.instructions.items.len;
+    try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
+    // Empty: produce nothing.
+    try em.pushInstr(.backtrack, .{ .none = {} }, node);
+    // Non-empty: load last element.
+    const ok_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[jif_pos].operand = .{ .index = ok_ip };
     try em.pushInstr(.load_index, .{ .index = -1 }, node);
 }
 
@@ -3076,18 +3221,21 @@ fn emitUntil(em: *Emitter, node: ir.Node) EmitError!void {
 //
 // Emit `expr as PATTERN | body` mirroring legacy `parseLogical` +
 // `parsePipe` (`compiler.zig:2499-2517`). Layout:
-//   <expr>                  ; vstack=[expr_result], current=original
-//   <destructure ladder>    ; pops vstack/current into pattern vars
-//   pipe                    ; the user `|`; vstack empty → no-op for
-//                             the simple-as case so current=original;
-//                             for array/object the destructure ladder
-//                             leaves current=expr_result and the pipe
-//                             is a no-op there too (matching legacy).
+//   push_current
+//   capture_variable($orig)  ; save original input (survives fork)
+//   <expr>                   ; current = expr_result (generators OK)
+//   <destructure ladder>     ; pops current/vstack into pattern vars
+//   load_variable($orig)
+//   pipe                     ; current = original input restored
 //   <body>
 //
-// This shape is the FIX for the bug where a stray `pipe` op between
-// `<expr>` and `<destructure>` was clobbering current with `expr`'s
-// result, breaking patterns like `"foo" as $k | .[$k]`.
+// The original input is saved in a variable (not the if_stack) so it
+// survives generator backtracking: fork frames do not restore
+// variable_store, meaning $orig persists across every backtrack
+// from the generator in <expr>.  This fixes the bug where body
+// inherited the mutated `it.current` from the generator expression
+// (e.g. `.[] as $x | [$x == .[]]` — the inner `.[...]` was
+// iterating the single element $x instead of the original array).
 fn emitAsBind(em: *Emitter, node: ir.Node) EmitError!void {
     std.debug.assert(node.span_len == 3);
     const span = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
@@ -3095,9 +3243,19 @@ fn emitAsBind(em: *Emitter, node: ir.Node) EmitError!void {
     const dx_idx = span[1];
     const body_idx = span[2];
 
+    const orig_var = em.allocVar();
+    // Capture original input before expr so body always sees the
+    // correct `.`.  Variable survives fork/backtrack.
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = orig_var }, node);
+
     try emitNode(em, expr_idx);
     try emitNode(em, dx_idx);
+
+    // Restore original input for body.
+    try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
+
     try emitNode(em, body_idx);
 }
 
@@ -3319,4 +3477,25 @@ fn collectPatternVarIdsFromIR(
             for (span) |sub| try collectPatternVarIdsFromIR(ir_obj, sub, out, allocator);
         },
     }
+}
+
+/// Return true if the IR subtree rooted at `node_idx` contains any
+/// `.iterate` node (i.e., the expression can generate multiple values
+/// via `each` by iterating `it.current`).  Used by the binary-op
+/// emitter to select between the safe variable-isolation path (needed
+/// when generators are present) and the original value-stack path
+/// (safe for recursive functions where fixed variable IDs would be
+/// clobbered by re-entrant calls).
+fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
+    const node = ir_obj.nodes.items[node_idx];
+    if (node.op == .iterate) return true;
+    // Two fixed children.
+    if (node.children[0] != 0 and subtreeHasIterate(ir_obj, node.children[0])) return true;
+    if (node.children[1] != 0 and subtreeHasIterate(ir_obj, node.children[1])) return true;
+    // Variable-arity span children.
+    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    for (span) |child| {
+        if (child != 0 and subtreeHasIterate(ir_obj, child)) return true;
+    }
+    return false;
 }

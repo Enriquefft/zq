@@ -1043,7 +1043,7 @@ pub const ResultIterator = struct {
                     key,
                 ) catch |err| {
                     if (err == error.TypeError) {
-                        it.type_error_detail = it.buildTypeErrorMsg(it.current, key);
+                        it.type_error_detail = it.buildTypeErrorMsg(it.current, .{ .index_string = key });
                     }
                     return err;
                 };
@@ -1204,7 +1204,7 @@ pub const ResultIterator = struct {
                 const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
                 it.current = lookupKeyInValue(&it.tape, it.nullAllowed(), it.current, key) catch |err| {
                     if (err == error.TypeError) {
-                        it.type_error_detail = it.buildTypeErrorMsg(it.current, key);
+                        it.type_error_detail = it.buildTypeErrorMsg(it.current, .{ .index_string = key });
                     }
                     return err;
                 };
@@ -2092,7 +2092,10 @@ pub const ResultIterator = struct {
                         }
                         return null;
                     },
-                    else => return error.TypeError,
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(it.current, .iterate);
+                        return error.TypeError;
+                    },
                 }
                 return null;
             },
@@ -2418,7 +2421,7 @@ pub const ResultIterator = struct {
                 return try it.buildNewArrayAtIndex(@intCast(idx), new_val);
             },
             else => {
-                it.type_error_detail = it.buildTypeErrorMsg(base, "number");
+                it.type_error_detail = it.buildTypeErrorMsg(base, .index_number);
                 return error.TypeError;
             },
         }
@@ -5752,6 +5755,89 @@ pub const ResultIterator = struct {
                     .end = result_end,
                 } };
             },
+            .object => |slice_span| {
+                // Slice path component: {"start": int|null, "end": int|null}.
+                // Splice new_val (must be array) into base[from..to].
+                const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse Value.null_val;
+                const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse Value.null_val;
+
+                const base_span: Value.TapeSpan = switch (base) {
+                    .array => |s| s,
+                    else => return error.TypeError,
+                };
+                const arr_len: i64 = @intCast(arrayLength(base_span.tape, base_span));
+                const from_raw: i64 = switch (from_val) {
+                    .int => |v| v,
+                    .null_val => 0,
+                    else => return error.TypeError,
+                };
+                const to_raw: i64 = switch (to_val) {
+                    .int => |v| v,
+                    .null_val => arr_len,
+                    else => return error.TypeError,
+                };
+                // Clamp bounds to [0, arr_len] and ensure from <= to.
+                const from_resolved: i64 = if (from_raw < 0) @max(0, arr_len + from_raw) else @min(from_raw, arr_len);
+                const to_clamped: i64 = if (to_raw < 0) @max(0, arr_len + to_raw) else @min(to_raw, arr_len);
+                const to_resolved: i64 = @max(from_resolved, to_clamped);
+
+                // new_val must be an array to splice in.
+                const rhs: Value.TapeSpan = switch (new_val) {
+                    .array => |s| s,
+                    else => return error.TypeError,
+                };
+
+                var tmp_tape = try types.RuntimeTape.init(it.alloc);
+                defer tmp_tape.deinit(it.alloc);
+
+                const out_start = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .array_start,
+                    .payload = .{ .skip = 0 },
+                });
+
+                // Copy base[0..from_resolved].
+                var pos = base_span.start + 1;
+                const base_end = base_span.end - 1;
+                var idx: i64 = 0;
+                while (idx < from_resolved and pos < base_end) : (idx += 1) {
+                    try writeValueToTape(&tmp_tape, it.alloc, tapeEntryToValue(base_span.tape, pos));
+                    pos = skipEntry(base_span.tape.*, pos);
+                }
+
+                // Splice in new_val elements.
+                var rhs_pos = rhs.start + 1;
+                const rhs_end = rhs.end - 1;
+                while (rhs_pos < rhs_end) {
+                    try writeValueToTape(&tmp_tape, it.alloc, tapeEntryToValue(rhs.tape, rhs_pos));
+                    rhs_pos = skipEntry(rhs.tape.*, rhs_pos);
+                }
+
+                // Skip base[from_resolved..to_resolved].
+                while (idx < to_resolved and pos < base_end) : (idx += 1) {
+                    pos = skipEntry(base_span.tape.*, pos);
+                }
+
+                // Copy base[to_resolved..].
+                while (pos < base_end) {
+                    try writeValueToTape(&tmp_tape, it.alloc, tapeEntryToValue(base_span.tape, pos));
+                    pos = skipEntry(base_span.tape.*, pos);
+                }
+
+                const out_end_idx = try tmp_tape.appendEntry(it.alloc, .{
+                    .tag = .array_end,
+                    .payload = .{ .none = {} },
+                });
+                tmp_tape.entries.items[out_start].payload.skip = out_end_idx + 1;
+
+                const result_start: u32 = @intCast(it.runtime_tape.entries.items.len);
+                try it.runtime_tape.copySpan(tmp_tape.asTape(), out_start, out_end_idx + 1, it.alloc);
+                const result_end: u32 = @intCast(it.runtime_tape.entries.items.len);
+                return .{ .array = .{
+                    .tape = &it.runtime_tape.view,
+                    .start = result_start,
+                    .end = result_end,
+                } };
+            },
             else => return error.TypeError,
         }
     }
@@ -5761,6 +5847,13 @@ pub const ResultIterator = struct {
     fn builtinDelpaths(it: *ResultIterator) ZqError!?StackValue {
         const paths_sv = try it.popValue();
         const paths_val = try stackValueToValue(paths_sv);
+        // jq error for non-array argument: "Paths must be specified as an array".
+        // Set detail before delegating to extractArrayElements so the TypeError
+        // surfaces with the right message rather than a bare type failure.
+        if (paths_val != .array) {
+            it.type_error_detail = .{ .string = "Paths must be specified as an array" };
+            return error.TypeError;
+        }
         const paths_elems = try it.extractArrayElements(paths_val);
         defer it.alloc.free(paths_elems);
 
@@ -7854,7 +7947,25 @@ pub const ResultIterator = struct {
     /// Build a jq-compatible TypeError detail message for field access on wrong type.
     /// Uses runtime tape for the message string so it remains valid during iteration.
     /// The key parameter is included via runtime tape string interning.
-    fn buildTypeErrorMsg(it: *ResultIterator, val: Value, key: []const u8) ?Value {
+    /// Describes what kind of type mismatch occurred.  Used by `buildTypeErrorMsg`
+    /// to produce jq-compatible error strings from a single formatting path.
+    const TypeErrorKind = union(enum) {
+        /// `.foo` / `.["key"]` field access on a non-object/null.
+        /// Produces: "Cannot index <type> with string ("<key>")"
+        index_string: []const u8,
+        /// `.[n]` / `.[n] = v` numeric index on a non-array/null.
+        /// Produces: "Cannot index <type> with number"
+        index_number,
+        /// `.[]` iteration on a non-array/object/null.
+        /// Produces: "Cannot iterate over <type> (<compact-json>)"
+        iterate,
+    };
+
+    /// Build a jq-compatible TypeError detail message.
+    /// The string is interned in the runtime tape so it lives as long as the
+    /// iterator.  Returns `null` on allocation failure (caller silently omits
+    /// detail — the error is still raised).
+    fn buildTypeErrorMsg(it: *ResultIterator, val: Value, kind: TypeErrorKind) ?Value {
         const type_name = switch (val) {
             .null_val => "null",
             .bool_val => |b| if (b) "boolean (true)" else "boolean (false)",
@@ -7867,11 +7978,27 @@ pub const ResultIterator = struct {
         };
         var buf = std.ArrayList(u8){};
         defer buf.deinit(it.alloc);
-        buf.appendSlice(it.alloc, "Cannot index ") catch return null;
-        buf.appendSlice(it.alloc, type_name) catch return null;
-        buf.appendSlice(it.alloc, " with string (\"") catch return null;
-        buf.appendSlice(it.alloc, key) catch return null;
-        buf.appendSlice(it.alloc, "\")") catch return null;
+        switch (kind) {
+            .index_string => |key| {
+                buf.appendSlice(it.alloc, "Cannot index ") catch return null;
+                buf.appendSlice(it.alloc, type_name) catch return null;
+                buf.appendSlice(it.alloc, " with string (\"") catch return null;
+                buf.appendSlice(it.alloc, key) catch return null;
+                buf.appendSlice(it.alloc, "\")") catch return null;
+            },
+            .index_number => {
+                buf.appendSlice(it.alloc, "Cannot index ") catch return null;
+                buf.appendSlice(it.alloc, type_name) catch return null;
+                buf.appendSlice(it.alloc, " with number") catch return null;
+            },
+            .iterate => {
+                buf.appendSlice(it.alloc, "Cannot iterate over ") catch return null;
+                buf.appendSlice(it.alloc, type_name) catch return null;
+                buf.appendSlice(it.alloc, " (") catch return null;
+                serializeValueCompact(&buf, it.alloc, val) catch return null;
+                buf.appendSlice(it.alloc, ")") catch return null;
+            },
+        }
         // Store in the runtime tape so the string lives as long as the iterator.
         // Note: callers must access this value before the iterator is deinitialized.
         const str_ref = it.runtime_tape.internString(it.alloc, buf.items) catch return null;

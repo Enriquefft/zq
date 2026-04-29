@@ -1735,6 +1735,12 @@ pub const BuiltinClass = enum {
     /// Cat-18 — `all(g;f)` (2-arity). Desugars to
     ///   [first(g | if f then empty else false end)] | if . == [] then true else .[0] end
     all_desugar2,
+    /// Cat-19 — `pick(f)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   . as $v | reduce path(f) as $p (null; setpath($p; $v | getpath($p)))
+    /// Synthesizes AST nodes for the full reduce expression and recurses via
+    /// lowerNode — no new VM opcode required; path/reduce/setpath/getpath are
+    /// already supported IR primitives.
+    pick_desugar1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1811,6 +1817,12 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // shape exactly.
     if (arity == 0 and std.mem.eql(u8, name, "first")) return .first_arg1;
     if (arity == 0 and std.mem.eql(u8, name, "last")) return .last_arg1;
+
+    // Cat-19 — `pick(f)` (1-arity). Pure AST desugar to the jq canonical
+    // prelude form; no VM opcode required. Routed before the generic
+    // arity tables because `pick` does not appear in any value/filter
+    // bucket and must not fall through to `.not_implemented`.
+    if (arity == 1 and std.mem.eql(u8, name, "pick")) return .pick_desugar1;
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
     // Dispatched before the generic 0-arity table because the 0-arity
@@ -2225,6 +2237,11 @@ fn lowerBuiltinCall(
         // Desugared via AST synthesis + recursive lowerNode call.
         .any_desugar1, .any_desugar2, .all_desugar1, .all_desugar2 => |cls| {
             return lowerAnyAllDesugar(ctx, bc, cls, src_start, src_len);
+        },
+        // Cat-19 — `pick(f)` (1-arity). Desugared to the jq canonical
+        // prelude form via AST synthesis + recursive lowerNode call.
+        .pick_desugar1 => {
+            return lowerPickDesugar(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -3209,6 +3226,108 @@ fn lowerAnyAllDesugar(
     const root_node = try alloc.create(ast.Node);
     root_node.* = .{
         .kind = .{ .pipe = .{ .left = arr_node, .right = outer_if } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
+}
+
+// ── Cat-19 — `pick(f)` desugar ───────────────────────────────────────────────
+//
+// Canonical jq prelude:
+//   def pick(f): . as $v | reduce path(f) as $p (null; setpath($p; $v | getpath($p)));
+//
+// Synthesizes the full AST tree and recurses via lowerNode. Uses only
+// AST node kinds already supported by the lowerer: as_pattern, reduce,
+// path_begin (builtin_call "path"), variable_ref, builtin_call "setpath"/
+// "getpath", literal null, identity, pipe. No new VM opcode is required.
+fn lowerPickDesugar(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    // f is bc.args[0] — the path-generating filter
+    const f_node: *ast.Node = bc.args[0];
+
+    // identity: .
+    const identity_node = try alloc.create(ast.Node);
+    identity_node.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // null literal for reduce init
+    const null_lit = try alloc.create(ast.Node);
+    null_lit.* = .{ .kind = .{ .literal = .null_val }, .span = ast.Span.empty() };
+
+    // $v — variable references used in the reduce body
+    const v_ref_for_getpath = try alloc.create(ast.Node);
+    v_ref_for_getpath.* = .{ .kind = .{ .variable_ref = .{ .name = "$v" } }, .span = ast.Span.empty() };
+
+    // $p — variable reference used as the setpath arg and inside getpath
+    const p_ref_setpath_arg = try alloc.create(ast.Node);
+    p_ref_setpath_arg.* = .{ .kind = .{ .variable_ref = .{ .name = "$p" } }, .span = ast.Span.empty() };
+
+    const p_ref_getpath_arg = try alloc.create(ast.Node);
+    p_ref_getpath_arg.* = .{ .kind = .{ .variable_ref = .{ .name = "$p" } }, .span = ast.Span.empty() };
+
+    // getpath($p) — 1-arg value builtin: $v | getpath($p)
+    const getpath_args = try alloc.alloc(*ast.Node, 1);
+    getpath_args[0] = p_ref_getpath_arg;
+    const getpath_call = try alloc.create(ast.Node);
+    getpath_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "getpath", .args = getpath_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // $v | getpath($p)
+    const vref_pipe_getpath = try alloc.create(ast.Node);
+    vref_pipe_getpath.* = .{
+        .kind = .{ .pipe = .{ .left = v_ref_for_getpath, .right = getpath_call } },
+        .span = ast.Span.empty(),
+    };
+
+    // setpath($p; $v | getpath($p)) — 2-arg math builtin
+    const setpath_args = try alloc.alloc(*ast.Node, 2);
+    setpath_args[0] = p_ref_setpath_arg;
+    setpath_args[1] = vref_pipe_getpath;
+    const setpath_call = try alloc.create(ast.Node);
+    setpath_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "setpath", .args = setpath_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // path(f) — the generator expression for the reduce
+    const path_args = try alloc.alloc(*ast.Node, 1);
+    path_args[0] = f_node;
+    const path_call = try alloc.create(ast.Node);
+    path_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "path", .args = path_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // reduce path(f) as $p (null; setpath($p; $v | getpath($p)))
+    const reduce_node = try alloc.create(ast.Node);
+    reduce_node.* = .{
+        .kind = .{ .reduce = .{
+            .expr = path_call,
+            .pattern = .{ .simple = "$p" },
+            .init = null_lit,
+            .update = setpath_call,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // . as $v | <reduce>
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .as_pattern = .{
+            .expr = identity_node,
+            .pattern = .{ .simple = "$v" },
+            .body = reduce_node,
+        } },
         .span = ast.Span.empty(),
     };
 
