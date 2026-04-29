@@ -11,7 +11,7 @@ from the LSP on every keystroke.
 The AST is consumed by:
 - `src/lsp/analysis.zig` — builds the `SemanticModel` for hover/definition/rename.
 - `src/lsp/features/*` — completion, semantic tokens, formatting walk the tree.
-- `legacy@22cd23c compiler.zig` — the prefilter-harvest pass (`harvestPrefilterFromAst`).
+- `src/prefilter/root.zig` — the prefilter-harvest pass (`prefilter.harvestFromAstRoot`).
 
 ---
 
@@ -177,10 +177,11 @@ be able to move forward, even under memory pressure.
   recursive descent; deeply nested `(((...)))` input can exhaust the host
   stack. Input length is the de facto depth bound — consistent with jq's own
   behavior.
-- **Used by the prefilter harvester.** `legacy@22cd23c compiler.zig` walks the
-  AST to lift literal regex patterns into the Sparser prefilter set. AST
-  shape changes (new `Kind` variants, renamed payload fields) ripple there
-  as well as through the LSP feature modules.
+- **Used by the prefilter harvester.** `prefilter.harvestFromAstRoot`
+  (`src/prefilter/root.zig:281`) walks the AST to lift literal regex patterns
+  into the Sparser prefilter set. AST shape changes (new `Kind` variants,
+  renamed payload fields) ripple there as well as through the LSP feature
+  modules.
 
 ---
 
