@@ -15,7 +15,7 @@
 //! `zq.microbench.v2`) to stdout, one object per phase. Stderr is reserved
 //! for status/warnings.
 //!
-//! See `research/phase-0-design.md` for methodology, schema, CLI, and
+//! See `src/microbench/DESIGN.md` for methodology, schema, CLI, and
 //! invariants.
 
 const std = @import("std");

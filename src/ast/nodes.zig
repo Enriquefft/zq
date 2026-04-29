@@ -79,9 +79,10 @@ pub const Node = struct {
         /// The strict `.path` LHS stays on `update_assign` so the fast-path
         /// `emitNavigation`/`emitUpdateChain` bytecode shape is preserved
         /// byte-for-byte. Complex LHSs route through this node instead.
-        /// See `research/phase-2-ast-walk-plan.md` §2 row "Update-assign LHS
-        /// that isn't a simple `.path.path[n]` chain" and §4 Stage 8 for
-        /// the rationale (Option A — AST-side).
+        /// Complex LHS choice rationale: Option A (AST-side) — complex
+        /// update-assign LHSs are routed through this node rather than
+        /// handled in the emitter, keeping `emitNavigation`/`emitUpdateChain`
+        /// byte-for-byte stable.
         assign_general: AssignGeneral,
 
         // ── Suffix chain ─────────────────────────────────────────────

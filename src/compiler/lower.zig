@@ -8,7 +8,7 @@
 //!
 //! Plan §3 R3 step 6 enumerates the operator categories; plan §1.3
 //! freezes the IR variable-arity contract; spec
-//! `research/compiler-ir-format.md` pins the text-dump shape that
+//! `src/compiler/IR-FORMAT.md` pins the text-dump shape that
 //! snapshot tests diff against (§10 examples are the contract).
 //!
 //! Lowering is a recursive descent on the typed AST root; no virtual
@@ -1524,9 +1524,8 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         //     unknown @fmt at emit / `nameToBuiltinId` fallback. Each is
         //     a named arm of an exhaustive switch, not a catch-all.
         //
-        // Those four sites are tracked by Wave-3-mini buckets in
-        // `research/phase-2r-coverage-gap.md` and stay live as SKIP
-        // markers for the harness; the dispatcher falls back to legacy
+        // Those four sites are tracked as Wave-3-mini SKIP markers;
+        // the dispatcher falls back to legacy
         // when they fire. The invariant for THIS arm — "if all explicit
         // AST-tag arms are non-fallthrough, the catch-all is unreachable"
         // — holds independently of those.
