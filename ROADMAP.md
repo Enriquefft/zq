@@ -28,9 +28,9 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-04-23)
+## Quick Status (Updated 2026-04-28)
 
-**Last updated:** Number-formatting + jq parity fixes. Rewrote `formatJqFloat` to match jq's `jvp_dtoa_fmt` (removed spurious i64 fast-path, ±inf→±DBL_MAX clamp, IGNORE_ZERO_SIGN). Rewrote `doMod` per jq's `binop_mod` with saturating `dtoiClamp` (inf%n, nan, INT64_MIN%-1). `doMul` nan/inf×string→null. Added `have_decnum`/`have_literal_numbers` builtins (return false). Added `Forkpoint.saved_stack` snapshots so binop left-operand survives generator backtrack inside array-collect (`[. * (a,b)]`). Fixed `insertRawInstr` off-by-one in jump-target shifting (`>=`→`>`) which silently skipped half the inner iterations in `(a,b)⊕(c,d,e)`.
+**Last updated:** Phase 2R AST-walk pipeline shipped (e4ef917, ee3d62f): AST → lower → fuse → emit → VM replaces the old single-pass recursive-descent compiler. K2 regression fixes landed: def-scope close-after-rest + recursive-self shadow guard asymmetry (5abfab2), expanding_stack push gated on is_recursive (ec21f78), Fix-C multi-element bracket access (7bcef99), Fix-D while(cond;update) inside arr_ctor fork-chain (464966b).
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
@@ -58,7 +58,7 @@ Parallel (file arg, complex transform, 15M-record JSONL, 1.3 GB):
   zq    2.22s              <- 43x faster than jq
 ```
 
-**Architecture:** error | types | io | parser | query | output | pool | describe | c_abi | main.zig — all modules complete.
+**Architecture:** error | types | io | lexer | parser | ast | compiler | vm | query | prefilter | output | describe | pool | lsp | c_abi | main.zig — all modules complete.
 **Agent interface:** `--json-errors`, `--describe`, `--validate`, exit codes, C ABI errors, `llms.txt`, 134 builtins, LSP.
 
 ---
@@ -95,10 +95,10 @@ Ranked by observed agent usage.
 |---|---------|---------------|--------|--------|
 | [x] | **`del()` with complex args** | ~6 | High | `del(.[2:4],.[0],.[-2:])`, `del(.[nan])`, `del(.), del(empty)`. Desugared to `. as $orig \| [path(f)] as $paths \| $orig \| delpaths($paths)`. |
 | [x] | **`contains` deep comparison** | ~2 | High | Root cause was object-literal evaluation: `object_construct_start`/`object_key` clobbered `it.current` with `it.input_value`, so any object literal preceded by a pipe (including `contains()`'s argument) lost its `.`. Fix: per-frame `it.current` snapshot stack mirroring `object_construct_depth`. |
-| [~] | **Variable destructuring — complex patterns** | ~5 | Medium | Simple patterns work; complex patterns (`. as {$a, $b:[$c, $d]}`, computed key destructuring) fail. |
+| [~] | **Variable destructuring — complex patterns** | ~3 | Medium | Most patterns work; remaining gaps: nested array-destructure patterns (`. as {$a, $b:[$c, $d]}`) and some computed-key shapes. Computed non-string guard fixed (2091aa1), `?//` alt_bind codegen added (f48ebcf). |
 | [ ] | **`any`/`all` short-circuit** | ~2 | Medium | `any(true, error; .)` should not evaluate the error expression. Eager evaluation today. |
 | [~] | **Core builtins — generator args** | ~4 | Medium | `first`/`last` with generator-expression arguments fail; single-value arguments work. |
-| [ ] | **User function scoping** | ~5 | Medium | Nested `def` shadowing, closure capture in complex contexts. |
+| [~] | **User function scoping** | ~3 | Medium | Two sub-bugs fixed: def scope close-after-rest + recursive-self shadow guard asymmetry (5abfab2); expanding_stack push gated on is_recursive (ec21f78). Complex closure capture in deeply-nested non-recursive defs may still surface edge cases (no current test exercises). |
 | [ ] | **`path_intact` validation** | ~3 | Low | `try ((map(select(.a == 1))[].a) \|= .+1) catch .` should error with "Invalid path expression near attempt to iterate through ...". Requires VM addition: per-fork `value_at_path` snapshot + `path_intact` check at INDEX/EACH/PATH_END. |
 
 ### 1.2 CLI — common flags not yet shipped
@@ -205,7 +205,8 @@ Number-formatting failures L593, L661, L674, L2195 require jq's arbitrary-precis
 | [ ] | **Type selectors** | `finites` |
 | [ ] | **SQL-style** | `GROUP_BY` |
 | [ ] | **Array** | `combinations` |
-| [ ] | **Misc** | `repeat`, `limit/2` |
+| [x] | **Misc** | `limit/2` (src/vm/root.zig:34, 1711–1753) |
+| [ ] | **Misc** | `repeat` (parser-only stub at src/ast/parser.zig:1681; no IR/emit/VM opcode) |
 
 ### 3.3 Module system
 
@@ -365,7 +366,8 @@ Pool module fully implemented; CLI surface pending.
 
 | | Item | Detail |
 |---|------|--------|
-| [x] | **jq compat test suite** | Fully migrated (533 tests). |
+| [x] | **jq compat test suite** | Fully migrated (569 tests; 547 passing, 22 known-fail tracked separately). |
+| [x] | **Snapshot test suite** | Compiler IR + fuse-pass snapshot tests in `tests/compiler/` (snapshots_test.zig, snapshots_fuse_test.zig). Post-cutover regression coverage. |
 | [x] | **CI: `zig build test`** | Every commit. |
 | [x] | **Error messages with filter position + input context** | Done. |
 | [ ] | **CI benchmark regression** | Fail CI if throughput drops > 10% vs previous release. |
