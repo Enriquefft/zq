@@ -285,9 +285,13 @@ pub const Parser = struct {
                     if (!p.peekIsDestructAlt()) break;
                 }
 
-                // Parse | body
+                // Parse | body. The body production matches jq's `Query`
+                // (parser.y:328 `Expr "as" Patterns '|' Query`), which
+                // includes `FuncDef Query` — so a leading `def` after `|`
+                // must be accepted. parseFilter dispatches `def_kw` to
+                // parseFunctionDef and otherwise falls through to parsePipe.
                 _ = p.expectOrError(.pipe, "expected '|' after destructuring patterns");
-                const body = p.parsePipe() catch return expr;
+                const body = p.parseFilter() catch return expr;
 
                 const span = Span.from(expr.span.start, body.span.end);
                 return p.createNode(.{ .destruct_alt = .{
@@ -297,9 +301,11 @@ pub const Parser = struct {
                 } }, span);
             }
 
-            // Parse | body (normal as pattern)
+            // Parse | body (normal as pattern). Body matches jq's `Query`
+            // (see comment in destruct_alt branch above) — leading `def`
+            // is accepted via parseFilter's `def_kw` dispatch.
             _ = p.expectOrError(.pipe, "expected '|' after pattern");
-            const body = p.parsePipe() catch return expr;
+            const body = p.parseFilter() catch return expr;
 
             const span = Span.from(expr.span.start, body.span.end);
             return p.createNode(.{ .as_pattern = .{
@@ -1502,8 +1508,7 @@ pub const Parser = struct {
                 while (true) {
                     const next = p.peek() orelse break;
                     if (next.tag == .rbrace) break;
-                    const field = try p.parsePatternField();
-                    fields.append(p.arena.allocator(), field) catch break;
+                    try p.parsePatternField(&fields);
                     const after = p.peek() orelse break;
                     if (after.tag == .comma) _ = p.advance();
                 }
@@ -1514,19 +1519,47 @@ pub const Parser = struct {
         }
     }
 
-    fn parsePatternField(p: *Parser) error{ParseFailed}!ObjectPatternField {
+    /// Parse one object-pattern field and append it (or, in the
+    /// `$var: subpat` case, two fields) to `out`. The two-field expansion
+    /// mirrors jq's `BINDING ':' Pattern` rule (parser.y:806), which
+    /// generates `BLOCK(DUP, STOREV name, sub)` — i.e. the value at key
+    /// `name` is BOTH bound to `$name` AND destructured by `sub`. Emitting
+    /// two independent matchers (`$name` shorthand + `name: sub`) on the
+    /// same key is observationally identical without growing the Pattern
+    /// union.
+    fn parsePatternField(
+        p: *Parser,
+        out: *std.ArrayList(ObjectPatternField),
+    ) error{ParseFailed}!void {
         const tok = p.peek() orelse return error.ParseFailed;
+        const alloc = p.arena.allocator();
 
-        // Shorthand: $var
+        // Shorthand: $var  — and the `$var: subpattern` extension which
+        // binds `$var` AND destructures the same value.
         if (tok.tag == .dollar) {
             _ = p.advance();
             const ident = p.advance() orelse return error.ParseFailed;
             if (!isVarNameToken(ident.tag)) return error.ParseFailed;
             const name = p.internName(p.tokenSlice(ident));
-            return .{
+
+            // Always emit the binding field first.
+            out.append(alloc, .{
                 .key = .{ .static = name },
                 .pattern = .{ .simple = name },
-            };
+            }) catch return error.ParseFailed;
+
+            // If a `:` follows, parse the sub-pattern and emit a second
+            // matcher on the same key that destructures the value.
+            const after = p.peek() orelse return;
+            if (after.tag == .colon) {
+                _ = p.advance();
+                const sub = try p.parsePattern();
+                out.append(alloc, .{
+                    .key = .{ .static = name },
+                    .pattern = sub,
+                }) catch return error.ParseFailed;
+            }
+            return;
         }
 
         // Computed key: (expr): pattern
@@ -1536,20 +1569,21 @@ pub const Parser = struct {
             _ = p.expectOrError(.rparen, "expected ')'");
             _ = p.expectOrError(.colon, "expected ':'");
             const sub = try p.parsePattern();
-            return .{
+            out.append(alloc, .{
                 .key = .{ .computed = expr },
                 .pattern = sub,
-            };
+            }) catch return error.ParseFailed;
+            return;
         }
 
         // Static key: name: pattern
         const key_name = try p.parseStaticPatternKey();
         _ = p.expectOrError(.colon, "expected ':'");
         const sub = try p.parsePattern();
-        return .{
+        out.append(alloc, .{
             .key = .{ .static = key_name },
             .pattern = sub,
-        };
+        }) catch return error.ParseFailed;
     }
 
     fn parseStaticPatternKey(p: *Parser) error{ParseFailed}![]const u8 {
