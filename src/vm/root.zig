@@ -2126,10 +2126,19 @@ pub const ResultIterator = struct {
                         outer.skip_components_for_computed_key = true;
                     } else {
                         // Terminal: inner path result is the outer body's
-                        // output. Mark the OUTER frame broken.
-                        const outer = &it.path_stack.items[it.path_stack.items.len - 2];
+                        // output. Pop the inner frame so the outer path_end
+                        // reads its own (outer) frame as the innermost frame,
+                        // then mark the outer frame broken. The path array
+                        // already pushed at L2099 stays on the value stack so
+                        // the outer path_end's result_val check
+                        // (value_stack.len > outer.saved_value_stack_len) finds
+                        // it and passes it to raisePathExprError as the result.
+                        var inner_frame = it.path_stack.pop().?;
+                        inner_frame.deinit(it.alloc);
+                        const outer = &it.path_stack.items[it.path_stack.items.len - 1];
                         outer.path_broken = true;
                         outer.break_origin = .upstream_value;
+                        outer.break_kind = .generic;
                     }
                 }
                 it.ip += 1;
