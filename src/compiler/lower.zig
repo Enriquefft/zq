@@ -1643,6 +1643,16 @@ pub const BuiltinClass = enum {
     /// `call_builtin` because the bytecode shape carries
     /// patch-table jumps that don't reduce to a flat builtin call.
     while_until_2arg,
+    /// Cat-13 — `repeat(f)` (1-arity). Streaming infinite generator
+    /// matching jq's `def repeat(exp): def _r: exp, _r; _r;`. Lowers
+    /// as a single-child `call_builtin`-shaped IR node; emit
+    /// brackets the body with `repeat_start` / `repeat_end` so the
+    /// VM's RepeatFrame captures the original input and re-enters
+    /// the body each time the body's generator chain exhausts.
+    /// Termination relies on an enclosing `limit` (matching jq's
+    /// `limit(N; repeat(f))` idiom); without one the loop runs
+    /// forever — matching jq's bare `repeat` semantics.
+    repeat_arg1,
     /// Cat-16 — `error(msg)` 1-arity. Legacy `compileErrorArg`
     /// (`compiler.zig:3956`) emits `<msg> ; pipe ; call_builtin(error_)`.
     /// The pipe is required because legacy first evaluates `msg` onto
@@ -1739,6 +1749,7 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (arity == 2 and isLimitSkipNthBuiltin(name)) return .limit_skip_nth;
     if (arity == 1 and std.mem.eql(u8, name, "first")) return .first_arg1;
     if (arity == 1 and std.mem.eql(u8, name, "last")) return .last_arg1;
+    if (arity == 1 and std.mem.eql(u8, name, "repeat")) return .repeat_arg1;
     // Cat-15 control-flow loop builtins. Both share the same
     // (cond; update) shape; emit picks the SemOp + bytecode pattern by
     // name. Routed before the generic arity tables because `while`
@@ -2099,7 +2110,7 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
-        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path, .map_arg1, .select_arg1 => {
+        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path, .map_arg1, .select_arg1, .repeat_arg1 => {
             // Lower every arg first into a scratch buffer — recursive
             // lowering of nested calls (or ctors) writes to
             // `extra_children`, so building our span via direct append
