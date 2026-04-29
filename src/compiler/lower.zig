@@ -3453,7 +3453,14 @@ fn inlineUserCall(
     ctx.var_table = fresh_var_table;
 
     // Push expanding stack so any self-ref inside body emits call_user.
-    try ctx.expanding_stack.append(alloc, fn_id);
+    // Gate: only push when the function is *known* recursive (detected
+    // pre-walk by `bodyReferencesSelf`). For non-recursive defs, leaving
+    // the stack untouched lets `lookupFunction` resolve `f` inside the
+    // body to whatever the lex scope has at that point — matching jq's
+    // shadowing rule where a same-named def declared between siblings
+    // takes precedence.
+    const did_push_expanding = ctx.function_table.items[fn_id].is_recursive;
+    if (did_push_expanding) try ctx.expanding_stack.append(alloc, fn_id);
 
     const func_table_save: u32 = @intCast(ctx.function_table.items.len);
 
@@ -3481,7 +3488,7 @@ fn inlineUserCall(
             ctx.function_table.items[k].out_of_scope = true;
         }
     }
-    _ = ctx.expanding_stack.pop();
+    if (did_push_expanding) _ = ctx.expanding_stack.pop();
     ctx.var_table.deinit(alloc);
     ctx.var_table = saved_var_table;
     ctx.func_hidden_start = saved_hidden_start;
