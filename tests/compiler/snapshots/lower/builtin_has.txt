@@ -1,0 +1,4 @@
+# source: has("a")
+# SemOp
+call_builtin("has") @0..8
+  load_const("a") @4..7

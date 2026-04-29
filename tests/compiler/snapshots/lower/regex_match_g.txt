@@ -1,0 +1,3 @@
+# source: match("o"; "g")
+# SemOp
+call_builtin("match", re_0 "/o/") @0..15

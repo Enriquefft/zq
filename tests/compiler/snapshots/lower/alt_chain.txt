@@ -1,0 +1,7 @@
+# source: null // false // 7
+# SemOp
+alt @0..18
+  alt @0..13
+    load_const(null) @0..4
+    load_const(false) @8..13
+  load_const(7) @17..18

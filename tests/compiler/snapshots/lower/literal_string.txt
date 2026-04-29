@@ -1,0 +1,3 @@
+# source: "hi"
+# SemOp
+load_const("hi") @0..4

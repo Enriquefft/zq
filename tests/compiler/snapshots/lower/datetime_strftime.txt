@@ -1,0 +1,4 @@
+# source: strftime("%Y-%m-%d")
+# SemOp
+call_builtin("strftime") @0..20
+  load_const("%Y-%m-%d") @9..19

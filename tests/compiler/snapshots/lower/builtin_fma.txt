@@ -1,0 +1,6 @@
+# source: fma(2; 3; 4)
+# SemOp
+call_builtin("fma") @0..12
+  load_const(2) @4..5
+  load_const(3) @7..8
+  load_const(4) @10..11

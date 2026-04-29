@@ -1,0 +1,11 @@
+# source: "foo" as $k | {"foo": 42} | .[$k]
+# SemOp
+as_bind @0..33
+  load_const("foo") @0..5
+  destructure(as, "k") @0..33
+  pipe @14..33
+    obj_ctor @14..25
+      load_const("foo") @15..24
+      load_const(42) @22..24
+    computed_index @28..33
+      load_var("k") @30..32

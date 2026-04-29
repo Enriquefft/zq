@@ -137,7 +137,7 @@ pub fn build(b: *std.Build) void {
     parser_module.addImport("types", types_module);
 
     const lexer_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/lexer.zig"),
+        .root_source_file = b.path("src/lexer/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -153,16 +153,47 @@ pub fn build(b: *std.Build) void {
     ast_module.addImport("types", types_module);
 
     // Prefilter harvester — defined early so every downstream module
-    // (query_module, compiler_legacy_module, compiler_ast_module) can import
-    // it by name and stay on a single module root. Phase 2 Stage 12 moved the
-    // AST-idiom matcher into this file so both compile paths share it.
+    // (currently `query_module`) can import it by name and stay on a single
+    // module root. The AST-idiom matcher lives here so the eventual new
+    // compiler can share it without re-rooting the file.
     const prefilter_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/prefilter.zig"),
+        .root_source_file = b.path("src/prefilter/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     prefilter_module.addImport("regex", regex_module);
     prefilter_module.addImport("ast", ast_module);
+
+    // Phase 2R compiler — production. Wired into every module that imports
+    // `query` so `src/query/root.zig` dispatches directly to it. Imports
+    // `ast` so the typed AST root flows in (plan §1.3 row 4 — no virtual
+    // dispatch, switch on tag); imports `types`, `error`, `regex`, and
+    // `prefilter` so the emit-side `Compiled` matches the bytecode shape
+    // the VM consumes (plan §1.3 row 7).
+    const compiler_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("ast", ast_module);
+    compiler_module.addImport("types", types_module);
+    compiler_module.addImport("error", error_module);
+    compiler_module.addImport("regex", regex_module);
+    compiler_module.addImport("prefilter", prefilter_module);
+
+    // VM (runtime executor) — consumes the bytecode produced by the
+    // compiler and produces `ResultIterator`. Phase 2R cutover: relocated
+    // from the legacy `query/src/vm.zig` to `src/vm/root.zig` so the query module
+    // imports it through the named-module graph (single root per file
+    // under Zig 0.15.2's duplicate-module constraint).
+    const vm_module = b.createModule(.{
+        .root_source_file = b.path("src/vm/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_module.addImport("error", error_module);
+    vm_module.addImport("types", types_module);
+    vm_module.addImport("regex", regex_module);
 
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),
@@ -173,10 +204,12 @@ pub fn build(b: *std.Build) void {
     query_module.addImport("types", types_module);
     query_module.addImport("lexer", lexer_module);
     query_module.addImport("regex", regex_module);
+    query_module.addImport("vm", vm_module);
     // Prefilter harvest walks the AST from src/ast/. Single source of truth:
     // the same parser the LSP uses — no second source-byte scanner.
     query_module.addImport("ast", ast_module);
     query_module.addImport("prefilter", prefilter_module);
+    query_module.addImport("compiler", compiler_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding
@@ -317,7 +350,6 @@ pub fn build(b: *std.Build) void {
     query_test_mod.addImport("types", types_module);
     query_test_mod.addImport("regex", regex_module);
     query_test_mod.addImport("error", error_module);
-    query_test_mod.addImport("build_options", build_options_module);
 
     const query_tests = b.addTest(.{ .root_module = query_test_mod });
     if (shim_build_step) |step| query_tests.step.dependOn(&step.step);
@@ -472,69 +504,6 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
     fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);
 
-    // ── AST-walk compile equivalence harness (NOT in test_step) ──────────
-    // Runs the Stage 0/1 equivalence check between the legacy token-driven
-    // compiler and the new AST walker at `src/ast/compiler.zig`. Exits
-    // nonzero on any mismatch. See `research/phase-2-ast-walk-plan.md` §3.
-    //
-    // Invocation: `zig build ast-compile-equiv`.
-    // Optional `-Dast-equiv-verbose=true` for raw-instruction dumps.
-    const ast_equiv_verbose = b.option(bool, "ast-equiv-verbose", "Dump per-fixture instructions from ast-compile-equiv") orelse false;
-    const ast_equiv_options = b.addOptions();
-    ast_equiv_options.addOption(bool, "ast_equiv_verbose", ast_equiv_verbose);
-    const ast_equiv_options_module = ast_equiv_options.createModule();
-
-    // Legacy compiler exposed as a sibling module so the harness can call
-    // `compile(src, external_vars, alloc)` directly. This mirrors the module
-    // wiring used by `query_module` but targets `src/query/src/compiler.zig`
-    // directly — production `query_module` is untouched.
-    const compiler_legacy_module = b.createModule(.{
-        .root_source_file = b.path("src/query/src/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    compiler_legacy_module.addImport("error", error_module);
-    compiler_legacy_module.addImport("types", types_module);
-    compiler_legacy_module.addImport("lexer", lexer_module);
-    compiler_legacy_module.addImport("regex", regex_module);
-    compiler_legacy_module.addImport("ast", ast_module);
-    // Share the same prefilter module created at the top of this function so
-    // the ast-compile-equiv harness (which also loads the walker) doesn't
-    // double-root `src/query/src/prefilter.zig`. Before Stage 12 the legacy
-    // compiler pulled the file in via a relative `@import("prefilter.zig")`;
-    // now it imports by module name and both compilers share the single
-    // root. See `src/query/src/compiler.zig` and `src/ast/compiler.zig`.
-    compiler_legacy_module.addImport("prefilter", prefilter_module);
-
-    // AST walker exposed as a sibling module. Parallel to the legacy
-    // compiler. Stage 13 cutover collapses these into one.
-    const compiler_ast_module = b.createModule(.{
-        .root_source_file = b.path("src/ast/compiler.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    compiler_ast_module.addImport("ast", ast_module);
-    compiler_ast_module.addImport("types", types_module);
-    compiler_ast_module.addImport("error", error_module);
-    compiler_ast_module.addImport("regex", regex_module);
-    compiler_ast_module.addImport("prefilter", prefilter_module);
-
-    const ast_equiv_step = b.step("ast-compile-equiv", "Run AST-walk compile equivalence harness (Phase 2)");
-    const ast_equiv_mod = b.createModule(.{
-        .root_source_file = b.path("tests/ast_compile_equiv.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ast_equiv_mod.addImport("compiler_legacy", compiler_legacy_module);
-    ast_equiv_mod.addImport("compiler_ast", compiler_ast_module);
-    ast_equiv_mod.addImport("types", types_module);
-    ast_equiv_mod.addImport("prefilter", prefilter_module);
-    ast_equiv_mod.addImport("regex", regex_module);
-    ast_equiv_mod.addImport("build_options", ast_equiv_options_module);
-    const ast_equiv_tests = b.addTest(.{ .root_module = ast_equiv_mod });
-    if (shim_build_step) |step| ast_equiv_tests.step.dependOn(&step.step);
-    ast_equiv_step.dependOn(&b.addRunArtifact(ast_equiv_tests).step);
-
     // ── Regex bench (NOT in test_step) ────────────────────────────────────
     // Latency probe. Prints median/p99 per pattern class to stderr. Not part
     // of the default test step to keep CI runs fast. Invoke with
@@ -551,6 +520,92 @@ pub fn build(b: *std.Build) void {
     const bench_regex_tests = b.addTest(.{ .root_module = bench_regex_mod });
     if (shim_build_step) |step| bench_regex_tests.step.dependOn(&step.step);
     bench_regex_step.dependOn(&b.addRunArtifact(bench_regex_tests).step);
+
+    // ── bench-compile (NOT in test_step) ──────────────────────────────────
+    // Compile-only throughput baseline (Phase 2R / Phase 3).
+    // Always built with ReleaseFast — perf bench requires it.
+    // Invocation: `zig build bench-compile`
+    const bench_compile_step = b.step("bench-compile", "Compile-only throughput baseline");
+    const bench_compile_mod = b.createModule(.{
+        .root_source_file = b.path("src/compiler/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_compile_mod.addImport("query", query_module);
+    bench_compile_mod.addImport("error", error_module);
+    const bench_compile_exe = b.addExecutable(.{
+        .name = "zq-bench-compile",
+        .root_module = bench_compile_mod,
+    });
+    if (shim_build_step) |step| bench_compile_exe.step.dependOn(&step.step);
+    const bench_compile_run = b.addRunArtifact(bench_compile_exe);
+    bench_compile_run.stdio = .inherit;
+    if (b.args) |args| bench_compile_run.addArgs(args);
+    bench_compile_step.dependOn(&bench_compile_run.step);
+
+    // ── compiler snapshot tests (in test_step) ────────────────────────────
+    // Snapshot diff for the IR text dumper produced by `lower` — fixtures
+    // pinned in `tests/compiler/snapshots/lower/`. Plan §3 R3 step 9.
+    const compiler_snapshots_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_snapshots_mod.addImport("ast", ast_module);
+    compiler_snapshots_mod.addImport("compiler", compiler_module);
+    const compiler_snapshots_tests = b.addTest(.{ .root_module = compiler_snapshots_mod });
+    if (shim_build_step) |step| compiler_snapshots_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(compiler_snapshots_tests).step);
+
+    // Fuse snapshot suite — pinned at `tests/compiler/snapshots/fuse/`.
+    // Plan §3 R3 step 8 (fuse pass) + step 9 (snapshot tests). Drives
+    // the IR-walking dumper so the load-path fold rewrite shows up in
+    // the diff.
+    const compiler_fuse_snapshots_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_fuse_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_fuse_snapshots_mod.addImport("ast", ast_module);
+    compiler_fuse_snapshots_mod.addImport("compiler", compiler_module);
+    const compiler_fuse_snapshots_tests = b.addTest(.{ .root_module = compiler_fuse_snapshots_mod });
+    if (shim_build_step) |step| compiler_fuse_snapshots_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(compiler_fuse_snapshots_tests).step);
+
+    // Leak regression for the new compiler's external_var_ids path.
+    const new_compile_leak_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/compile_leak_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    new_compile_leak_mod.addImport("query", query_module);
+    const new_compile_leak_tests = b.addTest(.{ .root_module = new_compile_leak_mod });
+    if (shim_build_step) |step| new_compile_leak_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(new_compile_leak_tests).step);
+
+    // ── snapshots-update (NOT in test_step) ───────────────────────────────
+    // Regenerate `tests/compiler/snapshots/lower/*.txt` from the current
+    // dumper output. Drives the same `compiler.dump` the snapshot test
+    // uses (single source of truth). Run after deliberate IR changes;
+    // commit the resulting diff. Plan §3 R3 step 9.
+    // Invocation: `zig build snapshots-update`.
+    const snapshots_update_step = b.step("snapshots-update", "Regenerate compiler lower snapshots");
+    const snapshots_update_mod = b.createModule(.{
+        .root_source_file = b.path("tests/compiler/snapshots_update.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    snapshots_update_mod.addImport("ast", ast_module);
+    snapshots_update_mod.addImport("compiler", compiler_module);
+    const snapshots_update_exe = b.addExecutable(.{
+        .name = "zq-snapshots-update",
+        .root_module = snapshots_update_mod,
+    });
+    if (shim_build_step) |step| snapshots_update_exe.step.dependOn(&step.step);
+    const snapshots_update_run = b.addRunArtifact(snapshots_update_exe);
+    snapshots_update_run.stdio = .inherit;
+    if (b.args) |args| snapshots_update_run.addArgs(args);
+    snapshots_update_step.dependOn(&snapshots_update_run.step);
 
     // ── Microbench (NOT in test_step) ─────────────────────────────────────
     // Per-stage latency harness — Phase 0 of the research roadmap. Drives

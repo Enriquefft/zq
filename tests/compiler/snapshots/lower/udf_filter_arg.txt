@@ -1,0 +1,6 @@
+# source: def double(x): x + x; double(. + 1)
+# SemOp
+call_user("double") @22..35
+  arith(add) @29..34
+    identity @29..30
+    load_const(1) @33..34

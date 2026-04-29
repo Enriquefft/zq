@@ -1,0 +1,10 @@
+# source: . as [$a, $b] | $a + $b
+# SemOp
+as_bind @0..23
+  identity @0..1
+  destructure(array) @0..23
+    destructure(as, "a") @0..23
+    destructure(as, "b") @0..23
+  arith(add) @16..23
+    load_var("a") @16..18
+    load_var("b") @21..23

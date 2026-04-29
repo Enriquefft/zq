@@ -1,0 +1,15 @@
+# source: .a | .[0] | .b
+# before
+# SemOp
+pipe @0..14
+  pipe @0..9
+    load_field("a") @0..2
+    load_index(0) @5..9
+  load_field("b") @12..14
+# after
+# SemOp
+pipe @0..14
+  pipe @0..9
+    load_field("a") @0..2
+    load_index(0) @5..9
+  load_field("b") @12..14

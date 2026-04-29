@@ -1,0 +1,7 @@
+# source: .a, .b | .c
+# SemOp
+pipe @0..11
+  comma @0..6
+    load_field("a") @0..2
+    load_field("b") @4..6
+  load_field("c") @9..11

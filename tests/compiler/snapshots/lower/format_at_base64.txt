@@ -1,0 +1,4 @@
+# source: @base64 "hello"
+# SemOp
+format("base64") @0..15
+  load_const("hello") @0..15

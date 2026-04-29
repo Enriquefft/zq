@@ -1,0 +1,7 @@
+# source: [indices("l", "o")]
+# SemOp
+arr_ctor @0..19
+  call_builtin("indices") @1..18
+    comma @9..17
+      load_const("l") @9..12
+      load_const("o") @14..17

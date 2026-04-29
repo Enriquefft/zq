@@ -1,0 +1,3 @@
+# source: true
+# SemOp
+load_const(true) @0..4

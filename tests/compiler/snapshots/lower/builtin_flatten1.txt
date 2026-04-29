@@ -1,0 +1,4 @@
+# source: flatten(1)
+# SemOp
+call_builtin("flatten") @0..10
+  load_const(1) @8..9

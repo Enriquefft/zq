@@ -1,0 +1,3 @@
+# source: capture("(?<n>[a-z]+)")
+# SemOp
+call_builtin("capture", re_0 "/(?<n>[a-z]+)/") @0..23

@@ -1,10 +1,13 @@
 const std = @import("std");
 const err_mod = @import("error");
 const types = @import("types");
-const compiler = @import("src/compiler.zig");
-const vm = @import("src/vm.zig");
+const vm = @import("vm");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
+// Phase 2R cutover: the new compiler at `src/compiler/` is the only
+// backend. The pre-cutover backend dispatcher and build flag are gone;
+// `compile()` is a thin wrapper over `new_compiler.compile`.
+const new_compiler = @import("compiler");
 
 pub const PrefilterSet = prefilter_mod.PrefilterSet;
 
@@ -16,7 +19,7 @@ pub const Value = types.Value;
 pub const ResultIterator = vm.ResultIterator;
 
 // Re-export types needed for external variable support.
-pub const ExternalVarDecl = compiler.ExternalVarDecl;
+pub const ExternalVarDecl = new_compiler.ExternalVarDecl;
 pub const ExternalVarBinding = vm.ExternalVarBinding;
 pub const StackValue = vm.StackValue;
 
@@ -60,18 +63,35 @@ pub const CompiledQuery = struct {
     /// Sparser raw-byte prefilter — populated at compile time when the
     /// source matches the exact shape `select(PATH | regex_builtin("lit"))`.
     /// `null` otherwise. The parallel chunk worker consults this before
-    /// parsing each record; see `src/query/src/prefilter.zig`.
+    /// parsing each record.
     prefilter: ?prefilter_mod.PrefilterSet,
 
     /// Compile `src` into bytecode. Returns a CompileResult union:
     /// `.ok` on success, `.err` with source location on compile error.
-    /// Only returns error.OutOfMemory as a Zig error.
+    ///
+    /// Phase 2R cutover: dispatches unconditionally to the new compiler
+    /// at `src/compiler/`. The pre-cutover backend dispatcher and build
+    /// flag are gone.
     pub fn compile(
         src: []const u8,
         opts: Opts,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!CompileResult {
-        const result = try compiler.compile(src, opts.external_vars, allocator);
+        // Translate the query-module's `ExternalVarDecl` slice into the
+        // compiler-module's shape. They are field-equivalent today; an
+        // explicit copy keeps the cross-module contract crisp.
+        var ext_decls: []new_compiler.ExternalVarDecl = &.{};
+        if (opts.external_vars.len > 0) {
+            ext_decls = try allocator.alloc(new_compiler.ExternalVarDecl, opts.external_vars.len);
+            for (opts.external_vars, ext_decls) |src_decl, *dst| {
+                dst.* = .{ .name = src_decl.name };
+            }
+        }
+        defer if (ext_decls.len > 0) allocator.free(ext_decls);
+
+        // Phase 2R cutover: the compiler covers every operator category;
+        // unhandled cases panic inside the compiler. Only OOM propagates.
+        const result = try new_compiler.compile(src, ext_decls, allocator);
         switch (result) {
             .ok => |compiled| return .{ .ok = CompiledQuery{
                 .allocator = allocator,

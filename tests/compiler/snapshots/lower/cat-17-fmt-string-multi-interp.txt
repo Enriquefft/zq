@@ -1,0 +1,8 @@
+# source: @uri "key1=\(.a)&key2=\(.b)"
+# SemOp
+format("uri") @0..28
+  load_const("key1=") @0..28
+  load_field("a") @13..15
+  load_const("&key2=") @0..28
+  load_field("b") @24..26
+  load_const("") @0..28

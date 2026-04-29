@@ -10,8 +10,10 @@ results/
 /result
 trace.zq
 *.trace
+zq-vm-equiv
 
 # Large benchmark data
 benchmarks/data/huge.jsonl
 .claude/
 .strategy/
+memory/

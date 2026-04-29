@@ -1,0 +1,19 @@
+# source: if .x then .a | .b | .c else null end
+# before
+# SemOp
+if @0..37
+  load_field("x") @3..5
+  pipe @11..23
+    pipe @11..18
+      load_field("a") @11..13
+      load_field("b") @16..18
+    load_field("c") @21..23
+  load_const(null) @29..33
+# after
+# SemOp
+if @0..37
+  load_field("x") @3..5
+# EmitOp
+  load_path("a.b.c") @11..23
+# SemOp
+  load_const(null) @29..33

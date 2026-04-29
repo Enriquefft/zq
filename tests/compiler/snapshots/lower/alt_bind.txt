@@ -1,0 +1,9 @@
+# source: . as $x ?// $y | $x
+# SemOp
+pipe @0..19
+  identity @0..1
+  pipe @0..19
+    destructure(alt_bind) @0..19
+      destructure(as, "x") @0..19
+      destructure(as, "y") @0..19
+    load_var("x") @17..19

@@ -1,0 +1,34 @@
+# source: .a | .b | .[] | .c | .d | .[0] | .e | .f
+# before
+# SemOp
+pipe @0..40
+  pipe @0..35
+    pipe @0..30
+      pipe @0..23
+        pipe @0..18
+          pipe @0..13
+            pipe @0..7
+              load_field("a") @0..2
+              load_field("b") @5..7
+            iterate @10..13
+          load_field("c") @16..18
+        load_field("d") @21..23
+      load_index(0) @26..30
+    load_field("e") @33..35
+  load_field("f") @38..40
+# after
+# SemOp
+pipe @0..40
+  pipe @0..30
+    pipe @0..23
+      pipe @0..13
+# EmitOp
+        load_path("a.b") @0..7
+# SemOp
+        iterate @10..13
+# EmitOp
+      load_path("c.d") @16..23
+# SemOp
+    load_index(0) @26..30
+# EmitOp
+  load_path("e.f") @33..40

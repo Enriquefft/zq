@@ -1,0 +1,6 @@
+# source: @csv "x\(.a)"
+# SemOp
+format("csv") @0..13
+  load_const("x") @0..13
+  load_field("a") @9..11
+  load_const("") @0..13

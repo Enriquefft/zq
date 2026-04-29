@@ -1,0 +1,5 @@
+# source: 10-3
+# SemOp
+arith(sub) @0..4
+  load_const(10) @0..2
+  load_const(3) @3..4

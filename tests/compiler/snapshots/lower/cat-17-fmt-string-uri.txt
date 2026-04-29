@@ -1,0 +1,6 @@
+# source: @uri "key=\(.foo)"
+# SemOp
+format("uri") @0..18
+  load_const("key=") @0..18
+  load_field("foo") @12..16
+  load_const("") @0..18

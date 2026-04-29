@@ -1,0 +1,11 @@
+# source: .alpha | .beta | .gamma
+# before
+# SemOp
+pipe @0..23
+  pipe @0..14
+    load_field("alpha") @0..6
+    load_field("beta") @9..14
+  load_field("gamma") @17..23
+# after
+# EmitOp
+load_path("alpha.beta.gamma") @0..23

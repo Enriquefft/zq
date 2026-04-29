@@ -1,0 +1,6 @@
+# source: .[(.a + .b)]
+# SemOp
+computed_index @0..12
+  arith(add) @3..10
+    load_field("a") @3..5
+    load_field("b") @8..10

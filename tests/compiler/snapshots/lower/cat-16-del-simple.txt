@@ -1,0 +1,4 @@
+# source: del(.a)
+# SemOp
+call_builtin("del") @0..7
+  load_field("a") @4..6

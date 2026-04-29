@@ -1,0 +1,5 @@
+# source: pow(2; 8)
+# SemOp
+call_builtin("pow") @0..9
+  load_const(2) @4..5
+  load_const(8) @7..8

@@ -1,0 +1,16 @@
+# source: {x: .a | .b | .c}
+# before
+# SemOp
+obj_ctor @0..17
+  load_const("x") @1..16
+  pipe @4..16
+    pipe @4..11
+      load_field("a") @4..6
+      load_field("b") @9..11
+    load_field("c") @14..16
+# after
+# SemOp
+obj_ctor @0..17
+  load_const("x") @1..16
+# EmitOp
+  load_path("a.b.c") @4..16

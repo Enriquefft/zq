@@ -1,0 +1,7 @@
+# source: 1 as $i | .[$i]
+# SemOp
+as_bind @0..15
+  load_const(1) @0..1
+  destructure(as, "i") @0..15
+  computed_index @10..15
+    load_var("i") @12..14

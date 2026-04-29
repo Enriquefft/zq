@@ -1,0 +1,3 @@
+# source: arrays
+# SemOp
+call_builtin("arrays") @0..6

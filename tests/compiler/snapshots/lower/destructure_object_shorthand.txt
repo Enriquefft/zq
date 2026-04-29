@@ -1,0 +1,10 @@
+# source: . as {$a, $b} | $a
+# SemOp
+as_bind @0..18
+  identity @0..1
+  destructure(object) @0..18
+    load_const("a") @0..18
+    destructure(as, "a") @0..18
+    load_const("b") @0..18
+    destructure(as, "b") @0..18
+  load_var("a") @16..18

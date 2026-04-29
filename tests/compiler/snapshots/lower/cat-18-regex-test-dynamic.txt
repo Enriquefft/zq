@@ -1,0 +1,7 @@
+# source: "h.*" as $p | test($p)
+# SemOp
+as_bind @0..22
+  load_const("h.*") @0..5
+  destructure(as, "p") @0..22
+  call_builtin("test") @14..22
+    load_var("p") @19..21

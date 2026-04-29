@@ -1,0 +1,5 @@
+# source: label $a | label $b | break $a
+# SemOp
+label("a") @0..30
+  label("b") @11..30
+    break("a") @22..30

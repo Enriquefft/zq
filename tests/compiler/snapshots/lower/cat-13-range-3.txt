@@ -1,0 +1,6 @@
+# source: range(0;10;2)
+# SemOp
+call_builtin("range") @0..13
+  load_const(0) @6..7
+  load_const(10) @8..10
+  load_const(2) @11..12

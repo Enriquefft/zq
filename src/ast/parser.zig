@@ -511,7 +511,7 @@ pub const Parser = struct {
                 return p.parseFormat(tok);
             },
             .string_part => {
-                return p.parseStringInterp(tok, null);
+                return p.parseStringInterp(tok, null, null);
             },
             .reduce_kw => {
                 return p.parseReduce(tok);
@@ -652,26 +652,59 @@ pub const Parser = struct {
                 return p.parseSliceTail(start, false, 0);
             },
             .int_lit, .minus => {
-                const n = p.tryParseInt() orelse return error.ParseFailed;
-                const after = p.peek() orelse return error.ParseFailed;
-                if (after.tag == .colon) {
-                    _ = p.advance();
-                    if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
-                        return p.makeError("index out of range", Span.from(start, p.lex.pos));
+                // Fast-path only for exact `.[<int>]` and `.[<int>:]` shapes.
+                // For anything else (e.g. `.[1,2]` with a comma following the
+                // int), restore position and route through parsePipe so the
+                // comma and any other binops are handled by their canonical parser.
+                const saved_pos = p.lex.pos;
+                if (p.tryParseInt()) |n| {
+                    const after = p.peek() orelse return error.ParseFailed;
+                    if (after.tag == .colon) {
+                        _ = p.advance();
+                        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
+                            return p.makeError("index out of range", Span.from(start, p.lex.pos));
+                        }
+                        return p.parseSliceTail(start, true, @intCast(n));
                     }
-                    return p.parseSliceTail(start, true, @intCast(n));
+                    if (after.tag == .rbracket) {
+                        _ = p.advance();
+                        return p.createNode(.{ .index_access = .{ .index = n } }, Span.from(start, after.offset + after.len));
+                    }
+                    // Not `]` or `:` — unwind and fall through to parsePipe.
+                    p.lex.pos = saved_pos;
+                } else {
+                    p.lex.pos = saved_pos;
+                    return error.ParseFailed;
                 }
-                const close = p.expectOrError(.rbracket, "expected ']'");
-                const end_pos = if (close) |c| c.offset + c.len else p.lex.pos;
-                return p.createNode(.{ .index_access = .{ .index = n } }, Span.from(start, end_pos));
+                // Fall through to computed bracket access via parsePipe.
+                const expr = p.parsePipe() catch return error.ParseFailed;
+                _ = p.expectOrError(.rbracket, "expected ']'");
+                return p.createNode(.{ .builtin_call = .{
+                    .name = "__computed_access",
+                    .args = p.allocSlice(*Node, &[_]*Node{expr}),
+                } }, Span.from(start, p.lex.pos));
             },
             .string_lit => {
+                // Fast-path only for exact `["<string>"]` shape. If the token
+                // after the string literal is not `]`, restore and use parsePipe.
+                const saved_pos = p.lex.pos;
                 const str_tok = p.advance().?;
-                const raw = p.tokenSlice(str_tok);
-                const content = raw[1 .. raw.len - 1];
+                const after = p.peek();
+                if (after != null and after.?.tag == .rbracket) {
+                    _ = p.advance();
+                    const raw = p.tokenSlice(str_tok);
+                    const content = raw[1 .. raw.len - 1];
+                    return p.createNode(.{ .field_access = .{
+                        .name = p.internName(content),
+                    } }, Span.from(start, p.lex.pos));
+                }
+                // Not an exact `["string"]` shape — unwind and use parsePipe.
+                p.lex.pos = saved_pos;
+                const expr = p.parsePipe() catch return error.ParseFailed;
                 _ = p.expectOrError(.rbracket, "expected ']'");
-                return p.createNode(.{ .field_access = .{
-                    .name = p.internName(content),
+                return p.createNode(.{ .builtin_call = .{
+                    .name = "__computed_access",
+                    .args = p.allocSlice(*Node, &[_]*Node{expr}),
                 } }, Span.from(start, p.lex.pos));
             },
             else => {
@@ -794,9 +827,9 @@ pub const Parser = struct {
             const has_colon = if (after_dollar) |t| t.tag == .colon else false;
 
             // Key shape in the AST for both `{$x}` and `{$x: VALUE}` is
-            // `.ident` carrying the variable *name*. The walker detects the
-            // `$` prefix by looking at the source byte at the cursor — see
-            // `emitObjectField` in `src/ast/compiler.zig`.
+            // `.ident` carrying the variable *name*. The compiler detects
+            // the `$` prefix by looking at the source byte at the key
+            // span's start.
             const key: Node.ObjectKey = .{ .ident = var_name };
 
             if (has_colon) {
@@ -1037,7 +1070,13 @@ pub const Parser = struct {
 
         if (after.tag == .string_part) {
             _ = p.advance();
-            return p.parseStringInterp(after, fmt_name);
+            // Pass the `@` token offset so the resulting `format_string`
+            // span starts at `@` (not the string_part). Lowering relies
+            // on this to anchor unknown-format `query_syntax_error`
+            // diagnostics at the format ident byte (one past the `@`),
+            // mirroring legacy `parsePrimary`'s `last_tok_offset`
+            // (`src/query/src/compiler.zig:6210`).
+            return p.parseStringInterp(after, fmt_name, at_tok.offset);
         }
         if (after.tag == .string_lit) {
             _ = p.advance();
@@ -1056,7 +1095,7 @@ pub const Parser = struct {
         } }, Span.from(at_tok.offset, fmt_ident.offset + fmt_ident.len));
     }
 
-    fn parseStringInterp(p: *Parser, first_part_tok: Token, format: ?[]const u8) error{ParseFailed}!*Node {
+    fn parseStringInterp(p: *Parser, first_part_tok: Token, format: ?[]const u8, format_span_start: ?u32) error{ParseFailed}!*Node {
         var parts = std.ArrayList(Node.StringPart){};
 
         // First literal part
@@ -1089,10 +1128,15 @@ pub const Parser = struct {
         const parts_slice = parts.toOwnedSlice(p.arena.allocator()) catch &[_]Node.StringPart{};
 
         if (format) |fmt| {
+            // Anchor span at the `@` token (when known) so lowering
+            // can report unknown-format `query_syntax_error` at the
+            // format ident byte (`sp.start + 1`) — see
+            // `src/compiler/lower.zig` `format_string` arm.
+            const span_start = format_span_start orelse first_part_tok.offset;
             return p.createNode(.{ .format_string = .{
                 .format = p.internName(fmt),
                 .parts = parts_slice,
-            } }, Span.from(first_part_tok.offset, p.lex.pos));
+            } }, Span.from(span_start, p.lex.pos));
         }
         return p.createNode(.{ .string_interp = .{
             .parts = parts_slice,
@@ -1614,7 +1658,7 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         "nearbyint",  "trunc",        "significand",   "logb",           "j0",
         "j1",         "lgamma",       "tgamma",        "ascii_downcase", "ascii_upcase",
         "ascii",      "explode",      "implode",       "tojson",         "fromjson",
-        "transpose",  "first",        "last",          "not",
+        "transpose",  "first",        "last",          "not",            "recurse",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;

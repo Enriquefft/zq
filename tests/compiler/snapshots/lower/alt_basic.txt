@@ -1,0 +1,5 @@
+# source: null // 5
+# SemOp
+alt @0..9
+  load_const(null) @0..4
+  load_const(5) @8..9

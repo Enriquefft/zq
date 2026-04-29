@@ -1,0 +1,5 @@
+# source: .foo | .bar
+# SemOp
+pipe @0..11
+  load_field("foo") @0..4
+  load_field("bar") @7..11

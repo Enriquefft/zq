@@ -1,0 +1,3 @@
+# source: null
+# SemOp
+load_const(null) @0..4

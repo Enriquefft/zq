@@ -1,0 +1,4 @@
+# source: -5
+# SemOp
+neg @0..2
+  load_const(5) @1..2

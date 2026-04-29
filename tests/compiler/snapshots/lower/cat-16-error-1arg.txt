@@ -1,0 +1,4 @@
+# source: error("oops")
+# SemOp
+call_builtin("error") @0..13
+  load_const("oops") @6..12

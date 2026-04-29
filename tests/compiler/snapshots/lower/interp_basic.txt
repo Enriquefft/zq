@@ -1,0 +1,6 @@
+# source: "hello \(.name)"
+# SemOp
+interp @1..16
+  load_const("hello ") @1..16
+  load_field("name") @9..14
+  load_const("") @1..16

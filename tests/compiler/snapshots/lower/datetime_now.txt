@@ -1,0 +1,3 @@
+# source: now
+# SemOp
+call_builtin("now") @0..3

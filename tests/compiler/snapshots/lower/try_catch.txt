@@ -1,0 +1,5 @@
+# source: try .x catch "err"
+# SemOp
+try @0..18
+  load_field("x") @4..6
+  load_const("err") @13..18

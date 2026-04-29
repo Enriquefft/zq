@@ -2,7 +2,6 @@ const std = @import("std");
 const query = @import("query");
 const types = @import("types");
 const regex = @import("regex");
-const build_options = @import("build_options");
 
 const CompiledQuery = query.CompiledQuery;
 const Opts = query.Opts;
@@ -702,7 +701,7 @@ test "BUG-005 does not regress BUG-006: {a: (1,2,3)} still compiles" {
 //
 // Pre-fix, any generator yielding N > 1 values inside `{a: <gen>}` raised a
 // runtime `type error` on the second yield. Fix lives in
-// `src/query/src/vm.zig` — `Forkpoint.saved_object` captures the
+// `legacy@22cd23c vm.zig` — `Forkpoint.saved_object` captures the
 // object-construction stacks at fork time; `backtrackToDepth` restores them
 // on every resume path (comma, each, range, alt, regex generators).
 // `saved_stack` was also broadened to fire when inside an object literal so
@@ -2881,12 +2880,6 @@ test "regex disabled build: literal test() surfaces regex_not_compiled" {
     }
 }
 
-test "unused build_options import placeholder" {
-    // Silence unused-import warnings if build_options is not referenced
-    // elsewhere in this test file.
-    _ = build_options;
-}
-
 // ── Runtime regex tests (Phase D) ──────────────────────────────────────────
 
 /// Build a tape holding one string value. Ownership: caller keeps `buf`
@@ -3769,6 +3762,45 @@ fn runNestedObjectCollect(src: []const u8, results: *std.ArrayList([]const u8)) 
         try dumpCompact(&buf, v);
         try results.append(alloc, try alloc.dupe(u8, buf.items));
     }
+}
+
+// ── Builtin: add/1 ────────────────────────────────────────────────────────────
+
+test "builtin: add on input array sums elements" {
+    var q = try compile("add");
+    defer q.deinit();
+
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 10 } },
+        .{ .tag = .int, .payload = .{ .int = 20 } },
+        .{ .tag = .int, .payload = .{ .int = 30 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 60), vals.items[0].int);
+}
+
+test "builtin: add(f) with multi-yield generator argument" {
+    // jq semantics: add(f) == reduce f as $x (null; . + $x).
+    // For f = range(3) on null input, the generator yields 0, 1, 2, so
+    // reduce produces null + 0 + 1 + 2 = 3 (null + n = n on first step).
+    var q = try compile("add(range(3))");
+    defer q.deinit();
+
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[0].int);
 }
 
 test "path(f): path(paths) on nested object yields descent paths" {

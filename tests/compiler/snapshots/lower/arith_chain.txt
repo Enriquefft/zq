@@ -1,0 +1,7 @@
+# source: 1+2*3
+# SemOp
+arith(add) @0..5
+  load_const(1) @0..1
+  arith(mul) @2..5
+    load_const(2) @2..3
+    load_const(3) @4..5

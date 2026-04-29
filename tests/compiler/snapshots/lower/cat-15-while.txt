@@ -1,0 +1,9 @@
+# source: while(.<100; .*2)
+# SemOp
+while @0..17
+  cmp(lt) @6..11
+    identity @6..7
+    load_const(100) @8..11
+  arith(mul) @13..16
+    identity @13..14
+    load_const(2) @15..16

@@ -1,0 +1,5 @@
+# source: true and false
+# SemOp
+logical(and) @0..14
+  load_const(true) @0..4
+  load_const(false) @9..14
