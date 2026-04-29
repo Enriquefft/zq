@@ -3,41 +3,43 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-29 (post G5 land — emit lhs-temp / save_input bracketing, vm slice + iter detail + delpaths msg, pick desugar).
+Last verified: 2026-04-29 (post G6 land — abort+emit cluster, path+clearsPathBroken cluster, autovivify+parser cluster, plus path_end terminal-else pop fix).
 
 ---
 
-## Active compat failures (1 emit residual + 4 path-flavor + 6 newly revealed + L1421 signal-6)
+## Active compat failures (7 newly unmasked from try_catch.zig)
 
-Post-G5 baseline: `zig build test` → 1146/1177 pass, 11 fail + 1 signal-6, 20 skipped.
+Post-G6 baseline: `zig build test` → 1151/1177 pass, 7 fail (all in `tests/compat/try_catch.zig`), 20 skipped. All 12 G6-target tags pass; the 7 remaining fails were masked by L1421's signal-6 in baseline.
 
-### Still failing after G5 (5)
+### Newly revealed by G6 — were masked by L1421 signal-6 in baseline (7)
 
-| Tag | Symptom | Repro | Category | Notes |
-|-----|---------|-------|----------|-------|
-| L878 | filter-param binding still leaks `it.current` into body — emitAsBind fix in G5 covers value-arg as-binds (L725) but the filter-arg call site uses a different emission path | `def x(a;b): a as $a \| b as $b \| $a + $b; def y($a;$b): $a + $b; ...` | Compiler emit | Sibling of fixed L725. Filter-arg `def` lowers to a different emit shape that needs the same save_input/restore_input bracket; not yet wrapped. |
-| L1127 | `path(.a \| map(select(.b == 0)) \| .[0])` — generic "Invalid path expression with result" message; jq says "near attempt to access element 0 of <v>" | `try path(...) catch .` | VM (error message) | Phase 1 inv-path identified `raisePathExprError` at `src/vm/root.zig:7888` needs op-flavor tag captured in PathFrame at the path-break site (`vm/root.zig:1004`). G5 G2 implementer punted on this (claimed they "already pass" — wrong). |
-| L1131 | same flavor as L1127, tail `.c` | `try path(.a \| map(select(.b == 0)) \| .c) catch .` | VM | Same site as L1127. |
-| L1135 | same flavor, tail `.[]` | `try path(.a \| map(select(.b == 0)) \| .[]) catch .` | VM | Same site as L1127. |
-| L1139 | `path(.a[path(.b)[0]])` returns wrong shape — nested-path heuristic at `vm/root.zig:1960-1962` poisons outer frame even when inner result is consumed as int subscript | `path(.a[path(.b)[0]])` on `{a:{b:42}}` | VM (heuristic) | Refine the heuristic — only mark broken if produced value is consumed as path-array, not scalar. |
+Once G6 fixed L1421 (`contains/inside` arity-1 routing), the test runner reached `try_catch.zig` sections that previously never ran. These are pre-existing failures, not regressions.
 
-### Newly revealed by G4+G5 — were masked by signal-6 aborts in baseline (6 + 1 signal-6)
+| Tag | Symptom | Repro | Category | Hypothesis |
+|-----|---------|-------|----------|-----------|
+| L1481 | `try -.? catch .` mismatched output | `try -.? catch .` | error message | unary-minus on non-numeric error string format mismatch vs jq |
+| L1592 | `.[:rindex("x")]` runFilter error | `.[:rindex("x")]` | builtin | `rindex` builtin not implemented |
+| L1668 | `(sort_by(.b) \| sort_by(.a))` etc. — wrong order | sort comparison | builtin | sort stability — zq sort is not stable; jq's sort preserves input order on ties |
+| L1684 | `[min, max, min_by(.[1]), max_by(.[1]), ...]` — last element wrong | min_by/max_by | builtin | tie-breaking semantics in min_by/max_by differ from jq |
+| L1692 | `.foo[.baz]` returns null instead of 4 | computed-field-access | path | computed-field path access on object — `.foo[.baz]` should compute `.baz` against the same input, then index `.foo` by that |
+| L1696 | `.[] \| .error = "no, it's OK"` — string-literal whitespace lost | string parser | parser | string literal interpretation strips whitespace after comma in interpolation context |
+| L1712 (signal 6) | `with_entries(.key \|= "KEY_" + .)` aborts | `with_entries(...)` | builtin | `with_entries` not implemented — falls through to `.not_implemented => unreachable` in lowerBuiltinCall (lower.zig:2253) |
 
-Once G4 fixed L1045 (signal-6 in user_functions) and G5 fixed L1201 (signal-6 in pick), the test runner reached compat sections that previously never ran. These are all pre-existing failures.
+L1712 is the new test-runner abort point. Once fixed, more pre-existing failures may surface (mirroring the L1045 → L1201 → L1421 → L1712 chain).
 
-| Tag | Symptom | Repro |
-|-----|---------|-------|
-| L1258 | `getpath([_a_,0,_b_]) \|= 5` mismatched error string | `.[] \| try (getpath([_a_,0,_b_]) \|= 5) catch .` |
-| L1290 | `((map(select(.a == 1))[].b) = 10)` mismatched output | `try ((map(select(.a == 1))[].b) = 10) catch .` |
-| L1294 | `((map(select(.a == 1))[].a) \|= .+1)` mismatched output | `try ((map(select(.a == 1))[].a) \|= .+1) catch .` |
-| L1302 | `def x: reverse; x=10` runtime error path | `try (def x: reverse; x=10) catch .` |
-| L1306 | `.[] = 1` parser bug — onWantValue rejects | `.[] = 1` |
-| L1322 | `[if 1,null,2 then 3 else 4 end]` VM crash at execOneInner:1292 | `[if 1,null,2 then 3 else 4 end]` |
-| L1421 (signal 6) | `[(_foo_ \| contains(_foo_)), ...]` aborts test runner — comparisons.zig:103 | `[("foo" \| contains("foo")), ...]` |
+### Fixed in G6 round (commits 5d8888b, 2b1fb80, 53f2a67, 0e020c6)
 
-L1421 is the new test-runner abort point. Once fixed, more pre-existing failures may surface (mirroring what L1045 → L1201 → L1421 chain has revealed).
+- L1421 (`contains/inside` arity-1 builtins added to lower + emit dispatch)
+- L1322 (`if-cond` reseed via variable instead of save/restore_input across fork-points)
+- L878 (factored `emitInputScopeBracket`/`emitInputScopeReseed` helpers in emit.zig; applied at filter-arg call sites)
+- L1127 / L1131 / L1135 (PathFrame extended with `break_kind` + `break_source` enum, populated at upstream-value descent ops, dispatched per-kind by `raisePathExprError`)
+- L1139 (path_end nested-path heuristic refined: terminal-output taints outer with `break_kind=.generic`, computed-key consumer pops + skips component append; outer-frame pop in terminal-else added in 0e020c6)
+- L1290 / L1294 (clearsPathBroken refined to consult `break_origin` enum — only clears when same-step-scratch, preserves when upstream-value)
+- L1258 (`getpath` marked path-emitting; `builtinGetpath` populates frame components for autovivify in `getpath(P) |= V`)
+- L1302 (parser dispatches lparen body to parseFilter so leading `def` is accepted before assignment)
+- L1306 (parser accepts `Infinity`, `-Infinity`, `NaN`, `-NaN` JSON literals)
 
-### Fixed in G5 round (commit pending)
+### Fixed in G5 round
 
 L200 (each iter detail), L353 (.arith lhs-temp), L401 (emitFirst empty-stream), L478 (setpath slice arm), L725 (emitAsBind save/restore), L775 (.obj_ctor computed-key save_input), L915 (.arith reduce), L1173 (delpaths msg), L1201 (pick desugar).
 
