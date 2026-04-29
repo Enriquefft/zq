@@ -8,4 +8,3 @@ Last verified: 2026-04-23.
 
 ## Active
 
-- Phase 2R compiler redesign — see `research/phase-2r-compiler-redesign-plan.md`
