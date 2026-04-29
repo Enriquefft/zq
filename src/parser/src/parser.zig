@@ -42,7 +42,7 @@ const NumSubState = enum(u8) {
     exp, // digits in exponent
 };
 
-const KeywordKind = enum(u2) { kw_true, kw_false, kw_null };
+const KeywordKind = enum(u3) { kw_true, kw_false, kw_null, kw_infinity, kw_nan, kw_neg_infinity, kw_neg_nan };
 
 const StateTag = enum(u8) {
     want_value,
@@ -307,6 +307,16 @@ pub const Parser = struct {
                 p.kw_pos = 1;
                 p.state = .in_keyword;
             },
+            'I' => {
+                p.kw_kind = .kw_infinity;
+                p.kw_pos = 1;
+                p.state = .in_keyword;
+            },
+            'N' => {
+                p.kw_kind = .kw_nan;
+                p.kw_pos = 1;
+                p.state = .in_keyword;
+            },
             else => return error.UnexpectedToken,
         }
     }
@@ -514,6 +524,20 @@ pub const Parser = struct {
                     try p.numAppend(byte);
                     p.num_sub = .int;
                 },
+                'I' => {
+                    // -Infinity: abandon number state, switch to keyword.
+                    p.num_buf.clearRetainingCapacity();
+                    p.kw_kind = .kw_neg_infinity;
+                    p.kw_pos = 1;
+                    p.state = .in_keyword;
+                },
+                'N' => {
+                    // -NaN: abandon number state, switch to keyword.
+                    p.num_buf.clearRetainingCapacity();
+                    p.kw_kind = .kw_neg_nan;
+                    p.kw_pos = 1;
+                    p.state = .in_keyword;
+                },
                 else => return error.InvalidNumber,
             },
             .leading_zero => switch (byte) {
@@ -591,12 +615,15 @@ pub const Parser = struct {
         p.kw_pos += 1;
 
         if (p.kw_pos == kw.len) {
-            const tag: types.Tape.Tag = switch (p.kw_kind) {
-                .kw_true => .true_val,
-                .kw_false => .false_val,
-                .kw_null => .null_val,
-            };
-            try p.tape_buf.append(p.allocator, .{ .tag = tag, .payload = PAYLOAD_NONE });
+            switch (p.kw_kind) {
+                .kw_true => try p.tape_buf.append(p.allocator, .{ .tag = .true_val, .payload = PAYLOAD_NONE }),
+                .kw_false => try p.tape_buf.append(p.allocator, .{ .tag = .false_val, .payload = PAYLOAD_NONE }),
+                .kw_null => try p.tape_buf.append(p.allocator, .{ .tag = .null_val, .payload = PAYLOAD_NONE }),
+                .kw_infinity => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = std.math.inf(f64) } }),
+                .kw_nan => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = std.math.nan(f64) } }),
+                .kw_neg_infinity => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = -std.math.inf(f64) } }),
+                .kw_neg_nan => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = -std.math.nan(f64) } }),
+            }
             p.transitionAfterValue();
         }
     }
@@ -746,6 +773,10 @@ pub const Parser = struct {
             .kw_true => "true",
             .kw_false => "false",
             .kw_null => "null",
+            // First byte already consumed by onWantValue or onInNumber .neg case;
+            // kw_pos starts at 1, so match from index 1 of the full keyword.
+            .kw_infinity, .kw_neg_infinity => "Infinity",
+            .kw_nan, .kw_neg_nan => "NaN",
         };
     }
 };
