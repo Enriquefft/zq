@@ -4,7 +4,7 @@
 
 zq parses JSON into a flat tape, compiles jq filters into bytecode, and executes them via a stack-based VM. For JSONL workloads, a fixed-size worker pool splits the input into newline-aligned chunks and processes them in parallel, reordering results before output.
 
-Zig 0.15.2 core. The vendored Rust `regex-automata` shim (`third_party/zq-regex-shim/`) is linked in when `-Dregex=true` (default); `-Dregex=false` builds are dependency-free and regex builtins return `regex_not_compiled`.
+Zig 0.15.0 core. The vendored Rust `regex-automata` shim (`third_party/zq-regex-shim/`) is linked in when `-Dregex=true` (default); `-Dregex=false` builds are dependency-free and regex builtins return `regex_not_compiled`.
 
 ## Data Flow
 
@@ -62,11 +62,21 @@ types    (no deps)          Tape, Value, Format, Instruction, Op, RuntimeTape, B
 io       → error            mmap (files) / ring buffer (pipes)
 parser   → error, types     Streaming state machine → flat Tape
 regex    → error            Vendored Rust regex-automata shim (gated on -Dregex)
-ast      → error            Error-tolerant recursive-descent AST (LSP + prefilter harvester)
-query    → error, types,    Compiler + fuse pass + literal prefilter + bytecode VM
-           ast, regex
+lexer    → error            Tokenizer for jq filter strings
+ast      → lexer, error,    Error-tolerant recursive-descent AST (LSP + prefilter harvester)
+           types
+prefilter → regex, ast      Literal set, AST-based harvestFromAstRoot, acceptance check
+compiler → ast, types,      AST → IR (lower), fuse pass, IR → bytecode (emit)
+           error, regex,
+           prefilter
+vm       → error, types,    Stack-based bytecode executor; unified fork stack
+           regex
+query    → error, types,    Compile dispatcher + bytecode VM execution
+           lexer, regex, vm,
+           ast, prefilter,
+           compiler
 output   → error, types     Buffered serialization, generic over sink type
-describe → parser, types    Schema inference for --describe
+describe → types            Schema inference for --describe
 pool     → io, parser,      Worker pool, Sequencer, InFlightLimiter, madvise(MADV_DONTNEED)
            query, output
 lsp      → ast, query       JSON-RPC server: diagnostics/completion/hover/...
@@ -75,7 +85,7 @@ c_abi    → error, types,    C ABI bridge: zq_compile/zq_compile_ext/zq_execute
 main     → all              CLI arg parsing, routing, --lsp entry
 ```
 
-Each module's public API, constraints, and invariants: `src/[module]/INTERFACE.md`
+Each module's public API, constraints, and invariants: `src/[module]/INTERFACE.md` (gaps: compiler, vm, lexer, prefilter, describe, microbench have no INTERFACE.md yet).
 
 ### error
 
@@ -117,11 +127,13 @@ Depth limit: 512. Not thread-safe — each worker owns its own instance.
 
 ### query
 
-Three phases:
+Five stages (Phase 2R pipeline):
 
-1. **Lexer** — tokenizes filter string. Handles string literals, operators, keywords, field names, numbers.
-2. **Compiler** — recursive descent → bytecode. Includes a **fuse pass**: `.a | .b | .c` collapsed into a single `load_path` instruction.
-3. **VM** — stack-based execution. Filters are generators (0..N outputs per input). Eval stack, value stack, unified fork stack (subsumes the former try/collect/if stacks — one `Forkpoint` type handles backtracking for try/catch, alternative, generators, and collect).
+1. **Parse** — `ast.parse(src)` produces an error-tolerant AST (`src/ast/`).
+2. **Lower** — AST → IR via `src/compiler/lower.zig`. Scope and variable resolution happen here.
+3. **Fuse** — IR rewrite pass collapses `.a | .b | .c` into `load_path` (`src/compiler/fuse.zig`).
+4. **Emit** — IR → bytecode (`Compiled`) via `src/compiler/emit.zig`.
+5. **VM** — `src/vm/root.zig` executes bytecode; stack-based, unified fork stack for backtracking (subsumes former try/collect/if stacks).
 
 `CompiledQuery` is immutable after compile — thread-safe for concurrent `execute()` calls. Each `execute()` produces an independent `ResultIterator`.
 
@@ -160,7 +172,7 @@ Compat delta vs jq/Onig: no backreferences in patterns, no lookaround, no `\g<na
 Error-tolerant recursive-descent parser (`src/ast/`). One AST, two consumers:
 
 1. **LSP** — drives diagnostics, hover, completion, definition, references, rename, signature help, semantic tokens, formatting. The AST survives partial input so the editor gets useful suggestions mid-keystroke.
-2. **Query compiler's literal-prefilter harvester** — walks the AST to find `select(X | test("literal"))` idioms, decodes `\uXXXX` escapes in the literal, and hands the byte sequence(s) to the pool for pre-parse raw-byte scanning.
+2. **Query compiler's literal-prefilter harvester** — two paths: legacy AST-walk in `src/prefilter/root.zig` (`harvestFromAstRoot`) and Phase-2R IR-walk in `src/compiler/harvest.zig` (walks IR after lower+fuse, avoids re-parsing). Both find `select(X | test("literal"))` idioms, decode `\uXXXX` escapes, and hand the byte sequence(s) to the pool for pre-parse raw-byte scanning.
 
 Single source of truth: both surfaces consume the same parser. A fix to AST handling improves LSP diagnostics and prefilter accuracy simultaneously.
 
@@ -261,7 +273,7 @@ The prefilter MUST NEVER produce false negatives. Two guarantees make this safe:
 
 The net effect on low-selectivity queries like `select(.message | test("CRITICAL"))` is that the slow paths (JSON parse, regex engine) only run on candidate records. End-to-end `test()` speedups reach ~47x vs jq on workloads where most records lack the literal.
 
-Implementation: `src/prefilter/root.zig` (literal set, harvesting, acceptance check). Pool integration: `src/pool/root.zig` (`prefilter_stats` counters and the per-chunk acceptance loop).
+Implementation: `src/prefilter/root.zig` (literal set data structure, AST-based `harvestFromAstRoot`, acceptance check); `src/compiler/harvest.zig` (IR-based harvest for Phase-2R compile path). Pool integration: `src/pool/root.zig` (`prefilter_stats` counters and the per-chunk acceptance loop).
 
 ### Arena-per-chunk with atomic deallocation
 
