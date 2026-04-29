@@ -76,6 +76,33 @@ const LimitState = struct {
     saved_collect_len: u32,
 };
 
+/// Classifies what kind of path-breaking access was attempted, so
+/// `raisePathExprError` can emit jq's per-access diagnostic messages.
+const PathBreakKind = enum {
+    /// Generic: "Invalid path expression with result <v>"
+    generic,
+    /// "Invalid path expression near attempt to access element <N> of <src>"
+    index_n,
+    /// "Invalid path expression near attempt to access element \"<k>\" of <src>"
+    key_s,
+    /// "Invalid path expression near attempt to iterate through <src>"
+    iterate,
+};
+
+/// Tracks whether the path_broken flag was set by an upstream call_builtin
+/// (whose output is being descended into) or by a same-step literal/arith
+/// (a scratch value used only as a key/predicate). Only the former prevents
+/// clearsPathBroken from resetting the flag — a scratch literal break is
+/// legitimately absorbed by the descent op that follows it.
+const PathBreakOrigin = enum {
+    /// Arithmetic, literals, or comparisons used to compute a key/index.
+    /// The descent op that follows MAY clear path_broken.
+    same_step_scratch,
+    /// An upstream call_builtin produced the value being navigated.
+    /// The descent op must NOT clear path_broken.
+    upstream_value,
+};
+
 /// State for path(f) tracking. Pushed by path_begin, popped by path_end.
 const PathFrame = struct {
     components: std.ArrayList(Value),
@@ -84,9 +111,20 @@ const PathFrame = struct {
     saved_value_stack_len: u32,
     /// Set when a path-breaking opcode (`types.Instruction.Op.breaksPath`)
     /// fires while this frame is innermost. `path_end` consults the flag to
-    /// raise jq's "Invalid path expression with result <tojson>" error.
+    /// raise jq's "Invalid path expression" error.
     /// Reset across generator iterations via `PathSnapshot` save/restore.
     path_broken: bool = false,
+    /// Classifies why path_broken was set; consulted by clearsPathBroken
+    /// logic and raisePathExprError for per-kind diagnostic messages.
+    break_origin: PathBreakOrigin = .same_step_scratch,
+    /// What kind of access was attempted when path broke.
+    break_kind: PathBreakKind = .generic,
+    /// The value being navigated when path broke (used in error messages).
+    break_source: Value = .null_val,
+    /// Populated when break_kind == .index_n.
+    break_index_n: i64 = 0,
+    /// Populated when break_kind == .key_s; points into string_buf.
+    break_key_s: []const u8 = &.{},
     /// True when the body is a path-emitting builtin (`paths`, `leaf_paths`,
     /// `..`/`recurse`) whose per-iteration current value already IS the path
     /// array for this `path(f)` call. `path_end` yields that value directly
@@ -95,6 +133,12 @@ const PathFrame = struct {
     /// each-iteration forkpoint must avoid appending an index/key component
     /// when this flag is set — see `advanceEachForkpoint` and `.each`.
     body_emits_paths_directly: bool = false,
+    /// Set when an inner path(f) result is being consumed as a computed key
+    /// (e.g. path(.a[path(.b)[0]])). While set, descent ops skip recording
+    /// path components — the intervening load_index/load_computed ops that
+    /// index the inner path result array are meta-level, not path descents.
+    /// Cleared by the `load_computed` that consumes the key.
+    skip_components_for_computed_key: bool = false,
 
     fn deinit(self: *PathFrame, alloc: std.mem.Allocator) void {
         self.components.deinit(alloc);
@@ -264,6 +308,12 @@ const PathSnapshot = struct {
     /// backtrack so generators like `path(.[])` start each iteration with a
     /// clean flag (the prior iteration's broken side-path can't leak).
     path_broken: bool = false,
+    break_origin: PathBreakOrigin = .same_step_scratch,
+    break_kind: PathBreakKind = .generic,
+    break_source: Value = .null_val,
+    break_index_n: i64 = 0,
+    break_key_s: []const u8 = &.{},
+    skip_components_for_computed_key: bool = false,
 };
 
 const Forkpoint = struct {
@@ -700,6 +750,12 @@ pub const ResultIterator = struct {
             .stack_len = @intCast(it.path_stack.items.len),
             .components_len = @intCast(frame.components.items.len),
             .path_broken = frame.path_broken,
+            .break_origin = frame.break_origin,
+            .break_kind = frame.break_kind,
+            .break_source = frame.break_source,
+            .break_index_n = frame.break_index_n,
+            .break_key_s = frame.break_key_s,
+            .skip_components_for_computed_key = frame.skip_components_for_computed_key,
         };
     }
 
@@ -721,6 +777,12 @@ pub const ResultIterator = struct {
                 frame.components.shrinkRetainingCapacity(snap.components_len);
             }
             frame.path_broken = snap.path_broken;
+            frame.break_origin = snap.break_origin;
+            frame.break_kind = snap.break_kind;
+            frame.break_source = snap.break_source;
+            frame.break_index_n = snap.break_index_n;
+            frame.break_key_s = snap.break_key_s;
+            frame.skip_components_for_computed_key = snap.skip_components_for_computed_key;
         }
     }
 
@@ -891,12 +953,15 @@ pub const ResultIterator = struct {
 
                 // No forkpoints — check for collect frame finalization.
                 if (it.collect_stack.items.len > 0) {
-                    var completed = it.collect_stack.pop().?;
-                    defer completed.buffer.deinit(it.alloc);
-                    const arr_val = try it.buildCollectedArray(&completed);
-                    it.pushValue(arr_val);
-                    it.if_stack.items.len = completed.outer_if_depth;
-                    it.ip = completed.end_ip + 1;
+                    const end_ip = it.collect_stack.items[it.collect_stack.items.len - 1].end_ip;
+                    const outer_if_depth = it.collect_stack.items[it.collect_stack.items.len - 1].outer_if_depth;
+                    it.if_stack.items.len = outer_if_depth;
+                    // Jump to the matching array_collect_end instruction so it
+                    // executes through execOne. This ensures path-tracking hooks
+                    // (breaksPath / clearsPathBroken) fire just as they would in
+                    // the non-generator code path, avoiding the need to duplicate
+                    // the path_broken=upstream_value logic here.
+                    it.ip = end_ip;
                     continue;
                 }
 
@@ -1001,13 +1066,41 @@ pub const ResultIterator = struct {
             const is_path_emit = instr.op == .call_builtin and
                 callBuiltinIsPathEmittingInFrame(types.builtinIdOf(instr.operand.index));
             if (!is_path_emit) {
-                it.path_stack.items[it.path_stack.items.len - 1].path_broken = true;
+                const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                frame.path_broken = true;
+                // Ops that produce a derived container value (array/object
+                // constructor end, most builtins) cannot legitimately be
+                // navigated as path steps. Mark as upstream so that
+                // clearsPathBroken is suppressed when a descent op follows.
+                // The break_source (value being navigated) is recorded by
+                // the descent op itself (it.current at that point).
+                // Literals and arithmetic are same-step scratch: a following
+                // descent op is using them as a computed key and CAN clear.
+                // Array/object constructors produce derived containers that
+                // cannot be navigated as path steps — mark as upstream so
+                // clearsPathBroken is suppressed when a descent op follows.
+                // call_builtin, literals, and arithmetic are same-step
+                // scratch: the descent op is computing a key and CAN clear.
+                if (instr.op == .array_collect_end or
+                    instr.op == .object_construct_end)
+                {
+                    frame.break_origin = .upstream_value;
+                } else {
+                    frame.break_origin = .same_step_scratch;
+                }
             }
         }
 
         const result = try it.execOneInner(instr);
         if (it.path_stack.items.len > 0 and instr.op.clearsPathBroken()) {
-            it.path_stack.items[it.path_stack.items.len - 1].path_broken = false;
+            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+            // Only clear path_broken for same-step scratch (literals/arith
+            // used to compute a key). When break_origin is upstream_value
+            // (a value that was piped to become the navigation source), the
+            // descent op is navigating a non-path value — don't clear.
+            if (frame.break_origin == .same_step_scratch) {
+                frame.path_broken = false;
+            }
         }
         return result;
     }
@@ -1036,6 +1129,26 @@ pub const ResultIterator = struct {
 
             .load_key => {
                 const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
+                // When an upstream call_builtin has broken the path, a key
+                // descent on its result cannot represent a valid path step.
+                // Record the per-kind break details and defer the error to
+                // path_end. Skip the actual lookup and push null as a
+                // placeholder so the instruction stream remains consistent.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    if (frame.path_broken and frame.break_origin == .upstream_value) {
+                        // Only record key_s details if no more-specific
+                        // break_kind was already recorded (e.g. by 'each').
+                        if (frame.break_kind == .generic) {
+                            frame.break_kind = .key_s;
+                            frame.break_key_s = key;
+                            frame.break_source = it.current;
+                        }
+                        it.pushValue(.{ .tape_value = .null_val });
+                        it.ip += 1;
+                        return null;
+                    }
+                }
                 const result = lookupKeyInValue(
                     &it.tape,
                     it.nullAllowed(),
@@ -1047,10 +1160,13 @@ pub const ResultIterator = struct {
                     }
                     return err;
                 };
-                // Record path component if path tracking is active.
+                // Record path component if path tracking is active and not
+                // suppressed for computed-key meta-ops.
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    try frame.components.append(it.alloc, .{ .string = key });
+                    if (!frame.skip_components_for_computed_key) {
+                        try frame.components.append(it.alloc, .{ .string = key });
+                    }
                 }
                 // Push result to value stack. Do NOT update it.current here — the
                 // pipe opcode (or explicit | between stages) is responsible for
@@ -1064,10 +1180,29 @@ pub const ResultIterator = struct {
 
             .load_index => {
                 const idx = instr.operand.index;
+                // When an upstream call_builtin has broken the path, record
+                // per-kind break details. The actual load still executes so
+                // the value stack stays consistent; path_end raises the error.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    if (frame.path_broken and frame.break_origin == .upstream_value) {
+                        // Only record index_n details if no more-specific
+                        // break_kind was already recorded (e.g. by 'each').
+                        if (frame.break_kind == .generic) {
+                            frame.break_kind = .index_n;
+                            frame.break_index_n = idx;
+                            frame.break_source = it.current;
+                        }
+                    }
+                }
                 const idx_result = try it.doLoadIndex(idx);
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    try frame.components.append(it.alloc, .{ .int = idx });
+                    const skip = frame.skip_components_for_computed_key or
+                        (frame.path_broken and frame.break_origin == .upstream_value);
+                    if (!skip) {
+                        try frame.components.append(it.alloc, .{ .int = idx });
+                    }
                 }
                 it.pushValue(try valueToStackValue(idx_result));
                 it.ip += 1;
@@ -1075,6 +1210,14 @@ pub const ResultIterator = struct {
             },
 
             .load_computed => {
+                // When an inner path(f) result was consumed as the computed
+                // key, the skip_components flag on the outer frame was set to
+                // suppress meta-level descent ops (load_index on path array).
+                // Clear it here so this load_computed records its component.
+                if (it.path_stack.items.len > 0) {
+                    it.path_stack.items[it.path_stack.items.len - 1]
+                        .skip_components_for_computed_key = false;
+                }
                 // Key/index: pop from value_stack if non-empty, else use current.
                 const key_sv = if (it.value_stack.items.len > 0)
                     try it.popValue()
@@ -1949,16 +2092,40 @@ pub const ResultIterator = struct {
                 else
                     try it.buildPathArray(frame.components.items);
                 it.pushValue(try valueToStackValue(path_arr));
-                // Nested path(path(f)): the value we just pushed is an
-                // array, which isn't a legitimate path component for the
-                // enclosing path() frame. The inner frame is NOT popped
-                // here (generators inside need it alive across backtracks —
-                // path_scope sentinel pops it on outer backtrack), so the
-                // outer path_end re-inspects the same frame as "innermost".
-                // Mark it broken so the outer path_end raises jq's
-                // "Invalid path expression with result <tojson>" error.
+                // Nested path(path(f)):
+                // Determine whether the inner path result is being consumed
+                // as a computed key/index for the outer path (e.g.
+                // path(.a[path(.b)[0]])) or is the outer body's terminal
+                // output (e.g. path(path(.a))). We scan past pipe/identity
+                // to find the next meaningful op.
                 if (it.path_stack.items.len >= 2) {
-                    frame.path_broken = true;
+                    var scan_ip = it.ip + 1;
+                    while (scan_ip < it.instructions.len) {
+                        const sop = it.instructions[scan_ip].op;
+                        if (sop == .pipe or sop == .identity) {
+                            scan_ip += 1;
+                        } else break;
+                    }
+                    const meaningful_clears = scan_ip < it.instructions.len and
+                        it.instructions[scan_ip].op.clearsPathBroken();
+                    if (meaningful_clears) {
+                        // Inner path result is consumed as computed key.
+                        // Pop inner frame so subsequent descent ops append
+                        // to the outer frame. Set skip_components flag on
+                        // outer frame to suppress recording the meta-level
+                        // ops (load_index on path array, etc.) until
+                        // load_computed consumes the key.
+                        var inner_frame = it.path_stack.pop().?;
+                        inner_frame.deinit(it.alloc);
+                        const outer = &it.path_stack.items[it.path_stack.items.len - 1];
+                        outer.skip_components_for_computed_key = true;
+                    } else {
+                        // Terminal: inner path result is the outer body's
+                        // output. Mark the OUTER frame broken.
+                        const outer = &it.path_stack.items[it.path_stack.items.len - 2];
+                        outer.path_broken = true;
+                        outer.break_origin = .upstream_value;
+                    }
                 }
                 it.ip += 1;
                 return null;
@@ -2017,6 +2184,22 @@ pub const ResultIterator = struct {
             },
 
             .each => {
+                // When an upstream call_builtin has broken the path, iterating
+                // through its result cannot represent a valid path step.
+                // Record break_kind=.iterate and defer the error to path_end.
+                if (it.path_stack.items.len > 0) {
+                    const ef = &it.path_stack.items[it.path_stack.items.len - 1];
+                    if (ef.path_broken and ef.break_origin == .upstream_value) {
+                        ef.break_kind = .iterate;
+                        ef.break_source = it.current;
+                        // Skip the iteration entirely and let path_end raise the
+                        // error. We backtrack past any generator context so the
+                        // path frame's path_broken is preserved for path_end.
+                        // Continue execution without forking — path_end sees the flag.
+                        it.ip += 1;
+                        return null;
+                    }
+                }
                 switch (it.current) {
                     .array => |span| {
                         const first = span.start + 1;
@@ -8012,14 +8195,51 @@ pub const ResultIterator = struct {
         return error.UserError;
     }
 
-    /// Set `user_error_msg` to jq's "Invalid path expression with result <v>"
-    /// where `<v>` is the compact JSON serialization of the body's result.
+    /// Set `user_error_msg` to jq's path-expression error, dispatching on
+    /// the innermost PathFrame's break_kind for the correct diagnostic:
+    ///   generic  → "Invalid path expression with result <result>"
+    ///   index_n  → "Invalid path expression near attempt to access element <N> of <src>"
+    ///   key_s    → "Invalid path expression near attempt to access element \"<k>\" of <src>"
+    ///   iterate  → "Invalid path expression near attempt to iterate through <src>"
+    /// `result` is the body's final value (used only for the generic case).
     /// Caller returns `error.UserError`.
     fn raisePathExprError(it: *ResultIterator, result: Value) ZqError!void {
         var buf = std.ArrayList(u8){};
         defer buf.deinit(it.alloc);
-        try buf.appendSlice(it.alloc, "Invalid path expression with result ");
-        try serializeValueCompact(&buf, it.alloc, result);
+        const frame = if (it.path_stack.items.len > 0)
+            &it.path_stack.items[it.path_stack.items.len - 1]
+        else
+            null;
+        const kind: PathBreakKind = if (frame) |f| f.break_kind else .generic;
+        switch (kind) {
+            .generic => {
+                try buf.appendSlice(it.alloc, "Invalid path expression with result ");
+                try serializeValueCompact(&buf, it.alloc, result);
+            },
+            .index_n => {
+                const src = if (frame) |f| f.break_source else result;
+                const idx = if (frame) |f| f.break_index_n else 0;
+                try buf.appendSlice(it.alloc, "Invalid path expression near attempt to access element ");
+                var idx_buf: [32]u8 = undefined;
+                const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{idx}) catch unreachable;
+                try buf.appendSlice(it.alloc, idx_str);
+                try buf.appendSlice(it.alloc, " of ");
+                try serializeValueCompact(&buf, it.alloc, src);
+            },
+            .key_s => {
+                const src = if (frame) |f| f.break_source else result;
+                const key = if (frame) |f| f.break_key_s else "";
+                try buf.appendSlice(it.alloc, "Invalid path expression near attempt to access element \"");
+                try buf.appendSlice(it.alloc, key);
+                try buf.appendSlice(it.alloc, "\" of ");
+                try serializeValueCompact(&buf, it.alloc, src);
+            },
+            .iterate => {
+                const src = if (frame) |f| f.break_source else result;
+                try buf.appendSlice(it.alloc, "Invalid path expression near attempt to iterate through ");
+                try serializeValueCompact(&buf, it.alloc, src);
+            },
+        }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
         it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
     }
