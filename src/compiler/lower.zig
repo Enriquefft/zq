@@ -81,6 +81,17 @@ pub const FilterArgBinding = struct {
     name: []const u8,
     arg_ast: *const Node,
     bindings_floor_at_capture: u32,
+    /// Snapshot of `var_table` at the time the binding was captured —
+    /// i.e. the *caller's* var-name → var-id mapping at the point the
+    /// filter-arg expression was passed in. `reLowerFilterArg` swaps
+    /// to this table during the re-walk so `$x` references inside the
+    /// captured AST resolve against the caller's scope rather than
+    /// the callee's (which may have rebound `x` via `as $x` or via a
+    /// value param). Mirrors jq's lex-pos snapshot semantics
+    /// (parser.y `Expr "as" Patterns '|' Query` + compile.c
+    /// `block_bind_subblock`); without this, `def f(x): 1 as $x | x;
+    /// 2000 as $x | f($x)` returns 1 instead of 2000.
+    var_table_at_capture: std.StringHashMapUnmanaged(u32),
 };
 
 /// User-function table entry (cat-9). Owns the params + body AST
@@ -3434,10 +3445,20 @@ fn inlineUserCall(
 
     for (params, args) |param, arg_ast| {
         if (!param.is_filter) continue;
+        // Snapshot caller's var_table at capture so the filter-arg
+        // re-walk later resolves `$x` against the caller's scope, not
+        // the callee's (which may rebind `x` via `as $x` or value
+        // params — see `FilterArgBinding.var_table_at_capture` doc).
+        var captured_vars: std.StringHashMapUnmanaged(u32) = .{};
+        var src_it = saved_var_table.iterator();
+        while (src_it.next()) |kv| {
+            try captured_vars.put(alloc, kv.key_ptr.*, kv.value_ptr.*);
+        }
         try ctx.filter_arg_bindings.append(alloc, .{
             .name = param.name,
             .arg_ast = arg_ast,
             .bindings_floor_at_capture = saved_bindings_len,
+            .var_table_at_capture = captured_vars,
         });
     }
 
@@ -3702,7 +3723,14 @@ fn reLowerFilterArg(ctx: *Lowerer, binding_idx: u32) LowerError!u32 {
     const binding = ctx.filter_arg_bindings.items[binding_idx];
     const saved_len: u32 = @intCast(ctx.filter_arg_bindings.items.len);
     ctx.filter_arg_bindings.items.len = binding.bindings_floor_at_capture;
+    // Swap to the var_table snapshot taken at the binding's capture
+    // site — `$x` (and bare-ident shadows of `$x`) references inside
+    // the captured AST must resolve against the caller's scope, not
+    // the callee's. Restore the callee's table after the re-walk.
+    const saved_var_table = ctx.var_table;
+    ctx.var_table = binding.var_table_at_capture;
     const result = try lowerNode(ctx, binding.arg_ast);
+    ctx.var_table = saved_var_table;
     ctx.filter_arg_bindings.items.len = saved_len;
     return result;
 }
