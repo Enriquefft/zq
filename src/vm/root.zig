@@ -3791,8 +3791,13 @@ pub const ResultIterator = struct {
                 // Pass through current value (debug is a no-op for now)
                 return try valueToStackValue(it.current);
             },
-            .input_, .inputs_ => {
-                // Produce empty — not applicable in query context
+            .input_ => {
+                // jq raises a catchable "break" error when there are no more inputs.
+                // This matches jq 1.8 behaviour: `try input catch .` → "break".
+                return try it.raiseUserError("break");
+            },
+            .inputs_ => {
+                // `inputs` (plural) silently produces nothing when exhausted.
                 it.ip = @intCast(it.instructions.len);
                 return null;
             },
