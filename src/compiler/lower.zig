@@ -750,40 +750,103 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             });
         },
 
-        // ── Logical `and` / `or` (category 5) ──────────────────────
-        // Single `logical` op; `extra_data[extra]` holds the
-        // `LogicalKind` discriminant (and/or). Legacy emits the runtime
-        // `and_op`/`or_op` opcodes which evaluate both sides eagerly
-        // — jq does NOT short-circuit at the bytecode level
-        // (`src/query/src/vm.zig:6575-6589`). The new compiler matches
-        // that emission shape so VM-equivalence holds byte-for-byte.
+        // ── Logical `and` / `or` (category 5) — short-circuit desugar ──
+        //
+        // jq's `and`/`or` short-circuit: when the LHS fully determines
+        // the result, RHS is NOT evaluated. The old `.logical` IR node
+        // (and the `and_op`/`or_op` VM opcodes it maps to) evaluated
+        // both operands eagerly, causing TypeErrors on RHS expressions
+        // like `has("b")` when the input is not an object but the LHS
+        // `type == "object"` was already false (L2126).
+        //
+        // Fix: desugar to nested `if-then-else` at lower time (same
+        // pattern as INDEX/JOIN/IN/isempty). `if` naturally short-
+        // circuits: the else branch never executes when the condition is
+        // truthy, and the then branch never executes when it is falsy.
+        //
+        //   A and B  →  if A then (if B then true else false end)
+        //               else false end
+        //
+        //   A or B   →  if A then true
+        //               else (if B then true else false end) end
+        //
+        // Both forms coerce to a proper boolean, matching jq's contract.
+        // Per jq spec: only `false` and `null` are falsy; everything
+        // else (0, "", [], {}) is truthy. The `if` VM opcode uses exactly
+        // that truthiness test (`isCondTruthy`), so coercion is free.
         .and_expr => |bn| {
-            const left = try lowerNode(ctx, bn.left);
-            const right = try lowerNode(ctx, bn.right);
             const alloc = ctx.arena.allocator();
-            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
-            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LogicalKind.and_));
-            return ctx.pushNode(.{
-                .op = .logical,
-                .children = .{ left, right },
-                .extra = extra_idx,
-                .src_start = sp.start,
-                .src_len = sp.len,
-            });
+
+            // Leaf: `true` and `false` boolean literal nodes
+            const true_node = try alloc.create(ast.Node);
+            true_node.* = .{ .kind = .{ .literal = .{ .bool_val = true } }, .span = ast.Span.empty() };
+            const false_node_inner = try alloc.create(ast.Node);
+            false_node_inner.* = .{ .kind = .{ .literal = .{ .bool_val = false } }, .span = ast.Span.empty() };
+            const false_node_outer = try alloc.create(ast.Node);
+            false_node_outer.* = .{ .kind = .{ .literal = .{ .bool_val = false } }, .span = ast.Span.empty() };
+
+            // Inner: `if B then true else false end`
+            const inner_if = try alloc.create(ast.Node);
+            inner_if.* = .{
+                .kind = .{ .if_expr = .{
+                    .cond = bn.right,
+                    .then_body = true_node,
+                    .elif_chains = &.{},
+                    .else_body = false_node_inner,
+                } },
+                .span = ast.Span.empty(),
+            };
+
+            // Outer: `if A then <inner_if> else false end`
+            const outer_if = try alloc.create(ast.Node);
+            outer_if.* = .{
+                .kind = .{ .if_expr = .{
+                    .cond = bn.left,
+                    .then_body = inner_if,
+                    .elif_chains = &.{},
+                    .else_body = false_node_outer,
+                } },
+                .span = ast.Span.empty(),
+            };
+
+            return lowerNode(ctx, outer_if);
         },
         .or_expr => |bn| {
-            const left = try lowerNode(ctx, bn.left);
-            const right = try lowerNode(ctx, bn.right);
             const alloc = ctx.arena.allocator();
-            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
-            try ctx.out.extra_data.append(alloc, @intFromEnum(ir.LogicalKind.or_));
-            return ctx.pushNode(.{
-                .op = .logical,
-                .children = .{ left, right },
-                .extra = extra_idx,
-                .src_start = sp.start,
-                .src_len = sp.len,
-            });
+
+            // Leaf: `true` and `false` boolean literal nodes
+            const true_node_outer = try alloc.create(ast.Node);
+            true_node_outer.* = .{ .kind = .{ .literal = .{ .bool_val = true } }, .span = ast.Span.empty() };
+            const true_node_inner = try alloc.create(ast.Node);
+            true_node_inner.* = .{ .kind = .{ .literal = .{ .bool_val = true } }, .span = ast.Span.empty() };
+            const false_node = try alloc.create(ast.Node);
+            false_node.* = .{ .kind = .{ .literal = .{ .bool_val = false } }, .span = ast.Span.empty() };
+
+            // Inner: `if B then true else false end`
+            const inner_if = try alloc.create(ast.Node);
+            inner_if.* = .{
+                .kind = .{ .if_expr = .{
+                    .cond = bn.right,
+                    .then_body = true_node_inner,
+                    .elif_chains = &.{},
+                    .else_body = false_node,
+                } },
+                .span = ast.Span.empty(),
+            };
+
+            // Outer: `if A then true else <inner_if> end`
+            const outer_if = try alloc.create(ast.Node);
+            outer_if.* = .{
+                .kind = .{ .if_expr = .{
+                    .cond = bn.left,
+                    .then_body = true_node_outer,
+                    .elif_chains = &.{},
+                    .else_body = inner_if,
+                } },
+                .span = ast.Span.empty(),
+            };
+
+            return lowerNode(ctx, outer_if);
         },
 
         // ── Alternative `//` (category 5) ──────────────────────────

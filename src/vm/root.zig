@@ -31,7 +31,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, path_scope, scan, match_g, splits };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, path_scope, scan, match_g, splits, recurse_path };
 
 const EachState = struct {
     pos: u32,
@@ -283,6 +283,41 @@ const SplitsState = struct {
     n_flag: bool = false,
 };
 
+/// One (value, path-components) pair collected by `..` (recurse) when it runs
+/// inside a `path(f)` frame. The path components are a heap-allocated slice of
+/// `Value` (int / string elements only); the value is a `Value` borrowed from
+/// the tape (lifetime = this `next()` call). Both stay valid across the full
+/// fork iteration since no tape compaction occurs within a single `next()`.
+const RecursePathEntry = struct {
+    /// The actual data value at this point in the DFS walk. Downstream filters
+    /// (e.g. `select(type == "object")`) operate on this value, not the path.
+    value: Value,
+    /// Path components from root to this node. Slice owned by the RecursePathState.
+    path_comps: []Value,
+};
+
+/// Fork state for `..` (recurse) inside a `path(f)` frame. Unlike the normal
+/// `body_emits_paths_directly` mode (which sets `it.current` to the path array
+/// itself and breaks any downstream filter), this mode keeps `it.current` as the
+/// actual value and repopulates `frame.components` from `path_comps` before each
+/// iteration — allowing `select`, type tests, and field access to work correctly.
+const RecursePathState = struct {
+    /// All (value, path) pairs collected via DFS. Slice owned by this struct.
+    items: []RecursePathEntry,
+    /// Index of the current entry (the one whose value is in `it.current` right now).
+    index: usize,
+    /// Allocator used to free `items` and each entry's `path_comps` when the
+    /// forkpoint is popped.
+    alloc: std.mem.Allocator,
+
+    fn deinit(self: *RecursePathState) void {
+        for (self.items) |entry| {
+            self.alloc.free(entry.path_comps);
+        }
+        self.alloc.free(self.items);
+    }
+};
+
 const ForkAux = union(ForkType) {
     normal: void,
     each: EachState,
@@ -312,6 +347,11 @@ const ForkAux = union(ForkType) {
     /// State for `splits(pattern; flags)` generator iterations. Yields each
     /// segment between matches plus the trailing tail.
     splits: SplitsState,
+    /// State for `..` (recurse) inside a `path(f)` frame. Stores all DFS
+    /// (value, path) pairs so downstream filters see actual values (not
+    /// pre-built path arrays) while `frame.components` is set correctly per
+    /// iteration for `path_end` to reconstruct the path.
+    recurse_path: RecursePathState,
 };
 
 /// Snapshot of the path-tracking state at the time a fork was created.
@@ -477,6 +517,11 @@ pub const ResultIterator = struct {
     /// Stack of saved `current` values for if/elif branch restoration.
     /// save_input pushes; restore_input pops.
     if_stack: std.ArrayList(Value),
+    /// Parallel to if_stack: stores the innermost path frame's components.items.len
+    /// at the time of save_input (or maxInt(u32) when no path frame is active).
+    /// restore_input truncates frame.components back to this length, preventing
+    /// navigations inside if/elif conditions from polluting the path component list.
+    if_path_comps_stack: std.ArrayList(u32),
     /// Active array collection frames. Pushed by array_collect_start.
     collect_stack: std.ArrayList(CollectFrame),
     /// Active call frames for user-defined recursive function calls.
@@ -567,6 +612,11 @@ pub const ResultIterator = struct {
         errdefer if_stack.deinit(allocator);
         try if_stack.ensureTotalCapacity(allocator, max_stack_depth);
 
+        // Initialize parallel path-components save stack for if-branch restoration
+        var if_path_comps_stack = std.ArrayList(u32){};
+        errdefer if_path_comps_stack.deinit(allocator);
+        try if_path_comps_stack.ensureTotalCapacity(allocator, max_stack_depth);
+
         // Initialize array collect stack (nesting depth rarely exceeds 8)
         var collect_stack = std.ArrayList(CollectFrame){};
         errdefer collect_stack.deinit(allocator);
@@ -615,6 +665,7 @@ pub const ResultIterator = struct {
             .object_construct_depth = object_construct_depth,
             .object_construct_input = object_construct_input,
             .if_stack = if_stack,
+            .if_path_comps_stack = if_path_comps_stack,
             .collect_stack = collect_stack,
             .call_stack = call_stack,
             .fork_stack = fork_stack,
@@ -676,6 +727,7 @@ pub const ResultIterator = struct {
         it.object_construct_depth.deinit(it.alloc);
         it.object_construct_input.deinit(it.alloc);
         it.if_stack.deinit(it.alloc);
+        it.if_path_comps_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
         it.call_stack.deinit(it.alloc);
@@ -683,6 +735,10 @@ pub const ResultIterator = struct {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
             if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
+            switch (fp.aux) {
+                .recurse_path => |*state| state.deinit(),
+                else => {},
+            }
         }
         it.fork_stack.deinit(it.alloc);
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
@@ -725,6 +781,7 @@ pub const ResultIterator = struct {
         it.object_construct_depth.clearRetainingCapacity();
         it.object_construct_input.clearRetainingCapacity();
         it.if_stack.clearRetainingCapacity();
+        it.if_path_comps_stack.clearRetainingCapacity();
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
         it.call_stack.clearRetainingCapacity();
@@ -732,6 +789,10 @@ pub const ResultIterator = struct {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
             if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
+            switch (fp.aux) {
+                .recurse_path => |*state| state.deinit(),
+                else => {},
+            }
         }
         it.fork_stack.clearRetainingCapacity();
         for (it.path_stack.items) |*frame| frame.deinit(it.alloc);
@@ -918,6 +979,10 @@ pub const ResultIterator = struct {
             // Clear to avoid double-free on any subsequent pass.
             switch (fp.aux) {
                 .scan, .match_g, .splits => fp.aux = .{ .normal = {} },
+                .recurse_path => |*state| {
+                    state.deinit();
+                    fp.aux = .{ .normal = {} };
+                },
                 else => {},
             }
         }
@@ -977,6 +1042,7 @@ pub const ResultIterator = struct {
                     const end_ip = it.collect_stack.items[it.collect_stack.items.len - 1].end_ip;
                     const outer_if_depth = it.collect_stack.items[it.collect_stack.items.len - 1].outer_if_depth;
                     it.if_stack.items.len = outer_if_depth;
+                    it.if_path_comps_stack.items.len = outer_if_depth;
                     // Jump to the matching array_collect_end instruction so it
                     // executes through execOne. This ensures path-tracking hooks
                     // (breaksPath / clearsPathBroken) fire just as they would in
@@ -1027,6 +1093,7 @@ pub const ResultIterator = struct {
             // Unwind other stacks.
             it.value_stack.items.len = fp.saved_value_stack_len;
             it.if_stack.items.len = state.saved_if_len;
+            it.if_path_comps_stack.items.len = state.saved_if_len;
             // Unwind collect frames (free buffers).
             while (it.collect_stack.items.len > state.saved_collect_len) {
                 var cf = it.collect_stack.pop().?;
@@ -1514,6 +1581,14 @@ pub const ResultIterator = struct {
             // Conditional branching
             .save_input => {
                 it.if_stack.appendAssumeCapacity(it.current);
+                // Also save the current path frame's components length (or sentinel
+                // when no path frame is active) so restore_input can truncate any
+                // path components appended by navigations inside the if/elif condition.
+                const comps_len: u32 = if (it.path_stack.items.len > 0)
+                    @intCast(it.path_stack.items[it.path_stack.items.len - 1].components.items.len)
+                else
+                    std.math.maxInt(u32);
+                it.if_path_comps_stack.appendAssumeCapacity(comps_len);
                 it.ip += 1;
                 return null;
             },
@@ -1521,6 +1596,16 @@ pub const ResultIterator = struct {
             .restore_input => {
                 if (it.if_stack.items.len == 0) return error.TypeError;
                 it.current = it.if_stack.pop().?;
+                // Restore path components to the saved length to undo any navigations
+                // that occurred inside the if/elif condition body.
+                if (it.if_path_comps_stack.pop()) |saved_len| {
+                    if (saved_len != std.math.maxInt(u32) and it.path_stack.items.len > 0) {
+                        const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                        if (frame.components.items.len > saved_len) {
+                            frame.components.shrinkRetainingCapacity(saved_len);
+                        }
+                    }
+                }
                 it.ip += 1;
                 return null;
             },
@@ -1961,6 +2046,7 @@ pub const ResultIterator = struct {
                             // Unwind other stacks.
                             it.value_stack.items.len = fp.saved_value_stack_len;
                             it.if_stack.items.len = state.saved_if_len;
+                            it.if_path_comps_stack.items.len = state.saved_if_len;
                             // Unwind collect frames, freeing buffers and propagating to parent.
                             while (it.collect_stack.items.len > state.saved_collect_len) {
                                 var cf = it.collect_stack.pop().?;
@@ -6741,12 +6827,24 @@ pub const ResultIterator = struct {
     /// into all sub-values. Errors from non-iterable values are suppressed.
     /// Equivalent to jq's `def recurse: ., (.[]? | recurse);`
     ///
-    /// Inside a `path(f)` frame: walk the same DFS but emit the PATH to each
-    /// visited node rather than the node itself. jq's `recurse` is defined in
-    /// terms of `.[]?` navigation, so `path(recurse)` yields `[]` for the
-    /// root then descends — matching `[], ["a"], ["b"], ["b","c"]` for a
-    /// nested object. The native builtin short-circuits that derivation but
-    /// still reproduces its path stream in path mode.
+    /// Inside a `path(f)` frame: two cases:
+    ///
+    ///   1. `path(..)` / `path(recurse)` — the body IS `..` with no
+    ///      downstream filter. Use the fast `body_emits_paths_directly` mode:
+    ///      collect path arrays upfront, iterate them as `it.current`, and
+    ///      have `path_end` yield each one directly. This matches jq's output
+    ///      for `path(..)` = `[], ["a"], ["a","b"], ...`.
+    ///
+    ///   2. `path(.. | filter)` — `..` is followed by something (select, type
+    ///      test, field access, ...). The filter must operate on the ACTUAL
+    ///      VALUE, not the path array. Use `recurse_path` forkpoints: collect
+    ///      (value, path_components) pairs, set `it.current` to the value and
+    ///      `frame.components` to the path per iteration so both the filter
+    ///      (sees real values) and `path_end` (reads components) work correctly.
+    ///
+    /// The distinction is made by peeking ahead in the instruction stream: if
+    /// the very next instruction (after any `pipe` that follows `call_builtin`)
+    /// is `path_end`, we are case 1. Otherwise case 2.
     fn builtinRecurse(it: *ResultIterator) ZqError!?StackValue {
         // When suspended (LHS of an `as` binding), the surrounding path
         // frame must not see this builtin as path-emitting — recurse runs in
@@ -6754,28 +6852,121 @@ pub const ResultIterator = struct {
         const in_path_frame = it.path_stack.items.len > 0 and
             !it.path_stack.items[it.path_stack.items.len - 1].suspended;
 
-        var all_items = std.ArrayList(Value){};
-        defer all_items.deinit(it.alloc);
-
         if (in_path_frame) {
+            // Peek ahead to detect case 1 vs case 2. Skip `pipe`/`identity`
+            // instructions (the compiler inserts a `pipe` between `call_builtin`
+            // and whatever follows it in the value-piping sequence). If we reach
+            // `path_end` before any other meaningful op, we are the direct body.
+            var scan_ip = it.ip + 1;
+            while (scan_ip < it.instructions.len) {
+                const sop = it.instructions[scan_ip].op;
+                if (sop == .pipe or sop == .identity) {
+                    scan_ip += 1;
+                } else break;
+            }
+            const next_is_path_end = scan_ip < it.instructions.len and
+                it.instructions[scan_ip].op == .path_end;
+
+            if (next_is_path_end) {
+                // Case 1: fast path — collect path arrays and emit directly.
+                var all_paths = std.ArrayList(Value){};
+                defer all_paths.deinit(it.alloc);
+                var path_buf = std.ArrayList(Value){};
+                defer path_buf.deinit(it.alloc);
+                try it.collectRecursePaths(it.current, &path_buf, &all_paths);
+
+                if (all_paths.items.len == 0) {
+                    if (!(try it.doBacktrack())) {
+                        it.ip = @intCast(it.instructions.len);
+                    }
+                    return null;
+                }
+
+                it.path_stack.items[it.path_stack.items.len - 1].body_emits_paths_directly = true;
+                const arr = try it.buildRuntimeArray(all_paths.items);
+                it.current = try stackValueToValue(arr);
+                if (!(try it.setupEachFromCurrent())) {
+                    if (!(try it.doBacktrack())) {
+                        it.ip = @intCast(it.instructions.len);
+                    }
+                }
+                return null;
+            }
+
+            // Case 2: collect (value, path_components) pairs. Downstream
+            // filters operate on values; path_end reads frame.components.
+            var pairs = std.ArrayList(RecursePathEntry){};
+            defer {
+                // Only free if we don't hand off to the forkpoint (error path).
+                pairs.deinit(it.alloc);
+            }
             var path_buf = std.ArrayList(Value){};
             defer path_buf.deinit(it.alloc);
-            try it.collectRecursePaths(it.current, &path_buf, &all_items);
-        } else {
-            try it.collectRecurse(it.current, &all_items);
+            try it.collectRecursePathValues(it.current, &path_buf, &pairs);
+
+            if (pairs.items.len == 0) {
+                if (!(try it.doBacktrack())) {
+                    it.ip = @intCast(it.instructions.len);
+                }
+                return null;
+            }
+
+            // Snapshot path state BEFORE modifying components so that the
+            // forkpoint's restorePathState truncates back to the pre-recurse
+            // component depth (typically 0) before each advance repopulates.
+            const saved_path_for_fork = it.snapshotPathState();
+
+            // Set up first iteration: value and path components of index 0.
+            const first = pairs.items[0];
+            it.current = first.value;
+            {
+                const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                frame.components.clearRetainingCapacity();
+                try frame.components.appendSlice(it.alloc, first.path_comps);
+            }
+
+            if (pairs.items.len == 1) {
+                // Only one entry — no fork needed, just continue.
+                it.ip += 1;
+                return null;
+            }
+
+            // Push a recurse_path forkpoint for entries 1..n-1.
+            const items_owned = try pairs.toOwnedSlice(it.alloc);
+            errdefer {
+                // If fork_stack.append or snapshot fails, free the items.
+                for (items_owned) |entry| it.alloc.free(entry.path_comps);
+                it.alloc.free(items_owned);
+            }
+            const saved_stack = try it.snapshotValueStackForFork();
+            const saved_object = try it.snapshotObjectConstructState();
+            try it.fork_stack.append(it.alloc, .{
+                .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                .saved_current = it.current,
+                .backtrack_ip = it.ip, // advance handler uses ip + 1
+                .aux = .{ .recurse_path = .{
+                    .items = items_owned,
+                    .index = 0,
+                    .alloc = it.alloc,
+                } },
+                .saved_path = saved_path_for_fork,
+                .saved_stack = saved_stack,
+                .saved_object = saved_object,
+            });
+            it.ip += 1;
+            return null;
         }
+
+        // Non-path frame: collect all values and iterate via setupEachFromCurrent.
+        var all_items = std.ArrayList(Value){};
+        defer all_items.deinit(it.alloc);
+        try it.collectRecurse(it.current, &all_items);
 
         if (all_items.items.len == 0) {
             if (!(try it.doBacktrack())) {
                 it.ip = @intCast(it.instructions.len);
             }
             return null;
-        }
-
-        if (in_path_frame) {
-            // See builtinPathsImpl — flag the frame so each-iteration path
-            // recording is skipped and path_end yields the current value.
-            it.path_stack.items[it.path_stack.items.len - 1].body_emits_paths_directly = true;
         }
 
         // Build a container array of all collected values on runtime tape.
@@ -6789,6 +6980,52 @@ pub const ResultIterator = struct {
             }
         }
         return null;
+    }
+
+    /// DFS walk that collects (value, path_components) pairs for `..` inside
+    /// a `path(f)` frame where a downstream filter follows `..`. Unlike
+    /// `collectRecursePaths` (which emits path arrays as values), this function
+    /// keeps the actual data value so downstream filters can operate on it.
+    ///
+    /// Each `path_comps` slice is independently allocated (owned by the caller /
+    /// the `RecursePathState`). `path_buf` is a scratch buffer for DFS state.
+    fn collectRecursePathValues(
+        it: *ResultIterator,
+        val: Value,
+        path_buf: *std.ArrayList(Value),
+        out: *std.ArrayList(RecursePathEntry),
+    ) ZqError!void {
+        // Emit the current (value, path) pair. Root has empty path — `[]`.
+        const path_comps = try it.alloc.dupe(Value, path_buf.items);
+        try out.append(it.alloc, .{ .value = val, .path_comps = path_comps });
+
+        switch (val) {
+            .array => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                var i: i64 = 0;
+                while (pos < end) : (i += 1) {
+                    const child_val = tapeEntryToValue(span.tape, pos);
+                    try path_buf.append(it.alloc, .{ .int = i });
+                    try it.collectRecursePathValues(child_val, path_buf, out);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos);
+                }
+            },
+            .object => |span| {
+                var pos = span.start + 1;
+                const end = span.end - 1;
+                while (pos < end) {
+                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
+                    const child_val = tapeEntryToValue(span.tape, pos + 1);
+                    try path_buf.append(it.alloc, .{ .string = k });
+                    try it.collectRecursePathValues(child_val, path_buf, out);
+                    _ = path_buf.pop();
+                    pos = skipEntry(span.tape.*, pos + 1);
+                }
+            },
+            else => {}, // leaf — no descent
+        }
     }
 
     /// DFS mirror of `collectRecurse` that emits the PATH to each visited
@@ -6989,6 +7226,7 @@ pub const ResultIterator = struct {
                     it.input_value = saved_input;
                     it.value_stack.items.len = saved_value_len;
                     it.if_stack.items.len = saved_if_len;
+                    it.if_path_comps_stack.items.len = saved_if_len;
                     while (it.collect_stack.items.len > saved_collect_len) {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
@@ -7015,6 +7253,7 @@ pub const ResultIterator = struct {
                     const arr_val = try it.buildCollectedArray(&completed);
                     it.pushValue(arr_val);
                     it.if_stack.items.len = completed.outer_if_depth;
+                    it.if_path_comps_stack.items.len = completed.outer_if_depth;
                     it.ip = completed.end_ip + 1;
                     continue;
                 }
@@ -7032,6 +7271,7 @@ pub const ResultIterator = struct {
         }
         it.truncateForkStack(saved_fork_len);
         it.if_stack.items.len = saved_if_len;
+        it.if_path_comps_stack.items.len = saved_if_len;
         it.value_stack.items.len = saved_value_len;
         while (it.path_stack.items.len > saved_path_len) {
             var pf = it.path_stack.pop().?;
@@ -7508,6 +7748,7 @@ pub const ResultIterator = struct {
                     }
                     it.current = fp.saved_current;
                     it.if_stack.items.len = state.saved_if_len;
+                    it.if_path_comps_stack.items.len = state.saved_if_len;
                     while (it.collect_stack.items.len > state.saved_collect_len) {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
@@ -7648,6 +7889,47 @@ pub const ResultIterator = struct {
                     if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
+                    _ = it.fork_stack.pop();
+                },
+                .recurse_path => {
+                    // Advance to the next (value, path) pair. We restore path
+                    // state first so the previous iteration's components are
+                    // cleared, then immediately repopulate from the next entry.
+                    it.restorePathState(fp.saved_path);
+                    var state = &fp.aux.recurse_path;
+                    const next_idx = state.index + 1;
+                    if (next_idx < state.items.len) {
+                        state.index = next_idx;
+                        const entry = state.items[next_idx];
+                        it.current = entry.value;
+                        // Repopulate frame.components from the stored path.
+                        if (it.path_stack.items.len > 0) {
+                            const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                            frame.components.clearRetainingCapacity();
+                            try frame.components.appendSlice(it.alloc, entry.path_comps);
+                        }
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
+                        it.ip = fp.backtrack_ip + 1; // resume after the call_builtin
+                        return true;
+                    }
+                    // All entries exhausted — pop and continue backtracking.
+                    if (fp.saved_stack) |snap| {
+                        it.alloc.free(snap);
+                        fp.saved_stack = null;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
+                    state.deinit();
                     _ = it.fork_stack.pop();
                 },
             }
