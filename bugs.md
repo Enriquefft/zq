@@ -3,31 +3,39 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-30 (post builtin-fixes wave — with_entries, rindex, sort_by stability, min_by/max_by tie-breaking).
+Last verified: 2026-04-30 (post pre-existing-fixes wave — L1481 unary-minus error format, L1692 computed-index outer-input reseed, L1696 string fixture correction).
 
 ---
 
-## Active compat failures (1 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
+## Active compat failures
 
-Current baseline: `zig build test` → 1127/1177 pass, 30 fail, 20 skipped.
+Current baseline: `zig build test` → 1131/1177 pass, 26 fail, 20 skipped.
 
-### Pre-existing failures (L1481)
+### Newly exposed post-L1481/L1692/L1696 fixes (datetime + numbers + try_catch + string_ops suites)
 
-Masked by L1712's signal-6 in prior baseline; remain unfixed.
-
-| Tag | Symptom | Repro | Category | Hypothesis |
-|-----|---------|-------|----------|-----------|
-| L1481 | `try -.? catch .` mismatched output | `try -.? catch .` | error message | unary-minus on non-numeric error string format mismatch vs jq |
-
-### Newly exposed post-L1712 fix (6)
-
-Once L1712 signal-6 was fixed, test runner continues and exposes pre-existing failures in datetime, numbers suites.
+With L1692 (signal-6 abort point) and L1696 fixed, the test runner now reaches further into `datetime.zig`, `numbers.zig`, `string_ops.zig`, and remaining `try_catch.zig` cases. These are pre-existing failures, not regressions — none touch any code paths modified by the recent fixes.
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
-| L2037–L2053 | div-by-zero error message mismatch | `try (1/0) catch .` | error message | try/catch error message format differs from jq |
-| L2062 | range parse error | `[range(-99/2;99/2;1)]` | parser | range with negative float bounds fails to parse |
-| L2080 | INDEX signal-6 abort | `INDEX(range(5)\|[., _foo_(.)_]; .[0])` | builtin | INDEX builtin triggers signal 6 (segfault equivalent) |
+| L1736 | `map([1,2][0:.])` runFilter abort in `sliceBoundFromStackValue` | `map([1,2][0:.])` | VM | computed slice bound rejects null-input (called via `map`) — needs jq-compatible coercion or null short-circuit |
+| L1802 | `try flatten(-1) catch .` output mismatch | `try flatten(-1) catch .` | error message | flatten error message format differs from jq |
+| L1838 | `strftime("%A, %B %d, %Y")` output mismatch | strftime format string | builtin | strftime format coverage / locale handling |
+| L1886 | strptime year-multiplier overflow in `doMul` | `last(range(365 * 67)\| ... \|strptime(...))` | VM | integer multiplication overflow checking in strptime path |
+| L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 | `import "x" as foo` / `include "x"` query syntax errors | various import/include test cases | parser/imports | module import & include statements not implemented |
+| L1960 / L1964 / L1968 | `modulemeta` lookupKeyInValue abort | `modulemeta`, `modulemeta \| .deps \| length`, `modulemeta \| .defs \| length` | builtin | `modulemeta` builtin not implemented (segfault on lookup) |
+| L1988 / L1992 / L1996 | `try -. catch .` / `try (.-.) catch .` over arrays | unary/binary minus on arrays | error message | minus error message format differs from jq for array operands |
+| L2005 | `try (. + "x") catch .` mul overflow during numeric coerce | `try (. + "x") catch .` | VM | numeric coercion path triggers std math overflow |
+| L2037 / L2041 / L2045 / L2049 / L2053 | div-by-zero / mod-by-zero error format mismatch (returns `"TypeError"`) | `try (1/0) catch .`, `try (1%0) catch .`, `try (1/.) catch .`, etc. | error message | div/mod-by-zero error format must match jq's `"number (a) and number (0) cannot be divided ..."` literal |
+| L2062 | `[range(-99/2;99/2;1)]` parse error | `[range(-99/2;99/2;1)] as $orig \| ...` | parser | range with negative float bounds fails to parse |
+| L2080 | `INDEX(range(5)\|[., _foo_(.)_]; .[0])` signal-6 abort | INDEX with two-arg form | builtin | INDEX builtin triggers signal 6 |
+
+### Fixed in pre-existing-fixes wave (3)
+
+Merged 2026-04-30: L1481 unary-minus error format, L1692 computed-index outer-input reseed, L1696 string fixture correction.
+
+- L1481: `try -.? catch .` — VM unary-minus error path now formats the operand with jq's `"<type> (<value>) cannot be negated"` shape instead of bare `"TypeError"`.
+- L1692: `.foo[.baz]` computed-index now reseeds outer input for key eval — restructured `computed_index` IR node to binary `[base, key]` shape; emit captures outer input pre-base, restores it pre-key; new `mark_computed_key` opcode suppresses path-component pollution during inner key eval inside `path(f)` / path-assign frames.
+- L1696: Test fixture corrected to match jq's actual output for `.[] | .error = "no, it's OK"` — no parser bug; the prior fixture string was wrong.
 
 ### Fixed in builtin-fixes wave (4)
 
@@ -49,10 +57,6 @@ Merged 2026-04-30: L1592 rindex, L1668 sort_by stability, L1684 min_by/max_by ti
 - L1258 (`getpath` marked path-emitting; `builtinGetpath` populates frame components for autovivify in `getpath(P) |= V`)
 - L1302 (parser dispatches lparen body to parseFilter so leading `def` is accepted before assignment)
 - L1306 (parser accepts `Infinity`, `-Infinity`, `NaN`, `-NaN` JSON literals)
-
-### Fixed post-G6
-
-- L1692 (`.foo[.baz]` computed-index now reseeds outer input for key eval — restructured `computed_index` IR node to binary `[base, key]` shape; emit captures outer input pre-base, restores it pre-key; new `mark_computed_key` opcode suppresses path-component pollution during inner key eval inside `path(f)` / path-assign frames)
 
 ### Fixed in G5 round
 
