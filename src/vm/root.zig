@@ -4876,7 +4876,7 @@ pub const ResultIterator = struct {
         while (epos < eend and kpos < kend) {
             const elem = tapeEntryToValue(orig_span.tape, epos);
             const key = tapeEntryToValue(keys_span.tape, kpos);
-            if (jqCompareValues(key, best_key) == .gt) {
+            if (jqCompareValues(key, best_key) != .lt) {
                 best_val = elem;
                 best_key = key;
             }
