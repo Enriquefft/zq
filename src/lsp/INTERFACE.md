@@ -189,7 +189,7 @@ pub fn byCategory(cat: Category, buf: []const *const BuiltinInfo) []const *const
 
 | Module              | Public surface (abbreviated)                                                              |
 |---------------------|-------------------------------------------------------------------------------------------|
-| `diagnostics`       | `fromParseResult`, `fromParseErrors`, `fromCompileErrors` (runs `query.CompiledQuery.compile`) |
+| `diagnostics`       | `fromParseErrors`, `fromCompileErrors` (runs `query.CompiledQuery.compile`)               |
 | `completion`        | `complete(...)` — context-aware completion from `SemanticModel` + `builtins`              |
 | `hover`             | `hover(...)` — MarkupContent for the node at offset                                       |
 | `definition`        | `definition(...)` — `Location` of the declaration for the symbol at offset                |

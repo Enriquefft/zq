@@ -13,9 +13,7 @@
 
 const std = @import("std");
 const types_mod = @import("types");
-const err_mod = @import("error");
 const regex_mod = @import("regex");
-const prefilter_mod = @import("prefilter");
 const ir = @import("ir.zig");
 const ctypes = @import("types.zig");
 const lower_mod = @import("lower.zig");

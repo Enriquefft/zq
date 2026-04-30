@@ -903,11 +903,6 @@ pub const ResultIterator = struct {
         it.fork_stack.items.len = new_len;
     }
 
-    fn peekValue(it: *ResultIterator) ZqError!StackValue {
-        if (it.value_stack.items.len == 0) return error.TypeError;
-        return it.value_stack.items[it.value_stack.items.len - 1];
-    }
-
     // ── Variable operations ─────────────────────────────────────────
     fn setVariable(it: *ResultIterator, var_id: u32, val: StackValue) void {
         if (var_id >= it.variable_store.items.len) return;
@@ -7182,23 +7177,6 @@ pub const ResultIterator = struct {
             .null_val => false,
             .bool_val => |b| b,
             else => true,
-        };
-    }
-
-    fn isTruthy(val: StackValue) ZqError!bool {
-        return switch (val) {
-            .bool_val => |b| b,
-            .null_val => false,
-            .int => |i| i != 0,
-            .float => |f| f != 0.0,
-            .big_number => true, // out-of-range numbers are always non-zero
-            .tape_value => |tv| switch (tv) {
-                .array, .object => true, // Non-empty containers are truthy
-                .string => |s| s.len > 0, // Non-empty string is truthy
-                .null_val => false,
-                .bool_val => |b| b,
-                else => true,
-            },
         };
     }
 
