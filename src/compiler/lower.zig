@@ -1790,6 +1790,12 @@ pub const BuiltinClass = enum {
     /// Synthesizes `any(s; IN(t))` as a builtin_call AST node and recurses
     /// via lowerNode — reuses in_desugar1 + any_desugar2 transitively.
     in_desugar2,
+    /// `isempty(f)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   def isempty(f): first((f | false), true);
+    /// Synthesizes `first(comma(pipe(f, false), true))` as a builtin_call AST
+    /// node and recurses via lowerNode — no new VM opcode required; the
+    /// first_arg1 path handles the generated first/1 call (limit(1; ...)).
+    isempty_desugar1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1902,6 +1908,12 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
         if (arity == 1) return .in_desugar1;
         if (arity == 2) return .in_desugar2;
     }
+
+    // `isempty(f)` — pure AST desugar to the jq canonical prelude form.
+    // Routed before the generic arity tables because isempty does not appear
+    // in any value/filter bucket and must not fall through to
+    // `.not_implemented`.
+    if (arity == 1 and std.mem.eql(u8, name, "isempty")) return .isempty_desugar1;
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
     // Dispatched before the generic 0-arity table because the 0-arity
@@ -2358,6 +2370,11 @@ fn lowerBuiltinCall(
         },
         .in_desugar2 => {
             return lowerInDesugar2(ctx, bc, src_start, src_len);
+        },
+        // `isempty(f)`. Desugared to the jq canonical prelude form
+        // via AST synthesis + recursive lowerNode call.
+        .isempty_desugar1 => {
+            return lowerIsemptyDesugar1(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -4012,6 +4029,61 @@ fn lowerInDesugar2(
     };
 
     return lowerNode(ctx, any_node);
+}
+
+// ── `isempty(f)` desugar ─────────────────────────────────────────────────────
+//
+// Canonical jq prelude (src/builtin.jq):
+//   def isempty(f): first((f | false), true);
+//
+// Synthesizes `first(comma(pipe(f, false), true))` and recurses via lowerNode.
+// `first/1` routes through `first_arg1` (limit(1; ...)) — lazy, correct for
+// infinite generators such as `isempty(repeat(1))`. No new VM opcode required.
+
+fn lowerIsemptyDesugar1(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const f_node: *ast.Node = bc.args[0];
+
+    // `false` literal — produced when f yields at least one value
+    const false_lit = try alloc.create(ast.Node);
+    false_lit.* = .{ .kind = .{ .literal = .{ .bool_val = false } }, .span = ast.Span.empty() };
+
+    // `true` literal — produced when f is empty
+    const true_lit = try alloc.create(ast.Node);
+    true_lit.* = .{ .kind = .{ .literal = .{ .bool_val = true } }, .span = ast.Span.empty() };
+
+    // `f | false` — pipe f into constant false; first output is always false
+    const pipe_node = try alloc.create(ast.Node);
+    pipe_node.* = .{
+        .kind = .{ .pipe = .{ .left = f_node, .right = false_lit } },
+        .span = ast.Span.empty(),
+    };
+
+    // `(f | false), true` — comma stream: false outputs from f, then true
+    const comma_node = try alloc.create(ast.Node);
+    comma_node.* = .{
+        .kind = .{ .comma = .{ .left = pipe_node, .right = true_lit } },
+        .span = ast.Span.empty(),
+    };
+
+    // `first((f | false), true)` — take the first output of the comma stream
+    const first_args = try alloc.alloc(*ast.Node, 1);
+    first_args[0] = comma_node;
+    const first_node = try alloc.create(ast.Node);
+    first_node.* = .{
+        .kind = .{ .builtin_call = .{ .name = "first", .args = first_args } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, first_node);
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────

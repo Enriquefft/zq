@@ -3805,7 +3805,11 @@ pub const ResultIterator = struct {
                 return error.UserError;
             },
             .map_values_ => return try it.builtinMapValues(),
-            .isempty_ => return try it.builtinIsempty(),
+            // `isempty_` is never emitted by the new compiler: isempty/1 is
+            // desugared at lower time to `first((f | false), true)` via
+            // lowerIsemptyDesugar1. BuiltinId.isempty_ is retained in types.zig
+            // for enum exhaustiveness only — no bytecode path reaches here.
+            .isempty_ => unreachable,
             .first_ => return try it.builtinFirst(),
             .last_ => return try it.builtinLast(),
 
@@ -8153,21 +8157,6 @@ pub const ResultIterator = struct {
             },
             else => return error.TypeError,
         }
-    }
-
-    fn builtinIsempty(it: *ResultIterator) ZqError!?StackValue {
-        // isempty(f) compiled as: save_input, [f], call_builtin
-        // The collected array is on value_stack
-        const arr_sv = try it.popValue();
-        if (it.if_stack.items.len > 0) _ = it.if_stack.pop(); // pop saved input
-        const is_empty = switch (arr_sv) {
-            .tape_value => |tv| switch (tv) {
-                .array => |span| arrayLength(span.tape, span) == 0,
-                else => false,
-            },
-            else => false,
-        };
-        return .{ .bool_val = is_empty };
     }
 
     fn builtinFirst(it: *ResultIterator) ZqError!?StackValue {
