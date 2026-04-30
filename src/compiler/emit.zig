@@ -441,7 +441,10 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             if (subtreeHasIterate(em.ir_obj, node.children[0]) or
                 subtreeHasIterate(em.ir_obj, node.children[1]))
             {
-                // Generator path.
+                // Generator path: at least one operand emits via
+                // `iterate`, which uses fork frames to backtrack and
+                // re-enter.  Variable slots survive backtracking; the
+                // value_stack does not.
                 const input_var = em.allocVar();
                 const rhs_var = em.allocVar();
                 try em.pushInstr(.push_current, .{ .none = {} }, node);
@@ -454,9 +457,49 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 try em.pushInstr(.pipe, .{ .none = {} }, node);
                 try emitNode(em, node.children[0]);
                 try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else if (subtreeRebindsCurrent(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[1]))
+            {
+                // Stack-based outer-input reseed: LHS rebinds
+                // `it.current` (pipes, builtins, field access) but
+                // neither operand forks.  jq evaluates RHS against the
+                // OUTER input — without reseed, RHS's `.` would
+                // observe LHS's residual `it.current` (see L1886).
+                // Note: the residual may not even be LHS's final
+                // RESULT; e.g.  `(5|tostring|tonumber)` leaves
+                // `it.current="5"` while pushing `5` to value_stack.
+                //
+                // Pattern (push/pop-balanced via if_stack):
+                //   save_input            ; if_stack: [outer]
+                //   [LHS]                 ; may finish via current OR stack
+                //   pipe ; push_current   ; canonicalize LHS result onto value_stack
+                //   restore_input         ; current = outer
+                //   [RHS]                 ; evaluates against outer
+                //   pipe ; push_current   ; canonicalize RHS result onto value_stack
+                //   op                    ; pops [LHS, RHS]
+                //
+                // Stack-based save_input/restore_input avoids the
+                // `allocVar` clobber-on-recursion failure mode that
+                // breaks `def f: . * (. - 1 | f); f`.
+                //
+                // RHS-only rebinding does NOT require this path: RHS is
+                // the LAST sub-expression before the binop fires; its
+                // residual `it.current` is irrelevant because the binop
+                // pops both values from `value_stack`.
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
             } else {
-                // Non-generator path: preserve value_stack ordering
-                // for recursive functions.
+                // Pure / RHS-only-rebinding path: LHS leaves
+                // `it.current` intact, so RHS sees the outer input
+                // naturally.  Preserves value_stack ordering for
+                // recursive functions (e.g. `def fac: . * (. - 1 | fac)`).
                 try emitNode(em, node.children[0]);
                 try emitNode(em, node.children[1]);
             }
@@ -489,6 +532,21 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 try em.pushInstr(.pipe, .{ .none = {} }, node);
                 try emitNode(em, node.children[0]);
                 try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else if (subtreeRebindsCurrent(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[1]))
+            {
+                // Same outer-input reseed pattern as `.arith`: LHS
+                // rebinds `it.current` but neither operand forks, so
+                // RHS must observe the OUTER input not LHS residual.
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
             } else {
                 try emitNode(em, node.children[0]);
                 try emitNode(em, node.children[1]);
@@ -522,6 +580,19 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 try em.pushInstr(.pipe, .{ .none = {} }, node);
                 try emitNode(em, node.children[0]);
                 try em.pushInstr(.load_variable, .{ .index = rhs_var }, node);
+            } else if (subtreeRebindsCurrent(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[0]) and
+                !subtreeMayFork(em.ir_obj, node.children[1]))
+            {
+                // Same outer-input reseed pattern as `.arith`/`.cmp`.
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[0]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+                try emitNode(em, node.children[1]);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
             } else {
                 try emitNode(em, node.children[0]);
                 try emitNode(em, node.children[1]);
@@ -3781,6 +3852,127 @@ fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
     const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
     for (span) |child| {
         if (child != 0 and subtreeHasIterate(ir_obj, child)) return true;
+    }
+    return false;
+}
+
+/// True if evaluating the subtree rooted at `node_idx` may rebind
+/// `it.current` (i.e., the residual `it.current` after evaluation may
+/// differ from what it was on entry).  Binary-op emitters use this on
+/// the LHS to decide whether the RHS needs an explicit outer-input
+/// reseed (see L1886): when LHS rebinds, RHS's `.` would otherwise
+/// observe LHS's intermediate `it.current` rather than the outer
+/// input.
+///
+/// Whitelist of "stack-rebinding only" ops (push their result to the
+/// value_stack without mutating `it.current`):
+///   load_const, load_var, identity, arith, cmp, logical, alt, neg,
+///   not, arr_ctor, obj_ctor, interp, format
+/// Note: `arith` etc. recurse through their own children — a pure-op
+/// wrapping a rebinding subtree is itself rebinding.  All other ops
+/// are conservatively treated as rebinding (pipe, builtins, field
+/// access, function calls, etc.).
+fn subtreeRebindsCurrent(ir_obj: ir.IR, node_idx: u32) bool {
+    const node = ir_obj.nodes.items[node_idx];
+    const stack_only: bool = switch (node.op) {
+        .load_const,
+        .load_var,
+        .identity,
+        .arith,
+        .cmp,
+        .logical,
+        .alt,
+        .neg,
+        .not,
+        .arr_ctor,
+        .obj_ctor,
+        .interp,
+        .format,
+        => true,
+        else => false,
+    };
+    if (!stack_only) return true;
+    if (node.children[0] != 0 and subtreeRebindsCurrent(ir_obj, node.children[0])) return true;
+    if (node.children[1] != 0 and subtreeRebindsCurrent(ir_obj, node.children[1])) return true;
+    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    for (span) |child| {
+        if (child != 0 and subtreeRebindsCurrent(ir_obj, child)) return true;
+    }
+    return false;
+}
+
+/// True if evaluating the subtree rooted at `node_idx` may emit a fork
+/// frame (multi-value generator semantics: `iterate`, `recurse`,
+/// `comma`, `alt`, `try_`, `reduce`, `foreach`, `call_user`, plus
+/// streaming builtins like `range`, `paths`, `leaf_paths`,
+/// `recurse_down`, `scan`, `match`, `splits`, `walk`, `repeat`,
+/// `limit`, `nth`, `first`, `last`, `until`, `while`, `getpath`,
+/// `flatten` (when streamed), etc.).
+///
+/// Used by binop emitters to decide between the stack-based
+/// `save_input`/`restore_input` reseed path (safe only when both
+/// operands evaluate exactly once with no backtracking through the
+/// `save_input`/`restore_input` pair) and the variable-isolation path
+/// (safe under forks but clobber-prone under recursion).
+fn subtreeMayFork(ir_obj: ir.IR, node_idx: u32) bool {
+    const node = ir_obj.nodes.items[node_idx];
+    const forks: bool = switch (node.op) {
+        .iterate,
+        .recurse,
+        .comma,
+        .alt,
+        .try_,
+        .reduce,
+        .foreach,
+        .call_user,
+        => true,
+        .call_builtin => callBuiltinMayFork(ir_obj, node),
+        else => false,
+    };
+    if (forks) return true;
+    if (node.children[0] != 0 and subtreeMayFork(ir_obj, node.children[0])) return true;
+    if (node.children[1] != 0 and subtreeMayFork(ir_obj, node.children[1])) return true;
+    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+    for (span) |child| {
+        if (child != 0 and subtreeMayFork(ir_obj, child)) return true;
+    }
+    return false;
+}
+
+/// Determine whether a `call_builtin` IR node refers to a streaming
+/// builtin that emits fork frames at the bytecode layer.  Mirrors the
+/// `bid != .empty and ...` chain in `vm/root.zig:1851` (the set of
+/// builtins whose `doBuiltin` handler does NOT auto-advance `ip`).
+fn callBuiltinMayFork(ir_obj: ir.IR, node: ir.Node) bool {
+    const slots = ir_obj.extra_data.items;
+    const offset: u32 = slots[node.extra];
+    const len: u32 = slots[node.extra + 1];
+    const name = ir_obj.string_buf.items[offset .. offset + len];
+    // Streaming generators / fork-emitting builtins (matches the
+    // dispatch list in vm/root.zig at the .call_builtin handler).
+    const forking_names = [_][]const u8{
+        "empty",
+        "range",
+        "paths",
+        "leaf_paths",
+        "recurse",
+        "recurse_down",
+        "scan",
+        "match",
+        "splits",
+        "walk",
+        "limit",
+        "nth",
+        "first",
+        "last",
+        "until",
+        "while",
+        "repeat",
+        "getpath",
+        "ascii",
+    };
+    for (forking_names) |fname| {
+        if (std.mem.eql(u8, name, fname)) return true;
     }
     return false;
 }

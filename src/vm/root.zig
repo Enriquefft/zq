@@ -2829,6 +2829,34 @@ pub const ResultIterator = struct {
 
     // ── Arithmetic operations ─────────────────────────────────────────────────────
 
+    /// Integer addition with overflow promotion to f64.  jq treats all
+    /// numbers as IEEE-754 doubles, so once an `i64 + i64` would wrap we
+    /// fall back to the float result silently — matches `jq_arith.c::jv_add`
+    /// which never wraps because it always operates on `double`.
+    fn addIntInt(li: i64, ri: i64) StackValue {
+        const r = @addWithOverflow(li, ri);
+        if (r[1] == 0) return .{ .int = r[0] };
+        return .{ .float = @as(f64, @floatFromInt(li)) + @as(f64, @floatFromInt(ri)) };
+    }
+
+    /// Integer subtraction with overflow promotion to f64.  Same rationale
+    /// as `addIntInt` — jq's reference VM never wraps i64s.
+    fn subIntInt(li: i64, ri: i64) StackValue {
+        const r = @subWithOverflow(li, ri);
+        if (r[1] == 0) return .{ .int = r[0] };
+        return .{ .float = @as(f64, @floatFromInt(li)) - @as(f64, @floatFromInt(ri)) };
+    }
+
+    /// Integer multiplication with overflow promotion to f64.  jq's `jv_mul`
+    /// always uses doubles, so `i64*i64` wrapping is a zq-specific bug
+    /// (L1886): `last(range(365 * 67) | strptime(...))` produced a wrap
+    /// during strptime's year multiplier computation.  Promote on overflow.
+    fn mulIntInt(li: i64, ri: i64) StackValue {
+        const r = @mulWithOverflow(li, ri);
+        if (r[1] == 0) return .{ .int = r[0] };
+        return .{ .float = @as(f64, @floatFromInt(li)) * @as(f64, @floatFromInt(ri)) };
+    }
+
     fn doAdd(it: *ResultIterator) ZqError!StackValue {
         const right = try it.popValue();
         const left = if (it.value_stack.items.len > 0)
@@ -3018,7 +3046,7 @@ pub const ResultIterator = struct {
 
         return switch (left) {
             .int => |li| switch (right) {
-                .int => |ri| .{ .int = li - ri },
+                .int => |ri| subIntInt(li, ri),
                 .float => |rf| .{ .float = @as(f64, @floatFromInt(li)) - rf },
                 else => it.raiseBinaryArithTypeError(left, right, .subtract),
             },
@@ -3282,13 +3310,13 @@ pub const ResultIterator = struct {
 
         return switch (left) {
             .int => |li| switch (right) {
-                .int => |ri| .{ .int = li * ri },
+                .int => |ri| mulIntInt(li, ri),
                 .float => |rf| .{ .float = @as(f64, @floatFromInt(li)) * rf },
                 .tape_value => |rtv| switch (rtv) {
                     .string => |s| try it.doStringRepeat(s, li),
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .multiply),
                 },
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .multiply),
             },
             .float => |lf| switch (right) {
                 .int => |ri| .{ .float = lf * @as(f64, @floatFromInt(ri)) },
@@ -3299,17 +3327,17 @@ pub const ResultIterator = struct {
                         .null_val
                     else
                         try it.doStringRepeat(s, @intFromFloat(@floor(lf))),
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .multiply),
                 },
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .multiply),
             },
             .tape_value => |ltv| switch (ltv) {
                 .object => |lspan| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
                         .object => |rspan| try it.doRecursiveMerge(lspan, rspan),
-                        else => error.TypeError,
+                        else => return it.raiseBinaryArithTypeError(left, right, .multiply),
                     },
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .multiply),
                 },
                 .string => |s| switch (right) {
                     .int => |ri| try it.doStringRepeat(s, ri),
@@ -3321,11 +3349,11 @@ pub const ResultIterator = struct {
                         .null_val
                     else
                         try it.doStringRepeat(s, @intFromFloat(@floor(rf))),
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .multiply),
                 },
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .multiply),
             },
-            else => error.TypeError,
+            else => return it.raiseBinaryArithTypeError(left, right, .multiply),
         };
     }
 
@@ -8314,7 +8342,7 @@ pub const ResultIterator = struct {
     /// zero" tail when both operands are numeric and rhs is exactly zero.
     /// Mirrors jq 1.8.1's `make_arith_op_type_error` callsites (builtin.c
     /// `binop_minus`, `binop_div`, `binop_mod`).
-    const BinaryArithOp = enum { subtract, divide, modulo };
+    const BinaryArithOp = enum { subtract, multiply, divide, modulo };
 
     const TypeErrorKind = union(enum) {
         /// `.foo` / `.["key"]` field access on a non-object/null.
@@ -8458,6 +8486,7 @@ pub const ResultIterator = struct {
                 buf.appendSlice(it.alloc, ") cannot be ") catch return null;
                 buf.appendSlice(it.alloc, switch (ba.op) {
                     .subtract => "subtracted",
+                    .multiply => "multiplied",
                     .divide, .modulo => "divided",
                 }) catch return null;
                 if (ba.op == .modulo) buf.appendSlice(it.alloc, " (remainder)") catch return null;
