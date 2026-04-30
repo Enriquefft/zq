@@ -3,29 +3,42 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-29 (post G6 land — abort+emit cluster, path+clearsPathBroken cluster, autovivify+parser cluster, plus path_end terminal-else pop fix).
+Last verified: 2026-04-30 (post builtin-fixes wave — with_entries, rindex, sort_by stability, min_by/max_by tie-breaking).
 
 ---
 
-## Active compat failures (7 newly unmasked from try_catch.zig)
+## Active compat failures (3 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
 
-Post-G6 baseline: `zig build test` → 1151/1177 pass, 7 fail (all in `tests/compat/try_catch.zig`), 20 skipped. All 12 G6-target tags pass; the 7 remaining fails were masked by L1421's signal-6 in baseline.
+Current baseline: `zig build test` → 1127/1177 pass, 30 fail, 20 skipped.
 
-### Newly revealed by G6 — were masked by L1421 signal-6 in baseline (7)
+### Pre-existing failures (L1481, L1692, L1696)
 
-Once G6 fixed L1421 (`contains/inside` arity-1 routing), the test runner reached `try_catch.zig` sections that previously never ran. These are pre-existing failures, not regressions.
+Masked by L1712's signal-6 in prior baseline; remain unfixed.
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
 | L1481 | `try -.? catch .` mismatched output | `try -.? catch .` | error message | unary-minus on non-numeric error string format mismatch vs jq |
-| L1592 | `.[:rindex("x")]` runFilter error | `.[:rindex("x")]` | builtin | `rindex` builtin not implemented |
-| L1668 | `(sort_by(.b) \| sort_by(.a))` etc. — wrong order | sort comparison | builtin | sort stability — zq sort is not stable; jq's sort preserves input order on ties |
-| L1684 | `[min, max, min_by(.[1]), max_by(.[1]), ...]` — last element wrong | min_by/max_by | builtin | tie-breaking semantics in min_by/max_by differ from jq |
 | L1692 | `.foo[.baz]` returns null instead of 4 | computed-field-access | path | computed-field path access on object — `.foo[.baz]` should compute `.baz` against the same input, then index `.foo` by that |
 | L1696 | `.[] \| .error = "no, it's OK"` — string-literal whitespace lost | string parser | parser | string literal interpretation strips whitespace after comma in interpolation context |
-| L1712 (signal 6) | `with_entries(.key \|= "KEY_" + .)` aborts | `with_entries(...)` | builtin | `with_entries` not implemented — falls through to `.not_implemented => unreachable` in lowerBuiltinCall (lower.zig:2253) |
 
-L1712 is the new test-runner abort point. Once fixed, more pre-existing failures may surface (mirroring the L1045 → L1201 → L1421 → L1712 chain).
+### Newly exposed post-L1712 fix (6)
+
+Once L1712 signal-6 was fixed, test runner continues and exposes pre-existing failures in datetime, numbers suites.
+
+| Tag | Symptom | Repro | Category | Hypothesis |
+|-----|---------|-------|----------|-----------|
+| L2037–L2053 | div-by-zero error message mismatch | `try (1/0) catch .` | error message | try/catch error message format differs from jq |
+| L2062 | range parse error | `[range(-99/2;99/2;1)]` | parser | range with negative float bounds fails to parse |
+| L2080 | INDEX signal-6 abort | `INDEX(range(5)\|[., _foo_(.)_]; .[0])` | builtin | INDEX builtin triggers signal 6 (segfault equivalent) |
+
+### Fixed in builtin-fixes wave (4)
+
+Merged 2026-04-30: L1592 rindex, L1668 sort_by stability, L1684 min_by/max_by tie-breaking, L1712 with_entries.
+
+- L1592: Computed slice bounds support (`parser` + `AST` + `IR` + `emit` + `VM` — `.[:rindex("x")]` now works; also fixed UTF-8 codepoint indexing in doSlice)
+- L1668: Sort multi-output key grouping in emit (array_collect wrapping for by-key family ensures 1:1 element-to-key pairing)
+- L1684: max_by tie-break from `== .gt` to `!= .lt` (jq asymmetry: min_by first-wins, max_by last-wins; min_by already correct)
+- L1712: with_entries desugar in lower (AST synthesis to `to_entries | map(f) | from_entries`; no new VM opcode)
 
 ### Fixed in G6 round (commits 5d8888b, 2b1fb80, 53f2a67, 0e020c6)
 
