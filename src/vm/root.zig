@@ -3020,12 +3020,12 @@ pub const ResultIterator = struct {
             .int => |li| switch (right) {
                 .int => |ri| .{ .int = li - ri },
                 .float => |rf| .{ .float = @as(f64, @floatFromInt(li)) - rf },
-                else => error.TypeError,
+                else => it.raiseBinaryArithTypeError(left, right, .subtract),
             },
             .float => |lf| switch (right) {
                 .int => |ri| .{ .float = lf - @as(f64, @floatFromInt(ri)) },
                 .float => |rf| .{ .float = lf - rf },
-                else => error.TypeError,
+                else => it.raiseBinaryArithTypeError(left, right, .subtract),
             },
             .tape_value => |ltv| switch (ltv) {
                 .array => |lspan| switch (right) {
@@ -3070,13 +3070,13 @@ pub const ResultIterator = struct {
                                 .end = arr_end_idx + 1,
                             } } };
                         },
-                        else => error.TypeError,
+                        else => it.raiseBinaryArithTypeError(left, right, .subtract),
                     },
-                    else => error.TypeError,
+                    else => it.raiseBinaryArithTypeError(left, right, .subtract),
                 },
-                else => error.TypeError,
+                else => it.raiseBinaryArithTypeError(left, right, .subtract),
             },
-            else => error.TypeError,
+            else => it.raiseBinaryArithTypeError(left, right, .subtract),
         };
     }
 
@@ -3512,40 +3512,40 @@ pub const ResultIterator = struct {
         switch (left) {
             .int => |li| switch (right) {
                 .int => |ri| {
-                    if (ri == 0) return it.raiseDivmodTypeError(left, right, false);
+                    if (ri == 0) return it.raiseBinaryArithTypeError(left, right, .divide);
                     // Integer division: if evenly divisible keep int, otherwise float
                     if (@rem(li, ri) == 0) return .{ .int = @divTrunc(li, ri) };
                     return .{ .float = @as(f64, @floatFromInt(li)) / @as(f64, @floatFromInt(ri)) };
                 },
                 .float => |rf| {
-                    if (rf == 0.0) return it.raiseDivmodTypeError(left, right, false);
+                    if (rf == 0.0) return it.raiseBinaryArithTypeError(left, right, .divide);
                     return .{ .float = @as(f64, @floatFromInt(li)) / rf };
                 },
-                else => return it.raiseDivmodTypeError(left, right, false),
+                else => return it.raiseBinaryArithTypeError(left, right, .divide),
             },
             .float => |lf| switch (right) {
                 .int => |ri| {
-                    if (ri == 0) return it.raiseDivmodTypeError(left, right, false);
+                    if (ri == 0) return it.raiseBinaryArithTypeError(left, right, .divide);
                     return .{ .float = lf / @as(f64, @floatFromInt(ri)) };
                 },
                 .float => |rf| {
-                    if (rf == 0.0) return it.raiseDivmodTypeError(left, right, false);
+                    if (rf == 0.0) return it.raiseBinaryArithTypeError(left, right, .divide);
                     return .{ .float = lf / rf };
                 },
-                else => return it.raiseDivmodTypeError(left, right, false),
+                else => return it.raiseBinaryArithTypeError(left, right, .divide),
             },
             // jq: string / string = split(separator)
             .tape_value => |ltv| switch (ltv) {
                 .string => |ls| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
                         .string => |rs| return try it.doStringSplit(ls, rs),
-                        else => return it.raiseDivmodTypeError(left, right, false),
+                        else => return it.raiseBinaryArithTypeError(left, right, .divide),
                     },
-                    else => return it.raiseDivmodTypeError(left, right, false),
+                    else => return it.raiseBinaryArithTypeError(left, right, .divide),
                 },
-                else => return it.raiseDivmodTypeError(left, right, false),
+                else => return it.raiseBinaryArithTypeError(left, right, .divide),
             },
-            else => return it.raiseDivmodTypeError(left, right, false),
+            else => return it.raiseBinaryArithTypeError(left, right, .divide),
         }
     }
 
@@ -3573,25 +3573,25 @@ pub const ResultIterator = struct {
             const lf: f64 = switch (left) {
                 .int => |i| @as(f64, @floatFromInt(i)),
                 .float => |f| f,
-                else => return it.raiseDivmodTypeError(left, right, true),
+                else => return it.raiseBinaryArithTypeError(left, right, .modulo),
             };
             const rf: f64 = switch (right) {
                 .int => |i| @as(f64, @floatFromInt(i)),
                 .float => |f| f,
-                else => return it.raiseDivmodTypeError(left, right, true),
+                else => return it.raiseBinaryArithTypeError(left, right, .modulo),
             };
             if (std.math.isNan(lf) or std.math.isNan(rf)) {
                 return .{ .float = std.math.nan(f64) };
             }
             const bi = dtoiClamp(rf);
-            if (bi == 0) return it.raiseDivmodTypeError(left, right, true);
+            if (bi == 0) return it.raiseBinaryArithTypeError(left, right, .modulo);
             if (bi == -1) return .{ .int = 0 };
             const ai = dtoiClamp(lf);
             return .{ .int = @rem(ai, bi) };
         }
-        const left_int = toInt(left) catch return it.raiseDivmodTypeError(left, right, true);
-        const right_int = toInt(right) catch return it.raiseDivmodTypeError(left, right, true);
-        if (right_int == 0) return it.raiseDivmodTypeError(left, right, true);
+        const left_int = toInt(left) catch return it.raiseBinaryArithTypeError(left, right, .modulo);
+        const right_int = toInt(right) catch return it.raiseBinaryArithTypeError(left, right, .modulo);
+        if (right_int == 0) return it.raiseBinaryArithTypeError(left, right, .modulo);
         if (right_int == -1) return .{ .int = 0 };
         return .{ .int = @rem(left_int, right_int) };
     }
@@ -8308,6 +8308,14 @@ pub const ResultIterator = struct {
     /// The key parameter is included via runtime tape string interning.
     /// Describes what kind of type mismatch occurred.  Used by `buildTypeErrorMsg`
     /// to produce jq-compatible error strings from a single formatting path.
+    /// Identifies the arithmetic operation in a binary-arith TypeError.
+    /// Each op contributes its own jq verb suffix; div/mod additionally
+    /// gain a "(remainder)" tag (mod only) and a "because the divisor is
+    /// zero" tail when both operands are numeric and rhs is exactly zero.
+    /// Mirrors jq 1.8.1's `make_arith_op_type_error` callsites (builtin.c
+    /// `binop_minus`, `binop_div`, `binop_mod`).
+    const BinaryArithOp = enum { subtract, divide, modulo };
+
     const TypeErrorKind = union(enum) {
         /// `.foo` / `.["key"]` field access on a non-object/null.
         /// Produces: "Cannot index <type> with string ("<key>")"
@@ -8324,14 +8332,14 @@ pub const ResultIterator = struct {
         /// Unary `-` applied to a non-numeric value.
         /// Produces: "<type> (<compact-json>) cannot be negated"
         negate,
-        /// `lhs / rhs` or `lhs % rhs` with an unsupported operand pair.
-        /// Produces: "<lhs_type> (<lhs_json>) and <rhs_type> (<rhs_json>) cannot be divided[ (remainder)][ because the divisor is zero]"
-        /// The "(remainder)" suffix is appended when `is_mod` is true; the
-        /// "because the divisor is zero" tail is appended when rhs is the
-        /// numeric value zero (matching jq 1.8.1's `make_arith_op_type_error`).
-        /// `val` is unused for this kind; the operand values are carried in
-        /// the variant payload.
-        divmod: struct { lhs: Value, rhs: Value, is_mod: bool },
+        /// Binary arithmetic (`-`, `/`, `%`) with an unsupported operand
+        /// pair, or a divide/modulo by numeric zero.
+        /// Produces: "<lhs_type> (<lhs_json>) and <rhs_type> (<rhs_json>) cannot be <verb>[ (remainder)][ because the divisor is zero]"
+        /// The "(remainder)" suffix is appended for `.modulo`; the
+        /// "because the divisor is zero" tail is appended when both
+        /// operands are numeric and rhs is exactly zero.
+        /// `val` is unused for this kind; operand values live in the payload.
+        binary_arith: struct { lhs: Value, rhs: Value, op: BinaryArithOp },
     };
 
     /// Base jq type name for `<type> (<compact-json>)`-style messages.
@@ -8368,20 +8376,21 @@ pub const ResultIterator = struct {
         };
     }
 
-    /// Set `type_error_detail` for a div/mod operand-type or divisor-zero
-    /// failure and return `error.TypeError`.  Single canonical formatter for
-    /// the entire div/mod arithmetic error class — see `TypeErrorKind.divmod`.
-    fn raiseDivmodTypeError(
+    /// Set `type_error_detail` for a binary-arithmetic operand-type or
+    /// divisor-zero failure and return `error.TypeError`.  Single canonical
+    /// formatter for the entire binary-arith error class — see
+    /// `TypeErrorKind.binary_arith`.  Used by `doSub`/`doDiv`/`doMod`.
+    fn raiseBinaryArithTypeError(
         it: *ResultIterator,
         left: StackValue,
         right: StackValue,
-        is_mod: bool,
+        op: BinaryArithOp,
     ) ZqError {
         const lhs = stackValueToValue(left) catch return error.TypeError;
         const rhs = stackValueToValue(right) catch return error.TypeError;
         it.type_error_detail = it.buildTypeErrorMsg(
             .null_val,
-            .{ .divmod = .{ .lhs = lhs, .rhs = rhs, .is_mod = is_mod } },
+            .{ .binary_arith = .{ .lhs = lhs, .rhs = rhs, .op = op } },
         );
         return error.TypeError;
     }
@@ -8429,29 +8438,33 @@ pub const ResultIterator = struct {
                 buf.appendSlice(it.alloc, "Cannot iterate over ") catch return null;
                 buf.appendSlice(it.alloc, type_name) catch return null;
                 buf.appendSlice(it.alloc, " (") catch return null;
-                serializeValueCompact(&buf, it.alloc, val) catch return null;
+                appendCompactJsonTrunc(&buf, it.alloc, val) catch return null;
                 buf.appendSlice(it.alloc, ")") catch return null;
             },
             .negate => {
                 buf.appendSlice(it.alloc, baseTypeName(val)) catch return null;
                 buf.appendSlice(it.alloc, " (") catch return null;
-                serializeValueCompact(&buf, it.alloc, val) catch return null;
+                appendCompactJsonTrunc(&buf, it.alloc, val) catch return null;
                 buf.appendSlice(it.alloc, ") cannot be negated") catch return null;
             },
-            .divmod => |dm| {
-                buf.appendSlice(it.alloc, baseTypeName(dm.lhs)) catch return null;
+            .binary_arith => |ba| {
+                buf.appendSlice(it.alloc, baseTypeName(ba.lhs)) catch return null;
                 buf.appendSlice(it.alloc, " (") catch return null;
-                serializeValueCompact(&buf, it.alloc, dm.lhs) catch return null;
+                appendCompactJsonTrunc(&buf, it.alloc, ba.lhs) catch return null;
                 buf.appendSlice(it.alloc, ") and ") catch return null;
-                buf.appendSlice(it.alloc, baseTypeName(dm.rhs)) catch return null;
+                buf.appendSlice(it.alloc, baseTypeName(ba.rhs)) catch return null;
                 buf.appendSlice(it.alloc, " (") catch return null;
-                serializeValueCompact(&buf, it.alloc, dm.rhs) catch return null;
-                buf.appendSlice(it.alloc, ") cannot be divided") catch return null;
-                if (dm.is_mod) buf.appendSlice(it.alloc, " (remainder)") catch return null;
+                appendCompactJsonTrunc(&buf, it.alloc, ba.rhs) catch return null;
+                buf.appendSlice(it.alloc, ") cannot be ") catch return null;
+                buf.appendSlice(it.alloc, switch (ba.op) {
+                    .subtract => "subtracted",
+                    .divide, .modulo => "divided",
+                }) catch return null;
+                if (ba.op == .modulo) buf.appendSlice(it.alloc, " (remainder)") catch return null;
                 // jq only appends "because the divisor is zero" when both
                 // operands are numeric and the divisor is zero — otherwise
                 // the type-mismatch is the primary cause of the error.
-                if (isNumber(dm.lhs) and isNumericZero(dm.rhs)) {
+                if ((ba.op == .divide or ba.op == .modulo) and isNumber(ba.lhs) and isNumericZero(ba.rhs)) {
                     buf.appendSlice(it.alloc, " because the divisor is zero") catch return null;
                 }
             },
@@ -10503,6 +10516,53 @@ fn serializeValueCompact(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val:
             try buf.append(alloc, '}');
         },
     }
+}
+
+/// Append a value's compact JSON form to `buf`, applying jq 1.8.1's
+/// `jv_dump_string_trunc` rule for embedded value renderings inside
+/// TypeError messages: if the JSON form is longer than 14 bytes,
+/// truncate to the longest UTF-8-aligned prefix that fits in 11 bytes
+/// and append `...` (no closing quote/bracket).  Mirrors jq's `errbuf[15]`
+/// + `strncpy` + `jvp_utf8_backtrack` logic in `src/builtin.c::type_error`.
+///
+/// The full serialization is built into a temporary buffer first so the
+/// truncation decision is made on the final byte length, not on partial
+/// output (matching jq's behavior of always producing full JSON before
+/// truncation).
+fn appendCompactJsonTrunc(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value) error{OutOfMemory}!void {
+    var tmp = std.ArrayList(u8){};
+    defer tmp.deinit(alloc);
+    try serializeValueCompact(&tmp, alloc, val);
+    const full = tmp.items;
+    // jq uses `errbuf[15]` and treats `len > bufsize - 1 = 14` as the
+    // truncation trigger.  Below the threshold, emit verbatim.
+    if (full.len <= 14) {
+        try buf.appendSlice(alloc, full);
+        return;
+    }
+    // Find the longest UTF-8-aligned prefix length <= 11.  jq's logic
+    // walks back from byte index 11 to the start of any UTF-8 codepoint
+    // it might be in the middle of; the result `s` is the codepoint
+    // start, and all bytes [0, s - outbuf) are kept.
+    const cut: usize = utf8AlignedTruncate(full, 11);
+    try buf.appendSlice(alloc, full[0..cut]);
+    try buf.appendSlice(alloc, "...");
+}
+
+/// Return the largest index `<= max_bytes` that is a UTF-8 codepoint
+/// boundary in `s`, walking back from `max_bytes` over any continuation
+/// bytes.  Mirrors `jvp_utf8_backtrack` semantics: if byte at `max_bytes`
+/// is a continuation byte, walk back until a lead byte is found and
+/// return that lead byte's index (so the partial codepoint is dropped).
+/// If the byte at `max_bytes` is itself a lead/ASCII, it is also dropped
+/// because jq's caller treats `s` as the codepoint START — bytes [0, s)
+/// are preserved; bytes [s, max_bytes] are replaced with `...`.
+fn utf8AlignedTruncate(s: []const u8, max_bytes: usize) usize {
+    if (max_bytes >= s.len) return s.len;
+    var i: usize = max_bytes;
+    // Walk back over any continuation bytes (0b10xxxxxx).
+    while (i > 0 and (s[i] & 0xC0) == 0x80) : (i -= 1) {}
+    return i;
 }
 
 /// Append the jq type name for a Value to a buffer.

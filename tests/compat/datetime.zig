@@ -227,7 +227,7 @@ test "jq:L1988 try -. catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try h.expectJsonEqual("\"string (\\\"very-long-long-long-long...\\\") cannot be negated\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"very-long-...) cannot be negated\"", results[0]);
 }
 
 test "jq:L1992 try (.-.) catch ." {
@@ -240,7 +240,7 @@ test "jq:L1992 try (.-.) catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try h.expectJsonEqual("\"string (\\\"very-long-long-long-long...\\\") and string (\\\"very-long-long-long-long...\\\") cannot be subtracted\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"very-long-...) and string (\\\"very-long-...) cannot be subtracted\"", results[0]);
 }
 
 test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
@@ -253,12 +253,12 @@ test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 6), results.len);
-    try h.expectJsonEqual("\"string (\\\"☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[0]);
-    try h.expectJsonEqual("\"string (\\\"xx☆☆☆☆☆☆☆☆\\\") cannot be negated\"", results[1]);
-    try h.expectJsonEqual("\"string (\\\"xxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[2]);
-    try h.expectJsonEqual("\"string (\\\"xxxxxx☆☆☆☆☆☆...\\\") cannot be negated\"", results[3]);
-    try h.expectJsonEqual("\"string (\\\"xxxxxxxx☆☆☆☆☆...\\\") cannot be negated\"", results[4]);
-    try h.expectJsonEqual("\"string (\\\"xxxxxxxxxx☆☆☆☆...\\\") cannot be negated\"", results[5]);
+    try h.expectJsonEqual("\"string (\\\"☆☆☆...) cannot be negated\"", results[0]);
+    try h.expectJsonEqual("\"string (\\\"xx☆☆...) cannot be negated\"", results[1]);
+    try h.expectJsonEqual("\"string (\\\"xxxx☆☆...) cannot be negated\"", results[2]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxx☆...) cannot be negated\"", results[3]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxxxx...) cannot be negated\"", results[4]);
+    try h.expectJsonEqual("\"string (\\\"xxxxxxxxxx...) cannot be negated\"", results[5]);
 }
 
 test "jq:L2005 try (. + _x_) catch . == if have_decnum then _number (123..." {
