@@ -1754,7 +1754,13 @@ pub const ResultIterator = struct {
                 const result: StackValue = switch (val) {
                     .int => |i| .{ .int = -i },
                     .float => |f| .{ .float = -f },
-                    else => return error.TypeError,
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(
+                            try stackValueToValue(val),
+                            .negate,
+                        );
+                        return error.TypeError;
+                    },
                 };
                 it.pushValue(result);
                 it.ip += 1;
@@ -8299,6 +8305,9 @@ pub const ResultIterator = struct {
         /// `.[]` iteration on a non-array/object/null.
         /// Produces: "Cannot iterate over <type> (<compact-json>)"
         iterate,
+        /// Unary `-` applied to a non-numeric value.
+        /// Produces: "<type> (<compact-json>) cannot be negated"
+        negate,
     };
 
     /// Build a jq-compatible TypeError detail message.
@@ -8346,6 +8355,20 @@ pub const ResultIterator = struct {
                 buf.appendSlice(it.alloc, " (") catch return null;
                 serializeValueCompact(&buf, it.alloc, val) catch return null;
                 buf.appendSlice(it.alloc, ")") catch return null;
+            },
+            .negate => {
+                const negate_type_name = switch (val) {
+                    .null_val => "null",
+                    .bool_val => "boolean",
+                    .int, .float, .big_number => "number",
+                    .string => "string",
+                    .array => "array",
+                    .object => "object",
+                };
+                buf.appendSlice(it.alloc, negate_type_name) catch return null;
+                buf.appendSlice(it.alloc, " (") catch return null;
+                serializeValueCompact(&buf, it.alloc, val) catch return null;
+                buf.appendSlice(it.alloc, ") cannot be negated") catch return null;
             },
         }
         // Store in the runtime tape so the string lives as long as the iterator.
