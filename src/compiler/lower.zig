@@ -2129,7 +2129,10 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         // The 1-arity and 2-arity forms desugar via `lowerAnyAllDesugar`
         // and never reach `isZeroArgBuiltin`.
         std.mem.eql(u8, name, "any") or
-        std.mem.eql(u8, name, "all");
+        std.mem.eql(u8, name, "all") or
+        // `debug/0` passes input through unchanged after writing
+        // `["DEBUG:",.]` JSON to stderr — VM dispatch at root.zig:3790.
+        std.mem.eql(u8, name, "debug");
 }
 
 /// Names accepted as 1-arg value-arg builtins. Mirrors the

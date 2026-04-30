@@ -3126,6 +3126,8 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         // The 1/2-arity forms are desugared in lowering and never reach here.
         if (std.mem.eql(u8, name, "any")) return .any;
         if (std.mem.eql(u8, name, "all")) return .all;
+        // `debug/0` — pass-through with stderr output; VM arm at root.zig:3790.
+        if (std.mem.eql(u8, name, "debug")) return .debug_;
         return null;
     }
 
