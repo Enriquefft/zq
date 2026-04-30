@@ -785,7 +785,7 @@ test "jq:L1696 .[] | .error = _no, it's OK_" {
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try h.expectJsonEqual("{\"error\":\"no,it's OK\"}", results[0]);
+    try h.expectJsonEqual("{\"error\":\"no, it's OK\"}", results[0]);
 }
 
 test "jq:L1700 [{a:1}] | .[] | .a=999" {

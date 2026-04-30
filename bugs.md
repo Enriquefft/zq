@@ -7,11 +7,11 @@ Last verified: 2026-04-30 (post builtin-fixes wave — with_entries, rindex, sor
 
 ---
 
-## Active compat failures (3 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
+## Active compat failures (2 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
 
 Current baseline: `zig build test` → 1127/1177 pass, 30 fail, 20 skipped.
 
-### Pre-existing failures (L1481, L1692, L1696)
+### Pre-existing failures (L1481, L1692)
 
 Masked by L1712's signal-6 in prior baseline; remain unfixed.
 
@@ -19,7 +19,6 @@ Masked by L1712's signal-6 in prior baseline; remain unfixed.
 |-----|---------|-------|----------|-----------|
 | L1481 | `try -.? catch .` mismatched output | `try -.? catch .` | error message | unary-minus on non-numeric error string format mismatch vs jq |
 | L1692 | `.foo[.baz]` returns null instead of 4 | computed-field-access | path | computed-field path access on object — `.foo[.baz]` should compute `.baz` against the same input, then index `.foo` by that |
-| L1696 | `.[] \| .error = "no, it's OK"` — string-literal whitespace lost | string parser | parser | string literal interpretation strips whitespace after comma in interpolation context |
 
 ### Newly exposed post-L1712 fix (6)
 
