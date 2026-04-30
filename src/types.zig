@@ -964,6 +964,18 @@ pub const Instruction = extern struct {
         /// path component). No-op when the path stack is empty (i.e. no
         /// enclosing `path(f)` / path-assign frame).
         mark_computed_key,
+        /// Suspend path recording on the innermost `PathFrame`. While
+        /// suspended, descent ops do not append components and path-breaking
+        /// ops do not set `path_broken`. Used to evaluate the LHS of an
+        /// `EXPR1 as $v | EXPR2` binding in value context: jq treats the
+        /// binding's LHS as outside the surrounding `path(f)` (the path is
+        /// `path(EXPR2)` only). No-op when no path frame is active.
+        path_suspend,
+        /// Resume path recording on the innermost `PathFrame`, clearing the
+        /// suspension set by `path_suspend`. No-op when no path frame is
+        /// active. Paired 1:1 with `path_suspend` — emitter must guarantee
+        /// matching boundaries (no nesting across forks).
+        path_resume,
 
         /// Whether this opcode's `operand.index` is an instruction-pointer that
         /// must be unconditionally rebased when instructions are shifted.
@@ -1070,6 +1082,8 @@ pub const Instruction = extern struct {
                 .path_begin,
                 .path_end,
                 .mark_computed_key,
+                .path_suspend,
+                .path_resume,
                 => false,
 
                 // ── Path-breaking: produce a value unrelated to the input ──

@@ -3609,12 +3609,21 @@ fn emitAsBind(em: *Emitter, node: ir.Node) EmitError!void {
     try em.pushInstr(.push_current, .{ .none = {} }, node);
     try em.pushInstr(.capture_variable, .{ .index = orig_var }, node);
 
+    // Path-context distinction: `path(EXPR1 as $v | EXPR2)` is
+    // `path(EXPR2)` evaluated under the env where $v = EXPR1 — jq treats
+    // EXPR1 as value-context, with no contribution to the surrounding
+    // path. The destructure ladder also runs against EXPR1's result (not
+    // the path target), so it is suspended too. `path_suspend` is a
+    // no-op outside a `path(f)` / path-assign frame, so this is free for
+    // bindings outside path expressions.
+    try em.pushInstr(.path_suspend, .{ .none = {} }, node);
     try emitNode(em, expr_idx);
     try emitNode(em, dx_idx);
 
     // Restore original input for body.
     try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
+    try em.pushInstr(.path_resume, .{ .none = {} }, node);
 
     try emitNode(em, body_idx);
 }

@@ -139,9 +139,27 @@ const PathFrame = struct {
     /// index the inner path result array are meta-level, not path descents.
     /// Cleared by the `load_computed` that consumes the key.
     skip_components_for_computed_key: bool = false,
+    /// Set by `path_suspend`, cleared by `path_resume`. While set, descent
+    /// ops skip component recording AND `breaksPath` ops do NOT mark
+    /// `path_broken`. Used to evaluate the LHS of an `EXPR1 as $v | EXPR2`
+    /// binding inside a path frame: jq treats EXPR1 as value-context (path
+    /// of the whole binding is `path(EXPR2)` only). Snapshotted alongside
+    /// the rest of the frame state so suspension persists across generator
+    /// backtracks within the LHS subexpression.
+    suspended: bool = false,
 
     fn deinit(self: *PathFrame, alloc: std.mem.Allocator) void {
         self.components.deinit(alloc);
+    }
+
+    /// True when descent ops should NOT append a path component to this
+    /// frame. Combined predicate for the two suppression mechanisms:
+    ///   - `skip_components_for_computed_key`: meta-level descents on an
+    ///     inner `path(f)` result consumed as a computed key/index.
+    ///   - `suspended`: the LHS of an `as` binding is being evaluated in
+    ///     value context (jq path semantics).
+    fn skipComponents(self: *const PathFrame) bool {
+        return self.skip_components_for_computed_key or self.suspended;
     }
 };
 
@@ -319,6 +337,7 @@ const PathSnapshot = struct {
     break_index_n: i64 = 0,
     break_key_s: []const u8 = &.{},
     skip_components_for_computed_key: bool = false,
+    suspended: bool = false,
 };
 
 const Forkpoint = struct {
@@ -761,6 +780,7 @@ pub const ResultIterator = struct {
             .break_index_n = frame.break_index_n,
             .break_key_s = frame.break_key_s,
             .skip_components_for_computed_key = frame.skip_components_for_computed_key,
+            .suspended = frame.suspended,
         };
     }
 
@@ -788,6 +808,7 @@ pub const ResultIterator = struct {
             frame.break_index_n = snap.break_index_n;
             frame.break_key_s = snap.break_key_s;
             frame.skip_components_for_computed_key = snap.skip_components_for_computed_key;
+            frame.suspended = snap.suspended;
         }
     }
 
@@ -1065,7 +1086,8 @@ pub const ResultIterator = struct {
         if (it.path_stack.items.len > 0 and instr.op.breaksPath()) {
             const is_path_emit = instr.op == .call_builtin and
                 callBuiltinIsPathEmittingInFrame(types.builtinIdOf(instr.operand.index));
-            if (!is_path_emit) {
+            const suspended = it.path_stack.items[it.path_stack.items.len - 1].suspended;
+            if (!is_path_emit and !suspended) {
                 const frame = &it.path_stack.items[it.path_stack.items.len - 1];
                 frame.path_broken = true;
                 // Ops that produce a derived container value (array/object
@@ -1098,7 +1120,9 @@ pub const ResultIterator = struct {
             // used to compute a key). When break_origin is upstream_value
             // (a value that was piped to become the navigation source), the
             // descent op is navigating a non-path value — don't clear.
-            if (frame.break_origin == .same_step_scratch) {
+            // Skip while the frame is suspended: LHS of an `as` binding does
+            // not interact with the surrounding path's broken-state at all.
+            if (!frame.suspended and frame.break_origin == .same_step_scratch) {
                 frame.path_broken = false;
             }
         }
@@ -1161,10 +1185,11 @@ pub const ResultIterator = struct {
                     return err;
                 };
                 // Record path component if path tracking is active and not
-                // suppressed for computed-key meta-ops.
+                // suppressed for computed-key meta-ops or suspended (LHS of
+                // an `as` binding).
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    if (!frame.skip_components_for_computed_key) {
+                    if (!frame.skipComponents()) {
                         try frame.components.append(it.alloc, .{ .string = key });
                     }
                 }
@@ -1198,7 +1223,7 @@ pub const ResultIterator = struct {
                 const idx_result = try it.doLoadIndex(idx);
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    const skip = frame.skip_components_for_computed_key or
+                    const skip = frame.skipComponents() or
                         (frame.path_broken and frame.break_origin == .upstream_value);
                     if (!skip) {
                         try frame.components.append(it.alloc, .{ .int = idx });
@@ -1229,10 +1254,13 @@ pub const ResultIterator = struct {
                 it.current = switch (key_sv) {
                     .tape_value => |tv| switch (tv) {
                         .string => |s| blk: {
-                            // Record path component if path tracking is active.
+                            // Record path component if path tracking is active
+                            // and not suspended.
                             if (it.path_stack.items.len > 0) {
                                 const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                                try frame.components.append(it.alloc, .{ .string = s });
+                                if (!frame.skipComponents()) {
+                                    try frame.components.append(it.alloc, .{ .string = s });
+                                }
                             }
                             break :blk switch (base) {
                                 .object => |span| lookupKey(span.tape, span, s) orelse @as(Value, .null_val),
@@ -1246,10 +1274,13 @@ pub const ResultIterator = struct {
                         else => return error.TypeError,
                     },
                     .int => |i| blk: {
-                        // Record path component if path tracking is active.
+                        // Record path component if path tracking is active
+                        // and not suspended.
                         if (it.path_stack.items.len > 0) {
                             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                            try frame.components.append(it.alloc, .{ .int = i });
+                            if (!frame.skipComponents()) {
+                                try frame.components.append(it.alloc, .{ .int = i });
+                            }
                         }
                         break :blk switch (base) {
                             .array => |span| blk2: {
@@ -1277,15 +1308,20 @@ pub const ResultIterator = struct {
                             if (std.math.isNan(f) or std.math.isInf(f)) {
                                 if (it.path_stack.items.len > 0) {
                                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                                    try frame.components.append(it.alloc, .null_val);
+                                    if (!frame.skipComponents()) {
+                                        try frame.components.append(it.alloc, .null_val);
+                                    }
                                 }
                                 break :blk @as(Value, .null_val);
                             }
                             const i: i64 = @intFromFloat(@trunc(f));
-                            // Record path component if path tracking is active.
+                            // Record path component if path tracking is active
+                            // and not suspended.
                             if (it.path_stack.items.len > 0) {
                                 const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                                try frame.components.append(it.alloc, .{ .int = i });
+                                if (!frame.skipComponents()) {
+                                    try frame.components.append(it.alloc, .{ .int = i });
+                                }
                             }
                             const resolved_idx = if (i < 0) blk2: {
                                 const len = arrayLength(span.tape, span);
@@ -1307,7 +1343,9 @@ pub const ResultIterator = struct {
                     .null_val => blk: {
                         if (it.path_stack.items.len > 0) {
                             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                            try frame.components.append(it.alloc, .null_val);
+                            if (!frame.skipComponents()) {
+                                try frame.components.append(it.alloc, .null_val);
+                            }
                         }
                         break :blk @as(Value, .null_val);
                     },
@@ -1321,9 +1359,11 @@ pub const ResultIterator = struct {
                 const path = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    var segs = std.mem.splitScalar(u8, path, '.');
-                    while (segs.next()) |seg| {
-                        try frame.components.append(it.alloc, .{ .string = seg });
+                    if (!frame.skipComponents()) {
+                        var segs = std.mem.splitScalar(u8, path, '.');
+                        while (segs.next()) |seg| {
+                            try frame.components.append(it.alloc, .{ .string = seg });
+                        }
                     }
                 }
                 it.current = try it.doLoadPath(path);
@@ -1333,12 +1373,15 @@ pub const ResultIterator = struct {
 
             .slice => {
                 const args = instr.operand.slice_args;
-                // Record slice path component if path tracking is active.
+                // Record slice path component if path tracking is active
+                // and not suspended.
                 // jq stores literal bounds (negative allowed, missing bound = null).
                 if (it.path_stack.items.len > 0) {
-                    const slice_obj = try it.buildSlicePathComponent(args);
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    try frame.components.append(it.alloc, slice_obj);
+                    if (!frame.skipComponents()) {
+                        const slice_obj = try it.buildSlicePathComponent(args);
+                        try frame.components.append(it.alloc, slice_obj);
+                    }
                 }
                 const result = try it.doSlice(args);
                 it.pushValue(result);
@@ -1375,9 +1418,11 @@ pub const ResultIterator = struct {
                 if (it.if_stack.items.len == 0) return error.TypeError;
                 it.current = it.if_stack.pop().?;
                 if (it.path_stack.items.len > 0) {
-                    const slice_obj = try it.buildSlicePathComponent(resolved);
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                    try frame.components.append(it.alloc, slice_obj);
+                    if (!frame.skipComponents()) {
+                        const slice_obj = try it.buildSlicePathComponent(resolved);
+                        try frame.components.append(it.alloc, slice_obj);
+                    }
                 }
                 const result = try it.doSlice(resolved);
                 it.pushValue(result);
@@ -2204,6 +2249,35 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .path_suspend => {
+                // Suspend path-component recording on the innermost path frame.
+                // While suspended, descent ops do not append components and
+                // path-breaking ops do not mark `path_broken`. Used by
+                // `emitAsBind` to evaluate the LHS of `EXPR1 as $v | EXPR2`
+                // in value context — jq's path semantics treat
+                // `path(EXPR1 as $v | EXPR2)` as `path(EXPR2)`. No-op when
+                // no path frame is active.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    frame.suspended = true;
+                }
+                it.ip += 1;
+                return null;
+            },
+
+            .path_resume => {
+                // Clear the `suspended` flag set by `path_suspend`. Emitter
+                // must guarantee 1:1 pairing — `path_resume` always follows
+                // a corresponding `path_suspend` within the same execution
+                // path. No-op when no path frame is active.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    frame.suspended = false;
+                }
+                it.ip += 1;
+                return null;
+            },
+
             // ── Walk opcodes ───────────────────────────────────────────────
 
             .walk_start => {
@@ -2302,7 +2376,9 @@ pub const ResultIterator = struct {
                         // Record path component (the array index 0).
                         if (it.path_stack.items.len > 0) {
                             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                            try frame.components.append(it.alloc, .{ .int = 0 });
+                            if (!frame.skipComponents()) {
+                                try frame.components.append(it.alloc, .{ .int = 0 });
+                            }
                         }
                         it.current = tapeEntryToValue(span.tape, first);
                         it.ip += 1;
@@ -2333,10 +2409,12 @@ pub const ResultIterator = struct {
                         });
                         // Record path component (the object key).
                         if (it.path_stack.items.len > 0) {
-                            const key_entry = span.tape.entries[first_key];
-                            const key = span.tape.getString(key_entry.payload.string);
                             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-                            try frame.components.append(it.alloc, .{ .string = key });
+                            if (!frame.skipComponents()) {
+                                const key_entry = span.tape.entries[first_key];
+                                const key = span.tape.getString(key_entry.payload.string);
+                                try frame.components.append(it.alloc, .{ .string = key });
+                            }
                         }
                         it.current = tapeEntryToValue(span.tape, first_key + 1);
                         it.ip += 1;
@@ -5900,9 +5978,12 @@ pub const ResultIterator = struct {
             else => return error.TypeError,
         };
 
-        // If inside a path(f) frame, record the path elements as components
-        // so path_end builds the correct path array (enabling |= autovivify).
-        if (it.path_stack.items.len > 0) {
+        // If inside a path(f) frame and not suspended (e.g. evaluating the
+        // LHS of an `as` binding in value context), record the path elements
+        // as components so path_end builds the correct path array (enabling
+        // |= autovivify). When suspended, getpath behaves as a pure value
+        // builtin and must not affect the surrounding path's components.
+        if (it.path_stack.items.len > 0 and !it.path_stack.items[it.path_stack.items.len - 1].suspended) {
             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
             frame.components.clearRetainingCapacity();
             var scan_pos = span.start + 1;
@@ -6585,8 +6666,9 @@ pub const ResultIterator = struct {
         // frame's components because the iterated container is a list of
         // pre-built path arrays (not a user value). Flag the frame so
         // advanceEachForkpoint skips path recording and path_end yields the
-        // current value (the path array) as the result.
-        if (it.path_stack.items.len > 0) {
+        // current value (the path array) as the result. Skipped while the
+        // frame is suspended — `paths` runs as a value-context generator.
+        if (it.path_stack.items.len > 0 and !it.path_stack.items[it.path_stack.items.len - 1].suspended) {
             it.path_stack.items[it.path_stack.items.len - 1].body_emits_paths_directly = true;
         }
 
@@ -6666,7 +6748,11 @@ pub const ResultIterator = struct {
     /// nested object. The native builtin short-circuits that derivation but
     /// still reproduces its path stream in path mode.
     fn builtinRecurse(it: *ResultIterator) ZqError!?StackValue {
-        const in_path_frame = it.path_stack.items.len > 0;
+        // When suspended (LHS of an `as` binding), the surrounding path
+        // frame must not see this builtin as path-emitting — recurse runs in
+        // value context and produces values, not paths.
+        const in_path_frame = it.path_stack.items.len > 0 and
+            !it.path_stack.items[it.path_stack.items.len - 1].suspended;
 
         var all_items = std.ArrayList(Value){};
         defer all_items.deinit(it.alloc);
@@ -7270,7 +7356,7 @@ pub const ResultIterator = struct {
         // a user value being descended into.
         if (it.path_stack.items.len > 0) {
             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
-            if (!frame.body_emits_paths_directly) {
+            if (!frame.body_emits_paths_directly and !frame.skipComponents()) {
                 if (st.is_object) {
                     const key_entry = st.tape.entries[next_pos];
                     const key = st.tape.getString(key_entry.payload.string);
