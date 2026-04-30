@@ -1754,6 +1754,17 @@ pub const BuiltinClass = enum {
     /// Synthesizes AST nodes and recurses via lowerNode — no new VM opcode
     /// required; to_entries/map/from_entries are already supported.
     with_entries_desugar1,
+    /// `INDEX(idx_expr)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   def INDEX(idx_expr): INDEX(.[]; idx_expr);
+    /// Synthesizes the 2-arg call AST and recurses via lowerNode.
+    index_desugar1,
+    /// `INDEX(stream; idx_expr)` (2-arity). Desugars to the canonical jq prelude form:
+    ///   def INDEX(stream; idx_expr):
+    ///     reduce stream as $row ({}; .[$row | idx_expr | tostring] = $row);
+    /// Synthesizes the reduce AST and recurses via lowerNode — no new VM
+    /// opcode required; reduce/object_construct/assign_general/tostring are
+    /// already supported IR primitives.
+    index_desugar2,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1837,6 +1848,15 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // bucket and must not fall through to `.not_implemented`.
     if (arity == 1 and std.mem.eql(u8, name, "pick")) return .pick_desugar1;
     if (arity == 1 and std.mem.eql(u8, name, "with_entries")) return .with_entries_desugar1;
+
+    // `INDEX(idx_expr)` / `INDEX(stream; idx_expr)` — pure AST desugar to the
+    // jq canonical prelude form. Routed before the generic arity tables
+    // because INDEX does not appear in any value/filter bucket and must not
+    // fall through to `.not_implemented`.
+    if (std.mem.eql(u8, name, "INDEX")) {
+        if (arity == 1) return .index_desugar1;
+        if (arity == 2) return .index_desugar2;
+    }
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
     // Dispatched before the generic 0-arity table because the 0-arity
@@ -2264,6 +2284,15 @@ fn lowerBuiltinCall(
         // recursive lowerNode call.
         .with_entries_desugar1 => {
             return lowerWithEntriesDesugar(ctx, bc, src_start, src_len);
+        },
+        // `INDEX(idx_expr)` / `INDEX(stream; idx_expr)`. Desugared to the
+        // jq canonical prelude form via AST synthesis + recursive lowerNode
+        // call.
+        .index_desugar1 => {
+            return lowerIndexDesugar1(ctx, bc, src_start, src_len);
+        },
+        .index_desugar2 => {
+            return lowerIndexDesugar2(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -3500,6 +3529,138 @@ fn lowerWithEntriesDesugar(
     };
 
     return lowerNode(ctx, root_node);
+}
+
+// ── `INDEX(idx_expr)` / `INDEX(stream; idx_expr)` desugar ────────────────────
+//
+// Canonical jq prelude:
+//   def INDEX(stream; idx_expr):
+//     reduce stream as $row ({}; .[$row | idx_expr | tostring] = $row);
+//   def INDEX(idx_expr): INDEX(.[]; idx_expr);
+//
+// The 2-arg form synthesizes the reduce-with-assign AST and recurses via
+// lowerNode. The 1-arg form synthesizes the 2-arg call (`.[]` as stream)
+// and recurses. No new VM opcode required — reduce/object_construct/
+// assign_general/tostring are already supported IR primitives.
+fn lowerIndexDesugar1(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    // .[] — iterate over the input
+    const iter_node = try alloc.create(ast.Node);
+    iter_node.* = .{ .kind = .iterate, .span = ast.Span.empty() };
+
+    // INDEX(.[]; idx_expr) — recurse via the 2-arg form
+    const args = try alloc.alloc(*ast.Node, 2);
+    args[0] = iter_node;
+    args[1] = bc.args[0];
+    const call = try alloc.create(ast.Node);
+    call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "INDEX", .args = args } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, call);
+}
+
+fn lowerIndexDesugar2(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const stream_node: *ast.Node = bc.args[0];
+    const idx_expr_node: *ast.Node = bc.args[1];
+
+    // {} — empty object literal for reduce init
+    const empty_obj = try alloc.create(ast.Node);
+    empty_obj.* = .{
+        .kind = .{ .object_construct = .{ .fields = &.{} } },
+        .span = ast.Span.empty(),
+    };
+
+    // $row | idx_expr | tostring — the key expression for the bracket subscript
+    const row_ref_for_key = try alloc.create(ast.Node);
+    row_ref_for_key.* = .{
+        .kind = .{ .variable_ref = .{ .name = "$row" } },
+        .span = ast.Span.empty(),
+    };
+
+    const tostring_call = try alloc.create(ast.Node);
+    tostring_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "tostring", .args = &.{} } },
+        .span = ast.Span.empty(),
+    };
+
+    // ($row | idx_expr)
+    const row_pipe_idx = try alloc.create(ast.Node);
+    row_pipe_idx.* = .{
+        .kind = .{ .pipe = .{ .left = row_ref_for_key, .right = idx_expr_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // ($row | idx_expr | tostring)
+    const key_expr = try alloc.create(ast.Node);
+    key_expr.* = .{
+        .kind = .{ .pipe = .{ .left = row_pipe_idx, .right = tostring_call } },
+        .span = ast.Span.empty(),
+    };
+
+    // identity for the suffix base (`.` in `.[key]`)
+    const identity_for_lhs = try alloc.create(ast.Node);
+    identity_for_lhs.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // .[key_expr] — Suffix with single bracket_expr op
+    const suffix_ops = try alloc.alloc(ast.Node.SuffixOp, 1);
+    suffix_ops[0] = .{ .bracket_expr = key_expr };
+    const lhs_node = try alloc.create(ast.Node);
+    lhs_node.* = .{
+        .kind = .{ .suffix = .{ .base = identity_for_lhs, .ops = suffix_ops } },
+        .span = ast.Span.empty(),
+    };
+
+    // $row — RHS of the assignment
+    const row_ref_for_rhs = try alloc.create(ast.Node);
+    row_ref_for_rhs.* = .{
+        .kind = .{ .variable_ref = .{ .name = "$row" } },
+        .span = ast.Span.empty(),
+    };
+
+    // .[$row | idx_expr | tostring] = $row
+    const assign_node = try alloc.create(ast.Node);
+    assign_node.* = .{
+        .kind = .{ .assign_general = .{
+            .lhs = lhs_node,
+            .op = .eq,
+            .rhs = row_ref_for_rhs,
+            .op_offset = 0,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // reduce stream as $row ({}; .[$row | idx_expr | tostring] = $row)
+    const reduce_node = try alloc.create(ast.Node);
+    reduce_node.* = .{
+        .kind = .{ .reduce = .{
+            .expr = stream_node,
+            .pattern = .{ .simple = "$row" },
+            .init = empty_obj,
+            .update = assign_node,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, reduce_node);
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────

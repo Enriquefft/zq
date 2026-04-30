@@ -2242,6 +2242,11 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // chain of `to_entries | map(f) | from_entries`. A call_builtin
         // node carrying this class must never reach emit.
         .with_entries_desugar1 => unreachable,
+        // `INDEX(idx_expr)` / `INDEX(stream; idx_expr)` are fully resolved
+        // at lower time. The 1-arg form recurses into the 2-arg form, which
+        // synthesizes a `reduce` + `assign_general` AST. A call_builtin node
+        // carrying these classes must never reach emit.
+        .index_desugar1, .index_desugar2 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
