@@ -244,13 +244,17 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
                     .optional => buf.append(alloc, '?') catch {},
                     .slice => |sl| {
                         buf.append(alloc, '[') catch {};
-                        if (sl.has_from) {
+                        if (sl.from_expr) |fe| {
+                            formatNode(fe, buf, alloc, indent);
+                        } else if (sl.has_from) {
                             var num_buf: [20]u8 = undefined;
                             const s = std.fmt.bufPrint(&num_buf, "{d}", .{sl.from}) catch "";
                             buf.appendSlice(alloc, s) catch {};
                         }
                         buf.append(alloc, ':') catch {};
-                        if (sl.has_to) {
+                        if (sl.to_expr) |te| {
+                            formatNode(te, buf, alloc, indent);
+                        } else if (sl.has_to) {
                             var num_buf: [20]u8 = undefined;
                             const s = std.fmt.bufPrint(&num_buf, "{d}", .{sl.to}) catch "";
                             buf.appendSlice(alloc, s) catch {};
@@ -382,13 +386,17 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
         .error_node => buf.appendSlice(alloc, "/* error */") catch {},
         .slice => |sl| {
             buf.appendSlice(alloc, ".[") catch {};
-            if (sl.has_from) {
+            if (sl.from_expr) |fe| {
+                formatNode(fe, buf, alloc, indent);
+            } else if (sl.has_from) {
                 var num_buf: [20]u8 = undefined;
                 const s = std.fmt.bufPrint(&num_buf, "{d}", .{sl.from}) catch "";
                 buf.appendSlice(alloc, s) catch {};
             }
             buf.append(alloc, ':') catch {};
-            if (sl.has_to) {
+            if (sl.to_expr) |te| {
+                formatNode(te, buf, alloc, indent);
+            } else if (sl.has_to) {
                 var num_buf: [20]u8 = undefined;
                 const s = std.fmt.bufPrint(&num_buf, "{d}", .{sl.to}) catch "";
                 buf.appendSlice(alloc, s) catch {};

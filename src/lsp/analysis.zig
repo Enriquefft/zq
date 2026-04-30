@@ -302,11 +302,19 @@ pub const SemanticModel = struct {
                 for (suf.ops) |op| {
                     switch (op) {
                         .bracket_expr => |expr| self.walkNode(expr, scope_id),
+                        .slice => |sl| {
+                            if (sl.from_expr) |fe| self.walkNode(fe, scope_id);
+                            if (sl.to_expr) |te| self.walkNode(te, scope_id);
+                        },
                         else => {},
                     }
                 }
             },
-            .identity, .recurse, .field_access, .index_access, .iterate, .slice, .literal, .error_node => {},
+            .slice => |sl| {
+                if (sl.from_expr) |fe| self.walkNode(fe, scope_id);
+                if (sl.to_expr) |te| self.walkNode(te, scope_id);
+            },
+            .identity, .recurse, .field_access, .index_access, .iterate, .literal, .error_node => {},
         }
     }
 

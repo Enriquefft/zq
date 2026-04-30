@@ -1348,6 +1348,45 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .slice_computed => {
+                // `.[<from_expr>:<to_expr>]` — at least one bound is an
+                // expression. Bounds were pushed onto `value_stack` in
+                // from-then-to order by `emitSliceComputed`; pop them in
+                // reverse (`to` first, then `from`). The slice base was
+                // pushed onto `if_stack` via the `save_input` that
+                // bracketed this opcode.
+                const op_args = instr.operand.slice_args;
+                var resolved = types.SliceArgs{
+                    .from = op_args.from,
+                    .to = op_args.to,
+                    .has_from = op_args.has_from,
+                    .has_to = op_args.has_to,
+                };
+                if (op_args.has_to_expr) {
+                    if (it.value_stack.items.len == 0) return error.TypeError;
+                    const to_sv = try it.popValue();
+                    resolved.to = try it.sliceBoundFromStackValue(to_sv);
+                    resolved.has_to = to_sv != .null_val;
+                }
+                if (op_args.has_from_expr) {
+                    if (it.value_stack.items.len == 0) return error.TypeError;
+                    const from_sv = try it.popValue();
+                    resolved.from = try it.sliceBoundFromStackValue(from_sv);
+                    resolved.has_from = from_sv != .null_val;
+                }
+                if (it.if_stack.items.len == 0) return error.TypeError;
+                it.current = it.if_stack.pop().?;
+                if (it.path_stack.items.len > 0) {
+                    const slice_obj = try it.buildSlicePathComponent(resolved);
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    try frame.components.append(it.alloc, slice_obj);
+                }
+                const result = try it.doSlice(resolved);
+                it.pushValue(result);
+                it.ip += 1;
+                return null;
+            },
+
             .navigate_key => {
                 const key = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
                 it.current = lookupKeyInValue(&it.tape, it.nullAllowed(), it.current, key) catch |err| {
@@ -2429,6 +2468,33 @@ pub const ResultIterator = struct {
         };
     }
 
+    /// Resolve a bound value popped off `value_stack` for
+    /// `slice_computed`. Mirrors jq's slice-bound coercion rules:
+    /// - int → used directly (clamped to i32 range; OOB → end-extreme)
+    /// - float → truncate toward zero, then int rule
+    /// - null → caller treats as "missing" (returns 0 placeholder; the
+    ///   caller flips `has_from` / `has_to` off to fall back to the
+    ///   length default in `doSlice`)
+    /// - anything else → TypeError
+    fn sliceBoundFromStackValue(it: *ResultIterator, sv: StackValue) ZqError!i32 {
+        _ = it;
+        return switch (sv) {
+            .int => |n| blk: {
+                if (n > std.math.maxInt(i32)) break :blk std.math.maxInt(i32);
+                if (n < std.math.minInt(i32)) break :blk std.math.minInt(i32);
+                break :blk @intCast(n);
+            },
+            .float => |f| blk: {
+                if (std.math.isNan(f)) break :blk 0;
+                if (f >= @as(f64, @floatFromInt(std.math.maxInt(i32)))) break :blk std.math.maxInt(i32);
+                if (f <= @as(f64, @floatFromInt(std.math.minInt(i32)))) break :blk std.math.minInt(i32);
+                break :blk @as(i32, @intFromFloat(@trunc(f)));
+            },
+            .null_val => 0,
+            else => error.TypeError,
+        };
+    }
+
     fn doSlice(it: *ResultIterator, args: types.SliceArgs) ZqError!StackValue {
         switch (it.current) {
             .array => |span| {
@@ -2473,12 +2539,45 @@ pub const ResultIterator = struct {
                 } } };
             },
             .string => |s| {
-                const len: i32 = @intCast(s.len);
-                const from = resolveSliceBound(if (args.has_from) args.from else 0, len);
-                const to_resolved = resolveSliceBound(if (args.has_to) args.to else len, len);
-                const actual_from: usize = @intCast(from);
-                const actual_to: usize = @intCast(if (to_resolved < from) from else to_resolved);
-                const str_ref = try it.runtime_tape.internString(it.alloc, s[actual_from..actual_to]);
+                // jq slice on strings is codepoint-indexed, not
+                // byte-indexed. Walk the UTF-8 sequence to map the
+                // requested codepoint bounds to byte offsets. ASCII
+                // strings remain a hot path because every codepoint
+                // is one byte; multibyte strings (e.g. `"正xyz"`)
+                // require the walk so `.[:1]` slices the first
+                // codepoint rather than splitting a multi-byte
+                // sequence into invalid UTF-8.
+                var cp_len: i32 = 0;
+                {
+                    var i: usize = 0;
+                    while (i < s.len) : (cp_len += 1) {
+                        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                        i += seq_len;
+                    }
+                }
+                const from = resolveSliceBound(if (args.has_from) args.from else 0, cp_len);
+                const to_resolved = resolveSliceBound(if (args.has_to) args.to else cp_len, cp_len);
+                const actual_to_cp: i32 = if (to_resolved < from) from else to_resolved;
+
+                // Walk to the byte offsets corresponding to the
+                // resolved codepoint bounds.
+                var byte_from: usize = 0;
+                var byte_to: usize = 0;
+                {
+                    var i: usize = 0;
+                    var cp_i: i32 = 0;
+                    while (i < s.len and cp_i < from) : (cp_i += 1) {
+                        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                        i += seq_len;
+                    }
+                    byte_from = i;
+                    while (i < s.len and cp_i < actual_to_cp) : (cp_i += 1) {
+                        const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                        i += seq_len;
+                    }
+                    byte_to = i;
+                }
+                const str_ref = try it.runtime_tape.internString(it.alloc, s[byte_from..byte_to]);
                 return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
             },
             // jq: slicing null yields null (not an error).

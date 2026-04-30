@@ -597,27 +597,7 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         }),
 
         // ── Slice `.[from:to]` (category 2) ─────────────────────────
-        .slice => |sl| {
-            const alloc = ctx.arena.allocator();
-            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
-            // Pack the four SliceArgs fields into two u32 slots: slot 0
-            // packs `from` (i32 low) | `to` (i32 high); slot 1 packs the
-            // two has_* booleans into the low two bits. Mirrors the
-            // legacy `types.SliceArgs` ABI without re-importing the
-            // shared types module across the compiler boundary.
-            const from_u: u32 = @bitCast(sl.from);
-            const to_u: u32 = @bitCast(sl.to);
-            try ctx.out.extra_data.append(alloc, from_u);
-            try ctx.out.extra_data.append(alloc, to_u);
-            const flags: u32 = (@as(u32, @intFromBool(sl.has_from))) | (@as(u32, @intFromBool(sl.has_to)) << 1);
-            try ctx.out.extra_data.append(alloc, flags);
-            return ctx.pushNode(.{
-                .op = .slice,
-                .extra = extra_idx,
-                .src_start = sp.start,
-                .src_len = sp.len,
-            });
-        },
+        .slice => |sl| return lowerSliceNode(ctx, sl, sp),
 
         // ── Postfix optional `expr?` (category 2) ───────────────────
         // Wraps the inner expression in `try_`, matching the legacy
@@ -2663,18 +2643,47 @@ fn lowerSuffixBracketExpr(ctx: *Lowerer, key_node: *Node, span: ast.Span) LowerE
 }
 
 /// Append a `slice` node for a SuffixOp `.slice`.
-fn lowerSuffixSlice(ctx: *Lowerer, sl: ast.Node.Slice, span: ast.Span) error{OutOfMemory}!u32 {
+fn lowerSuffixSlice(ctx: *Lowerer, sl: ast.Node.Slice, span: ast.Span) LowerError!u32 {
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return lowerSliceNode(ctx, sl, sp);
+}
+
+/// Shared lowering for the two slice-shaped AST nodes (`.slice` at
+/// `lowerNode` and `.suffix.slice` at `lowerSuffixSlice`). When either
+/// bound carries a non-null `from_expr` / `to_expr`, route through
+/// `computed_slice` and lower the bound expressions as `children[0..2]`.
+/// Otherwise emit the legacy `slice` op with literal bounds.
+///
+/// Flag layout in extra_data slot 2 (4 bits):
+///   bit 0 — has_from
+///   bit 1 — has_to
+///   bit 2 — has_from_expr  (children[0] valid)
+///   bit 3 — has_to_expr    (children[1] valid)
+fn lowerSliceNode(ctx: *Lowerer, sl: ast.Node.Slice, sp: anytype) LowerError!u32 {
     const alloc = ctx.arena.allocator();
+    const has_from_expr = sl.from_expr != null;
+    const has_to_expr = sl.to_expr != null;
+    const is_computed = has_from_expr or has_to_expr;
+
+    var children: [2]u32 = .{ 0, 0 };
+    if (has_from_expr) children[0] = try lowerNode(ctx, sl.from_expr.?);
+    if (has_to_expr) children[1] = try lowerNode(ctx, sl.to_expr.?);
+
     const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
     const from_u: u32 = @bitCast(sl.from);
     const to_u: u32 = @bitCast(sl.to);
     try ctx.out.extra_data.append(alloc, from_u);
     try ctx.out.extra_data.append(alloc, to_u);
-    const flags: u32 = (@as(u32, @intFromBool(sl.has_from))) | (@as(u32, @intFromBool(sl.has_to)) << 1);
+    const flags: u32 =
+        (@as(u32, @intFromBool(sl.has_from))) |
+        (@as(u32, @intFromBool(sl.has_to)) << 1) |
+        (@as(u32, @intFromBool(has_from_expr)) << 2) |
+        (@as(u32, @intFromBool(has_to_expr)) << 3);
     try ctx.out.extra_data.append(alloc, flags);
-    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+
     return ctx.pushNode(.{
-        .op = .slice,
+        .op = if (is_computed) .computed_slice else .slice,
+        .children = children,
         .extra = extra_idx,
         .src_start = sp.start,
         .src_len = sp.len,

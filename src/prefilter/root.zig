@@ -369,7 +369,14 @@ fn isPureAccessorNode(n: *const ast.Node) bool {
         .field_access => true,
         .iterate => true,
         .index_access => true,
-        .slice => true,
+        .slice => |sl| blk: {
+            // Computed-bound slices carry arbitrary expressions and
+            // are not pure accessors. Recurse into the bounds to be
+            // sure each side is itself pure.
+            if (sl.from_expr) |fe| if (!isPureAccessorNode(fe)) break :blk false;
+            if (sl.to_expr) |te| if (!isPureAccessorNode(te)) break :blk false;
+            break :blk true;
+        },
         .recurse => true,
         .optional => |u| isPureAccessorNode(u.operand),
         .paren => |u| isPureAccessorNode(u.operand),
@@ -378,7 +385,11 @@ fn isPureAccessorNode(n: *const ast.Node) bool {
             if (!isPureAccessorNode(s.base)) break :blk false;
             for (s.ops) |op| {
                 switch (op) {
-                    .field, .index, .iterate, .slice, .optional, .bracket_str => {},
+                    .field, .index, .iterate, .optional, .bracket_str => {},
+                    .slice => |sl| {
+                        if (sl.from_expr) |fe| if (!isPureAccessorNode(fe)) break :blk false;
+                        if (sl.to_expr) |te| if (!isPureAccessorNode(te)) break :blk false;
+                    },
                     .bracket_expr => |inner| {
                         switch (inner.kind) {
                             .literal => {},

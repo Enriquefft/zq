@@ -177,6 +177,16 @@ pub const Op = enum(u8) {
     /// Plan §3.5 row P27 / cat-18.
     computed_index,
 
+    /// Computed-bound slice (`.[expr1:expr2]` where either bound is a
+    /// non-integer-literal expression). `children[0]` lowers `from_expr`
+    /// (when present), `children[1]` lowers `to_expr` (when present).
+    /// `extra` slot 2 holds a 4-bit flag word: bit 0 has_from, bit 1
+    /// has_to, bit 2 has_from_expr (children[0] valid), bit 3
+    /// has_to_expr (children[1] valid). When neither expr-bit is set,
+    /// the lowerer emits `slice` instead. Plan §3.5 / cat-18 cousin of
+    /// `computed_index`.
+    computed_slice,
+
     pipe,
     comma,
     arith,
@@ -579,12 +589,14 @@ fn dumpAst(
         .slice => |sl| {
             try writeIndent(writer, depth);
             try writer.writeAll("slice(");
-            if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
+            if (sl.from_expr != null) try writer.writeAll("expr") else if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
             try writer.writeAll(", ");
-            if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
+            if (sl.to_expr != null) try writer.writeAll("expr") else if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
             try writer.writeAll(")");
             try writeSpan(writer, node.span);
             try writer.writeAll("\n");
+            if (sl.from_expr) |fe| try dumpAst(ir_obj, fe, source, depth + 1, writer);
+            if (sl.to_expr) |te| try dumpAst(ir_obj, te, source, depth + 1, writer);
         },
         .optional => |un| {
             try writeIndent(writer, depth);
@@ -1202,9 +1214,9 @@ fn dumpSuffixOp(
         .iterate => try writer.writeAll("iterate"),
         .slice => |sl| {
             try writer.writeAll("slice(");
-            if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
+            if (sl.from_expr != null) try writer.writeAll("expr") else if (sl.has_from) try writer.print("{d}", .{sl.from}) else try writer.writeAll("_");
             try writer.writeAll(", ");
-            if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
+            if (sl.to_expr != null) try writer.writeAll("expr") else if (sl.has_to) try writer.print("{d}", .{sl.to}) else try writer.writeAll("_");
             try writer.writeAll(")");
         },
         .optional => unreachable, // handled by renderSuffixChain wrap
@@ -1679,6 +1691,21 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
         .pipe => try writer.writeAll("pipe"),
         .comma => try writer.writeAll("comma"),
         .computed_index => try writer.writeAll("computed_index"),
+        .computed_slice => {
+            const slots = ir_obj.extra_data.items;
+            const from_u: u32 = slots[node.extra];
+            const to_u: u32 = slots[node.extra + 1];
+            const flags: u32 = slots[node.extra + 2];
+            const has_from = (flags & 1) != 0;
+            const has_to = (flags & 2) != 0;
+            const has_from_expr = (flags & 4) != 0;
+            const has_to_expr = (flags & 8) != 0;
+            try writer.writeAll("computed_slice(");
+            if (has_from_expr) try writer.writeAll("expr") else if (has_from) try writer.print("{d}", .{@as(i32, @bitCast(from_u))}) else try writer.writeAll("_");
+            try writer.writeAll(", ");
+            if (has_to_expr) try writer.writeAll("expr") else if (has_to) try writer.print("{d}", .{@as(i32, @bitCast(to_u))}) else try writer.writeAll("_");
+            try writer.writeAll(")");
+        },
         .iterate => try writer.writeAll("iterate"),
         .recurse => try writer.writeAll("recurse"),
         .try_ => try writer.writeAll("try"),
@@ -1819,6 +1846,18 @@ fn dumpIRChildren(
     // operates on the implicit current input — see `lower.zig:1539`).
     switch (node.op) {
         .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end, .break_ => return,
+        .computed_slice => {
+            // Dynamic arity: 0/1/2 child exprs depending on which
+            // bound flags are set. Mirrors the fuse.zig `childArity`
+            // computation so dump and copy agree on which slots to
+            // visit.
+            const flags: u32 = ir_obj.extra_data.items[node.extra + 2];
+            const has_from_expr = (flags & 4) != 0;
+            const has_to_expr = (flags & 8) != 0;
+            if (has_from_expr) try dumpIRNode(ir_obj, node.children[0], depth, tracker, writer);
+            if (has_to_expr) try dumpIRNode(ir_obj, node.children[1], depth, tracker, writer);
+            return;
+        },
         else => {},
     }
     if (node.span_len > 0) {
