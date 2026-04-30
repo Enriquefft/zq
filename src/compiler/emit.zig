@@ -2252,6 +2252,11 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // nodes. A call_builtin node carrying these classes must never
         // reach emit.
         .join_desugar2, .join_desugar3, .join_desugar4 => unreachable,
+        // `IN(s)` / `IN(s; t)` are fully resolved at lower time into
+        // `any/2` (which itself desugars further) + `comparison` +
+        // `identity` + `builtin_call("IN", ...)` IR nodes. A call_builtin
+        // node carrying these classes must never reach emit.
+        .in_desugar1, .in_desugar2 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,

@@ -1779,6 +1779,17 @@ pub const BuiltinClass = enum {
     ///   def JOIN($idx; stream; idx_expr; join_expr):
     ///     stream | [., $idx[idx_expr]] | join_expr;
     join_desugar4,
+    /// `IN(s)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   def IN(s): any(s == .; .);
+    /// Synthesizes `any(s == .; .)` as a builtin_call AST node and recurses
+    /// via lowerNode — no new VM opcode required; the any_desugar2 path
+    /// handles the generated any/2 call.
+    in_desugar1,
+    /// `IN(s; t)` (2-arity). Desugars to the canonical jq prelude form:
+    ///   def IN(s; t): any(s; IN(t));
+    /// Synthesizes `any(s; IN(t))` as a builtin_call AST node and recurses
+    /// via lowerNode — reuses in_desugar1 + any_desugar2 transitively.
+    in_desugar2,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1881,6 +1892,15 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
         if (arity == 2) return .join_desugar2;
         if (arity == 3) return .join_desugar3;
         if (arity == 4) return .join_desugar4;
+    }
+
+    // `IN(s)` / `IN(s; t)` — pure AST desugar to the jq canonical prelude
+    // form. Routed before the generic arity tables because IN does not appear
+    // in any value/filter bucket and must not fall through to
+    // `.not_implemented`.
+    if (std.mem.eql(u8, name, "IN")) {
+        if (arity == 1) return .in_desugar1;
+        if (arity == 2) return .in_desugar2;
     }
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
@@ -2330,6 +2350,14 @@ fn lowerBuiltinCall(
         },
         .join_desugar4 => {
             return lowerJoinDesugar4(ctx, bc, src_start, src_len);
+        },
+        // `IN(s)` / `IN(s; t)`. Desugared to the jq canonical prelude form
+        // via AST synthesis + recursive lowerNode call.
+        .in_desugar1 => {
+            return lowerInDesugar1(ctx, bc, src_start, src_len);
+        },
+        .in_desugar2 => {
+            return lowerInDesugar2(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -3891,6 +3919,99 @@ fn lowerJoinDesugar4(
     };
 
     return lowerNode(ctx, root_node);
+}
+
+// ── `IN(s)` / `IN(s; t)` desugar ────────────────────────────────────────────
+//
+// Canonical jq prelude (src/builtin.jq):
+//   def IN(s): any(s == .; .);
+//   def IN(s; t): any(s; IN(t));
+//
+// Both forms synthesize a `builtin_call("any", ...)` AST node and recurse
+// via lowerNode, which routes through `any_desugar2` for the generated
+// `any/2` call (and `in_desugar1` transitively for the `IN(t)` sub-call in
+// IN/2). No new VM opcode required.
+
+fn lowerInDesugar1(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const s_node: *ast.Node = bc.args[0];
+
+    // `.` — left-hand side of the `. == s` comparison.
+    // NOTE: the canonical prelude writes `s == .`; we use `. == s` (same
+    // semantics for `eq`) because the cmp emitter's generator-path detection
+    // is keyed on `subtreeHasIterate` in `children[1]`, and placing the
+    // stream arg `s` on the right produces correct bytecode for any `s` that
+    // is a multi-output generator (e.g. `range/1`).  Placing `s` on the left
+    // hits the "simple LHS + identity RHS" mis-emit where the identity reads
+    // `it.current` after the generator has already advanced it.
+    const identity_lhs = try alloc.create(ast.Node);
+    identity_lhs.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // `. == s` — generator: for each value produced by s, compare with input
+    const cmp_node = try alloc.create(ast.Node);
+    cmp_node.* = .{
+        .kind = .{ .comparison = .{ .op = .eq, .left = identity_lhs, .right = s_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // `.` — predicate: identity passes true through, drops false
+    const identity_pred = try alloc.create(ast.Node);
+    identity_pred.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // `any(. == s; .)` — semantically identical to `any(s == .; .)` for `eq`
+    const any_args = try alloc.alloc(*ast.Node, 2);
+    any_args[0] = cmp_node;
+    any_args[1] = identity_pred;
+    const any_node = try alloc.create(ast.Node);
+    any_node.* = .{
+        .kind = .{ .builtin_call = .{ .name = "any", .args = any_args } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, any_node);
+}
+
+fn lowerInDesugar2(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const s_node: *ast.Node = bc.args[0];
+    const t_node: *ast.Node = bc.args[1];
+
+    // `IN(t)` — the 1-arity IN call that will be desugared transitively
+    const in_args = try alloc.alloc(*ast.Node, 1);
+    in_args[0] = t_node;
+    const in_t_node = try alloc.create(ast.Node);
+    in_t_node.* = .{
+        .kind = .{ .builtin_call = .{ .name = "IN", .args = in_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // `any(s; IN(t))`
+    const any_args = try alloc.alloc(*ast.Node, 2);
+    any_args[0] = s_node;
+    any_args[1] = in_t_node;
+    const any_node = try alloc.create(ast.Node);
+    any_node.* = .{
+        .kind = .{ .builtin_call = .{ .name = "any", .args = any_args } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, any_node);
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────
