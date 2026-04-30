@@ -7073,15 +7073,6 @@ pub const ResultIterator = struct {
         return @intFromFloat(x);
     }
 
-    fn toFloat(val: StackValue) ZqError!f64 {
-        return switch (val) {
-            .float => |f| f,
-            .int => |i| @floatFromInt(i),
-            .bool_val => |b| if (b) 1.0 else 0.0,
-            else => error.TypeError,
-        };
-    }
-
     // ── Comparison operations ─────────────────────────────────────────────────────
 
     fn doEq(it: *ResultIterator) ZqError!bool {
