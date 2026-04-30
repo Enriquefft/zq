@@ -7,18 +7,17 @@ Last verified: 2026-04-30 (post builtin-fixes wave — with_entries, rindex, sor
 
 ---
 
-## Active compat failures (2 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
+## Active compat failures (1 pre-existing from try_catch.zig + 6 newly-exposed post-fixes)
 
 Current baseline: `zig build test` → 1127/1177 pass, 30 fail, 20 skipped.
 
-### Pre-existing failures (L1481, L1692)
+### Pre-existing failures (L1481)
 
 Masked by L1712's signal-6 in prior baseline; remain unfixed.
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
 | L1481 | `try -.? catch .` mismatched output | `try -.? catch .` | error message | unary-minus on non-numeric error string format mismatch vs jq |
-| L1692 | `.foo[.baz]` returns null instead of 4 | computed-field-access | path | computed-field path access on object — `.foo[.baz]` should compute `.baz` against the same input, then index `.foo` by that |
 
 ### Newly exposed post-L1712 fix (6)
 
@@ -50,6 +49,10 @@ Merged 2026-04-30: L1592 rindex, L1668 sort_by stability, L1684 min_by/max_by ti
 - L1258 (`getpath` marked path-emitting; `builtinGetpath` populates frame components for autovivify in `getpath(P) |= V`)
 - L1302 (parser dispatches lparen body to parseFilter so leading `def` is accepted before assignment)
 - L1306 (parser accepts `Infinity`, `-Infinity`, `NaN`, `-NaN` JSON literals)
+
+### Fixed post-G6
+
+- L1692 (`.foo[.baz]` computed-index now reseeds outer input for key eval — restructured `computed_index` IR node to binary `[base, key]` shape; emit captures outer input pre-base, restores it pre-key; new `mark_computed_key` opcode suppresses path-component pollution during inner key eval inside `path(f)` / path-assign frames)
 
 ### Fixed in G5 round
 

@@ -454,14 +454,15 @@ const MAX_VAR_SPAN: usize = 64;
 /// node 0.
 fn childArity(ctx: *const WalkCtx, node: ir.Node) struct { u8, u8 } {
     return switch (node.op) {
-        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_ => .{ 0, 2 },
+        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_, .computed_index => .{ 0, 2 },
         // `not` is lowered as a leaf — it operates on the implicit
         // current input and consumes no IR child (`lower.zig:1539`).
         // `neg`, `try_`, and `path_begin` carry their operand at
         // `children[0]`. `label` is unary — body lives in `children[0]`.
-        // `break_` is a leaf (no children — the var_id reference is in
-        // `extra_data`). `computed_index` is unary — key expr at `children[0]`.
-        .try_, .neg, .path_begin, .label, .computed_index => .{ 0, 1 },
+        // `extra_data`). `computed_index` is binary — base at
+        // `children[0]`, key at `children[1]` (handled by the
+        // binary-arity row above alongside `.pipe`/`.comma`/etc).
+        .try_, .neg, .path_begin, .label => .{ 0, 1 },
         // `computed_slice` carries up to two child expressions
         // (`from_expr` at children[0], `to_expr` at children[1]) gated
         // by flag bits 2 and 3 in `extra_data[extra+2]`. Unused slots

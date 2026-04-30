@@ -2,6 +2,7 @@
 # SemOp
 arr_ctor @0..10
   computed_index @1..9
+    identity @1..9
     comma @4..7
       load_const(0) @4..5
       load_const(2) @6..7
