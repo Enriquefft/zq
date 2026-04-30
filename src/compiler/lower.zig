@@ -1741,6 +1741,11 @@ pub const BuiltinClass = enum {
     /// lowerNode — no new VM opcode required; path/reduce/setpath/getpath are
     /// already supported IR primitives.
     pick_desugar1,
+    /// `with_entries(f)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   to_entries | map(f) | from_entries
+    /// Synthesizes AST nodes and recurses via lowerNode — no new VM opcode
+    /// required; to_entries/map/from_entries are already supported.
+    with_entries_desugar1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1823,6 +1828,7 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // arity tables because `pick` does not appear in any value/filter
     // bucket and must not fall through to `.not_implemented`.
     if (arity == 1 and std.mem.eql(u8, name, "pick")) return .pick_desugar1;
+    if (arity == 1 and std.mem.eql(u8, name, "with_entries")) return .with_entries_desugar1;
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
     // Dispatched before the generic 0-arity table because the 0-arity
@@ -2244,6 +2250,12 @@ fn lowerBuiltinCall(
         // prelude form via AST synthesis + recursive lowerNode call.
         .pick_desugar1 => {
             return lowerPickDesugar(ctx, bc, src_start, src_len);
+        },
+        // `with_entries(f)` (1-arity). Desugared to
+        // `to_entries | map(f) | from_entries` via AST synthesis +
+        // recursive lowerNode call.
+        .with_entries_desugar1 => {
+            return lowerWithEntriesDesugar(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -3330,6 +3342,63 @@ fn lowerPickDesugar(
             .pattern = .{ .simple = "$v" },
             .body = reduce_node,
         } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
+}
+
+// ── `with_entries(f)` desugar ────────────────────────────────────────────────
+//
+// Canonical jq prelude:
+//   def with_entries(f): to_entries | map(f) | from_entries;
+//
+// Synthesizes the pipe chain as AST nodes and recurses via lowerNode.
+// `to_entries`/`from_entries` are zero-arg builtins; `map(f)` is the
+// dedicated `map_arg1` class. No new VM opcode required.
+fn lowerWithEntriesDesugar(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const f_node: *ast.Node = bc.args[0];
+
+    const to_entries_call = try alloc.create(ast.Node);
+    to_entries_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "to_entries", .args = &.{} } },
+        .span = ast.Span.empty(),
+    };
+
+    const map_args = try alloc.alloc(*ast.Node, 1);
+    map_args[0] = f_node;
+    const map_call = try alloc.create(ast.Node);
+    map_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "map", .args = map_args } },
+        .span = ast.Span.empty(),
+    };
+
+    const from_entries_call = try alloc.create(ast.Node);
+    from_entries_call.* = .{
+        .kind = .{ .builtin_call = .{ .name = "from_entries", .args = &.{} } },
+        .span = ast.Span.empty(),
+    };
+
+    // to_entries | map(f)
+    const left_pipe = try alloc.create(ast.Node);
+    left_pipe.* = .{
+        .kind = .{ .pipe = .{ .left = to_entries_call, .right = map_call } },
+        .span = ast.Span.empty(),
+    };
+
+    // (to_entries | map(f)) | from_entries
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .pipe = .{ .left = left_pipe, .right = from_entries_call } },
         .span = ast.Span.empty(),
     };
 
