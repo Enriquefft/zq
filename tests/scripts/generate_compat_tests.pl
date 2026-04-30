@@ -133,8 +133,9 @@ while (defined(my $line = <$fh>)) {
         next if $line =~ /^#/;
         # Normalize to compact JSON: jq's test file sometimes has spaces
         # after commas/colons but jq -c (our target format) never does.
-        $line =~ s/,\s+/,/g;
-        $line =~ s/:\s+/:/g;
+        # JSON-aware: only collapse whitespace OUTSIDE string literals so
+        # we don't corrupt values like "Tuesday, June 30, 2015".
+        $line = compact_json_outside_strings($line);
         push @outputs, $line;
     }
 
@@ -152,6 +153,53 @@ close $fh;
 printf "Parsed %d test cases\n", scalar @tests;
 
 # ── Escaping helpers ──────────────────────────────────────────────────────────
+
+# Strip whitespace following ',' and ':' that appears OUTSIDE JSON string
+# literals. We track string context with a tiny scanner and respect '\\'
+# escapes inside strings. Inputs from jq.test are well-formed JSON
+# (possibly multiple values concatenated by whitespace), so a single-pass
+# scanner is sufficient.
+sub compact_json_outside_strings {
+    my ($s) = @_;
+    my $out      = '';
+    my $in_str   = 0;
+    my $i        = 0;
+    my $len      = length($s);
+    while ($i < $len) {
+        my $c = substr($s, $i, 1);
+        if ($in_str) {
+            $out .= $c;
+            if ($c eq '\\' && $i + 1 < $len) {
+                $out .= substr($s, $i + 1, 1);
+                $i += 2;
+                next;
+            }
+            $in_str = 0 if $c eq '"';
+            $i++;
+            next;
+        }
+        if ($c eq '"') {
+            $in_str = 1;
+            $out .= $c;
+            $i++;
+            next;
+        }
+        if ($c eq ',' || $c eq ':') {
+            $out .= $c;
+            $i++;
+            # Skip following whitespace.
+            while ($i < $len) {
+                my $n = substr($s, $i, 1);
+                last unless $n =~ /\s/;
+                $i++;
+            }
+            next;
+        }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
 
 sub zig_str {
     my ($s) = @_;

@@ -10868,10 +10868,22 @@ fn datetimeToUnix(year: i64, month_0: i64, mday: i64, hour: i64, min: i64, sec: 
     return days * 86400 + hour * 3600 + min * 60 + sec;
 }
 
+// POSIX "C" locale day/month names — single source of truth for strftime
+// %A/%a/%B/%b. Abbreviations are derived from the full names at comptime
+// (POSIX C locale uses the first 3 chars of every full name verbatim), so
+// any future locale change propagates from one place.
 const weekday_names = [7][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
-const weekday_abbrs = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 const month_names = [12][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
-const month_abbrs = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const weekday_abbrs = blk: {
+    var out: [7][]const u8 = undefined;
+    for (weekday_names, 0..) |name, i| out[i] = name[0..3];
+    break :blk out;
+};
+const month_abbrs = blk: {
+    var out: [12][]const u8 = undefined;
+    for (month_names, 0..) |name, i| out[i] = name[0..3];
+    break :blk out;
+};
 
 fn formatDatetime(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, fmt: []const u8, bd: BrokenDownTime) !void {
     var tmp: [64]u8 = undefined;
