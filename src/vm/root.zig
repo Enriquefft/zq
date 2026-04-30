@@ -3509,44 +3509,44 @@ pub const ResultIterator = struct {
         else
             try valueToStackValue(it.current);
 
-        return switch (left) {
+        switch (left) {
             .int => |li| switch (right) {
-                .int => |ri| blk: {
-                    if (ri == 0) return error.TypeError;
+                .int => |ri| {
+                    if (ri == 0) return it.raiseDivmodTypeError(left, right, false);
                     // Integer division: if evenly divisible keep int, otherwise float
-                    if (@rem(li, ri) == 0) break :blk .{ .int = @divTrunc(li, ri) };
-                    break :blk .{ .float = @as(f64, @floatFromInt(li)) / @as(f64, @floatFromInt(ri)) };
+                    if (@rem(li, ri) == 0) return .{ .int = @divTrunc(li, ri) };
+                    return .{ .float = @as(f64, @floatFromInt(li)) / @as(f64, @floatFromInt(ri)) };
                 },
-                .float => |rf| blk: {
-                    if (rf == 0.0) return error.TypeError;
-                    break :blk .{ .float = @as(f64, @floatFromInt(li)) / rf };
+                .float => |rf| {
+                    if (rf == 0.0) return it.raiseDivmodTypeError(left, right, false);
+                    return .{ .float = @as(f64, @floatFromInt(li)) / rf };
                 },
-                else => error.TypeError,
+                else => return it.raiseDivmodTypeError(left, right, false),
             },
             .float => |lf| switch (right) {
-                .int => |ri| blk: {
-                    if (ri == 0) return error.TypeError;
-                    break :blk .{ .float = lf / @as(f64, @floatFromInt(ri)) };
+                .int => |ri| {
+                    if (ri == 0) return it.raiseDivmodTypeError(left, right, false);
+                    return .{ .float = lf / @as(f64, @floatFromInt(ri)) };
                 },
-                .float => |rf| blk: {
-                    if (rf == 0.0) return error.TypeError;
-                    break :blk .{ .float = lf / rf };
+                .float => |rf| {
+                    if (rf == 0.0) return it.raiseDivmodTypeError(left, right, false);
+                    return .{ .float = lf / rf };
                 },
-                else => error.TypeError,
+                else => return it.raiseDivmodTypeError(left, right, false),
             },
             // jq: string / string = split(separator)
             .tape_value => |ltv| switch (ltv) {
                 .string => |ls| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
-                        .string => |rs| try it.doStringSplit(ls, rs),
-                        else => error.TypeError,
+                        .string => |rs| return try it.doStringSplit(ls, rs),
+                        else => return it.raiseDivmodTypeError(left, right, false),
                     },
-                    else => error.TypeError,
+                    else => return it.raiseDivmodTypeError(left, right, false),
                 },
-                else => error.TypeError,
+                else => return it.raiseDivmodTypeError(left, right, false),
             },
-            else => error.TypeError,
-        };
+            else => return it.raiseDivmodTypeError(left, right, false),
+        }
     }
 
     fn doMod(it: *ResultIterator) ZqError!StackValue {
@@ -3573,25 +3573,25 @@ pub const ResultIterator = struct {
             const lf: f64 = switch (left) {
                 .int => |i| @as(f64, @floatFromInt(i)),
                 .float => |f| f,
-                else => return error.TypeError,
+                else => return it.raiseDivmodTypeError(left, right, true),
             };
             const rf: f64 = switch (right) {
                 .int => |i| @as(f64, @floatFromInt(i)),
                 .float => |f| f,
-                else => return error.TypeError,
+                else => return it.raiseDivmodTypeError(left, right, true),
             };
             if (std.math.isNan(lf) or std.math.isNan(rf)) {
                 return .{ .float = std.math.nan(f64) };
             }
             const bi = dtoiClamp(rf);
-            if (bi == 0) return error.TypeError; // modulo by zero
+            if (bi == 0) return it.raiseDivmodTypeError(left, right, true);
             if (bi == -1) return .{ .int = 0 };
             const ai = dtoiClamp(lf);
             return .{ .int = @rem(ai, bi) };
         }
-        const left_int = try toInt(left);
-        const right_int = try toInt(right);
-        if (right_int == 0) return error.TypeError; // modulo by zero
+        const left_int = toInt(left) catch return it.raiseDivmodTypeError(left, right, true);
+        const right_int = toInt(right) catch return it.raiseDivmodTypeError(left, right, true);
+        if (right_int == 0) return it.raiseDivmodTypeError(left, right, true);
         if (right_int == -1) return .{ .int = 0 };
         return .{ .int = @rem(left_int, right_int) };
     }
@@ -8324,7 +8324,67 @@ pub const ResultIterator = struct {
         /// Unary `-` applied to a non-numeric value.
         /// Produces: "<type> (<compact-json>) cannot be negated"
         negate,
+        /// `lhs / rhs` or `lhs % rhs` with an unsupported operand pair.
+        /// Produces: "<lhs_type> (<lhs_json>) and <rhs_type> (<rhs_json>) cannot be divided[ (remainder)][ because the divisor is zero]"
+        /// The "(remainder)" suffix is appended when `is_mod` is true; the
+        /// "because the divisor is zero" tail is appended when rhs is the
+        /// numeric value zero (matching jq 1.8.1's `make_arith_op_type_error`).
+        /// `val` is unused for this kind; the operand values are carried in
+        /// the variant payload.
+        divmod: struct { lhs: Value, rhs: Value, is_mod: bool },
     };
+
+    /// Base jq type name for `<type> (<compact-json>)`-style messages.
+    /// Unlike the indexer-style `type_name` (which folds the boolean value
+    /// into the type name), this returns just the base label so callers can
+    /// append `(<compact-json>)` themselves and avoid double-rendering.
+    fn baseTypeName(val: Value) []const u8 {
+        return switch (val) {
+            .null_val => "null",
+            .bool_val => "boolean",
+            .int, .float, .big_number => "number",
+            .string => "string",
+            .array => "array",
+            .object => "object",
+        };
+    }
+
+    /// True if `val` is a JSON number (int, float, or big_number).
+    fn isNumber(val: Value) bool {
+        return switch (val) {
+            .int, .float, .big_number => true,
+            else => false,
+        };
+    }
+
+    /// True if `val` is a number whose value is exactly zero.  Used to decide
+    /// whether to append jq's "because the divisor is zero" tail to a
+    /// divmod-type-error message.
+    fn isNumericZero(val: Value) bool {
+        return switch (val) {
+            .int => |i| i == 0,
+            .float => |f| f == 0.0,
+            else => false,
+        };
+    }
+
+    /// Set `type_error_detail` for a div/mod operand-type or divisor-zero
+    /// failure and return `error.TypeError`.  Single canonical formatter for
+    /// the entire div/mod arithmetic error class — see `TypeErrorKind.divmod`.
+    fn raiseDivmodTypeError(
+        it: *ResultIterator,
+        left: StackValue,
+        right: StackValue,
+        is_mod: bool,
+    ) ZqError {
+        const lhs = stackValueToValue(left) catch return error.TypeError;
+        const rhs = stackValueToValue(right) catch return error.TypeError;
+        it.type_error_detail = it.buildTypeErrorMsg(
+            .null_val,
+            .{ .divmod = .{ .lhs = lhs, .rhs = rhs, .is_mod = is_mod } },
+        );
+        return error.TypeError;
+    }
 
     /// Build a jq-compatible TypeError detail message.
     /// The string is interned in the runtime tape so it lives as long as the
@@ -8373,18 +8433,27 @@ pub const ResultIterator = struct {
                 buf.appendSlice(it.alloc, ")") catch return null;
             },
             .negate => {
-                const negate_type_name = switch (val) {
-                    .null_val => "null",
-                    .bool_val => "boolean",
-                    .int, .float, .big_number => "number",
-                    .string => "string",
-                    .array => "array",
-                    .object => "object",
-                };
-                buf.appendSlice(it.alloc, negate_type_name) catch return null;
+                buf.appendSlice(it.alloc, baseTypeName(val)) catch return null;
                 buf.appendSlice(it.alloc, " (") catch return null;
                 serializeValueCompact(&buf, it.alloc, val) catch return null;
                 buf.appendSlice(it.alloc, ") cannot be negated") catch return null;
+            },
+            .divmod => |dm| {
+                buf.appendSlice(it.alloc, baseTypeName(dm.lhs)) catch return null;
+                buf.appendSlice(it.alloc, " (") catch return null;
+                serializeValueCompact(&buf, it.alloc, dm.lhs) catch return null;
+                buf.appendSlice(it.alloc, ") and ") catch return null;
+                buf.appendSlice(it.alloc, baseTypeName(dm.rhs)) catch return null;
+                buf.appendSlice(it.alloc, " (") catch return null;
+                serializeValueCompact(&buf, it.alloc, dm.rhs) catch return null;
+                buf.appendSlice(it.alloc, ") cannot be divided") catch return null;
+                if (dm.is_mod) buf.appendSlice(it.alloc, " (remainder)") catch return null;
+                // jq only appends "because the divisor is zero" when both
+                // operands are numeric and the divisor is zero — otherwise
+                // the type-mismatch is the primary cause of the error.
+                if (isNumber(dm.lhs) and isNumericZero(dm.rhs)) {
+                    buf.appendSlice(it.alloc, " because the divisor is zero") catch return null;
+                }
             },
         }
         // Store in the runtime tape so the string lives as long as the iterator.
