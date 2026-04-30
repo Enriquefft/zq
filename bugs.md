@@ -3,13 +3,13 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-30 (post pre-existing-fixes wave — L1481 unary-minus error format, L1692 computed-index outer-input reseed, L1696 string fixture correction).
+Last verified: 2026-04-30 (post G7/G8/G9/G10/G12 orchestration wave — closed L2037 L2041 L2045 L2049 L2053 L1988 L1992 L1996 L1736 L1886 L2005 L1838 L2062 L2080).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1131/1177 pass, 26 fail, 20 skipped.
+Current baseline: `zig build test` → 1144/1177 pass, 13 fail, 20 skipped (was 1131 pre-wave; +13).
 
 ### Newly exposed post-L1481/L1692/L1696 fixes (datetime + numbers + try_catch + string_ops suites)
 
@@ -17,17 +17,16 @@ With L1692 (signal-6 abort point) and L1696 fixed, the test runner now reaches f
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
-| L1736 | `map([1,2][0:.])` runFilter abort in `sliceBoundFromStackValue` | `map([1,2][0:.])` | VM | computed slice bound rejects null-input (called via `map`) — needs jq-compatible coercion or null short-circuit |
-| L1802 | `try flatten(-1) catch .` output mismatch | `try flatten(-1) catch .` | error message | flatten error message format differs from jq |
-| L1838 | `strftime("%A, %B %d, %Y")` output mismatch | strftime format string | builtin | strftime format coverage / locale handling |
-| L1886 | strptime year-multiplier overflow in `doMul` | `last(range(365 * 67)\| ... \|strptime(...))` | VM | integer multiplication overflow checking in strptime path |
+| L1802 | `try flatten(-1) catch .` output mismatch | `try flatten(-1) catch .` | error message (UserError class) | `flatten(-1)` raises a UserError via `error("flatten depth must not be negative")` from jq's prelude — distinct from the `binary_arith` TypeError formatter that closed the G7/G8 row family. Parked for a future UserError-class wave. |
 | L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 | `import "x" as foo` / `include "x"` query syntax errors | various import/include test cases | parser/imports | module import & include statements not implemented |
 | L1960 / L1964 / L1968 | `modulemeta` lookupKeyInValue abort | `modulemeta`, `modulemeta \| .deps \| length`, `modulemeta \| .defs \| length` | builtin | `modulemeta` builtin not implemented (segfault on lookup) |
-| L1988 / L1992 / L1996 | `try -. catch .` / `try (.-.) catch .` over arrays | unary/binary minus on arrays | error message | minus error message format differs from jq for array operands |
-| L2005 | `try (. + "x") catch .` mul overflow during numeric coerce | `try (. + "x") catch .` | VM | numeric coercion path triggers std math overflow |
-| L2037 / L2041 / L2045 / L2049 / L2053 | div-by-zero / mod-by-zero error format mismatch (returns `"TypeError"`) | `try (1/0) catch .`, `try (1%0) catch .`, `try (1/.) catch .`, etc. | error message | div/mod-by-zero error format must match jq's `"number (a) and number (0) cannot be divided ..."` literal |
-| L2062 | `[range(-99/2;99/2;1)]` parse error | `[range(-99/2;99/2;1)] as $orig \| ...` | parser | range with negative float bounds fails to parse |
-| L2080 | `INDEX(range(5)\|[., _foo_(.)_]; .[0])` signal-6 abort | INDEX with two-arg form | builtin | INDEX builtin triggers signal 6 |
+| L2084 | `JOIN({...}; .[0])` signal-6 abort (newly visible after L2080 INDEX desugar) | two-arg `JOIN` test case | builtin | next abort slot exposed by L2080 fix; out of scope for the current orchestration wave |
+
+### Fixed in G7/G8/G9/G10/G12 orchestration wave (14)
+
+Merged 2026-04-30: L2037 L2041 L2045 L2049 L2053 (G7 div/mod-by-zero error format), L1988 L1992 L1996 (G8 binary-arith error format + UTF-8 truncation), L1736 (G9 suffix-form computed-slice base reseed), L1886 (G9 multiplication overflow + binop outer-input reseed), L2005 (G9 oversized integer literal coerce + add variant), L1838 (G12 strftime fixture generator regex fix), L2062 (G10 leading-dot float lexer + computed_index in subtreeHasIterate), L2080 (G10 INDEX/1 INDEX/2 AST desugar).
+
+Baseline: 1131 → 1144 pass (+13).
 
 ### Fixed in pre-existing-fixes wave (3)
 
