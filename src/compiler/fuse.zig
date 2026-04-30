@@ -454,14 +454,15 @@ const MAX_VAR_SPAN: usize = 64;
 /// node 0.
 fn childArity(ctx: *const WalkCtx, node: ir.Node) struct { u8, u8 } {
     return switch (node.op) {
-        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_ => .{ 0, 2 },
+        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_, .computed_index => .{ 0, 2 },
         // `not` is lowered as a leaf — it operates on the implicit
         // current input and consumes no IR child (`lower.zig:1539`).
         // `neg`, `try_`, and `path_begin` carry their operand at
         // `children[0]`. `label` is unary — body lives in `children[0]`.
         // `break_` is a leaf (no children — the var_id reference is in
-        // `extra_data`). `computed_index` is unary — key expr at `children[0]`.
-        .try_, .neg, .path_begin, .label, .computed_index => .{ 0, 1 },
+        // `extra_data`). `computed_index` is binary — base at children[0],
+        // key at children[1].
+        .try_, .neg, .path_begin, .label => .{ 0, 1 },
         .update_assign => blk: {
             const kind: ir.UpdateOpKind = @enumFromInt(ctx.src.extra_data.items[node.extra]);
             break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 }; // skip slot 0 (sentinel) for fast path

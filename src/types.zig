@@ -937,6 +937,15 @@ pub const Instruction = extern struct {
         /// Exit path-tracking mode. Pops PathFrame, builds path array from tracked
         /// components and pushes it to value_stack.
         path_end,
+        /// Mark the next descent ops as meta-level (e.g. evaluating the inner
+        /// key expression of a computed-index `EXPR[KEY]`). Sets the topmost
+        /// `PathFrame.skip_components_for_computed_key` flag so intermediate
+        /// `load_key`/`load_index` ops do NOT append components to the outer
+        /// path. The flag is cleared by the matching `load_computed` that
+        /// consumes the key (which then records the actual key as a single
+        /// path component). No-op when the path stack is empty (i.e. no
+        /// enclosing `path(f)` / path-assign frame).
+        mark_computed_key,
 
         /// Whether this opcode's `operand.index` is an instruction-pointer that
         /// must be unconditionally rebased when instructions are shifted.
@@ -1041,6 +1050,7 @@ pub const Instruction = extern struct {
                 .pop_try,
                 .path_begin,
                 .path_end,
+                .mark_computed_key,
                 => false,
 
                 // ── Path-breaking: produce a value unrelated to the input ──

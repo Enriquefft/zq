@@ -2685,15 +2685,22 @@ fn emitSelect(em: *Emitter, node: ir.Node) EmitError!void {
     em.instructions.items[jmp_pos].operand = .{ .index = done_ip };
 }
 
-/// Emit `computed_index` (cat-18 / Phase 27). Mirrors legacy
-/// `compileComputedBracket` (`src/query/src/compiler.zig:7040`)
-/// byte-for-byte:
+/// Emit `computed_index(base, key)` (cat-18 / Phase 27). Implements
+/// jq's `EXPR[key]` semantics: the key expression resolves against
+/// the OUTER input (the input the suffix chain receives), not
+/// against the result of `EXPR`. Standalone `.[key]` reuses this
+/// path with `base = identity`, where the captured outer input and
+/// the base value are equal.
 ///
 /// ```
-/// push_current               ; preserve input as the lookup base
-/// capture_variable($base)
-/// <key expression>           ; may be a generator (fork/backtrack)
-/// capture_variable($key)     ; per-iteration: capture each yielded key
+/// push_current               ; preserve outer input
+/// capture_variable($outer)
+/// <base expression>          ; may be a generator (fork/backtrack)
+/// capture_variable($base)    ; per-iteration: capture each base
+/// load_variable($outer)      ; restore current = outer input
+/// pipe                       ; advance to key phase
+/// <key expression>           ; eval key against outer input
+/// capture_variable($key)     ; per-iteration: capture each key
 /// load_variable($base)       ; restore base value
 /// pipe                       ; advance to lookup phase
 /// save_input                 ; bracket the load_computed
@@ -2701,26 +2708,40 @@ fn emitSelect(em: *Emitter, node: ir.Node) EmitError!void {
 /// load_computed              ; .[$key] on the base
 /// ```
 ///
-/// The two var_ids are allocated from the emitter (above the
+/// The three var_ids are allocated from the emitter (above the
 /// `next_var_id_seed` watermark) so the captures don't collide with
 /// any outer cat-9 / cat-13 frame variables. No SemOp `pop_variable`
 /// is emitted: legacy uses `popScope` here, which is a compile-time
 /// bookkeeping op with no runtime opcode — same divergence rationale
 /// as `emitLimitSkipNth`'s comment.
 fn emitComputedIndex(em: *Emitter, node: ir.Node) EmitError!void {
+    const outer_var: i64 = @intCast(em.allocVar());
     const base_var: i64 = @intCast(em.allocVar());
     const key_var: i64 = @intCast(em.allocVar());
 
+    // Capture outer input.
     try em.pushInstr(.push_current, .{ .none = {} }, node);
-    try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+    try em.pushInstr(.capture_variable, .{ .index = outer_var }, node);
 
-    // The key expression's lowered IR is the only child. Generator
-    // forms (`(0,2)`, `range(N)`, etc.) emit fork instructions inside
-    // here; the per-iteration block below re-runs for every yielded
-    // value because the value-stack capture/restore pair surrounds
-    // each fork output. Legacy at compiler.zig:7054 calls
-    // `parsePipe(ctx)` here — same effect.
+    // Evaluate base against outer input. Generator-form bases
+    // (`(.a, .b)[k]`) fork here; the per-iteration block below
+    // re-runs for every yielded base.
     try emitNode(em, node.children[0]);
+
+    try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+    try em.pushInstr(.load_variable, .{ .index = outer_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
+
+    // Mark the key-eval region as meta-level for any enclosing
+    // `path(f)` / path-assign frame: descent ops inside the key
+    // expression must not append to the outer path. The matching
+    // `load_computed` below clears the flag and records the actual
+    // key as the single path component. No-op outside a path frame.
+    try em.pushInstr(.mark_computed_key, .{ .none = {} }, node);
+
+    // Evaluate key against outer input. Generator-form keys fork
+    // here; lookup runs once per (base × key) combination.
+    try emitNode(em, node.children[1]);
 
     try em.pushInstr(.capture_variable, .{ .index = key_var }, node);
     try em.pushInstr(.load_variable, .{ .index = base_var }, node);

@@ -168,13 +168,15 @@ pub const Op = enum(u8) {
     /// `slice_args`). Plan §1.3 row 5.
     slice,
     /// Computed-key array/object access (`base[expr]` / `.[expr]`).
-    /// `children[0]` lowers the key expression; the base flows from
-    /// the surrounding `pipe` left-side (or the caller's input for
-    /// standalone `.[expr]`). The two-var capture pattern (base + key)
-    /// is synthesized at emit time so the bracket expression's
-    /// fork/backtrack iteration over generator keys re-runs the
-    /// per-iteration `load_computed` for every yielded key.
-    /// Plan §3.5 row P27 / cat-18.
+    /// `children[0]` lowers the base expression (`identity` for the
+    /// standalone `.[expr]` form), `children[1]` lowers the key. Emit
+    /// captures the outer input first, evaluates `base` against it,
+    /// restores the outer input, then evaluates `key` against it
+    /// (jq semantic: `EXPR[key]` — `key` resolves against outer
+    /// input, not against `EXPR`'s output). Generator-form bases
+    /// and keys re-run the per-iteration `load_computed` for every
+    /// yielded value via the natural fork/backtrack flow over the
+    /// lowered IR. Plan §3.5 row P27 / cat-18.
     computed_index,
 
     pipe,
@@ -704,13 +706,17 @@ fn dumpAst(
                 return;
             }
             // `__computed_access(expr)` is the parser's synthesized form
-            // for standalone `.[expr]`. Lowers to the cat-18
-            // `computed_index` SemOp; render the dump in the same shape
-            // so suffixed (`expr[$x]`) and standalone (`.[$x]`) forms
-            // both surface as `computed_index` with the key expression
-            // as the only child. Plan §3.5 row P27.
+            // for standalone `.[expr]`. Lowers to the cat-18 binary
+            // `computed_index(base, key)` SemOp; the base is `identity`
+            // (the outer input itself), the key is the bracketed
+            // expression. Render that shape so suffixed and standalone
+            // forms surface uniformly. Plan §3.5 row P27.
             if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "__computed_access")) {
                 try writer.writeAll("computed_index");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try writeIndent(writer, depth + 1);
+                try writer.writeAll("identity");
                 try writeSpan(writer, node.span);
                 try writer.writeAll("\n");
                 try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
@@ -1138,6 +1144,36 @@ fn renderSuffixChain(
         return;
     }
 
+    // `bracket_expr` carries an AST sub-tree (the key expression).
+    // Lowering produces a binary `computed_index(base, key)` node
+    // (no surrounding pipe) — base is the chain accumulated so far,
+    // key is the bracketed expression evaluated against the outer
+    // input. Render that shape directly. Trailing `optional`s on
+    // the bracket op nest `try` wraps around the `computed_index`.
+    const tail_op = sf.ops[rh_end - 1];
+    if (tail_op == .bracket_expr) {
+        var t: usize = 0;
+        while (t < try_wrap_count) : (t += 1) {
+            try writeIndent(writer, depth + t);
+            try writer.writeAll("try");
+            try writeSpan(writer, span);
+            try writer.writeAll("\n");
+        }
+        try writeIndent(writer, depth + try_wrap_count);
+        try writer.writeAll("computed_index");
+        try writeSpan(writer, span);
+        try writer.writeAll("\n");
+        // Base chain (children[0]).
+        if (rh_end - 1 == 0) {
+            try dumpAst(ir_obj, sf.base, source, depth + 1 + try_wrap_count, writer);
+        } else {
+            try renderSuffixChain(ir_obj, sf, rh_end - 1, span, source, depth + 1 + try_wrap_count, writer);
+        }
+        // Key expression (children[1]).
+        try dumpAst(ir_obj, tail_op.bracket_expr, source, depth + 1 + try_wrap_count, writer);
+        return;
+    }
+
     // Topmost pipe: left = chain[0 .. rh_end-1], right = ops[rh_end-1]
     // possibly wrapped in `try` (one wrap per trailing optional).
     try writeIndent(writer, depth);
@@ -1161,18 +1197,6 @@ fn renderSuffixChain(
         try writer.writeAll("try");
         try writeSpan(writer, span);
         try writer.writeAll("\n");
-    }
-    // `bracket_expr` carries an AST sub-tree (the key expression);
-    // render `computed_index` and recurse into the key. All other
-    // suffix ops are inline-payload only — `dumpSuffixOp` covers them.
-    const tail_op = sf.ops[rh_end - 1];
-    if (tail_op == .bracket_expr) {
-        try writeIndent(writer, depth + 1 + try_wrap_count);
-        try writer.writeAll("computed_index");
-        try writeSpan(writer, span);
-        try writer.writeAll("\n");
-        try dumpAst(ir_obj, tail_op.bracket_expr, source, depth + 2 + try_wrap_count, writer);
-        return;
     }
     try dumpSuffixOp(tail_op, depth + 1 + try_wrap_count, span, writer);
 }
@@ -1835,9 +1859,9 @@ fn dumpIRChildren(
     // same special case in `fuse.zig:childArity`.
     const arity: struct { u8, u8 } = switch (node.op) {
         // Binary
-        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_ => .{ 0, 2 },
+        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_, .computed_index => .{ 0, 2 },
         // Unary
-        .try_, .neg, .path_begin, .label, .computed_index => .{ 0, 1 },
+        .try_, .neg, .path_begin, .label => .{ 0, 1 },
         .update_assign => blk: {
             const kind: UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
             break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 };

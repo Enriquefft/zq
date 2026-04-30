@@ -7,11 +7,11 @@ Last verified: 2026-04-29 (post G6 land — abort+emit cluster, path+clearsPathB
 
 ---
 
-## Active compat failures (7 newly unmasked from try_catch.zig)
+## Active compat failures (6 newly unmasked from try_catch.zig)
 
-Post-G6 baseline: `zig build test` → 1151/1177 pass, 7 fail (all in `tests/compat/try_catch.zig`), 20 skipped. All 12 G6-target tags pass; the 7 remaining fails were masked by L1421's signal-6 in baseline.
+Post-G6 baseline: `zig build test` → 1152/1177 pass, 6 fail (all in `tests/compat/try_catch.zig`), 20 skipped. All 12 G6-target tags pass; the 6 remaining fails were masked by L1421's signal-6 in baseline.
 
-### Newly revealed by G6 — were masked by L1421 signal-6 in baseline (7)
+### Newly revealed by G6 — were masked by L1421 signal-6 in baseline (6)
 
 Once G6 fixed L1421 (`contains/inside` arity-1 routing), the test runner reached `try_catch.zig` sections that previously never ran. These are pre-existing failures, not regressions.
 
@@ -21,7 +21,6 @@ Once G6 fixed L1421 (`contains/inside` arity-1 routing), the test runner reached
 | L1592 | `.[:rindex("x")]` runFilter error | `.[:rindex("x")]` | builtin | `rindex` builtin not implemented |
 | L1668 | `(sort_by(.b) \| sort_by(.a))` etc. — wrong order | sort comparison | builtin | sort stability — zq sort is not stable; jq's sort preserves input order on ties |
 | L1684 | `[min, max, min_by(.[1]), max_by(.[1]), ...]` — last element wrong | min_by/max_by | builtin | tie-breaking semantics in min_by/max_by differ from jq |
-| L1692 | `.foo[.baz]` returns null instead of 4 | computed-field-access | path | computed-field path access on object — `.foo[.baz]` should compute `.baz` against the same input, then index `.foo` by that |
 | L1696 | `.[] \| .error = "no, it's OK"` — string-literal whitespace lost | string parser | parser | string literal interpretation strips whitespace after comma in interpolation context |
 | L1712 (signal 6) | `with_entries(.key \|= "KEY_" + .)` aborts | `with_entries(...)` | builtin | `with_entries` not implemented — falls through to `.not_implemented => unreachable` in lowerBuiltinCall (lower.zig:2253) |
 
@@ -38,6 +37,10 @@ L1712 is the new test-runner abort point. Once fixed, more pre-existing failures
 - L1258 (`getpath` marked path-emitting; `builtinGetpath` populates frame components for autovivify in `getpath(P) |= V`)
 - L1302 (parser dispatches lparen body to parseFilter so leading `def` is accepted before assignment)
 - L1306 (parser accepts `Infinity`, `-Infinity`, `NaN`, `-NaN` JSON literals)
+
+### Fixed post-G6
+
+- L1692 (`.foo[.baz]` computed-index now reseeds outer input for key eval — restructured `computed_index` IR node to binary `[base, key]` shape; emit captures outer input pre-base, restores it pre-key; new `mark_computed_key` opcode suppresses path-component pollution during inner key eval inside `path(f)` / path-assign frames)
 
 ### Fixed in G5 round
 

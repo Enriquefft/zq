@@ -691,8 +691,15 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                         cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
                     },
                     .bracket_expr => |key_node| {
-                        const op_idx = try lowerSuffixBracketExpr(ctx, key_node, sf.base.span);
-                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                        // jq semantics: `EXPR[key]` evaluates `key` against
+                        // the OUTER input, not the result of `EXPR`. The
+                        // accumulated chain so far is the base; emit a
+                        // binary `computed_index(base, key)` node so emit
+                        // can preserve the outer input across base
+                        // evaluation. No surrounding pipe — the binary node
+                        // owns base+key and synthesises the outer-input
+                        // capture pattern.
+                        cur = try lowerSuffixBracketExpr(ctx, cur, key_node, sf.base.span);
                     },
                 }
             }
@@ -913,10 +920,18 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
             // shape for a standalone `.[expr]` (no preceding suffix
             // chain — see `src/ast/parser.zig:680-684`). Route to the
             // same `computed_index` SemOp the SuffixOp.bracket_expr
-            // arm produces so emit's two-var capture pattern is the
-            // single source of truth for both shapes. Plan §3.5 row P27.
+            // arm produces so emit's outer-input capture pattern is
+            // the single source of truth for both shapes. Standalone
+            // form's base is `identity` — the outer input itself.
+            // Plan §3.5 row P27.
             if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "__computed_access")) {
-                return lowerSuffixBracketExpr(ctx, bc.args[0], .{ .start = sp.start, .end = sp.start + sp.len });
+                const id_span: ast.Span = .{ .start = sp.start, .end = sp.start + sp.len };
+                const base_idx = try ctx.pushNode(.{
+                    .op = .identity,
+                    .src_start = id_span.start,
+                    .src_len = if (id_span.end >= id_span.start) id_span.end - id_span.start else 0,
+                });
+                return lowerSuffixBracketExpr(ctx, base_idx, bc.args[0], id_span);
             }
             // 2. Fall through to cat-10's builtin classifier (handles
             //    `not`/`type`/`path` plus the wider alphabet).
@@ -2633,18 +2648,21 @@ fn lowerSuffixIterate(ctx: *Lowerer, span: ast.Span) error{OutOfMemory}!u32 {
     });
 }
 
-/// Append a `computed_index` node for a SuffixOp `.bracket_expr`. The
-/// key expression is lowered first; the parent SemOp carries it as
-/// `children[0]`. Emit synthesizes the legacy two-var capture pattern
-/// (base + key) around the key emission so generator-form keys
-/// (`[1,2,3] | .[(0,2)]`) re-run the per-iteration `load_computed` for
-/// every yielded key. Plan §3.5 row P27 / cat-18.
-fn lowerSuffixBracketExpr(ctx: *Lowerer, key_node: *Node, span: ast.Span) LowerError!u32 {
+/// Append a binary `computed_index(base, key)` node. The base expr
+/// is the IR node carrying the suffix chain accumulated so far (or
+/// `identity` for standalone `.[expr]`). The key expression is
+/// lowered against the same outer input — emit replays the captured
+/// outer input as `current` before evaluating the key so jq's
+/// `EXPR[key]` semantics ("key resolves against outer input, not
+/// EXPR's output") hold. The pattern handles generator-form bases
+/// and keys via the natural fork/backtrack flow over the lowered
+/// IR. Plan §3.5 row P27 / cat-18.
+fn lowerSuffixBracketExpr(ctx: *Lowerer, base_idx: u32, key_node: *Node, span: ast.Span) LowerError!u32 {
     const key_idx = try lowerNode(ctx, key_node);
     const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
     return ctx.pushNode(.{
         .op = .computed_index,
-        .children = .{ key_idx, 0 },
+        .children = .{ base_idx, key_idx },
         .src_start = sp.start,
         .src_len = sp.len,
     });

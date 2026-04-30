@@ -2145,6 +2145,22 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .mark_computed_key => {
+                // Set the skip flag on the topmost path frame so the upcoming
+                // key-evaluation block (e.g. inner `.baz` of `.foo[.baz]`)
+                // does NOT pollute the outer path with its own descent ops.
+                // The flag is cleared by `load_computed` once the key has
+                // been consumed, which then records the actual key as the
+                // single legitimate path component. No-op outside a
+                // `path(f)` / path-assign frame.
+                if (it.path_stack.items.len > 0) {
+                    const frame = &it.path_stack.items[it.path_stack.items.len - 1];
+                    frame.skip_components_for_computed_key = true;
+                }
+                it.ip += 1;
+                return null;
+            },
+
             // ── Walk opcodes ───────────────────────────────────────────────
 
             .walk_start => {
