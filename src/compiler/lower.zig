@@ -1765,6 +1765,20 @@ pub const BuiltinClass = enum {
     /// opcode required; reduce/object_construct/assign_general/tostring are
     /// already supported IR primitives.
     index_desugar2,
+    /// `JOIN($idx; idx_expr)` (2-arity). Desugars to the canonical jq prelude form:
+    ///   def JOIN($idx; idx_expr): [.[] | [., $idx[idx_expr]]];
+    /// Synthesizes the as-pattern + array_construct AST and recurses via
+    /// lowerNode — no new VM opcode required; as_pattern/array_construct/
+    /// pipe/iterate/comma/suffix(bracket_expr)/variable_ref are already
+    /// supported IR primitives.
+    join_desugar2,
+    /// `JOIN($idx; stream; idx_expr)` (3-arity). Desugars to:
+    ///   def JOIN($idx; stream; idx_expr): stream | [., $idx[idx_expr]];
+    join_desugar3,
+    /// `JOIN($idx; stream; idx_expr; join_expr)` (4-arity). Desugars to:
+    ///   def JOIN($idx; stream; idx_expr; join_expr):
+    ///     stream | [., $idx[idx_expr]] | join_expr;
+    join_desugar4,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1856,6 +1870,17 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     if (std.mem.eql(u8, name, "INDEX")) {
         if (arity == 1) return .index_desugar1;
         if (arity == 2) return .index_desugar2;
+    }
+
+    // `JOIN($idx; idx_expr)` / `JOIN($idx; stream; idx_expr)` /
+    // `JOIN($idx; stream; idx_expr; join_expr)` — pure AST desugar to the
+    // jq canonical prelude form. Routed before the generic arity tables
+    // because JOIN does not appear in any value/filter bucket and must not
+    // fall through to `.not_implemented`.
+    if (std.mem.eql(u8, name, "JOIN")) {
+        if (arity == 2) return .join_desugar2;
+        if (arity == 3) return .join_desugar3;
+        if (arity == 4) return .join_desugar4;
     }
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
@@ -2293,6 +2318,18 @@ fn lowerBuiltinCall(
         },
         .index_desugar2 => {
             return lowerIndexDesugar2(ctx, bc, src_start, src_len);
+        },
+        // `JOIN($idx; idx_expr)` / `JOIN($idx; stream; idx_expr)` /
+        // `JOIN($idx; stream; idx_expr; join_expr)`. Desugared to the jq
+        // canonical prelude form via AST synthesis + recursive lowerNode call.
+        .join_desugar2 => {
+            return lowerJoinDesugar2(ctx, bc, src_start, src_len);
+        },
+        .join_desugar3 => {
+            return lowerJoinDesugar3(ctx, bc, src_start, src_len);
+        },
+        .join_desugar4 => {
+            return lowerJoinDesugar4(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -3661,6 +3698,199 @@ fn lowerIndexDesugar2(
     };
 
     return lowerNode(ctx, reduce_node);
+}
+
+// ── `JOIN($idx; ...)` desugar ────────────────────────────────────────────────
+//
+// Canonical jq prelude (src/builtin.jq):
+//   def JOIN($idx; idx_expr):
+//     [.[] | [., $idx[idx_expr]]];
+//   def JOIN($idx; stream; idx_expr):
+//     stream | [., $idx[idx_expr]];
+//   def JOIN($idx; stream; idx_expr; join_expr):
+//     stream | [., $idx[idx_expr]] | join_expr;
+//
+// `$idx` is a value-bound parameter (`$name` form): the first arg is bound
+// to the variable `$idx` via `as_pattern`. The remaining args (`idx_expr`,
+// `stream`, `join_expr`) are filter parameters, substituted syntactically
+// into the body. No new VM opcode required — as_pattern, array_construct,
+// pipe, comma, iterate, suffix(bracket_expr), and variable_ref are already
+// supported IR primitives.
+
+/// Build `[ . , $idx[idx_expr] ]` — the per-row pair: input value and the
+/// idx-table lookup. Shared between JOIN/2, JOIN/3, JOIN/4.
+fn buildJoinPair(
+    alloc: std.mem.Allocator,
+    idx_var_name: []const u8,
+    idx_expr_node: *ast.Node,
+) LowerError!*ast.Node {
+    // identity `.` — left side of the comma
+    const identity_node = try alloc.create(ast.Node);
+    identity_node.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // $idx — base of the bracket lookup
+    const idx_ref = try alloc.create(ast.Node);
+    idx_ref.* = .{
+        .kind = .{ .variable_ref = .{ .name = idx_var_name } },
+        .span = ast.Span.empty(),
+    };
+
+    // $idx[idx_expr] — Suffix with single bracket_expr op
+    const suffix_ops = try alloc.alloc(ast.Node.SuffixOp, 1);
+    suffix_ops[0] = .{ .bracket_expr = idx_expr_node };
+    const lookup_node = try alloc.create(ast.Node);
+    lookup_node.* = .{
+        .kind = .{ .suffix = .{ .base = idx_ref, .ops = suffix_ops } },
+        .span = ast.Span.empty(),
+    };
+
+    // ., $idx[idx_expr]
+    const comma_node = try alloc.create(ast.Node);
+    comma_node.* = .{
+        .kind = .{ .comma = .{ .left = identity_node, .right = lookup_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // [., $idx[idx_expr]]
+    const arr_node = try alloc.create(ast.Node);
+    arr_node.* = .{
+        .kind = .{ .array_construct = .{ .expr = comma_node } },
+        .span = ast.Span.empty(),
+    };
+
+    return arr_node;
+}
+
+fn lowerJoinDesugar2(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const idx_arg: *ast.Node = bc.args[0];
+    const idx_expr_node: *ast.Node = bc.args[1];
+
+    // [., $idx[idx_expr]]
+    const pair_node = try buildJoinPair(alloc, "$idx", idx_expr_node);
+
+    // .[] — iterate over the input
+    const iter_node = try alloc.create(ast.Node);
+    iter_node.* = .{ .kind = .iterate, .span = ast.Span.empty() };
+
+    // .[] | [., $idx[idx_expr]]
+    const inner_pipe = try alloc.create(ast.Node);
+    inner_pipe.* = .{
+        .kind = .{ .pipe = .{ .left = iter_node, .right = pair_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // [.[] | [., $idx[idx_expr]]]
+    const collect = try alloc.create(ast.Node);
+    collect.* = .{
+        .kind = .{ .array_construct = .{ .expr = inner_pipe } },
+        .span = ast.Span.empty(),
+    };
+
+    // <idx_arg> as $idx | [.[] | [., $idx[idx_expr]]]
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .as_pattern = .{
+            .expr = idx_arg,
+            .pattern = .{ .simple = "$idx" },
+            .body = collect,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
+}
+
+fn lowerJoinDesugar3(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const idx_arg: *ast.Node = bc.args[0];
+    const stream_node: *ast.Node = bc.args[1];
+    const idx_expr_node: *ast.Node = bc.args[2];
+
+    // [., $idx[idx_expr]]
+    const pair_node = try buildJoinPair(alloc, "$idx", idx_expr_node);
+
+    // stream | [., $idx[idx_expr]]
+    const body_pipe = try alloc.create(ast.Node);
+    body_pipe.* = .{
+        .kind = .{ .pipe = .{ .left = stream_node, .right = pair_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // <idx_arg> as $idx | stream | [., $idx[idx_expr]]
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .as_pattern = .{
+            .expr = idx_arg,
+            .pattern = .{ .simple = "$idx" },
+            .body = body_pipe,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
+}
+
+fn lowerJoinDesugar4(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    const idx_arg: *ast.Node = bc.args[0];
+    const stream_node: *ast.Node = bc.args[1];
+    const idx_expr_node: *ast.Node = bc.args[2];
+    const join_expr_node: *ast.Node = bc.args[3];
+
+    // [., $idx[idx_expr]]
+    const pair_node = try buildJoinPair(alloc, "$idx", idx_expr_node);
+
+    // [., $idx[idx_expr]] | join_expr
+    const pair_pipe_join = try alloc.create(ast.Node);
+    pair_pipe_join.* = .{
+        .kind = .{ .pipe = .{ .left = pair_node, .right = join_expr_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // stream | [., $idx[idx_expr]] | join_expr
+    const body_pipe = try alloc.create(ast.Node);
+    body_pipe.* = .{
+        .kind = .{ .pipe = .{ .left = stream_node, .right = pair_pipe_join } },
+        .span = ast.Span.empty(),
+    };
+
+    // <idx_arg> as $idx | stream | [., $idx[idx_expr]] | join_expr
+    const root_node = try alloc.create(ast.Node);
+    root_node.* = .{
+        .kind = .{ .as_pattern = .{
+            .expr = idx_arg,
+            .pattern = .{ .simple = "$idx" },
+            .body = body_pipe,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, root_node);
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────

@@ -2245,6 +2245,13 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // synthesizes a `reduce` + `assign_general` AST. A call_builtin node
         // carrying these classes must never reach emit.
         .index_desugar1, .index_desugar2 => unreachable,
+        // `JOIN($idx; idx_expr)` / `JOIN($idx; stream; idx_expr)` /
+        // `JOIN($idx; stream; idx_expr; join_expr)` are fully resolved at
+        // lower time into `as_pattern` + `array_construct` + `pipe` +
+        // `iterate` + `comma` + `suffix(bracket_expr)` + `variable_ref` IR
+        // nodes. A call_builtin node carrying these classes must never
+        // reach emit.
+        .join_desugar2, .join_desugar3, .join_desugar4 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
