@@ -182,11 +182,19 @@ pub const Op = enum(u8) {
     /// Computed-bound slice (`.[expr1:expr2]` where either bound is a
     /// non-integer-literal expression). `children[0]` lowers `from_expr`
     /// (when present), `children[1]` lowers `to_expr` (when present).
-    /// `extra` slot 2 holds a 4-bit flag word: bit 0 has_from, bit 1
+    /// `extra` slot 2 holds a 5-bit flag word: bit 0 has_from, bit 1
     /// has_to, bit 2 has_from_expr (children[0] valid), bit 3
-    /// has_to_expr (children[1] valid). When neither expr-bit is set,
-    /// the lowerer emits `slice` instead. Plan §3.5 / cat-18 cousin of
-    /// `computed_index`.
+    /// has_to_expr (children[1] valid), bit 4 has_base. When `has_base`
+    /// is set, slot 3 holds the base IR-node index (suffix-form
+    /// `EXPR[a:b]`); emit captures the outer input first, evaluates
+    /// `base` against it, restores the outer input for bound evaluation,
+    /// then loads the base value for the slice phase. Mirrors
+    /// `computed_index`'s outer-input capture pattern (jq semantic: bound
+    /// expressions resolve against the OUTER input, not against the
+    /// slice base's output). When `has_base` is clear, the slice operates
+    /// on the current input directly (standalone `.[expr1:expr2]`).
+    /// When neither expr-bit is set, the lowerer emits `slice` instead.
+    /// Plan §3.5 / cat-18 cousin of `computed_index`.
     computed_slice,
 
     pipe,
@@ -1872,14 +1880,31 @@ fn dumpIRChildren(
         .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end, .break_ => return,
         .computed_slice => {
             // Dynamic arity: 0/1/2 child exprs depending on which
-            // bound flags are set. Mirrors the fuse.zig `childArity`
-            // computation so dump and copy agree on which slots to
-            // visit.
+            // bound flags are set, plus an optional base when has_base
+            // is set (suffix form `EXPR[a:b]`). Layout mirrors
+            // `lowerSliceNodeImpl` and `emitSliceComputed`:
+            //   has_base=true:  extra_children = [base, ?from, ?to]
+            //   has_base=false: children[0]=from, children[1]=to
             const flags: u32 = ir_obj.extra_data.items[node.extra + 2];
             const has_from_expr = (flags & 4) != 0;
             const has_to_expr = (flags & 8) != 0;
-            if (has_from_expr) try dumpIRNode(ir_obj, node.children[0], depth, tracker, writer);
-            if (has_to_expr) try dumpIRNode(ir_obj, node.children[1], depth, tracker, writer);
+            const has_base = (flags & 16) != 0;
+            if (has_base) {
+                const ec = ir_obj.extra_children.items[node.span_start..][0..node.span_len];
+                try dumpIRNode(ir_obj, ec[0], depth, tracker, writer);
+                var idx: usize = 1;
+                if (has_from_expr) {
+                    try dumpIRNode(ir_obj, ec[idx], depth, tracker, writer);
+                    idx += 1;
+                }
+                if (has_to_expr) {
+                    try dumpIRNode(ir_obj, ec[idx], depth, tracker, writer);
+                    idx += 1;
+                }
+            } else {
+                if (has_from_expr) try dumpIRNode(ir_obj, node.children[0], depth, tracker, writer);
+                if (has_to_expr) try dumpIRNode(ir_obj, node.children[1], depth, tracker, writer);
+            }
             return;
         },
         else => {},

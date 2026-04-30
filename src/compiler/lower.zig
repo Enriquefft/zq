@@ -667,8 +667,21 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                         cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
                     },
                     .slice => |sl| {
-                        const op_idx = try lowerSuffixSlice(ctx, sl, sf.base.span);
-                        cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                        // jq semantics: `EXPR[a:b]` evaluates the bound
+                        // expressions `a` / `b` against the OUTER input,
+                        // not against `EXPR`'s output. When either bound
+                        // is computed, route through `computed_slice`
+                        // owning `cur` as its base so emit reseeds the
+                        // outer input before evaluating the bounds (cat-18
+                        // sibling of `computed_index`'s outer-input
+                        // capture pattern). For literal bounds, the
+                        // legacy pipe shape suffices.
+                        if (sl.from_expr != null or sl.to_expr != null) {
+                            cur = try lowerSliceNodeWithBase(ctx, sl, cur, sf.base.span);
+                        } else {
+                            const op_idx = try lowerSuffixSlice(ctx, sl, sf.base.span);
+                            cur = try lowerSuffixPipe(ctx, cur, op_idx, sf.base.span);
+                        }
                     },
                     .bracket_expr => |key_node| {
                         // jq semantics: `EXPR[key]` evaluates `key` against
@@ -2672,20 +2685,74 @@ fn lowerSuffixSlice(ctx: *Lowerer, sl: ast.Node.Slice, span: ast.Span) LowerErro
 /// `computed_slice` and lower the bound expressions as `children[0..2]`.
 /// Otherwise emit the legacy `slice` op with literal bounds.
 ///
-/// Flag layout in extra_data slot 2 (4 bits):
+/// Flag layout in extra_data slot 2 (5 bits):
 ///   bit 0 — has_from
 ///   bit 1 — has_to
 ///   bit 2 — has_from_expr  (children[0] valid)
 ///   bit 3 — has_to_expr    (children[1] valid)
+///   bit 4 — has_base       (extra_data slot 3 holds base IR idx)
 fn lowerSliceNode(ctx: *Lowerer, sl: ast.Node.Slice, sp: anytype) LowerError!u32 {
+    return lowerSliceNodeImpl(ctx, sl, null, sp);
+}
+
+/// Suffix-form lowering for `EXPR[a:b]` when at least one bound is a
+/// computed expression. Owns `base_idx` (the accumulated suffix chain)
+/// so emit can reseed the outer input before evaluating the bounds.
+/// Mirrors `lowerSuffixBracketExpr`'s structural fix for the
+/// `computed_index` sibling op (jq semantic: bound expressions resolve
+/// against the OUTER input, not the slice base's output).
+fn lowerSliceNodeWithBase(
+    ctx: *Lowerer,
+    sl: ast.Node.Slice,
+    base_idx: u32,
+    span: ast.Span,
+) LowerError!u32 {
+    const sp = .{ .start = span.start, .len = if (span.end >= span.start) span.end - span.start else 0 };
+    return lowerSliceNodeImpl(ctx, sl, base_idx, sp);
+}
+
+fn lowerSliceNodeImpl(
+    ctx: *Lowerer,
+    sl: ast.Node.Slice,
+    base_idx: ?u32,
+    sp: anytype,
+) LowerError!u32 {
     const alloc = ctx.arena.allocator();
     const has_from_expr = sl.from_expr != null;
     const has_to_expr = sl.to_expr != null;
     const is_computed = has_from_expr or has_to_expr;
+    const has_base = is_computed and base_idx != null;
 
+    // Two storage shapes for the children:
+    //   has_base=false: children[0]=from_expr, children[1]=to_expr
+    //                   (legacy two-child layout; `slice` op too).
+    //   has_base=true:  extra_children = [base, ?from_expr, ?to_expr]
+    //                   in that order, gated by flag bits 2/3. Using
+    //                   `extra_children` lets fuse's variable-arity
+    //                   copy walk remap every child IR-node ref in one
+    //                   pass; mixing fixed-arity and variable-arity
+    //                   would require bespoke fuse support.
     var children: [2]u32 = .{ 0, 0 };
-    if (has_from_expr) children[0] = try lowerNode(ctx, sl.from_expr.?);
-    if (has_to_expr) children[1] = try lowerNode(ctx, sl.to_expr.?);
+    var span_start: u32 = 0;
+    var span_len: u32 = 0;
+    if (has_base) {
+        span_start = @intCast(ctx.out.extra_children.items.len);
+        try ctx.out.extra_children.append(alloc, base_idx.?);
+        span_len = 1;
+        if (has_from_expr) {
+            const from_idx = try lowerNode(ctx, sl.from_expr.?);
+            try ctx.out.extra_children.append(alloc, from_idx);
+            span_len += 1;
+        }
+        if (has_to_expr) {
+            const to_idx = try lowerNode(ctx, sl.to_expr.?);
+            try ctx.out.extra_children.append(alloc, to_idx);
+            span_len += 1;
+        }
+    } else {
+        if (has_from_expr) children[0] = try lowerNode(ctx, sl.from_expr.?);
+        if (has_to_expr) children[1] = try lowerNode(ctx, sl.to_expr.?);
+    }
 
     const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
     const from_u: u32 = @bitCast(sl.from);
@@ -2696,12 +2763,15 @@ fn lowerSliceNode(ctx: *Lowerer, sl: ast.Node.Slice, sp: anytype) LowerError!u32
         (@as(u32, @intFromBool(sl.has_from))) |
         (@as(u32, @intFromBool(sl.has_to)) << 1) |
         (@as(u32, @intFromBool(has_from_expr)) << 2) |
-        (@as(u32, @intFromBool(has_to_expr)) << 3);
+        (@as(u32, @intFromBool(has_to_expr)) << 3) |
+        (@as(u32, @intFromBool(has_base)) << 4);
     try ctx.out.extra_data.append(alloc, flags);
 
     return ctx.pushNode(.{
         .op = if (is_computed) .computed_slice else .slice,
         .children = children,
+        .span_start = span_start,
+        .span_len = span_len,
         .extra = extra_idx,
         .src_start = sp.start,
         .src_len = sp.len,

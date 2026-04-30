@@ -2827,32 +2827,79 @@ fn emitSliceComputed(em: *Emitter, node: ir.Node) EmitError!void {
     const has_to = (flags & 2) != 0;
     const has_from_expr = (flags & 4) != 0;
     const has_to_expr = (flags & 8) != 0;
+    const has_base = (flags & 16) != 0;
 
+    // Resolve child IR-node indices (two storage shapes — see
+    // `lowerSliceNodeImpl`).
+    var from_child: u32 = 0;
+    var to_child: u32 = 0;
+    var base_child: u32 = 0;
+    if (has_base) {
+        const ec = em.ir_obj.extra_children.items[node.span_start..][0..node.span_len];
+        base_child = ec[0];
+        var idx: usize = 1;
+        if (has_from_expr) {
+            from_child = ec[idx];
+            idx += 1;
+        }
+        if (has_to_expr) {
+            to_child = ec[idx];
+            idx += 1;
+        }
+    } else {
+        if (has_from_expr) from_child = node.children[0];
+        if (has_to_expr) to_child = node.children[1];
+    }
+
+    const outer_var: i64 = if (has_base) @intCast(em.allocVar()) else 0;
     const base_var: i64 = @intCast(em.allocVar());
     const from_var: i64 = if (has_from_expr) @intCast(em.allocVar()) else 0;
     const to_var: i64 = if (has_to_expr) @intCast(em.allocVar()) else 0;
 
-    try em.pushInstr(.push_current, .{ .none = {} }, node);
-    try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+    if (has_base) {
+        // Suffix form `EXPR[a:b]`: capture the outer input first, then
+        // evaluate the base expression against it.  Bound expressions
+        // must reseed against the OUTER input (jq semantic: `EXPR[a:b]`
+        // — `a`/`b` resolve against outer, not against EXPR's output).
+        // Mirrors `emitComputedIndex`'s pattern.
+        try em.pushInstr(.push_current, .{ .none = {} }, node);
+        try em.pushInstr(.capture_variable, .{ .index = outer_var }, node);
+        try emitNode(em, base_child);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+        try em.pushInstr(.push_current, .{ .none = {} }, node);
+        try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+        // Reseed outer input for bound evaluation.
+        try em.pushInstr(.load_variable, .{ .index = outer_var }, node);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+    } else {
+        try em.pushInstr(.push_current, .{ .none = {} }, node);
+        try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+    }
 
     if (has_from_expr) {
-        try emitNode(em, node.children[0]);
+        try emitNode(em, from_child);
         try em.pushInstr(.capture_variable, .{ .index = from_var }, node);
-        // Restore base for the next evaluation phase (to_expr or
-        // the slice itself).
-        try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+        // Restore the input for the next bound: when `has_base`, we
+        // restore the OUTER input so the to_expr also reseeds against
+        // it; when `has_base` is false, we restore base (= outer = the
+        // slice input).
+        const restore_var: i64 = if (has_base) outer_var else base_var;
+        try em.pushInstr(.load_variable, .{ .index = restore_var }, node);
         try em.pushInstr(.pipe, .{ .none = {} }, node);
     }
     if (has_to_expr) {
-        try emitNode(em, node.children[1]);
+        try emitNode(em, to_child);
         try em.pushInstr(.capture_variable, .{ .index = to_var }, node);
-        try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+        const restore_var: i64 = if (has_base) outer_var else base_var;
+        try em.pushInstr(.load_variable, .{ .index = restore_var }, node);
         try em.pushInstr(.pipe, .{ .none = {} }, node);
     }
 
     // Surrounding capture for the slice itself: if_stack ← base.
     // Bound values pushed onto value_stack in from-then-to order so
     // the VM pops `to` first, then `from`.
+    try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+    try em.pushInstr(.pipe, .{ .none = {} }, node);
     try em.pushInstr(.save_input, .{ .none = {} }, node);
     if (has_from_expr) try em.pushInstr(.load_variable, .{ .index = from_var }, node);
     if (has_to_expr) try em.pushInstr(.load_variable, .{ .index = to_var }, node);

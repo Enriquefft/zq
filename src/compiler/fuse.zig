@@ -467,7 +467,10 @@ fn childArity(ctx: *const WalkCtx, node: ir.Node) struct { u8, u8 } {
         // (`from_expr` at children[0], `to_expr` at children[1]) gated
         // by flag bits 2 and 3 in `extra_data[extra+2]`. Unused slots
         // hold sentinel `0` and must be skipped during the copy walk
-        // so a stray ref to node 0 isn't introduced.
+        // so a stray ref to node 0 isn't introduced. The suffix-form
+        // case (flag bit 4 has_base) lifts all children into
+        // `extra_children` and uses the variable-arity copy path —
+        // this fixed-arity arm only fires for the no-base shape.
         .computed_slice => blk: {
             const flags: u32 = ctx.src.extra_data.items[node.extra + 2];
             const has_from_expr = (flags & 4) != 0;
