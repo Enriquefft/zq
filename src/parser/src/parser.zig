@@ -704,15 +704,25 @@ pub const Parser = struct {
             const val = std.fmt.parseFloat(f64, num_str) catch return error.InvalidNumber;
             try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = val } });
         } else {
-            const val = std.fmt.parseInt(i64, num_str, 10) catch return error.InvalidNumber;
-            // jq uses float64 for all numbers. Integers that cannot be exactly represented
-            // in float64 (|n| > 2^53) are stored as float to match jq precision semantics.
-            const max_exact: i64 = 1 << 53; // 9007199254740992
-            if (val > max_exact or val < -max_exact) {
-                const fval: f64 = @floatFromInt(val);
+            // jq uses float64 for all numbers. Integers that cannot be
+            // exactly represented in float64 (|n| > 2^53) — including
+            // those that exceed i64 entirely (e.g.
+            // `123456789012345678901234567890`) — are stored as float
+            // to match jq precision semantics. Integer literals that
+            // overflow i64 round-trip through `parseFloat`, so the
+            // parser stays parity-safe with jq's "all numbers are
+            // doubles" model rather than rejecting the input.
+            if (std.fmt.parseInt(i64, num_str, 10)) |val| {
+                const max_exact: i64 = 1 << 53; // 9007199254740992
+                if (val > max_exact or val < -max_exact) {
+                    const fval: f64 = @floatFromInt(val);
+                    try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = fval } });
+                } else {
+                    try p.tape_buf.append(p.allocator, .{ .tag = .int, .payload = .{ .int = val } });
+                }
+            } else |_| {
+                const fval = std.fmt.parseFloat(f64, num_str) catch return error.InvalidNumber;
                 try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = fval } });
-            } else {
-                try p.tape_buf.append(p.allocator, .{ .tag = .int, .payload = .{ .int = val } });
             }
         }
         p.transitionAfterValue();

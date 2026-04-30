@@ -262,8 +262,12 @@ test "jq:L1996 _x_ * range(0; 12; 2) + ___ * 8 | try -. catch ." {
 }
 
 test "jq:L2005 try (. + _x_) catch . == if have_decnum then _number (123..." {
+    // jq 1.8.1 uses `errbuf[15]` in src/builtin.c::type_error2, so the
+    // operand renderings are the first 11 bytes + "..." (no closing
+    // quote/delim).  jq main bumped this to 30 bytes post-#3478, but
+    // the parity oracle here is 1.8.1.
     const results = try h.runFilter(
-        "try (. + \"x\") catch . == if have_decnum then \"number (12345678901234567890123456...) and string (\\\"x\\\") cannot be added\" else \"number (12345678901234568000000000...) and string (\\\"x\\\") cannot be added\" end",
+        "try (. + \"x\") catch . == if have_decnum then \"number (12345678901...) and string (\\\"x\\\") cannot be added\" else \"number (12345678901...) and string (\\\"x\\\") cannot be added\" end",
         "123456789012345678901234567890",
     );
     defer {

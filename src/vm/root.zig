@@ -2871,18 +2871,18 @@ pub const ResultIterator = struct {
     fn doAddValues(it: *ResultIterator, left: StackValue, right: StackValue) ZqError!StackValue {
         return switch (left) {
             .int => |li| switch (right) {
-                .int => |ri| .{ .int = li + ri },
+                .int => |ri| addIntInt(li, ri),
                 .float => |rf| .{ .float = @as(f64, @floatFromInt(li)) + rf },
                 .null_val => left,
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .add),
             },
             .float => |lf| switch (right) {
                 .int => |ri| .{ .float = lf + @as(f64, @floatFromInt(ri)) },
                 .float => |rf| .{ .float = lf + rf },
                 .null_val => left,
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .add),
             },
-            .big_number => return error.TypeError,
+            .big_number => return it.raiseBinaryArithTypeError(left, right, .add),
             .null_val => switch (right) {
                 .null_val => .null_val,
                 else => right,
@@ -2900,10 +2900,10 @@ pub const ResultIterator = struct {
                             break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[concat_off..][0..total_len] } };
                         },
                         .null_val => left,
-                        else => error.TypeError,
+                        else => return it.raiseBinaryArithTypeError(left, right, .add),
                     },
                     .null_val => left,
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .add),
                 },
                 .array => |lspan| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
@@ -2941,10 +2941,10 @@ pub const ResultIterator = struct {
                             } } };
                         },
                         .null_val => left,
-                        else => error.TypeError,
+                        else => return it.raiseBinaryArithTypeError(left, right, .add),
                     },
                     .null_val => left,
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .add),
                 },
                 .object => |lspan| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
@@ -3022,18 +3022,18 @@ pub const ResultIterator = struct {
                             } } };
                         },
                         .null_val => left,
-                        else => error.TypeError,
+                        else => return it.raiseBinaryArithTypeError(left, right, .add),
                     },
                     .null_val => left,
-                    else => error.TypeError,
+                    else => return it.raiseBinaryArithTypeError(left, right, .add),
                 },
                 .null_val => switch (right) {
                     .null_val => .null_val,
                     else => right,
                 },
-                else => error.TypeError,
+                else => return it.raiseBinaryArithTypeError(left, right, .add),
             },
-            .bool_val => return error.TypeError,
+            .bool_val => return it.raiseBinaryArithTypeError(left, right, .add),
         };
     }
 
@@ -8342,7 +8342,7 @@ pub const ResultIterator = struct {
     /// zero" tail when both operands are numeric and rhs is exactly zero.
     /// Mirrors jq 1.8.1's `make_arith_op_type_error` callsites (builtin.c
     /// `binop_minus`, `binop_div`, `binop_mod`).
-    const BinaryArithOp = enum { subtract, multiply, divide, modulo };
+    const BinaryArithOp = enum { add, subtract, multiply, divide, modulo };
 
     const TypeErrorKind = union(enum) {
         /// `.foo` / `.["key"]` field access on a non-object/null.
@@ -8485,6 +8485,7 @@ pub const ResultIterator = struct {
                 appendCompactJsonTrunc(&buf, it.alloc, ba.rhs) catch return null;
                 buf.appendSlice(it.alloc, ") cannot be ") catch return null;
                 buf.appendSlice(it.alloc, switch (ba.op) {
+                    .add => "added",
                     .subtract => "subtracted",
                     .multiply => "multiplied",
                     .divide, .modulo => "divided",
