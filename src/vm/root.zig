@@ -1237,7 +1237,10 @@ pub const ResultIterator = struct {
                             break :blk switch (base) {
                                 .object => |span| lookupKey(span.tape, span, s) orelse @as(Value, .null_val),
                                 .null_val => @as(Value, .null_val),
-                                else => return error.TypeError,
+                                else => {
+                                    it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_string = s });
+                                    return error.TypeError;
+                                },
                             };
                         },
                         else => return error.TypeError,
@@ -7990,24 +7993,72 @@ pub const ResultIterator = struct {
     fn builtinImplode(it: *ResultIterator) ZqError!?StackValue {
         const span = switch (it.current) {
             .array => |s| s,
-            else => return error.TypeError,
+            else => {
+                // Non-array input: raise a catchable error matching jq's message.
+                return it.raiseUserError("implode input must be an array");
+            },
         };
         var buf = std.ArrayList(u8){};
         defer buf.deinit(it.alloc);
         var pos = span.start + 1;
         const end = span.end - 1;
+        // U+FFFD (REPLACEMENT CHARACTER) UTF-8 encoding.
+        const fffd_utf8 = "\xEF\xBF\xBD";
         while (pos < end) {
             const val = tapeEntryToValue(span.tape, pos);
+            // Resolve the element to a signed codepoint integer.
+            // Strings, bools, arrays, objects, and nan/inf floats are not valid
+            // unicode codepoints — raise a catchable jq-compatible UserError.
             const cp_i: i64 = switch (val) {
                 .int => |i| i,
-                .float => |f| @intFromFloat(f),
-                else => return error.TypeError,
+                .float => |f| blk: {
+                    // nan and inf are not valid codepoints.
+                    if (std.math.isNan(f) or std.math.isInf(f)) {
+                        // Build error message: "<type> (<json>) can't be imploded,unicode codepoint needs to be numeric"
+                        var msg_buf = std.ArrayList(u8){};
+                        defer msg_buf.deinit(it.alloc);
+                        try msg_buf.appendSlice(it.alloc, baseTypeName(val));
+                        try msg_buf.append(it.alloc, ' ');
+                        try msg_buf.append(it.alloc, '(');
+                        try appendCompactJsonTrunc(&msg_buf, it.alloc, val);
+                        try msg_buf.appendSlice(it.alloc, ") can't be imploded,unicode codepoint needs to be numeric");
+                        const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                        return error.UserError;
+                    }
+                    // Valid finite float: truncate toward zero (jq behaviour).
+                    break :blk @as(i64, @intFromFloat(@trunc(f)));
+                },
+                else => {
+                    // Non-numeric element: raise catchable error.
+                    var msg_buf = std.ArrayList(u8){};
+                    defer msg_buf.deinit(it.alloc);
+                    try msg_buf.appendSlice(it.alloc, baseTypeName(val));
+                    try msg_buf.append(it.alloc, ' ');
+                    try msg_buf.append(it.alloc, '(');
+                    try appendCompactJsonTrunc(&msg_buf, it.alloc, val);
+                    try msg_buf.appendSlice(it.alloc, ") can't be imploded,unicode codepoint needs to be numeric");
+                    const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
+                    it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                    return error.UserError;
+                },
             };
-            if (cp_i < 0 or cp_i > 0x10FFFF) return error.TypeError;
-            const cp: u21 = @intCast(@as(u32, @intCast(cp_i)));
-            var encode_buf: [4]u8 = undefined;
-            const len = std.unicode.utf8Encode(cp, &encode_buf) catch return error.TypeError;
-            try buf.appendSlice(it.alloc, encode_buf[0..len]);
+            // Validate codepoint: negative, > U+10FFFF, or surrogate (U+D800–U+DFFF)
+            // are replaced with U+FFFD (REPLACEMENT CHARACTER), matching jq behaviour.
+            if (cp_i < 0 or cp_i > 0x10FFFF or (cp_i >= 0xD800 and cp_i <= 0xDFFF)) {
+                try buf.appendSlice(it.alloc, fffd_utf8);
+            } else {
+                const cp: u21 = @intCast(@as(u32, @intCast(cp_i)));
+                var encode_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &encode_buf) catch {
+                    // Should be unreachable after the range checks above,
+                    // but substitute FFFD defensively.
+                    try buf.appendSlice(it.alloc, fffd_utf8);
+                    pos = skipEntry(span.tape.*, pos);
+                    continue;
+                };
+                try buf.appendSlice(it.alloc, encode_buf[0..len]);
+            }
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
