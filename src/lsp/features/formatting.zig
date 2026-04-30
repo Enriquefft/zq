@@ -187,6 +187,10 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
             for (oc.fields, 0..) |field, i| {
                 if (i > 0) buf.appendSlice(alloc, ", ") catch {};
                 switch (field.key) {
+                    .dollar_ident => |name| {
+                        buf.append(alloc, '$') catch {};
+                        buf.appendSlice(alloc, name) catch {};
+                    },
                     .ident => |name| buf.appendSlice(alloc, name) catch {},
                     .string => |s| {
                         buf.append(alloc, '"') catch {};

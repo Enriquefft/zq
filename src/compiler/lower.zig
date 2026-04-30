@@ -2979,6 +2979,33 @@ fn lowerObjectKey(ctx: *Lowerer, fld: *const ast.Node.ObjectField) LowerError!u3
     const alloc = ctx.arena.allocator();
     const sp = .{ .start = fld.span.start, .len = if (fld.span.end >= fld.span.start) fld.span.end - fld.span.start else 0 };
     switch (fld.key) {
+        .dollar_ident => |name| {
+            // `{$y: VALUE}` — key is the runtime value of variable `$y`.
+            // The parser uses `.dollar_ident` (not `.ident`) for this shape
+            // so the compiler unambiguously emits a `load_var` rather than a
+            // literal-string key.  jq rejects non-string values at runtime
+            // ("Cannot use X as object key"); no extra coercion opcode needed.
+            const var_id = ctx.lookupVar(name) orelse {
+                ctx.compile_err = .{
+                    .kind = .query_syntax_error,
+                    .offset = sp.start,
+                    .len = 0,
+                };
+                return error.LowerDiagnostic;
+            };
+            const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
+            const str_offset: u32 = @intCast(ctx.out.string_buf.items.len);
+            try ctx.out.string_buf.appendSlice(alloc, name);
+            try ctx.out.extra_data.append(alloc, str_offset);
+            try ctx.out.extra_data.append(alloc, @intCast(name.len));
+            try ctx.out.extra_data.append(alloc, var_id);
+            return ctx.pushNode(.{
+                .op = .load_var,
+                .extra = extra_idx,
+                .src_start = sp.start,
+                .src_len = sp.len,
+            });
+        },
         .ident => |name| {
             // Ident keys are the raw token bytes — no escape decoding
             // (legacy `internStr`, `src/query/src/compiler.zig:6823`).
@@ -4909,7 +4936,7 @@ fn bodyReferencesSelf(node: *const Node, name: []const u8, arity: u32) bool {
         .object_construct => |oc| {
             for (oc.fields) |fld| {
                 switch (fld.key) {
-                    .ident, .string => {},
+                    .ident, .string, .dollar_ident => {},
                     .expr => |e| if (bodyReferencesSelf(e, name, arity)) return true,
                 }
                 if (bodyReferencesSelf(fld.value, name, arity)) return true;

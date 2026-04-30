@@ -204,7 +204,12 @@ pub const Node = struct {
     };
 
     pub const ObjectKey = union(enum) {
+        /// Plain identifier key, e.g. `{foo: 1}` or `{foo}` shorthand.
         ident: []const u8,
+        /// `{$y: VALUE}` form: key is the *runtime value* of variable `$y`
+        /// (jq semantics: must be a string). Distinct from the `{$x}`
+        /// shorthand which uses `.ident` with the bare name as a literal key.
+        dollar_ident: []const u8,
         string: []const u8,
         expr: *Node,
     };

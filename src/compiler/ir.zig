@@ -1038,6 +1038,14 @@ fn dumpObjectKey(
     writer: anytype,
 ) @TypeOf(writer).Error!void {
     switch (fld.key) {
+        .dollar_ident => |name| {
+            try writeIndent(writer, depth);
+            try writer.writeAll("load_var($");
+            try writer.writeAll(name);
+            try writer.writeAll(")");
+            try writeSpan(writer, fld.span);
+            try writer.writeAll("\n");
+        },
         .ident => |name| {
             try writeIndent(writer, depth);
             try writer.writeAll("load_const(");

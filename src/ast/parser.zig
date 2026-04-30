@@ -867,31 +867,30 @@ pub const Parser = struct {
             const after_dollar = p.peek();
             const has_colon = if (after_dollar) |t| t.tag == .colon else false;
 
-            // Key shape in the AST for both `{$x}` and `{$x: VALUE}` is
-            // `.ident` carrying the variable *name*. The compiler detects
-            // the `$` prefix by looking at the source byte at the key
-            // span's start.
-            const key: Node.ObjectKey = .{ .ident = var_name };
-
             if (has_colon) {
                 _ = p.advance(); // consume ':'
                 const value = try p.parseObjectFieldValue();
+                // `{$y: VALUE}` — the key is the *runtime value* of variable
+                // `$y` (jq semantics: must be a string at runtime).  Use
+                // `.dollar_ident` so lowerObjectKey emits a `load_var` rather
+                // than a literal string.
                 return .{
-                    .key = key,
+                    .key = .{ .dollar_ident = var_name },
                     .value = value,
                     .span = Span.from(start, value.span.end),
                 };
             }
 
-            // Shorthand `{$x}` — synthesized value is the variable reference
-            // itself. The walker then emits push_string(name) +
-            // load_variable(id) — no replay (legacy compiler.zig:6859-6868).
+            // Shorthand `{$x}` — key is the literal string name "x", value
+            // is $x's runtime value. Uses `.ident` (not `.dollar_ident`) so
+            // lowerObjectKey emits load_const("x").
+            // (`legacy compiler.zig:6859-6868`).
             const value = p.createNode(.{ .variable_ref = .{
                 .name = var_name,
             } }, dollar_span);
 
             return .{
-                .key = key,
+                .key = .{ .ident = var_name },
                 .value = value,
                 .span = Span.from(start, value.span.end),
             };
@@ -941,6 +940,9 @@ pub const Parser = struct {
                 ops[0] = .{ .bracket_expr = expr };
                 break :blk p.createNode(.{ .suffix = .{ .base = id, .ops = ops } }, Span.from(key_start, p.lex.pos));
             },
+            // `.dollar_ident` is only produced in the `$` branch above,
+            // which returns early — this arm is unreachable for non-$ keys.
+            .dollar_ident => unreachable,
         };
 
         return .{
