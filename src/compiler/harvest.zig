@@ -215,6 +215,10 @@ fn isPureAccessor(ir_obj: *const ir.IR, node_idx: u32) bool {
         .load_path => true,
         .load_index => true,
         .slice => true,
+        // `computed_slice` carries expression bounds whose purity isn't
+        // guaranteed; conservative `false` keeps the prefilter from
+        // descending into a node it can't statically classify.
+        .computed_slice => false,
         .iterate => true,
         .try_ => isPureAccessor(ir_obj, node.children[0]),
         .pipe => isPureAccessor(ir_obj, node.children[0]) and isPureAccessor(ir_obj, node.children[1]),

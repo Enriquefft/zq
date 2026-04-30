@@ -311,6 +311,8 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             try em.pushInstr(.slice, .{ .slice_args = args }, node);
         },
 
+        .computed_slice => try emitSliceComputed(em, node),
+
         // Pipe: emit left, then `pipe` instruction, then right. The
         // legacy walker emits the same shape — `pipe` between adjacent
         // suffix elements, never bracketing both children.
@@ -2728,6 +2730,87 @@ fn emitComputedIndex(em: *Emitter, node: ir.Node) EmitError!void {
     try em.pushInstr(.save_input, .{ .none = {} }, node);
     try em.pushInstr(.load_variable, .{ .index = key_var }, node);
     try em.pushInstr(.load_computed, .{ .none = {} }, node);
+}
+
+/// Emit `computed_slice` (cat-18 sibling of `computed_index`).
+/// Implements `.[<from_expr>:<to_expr>]` where either bound is a
+/// non-integer-literal expression. Mirrors `emitComputedIndex`'s
+/// capture pattern — the base (slice input) is preserved across bound
+/// evaluations via a captured variable, and the base is restored
+/// between exprs so each evaluates against the original input rather
+/// than the previous bound's result.
+///
+/// Sequence (when both bounds are exprs):
+/// ```
+/// push_current               ; value_stack ← current (base)
+/// capture_variable($base)
+/// <from_expr>                ; current = from result
+/// capture_variable($from)
+/// load_variable($base)       ; restore current = base
+/// pipe
+/// <to_expr>                  ; current = to result
+/// capture_variable($to)
+/// load_variable($base)       ; restore current = base for slice phase
+/// pipe
+/// save_input                 ; if_stack ← base
+/// load_variable($from)       ; value_stack ← from
+/// load_variable($to)         ; value_stack ← to (top)
+/// slice_computed <flags>     ; pops to, from from value_stack;
+///                              base from if_stack
+/// ```
+///
+/// When only one bound is an expr, the literal-bound side is encoded
+/// in `slice_args.from` / `slice_args.to` and skipped on the
+/// value-stack path. The four flag bits (has_from, has_to,
+/// has_from_expr, has_to_expr) tell the VM which slots to consume.
+fn emitSliceComputed(em: *Emitter, node: ir.Node) EmitError!void {
+    const slots = em.ir_obj.extra_data.items;
+    const from_u: u32 = slots[node.extra];
+    const to_u: u32 = slots[node.extra + 1];
+    const flags: u32 = slots[node.extra + 2];
+    const has_from = (flags & 1) != 0;
+    const has_to = (flags & 2) != 0;
+    const has_from_expr = (flags & 4) != 0;
+    const has_to_expr = (flags & 8) != 0;
+
+    const base_var: i64 = @intCast(em.allocVar());
+    const from_var: i64 = if (has_from_expr) @intCast(em.allocVar()) else 0;
+    const to_var: i64 = if (has_to_expr) @intCast(em.allocVar()) else 0;
+
+    try em.pushInstr(.push_current, .{ .none = {} }, node);
+    try em.pushInstr(.capture_variable, .{ .index = base_var }, node);
+
+    if (has_from_expr) {
+        try emitNode(em, node.children[0]);
+        try em.pushInstr(.capture_variable, .{ .index = from_var }, node);
+        // Restore base for the next evaluation phase (to_expr or
+        // the slice itself).
+        try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+    }
+    if (has_to_expr) {
+        try emitNode(em, node.children[1]);
+        try em.pushInstr(.capture_variable, .{ .index = to_var }, node);
+        try em.pushInstr(.load_variable, .{ .index = base_var }, node);
+        try em.pushInstr(.pipe, .{ .none = {} }, node);
+    }
+
+    // Surrounding capture for the slice itself: if_stack ← base.
+    // Bound values pushed onto value_stack in from-then-to order so
+    // the VM pops `to` first, then `from`.
+    try em.pushInstr(.save_input, .{ .none = {} }, node);
+    if (has_from_expr) try em.pushInstr(.load_variable, .{ .index = from_var }, node);
+    if (has_to_expr) try em.pushInstr(.load_variable, .{ .index = to_var }, node);
+
+    const args = types_mod.SliceArgs{
+        .from = @bitCast(from_u),
+        .to = @bitCast(to_u),
+        .has_from = has_from,
+        .has_to = has_to,
+        .has_from_expr = has_from_expr,
+        .has_to_expr = has_to_expr,
+    };
+    try em.pushInstr(.slice_computed, .{ .slice_args = args }, node);
 }
 
 /// Map a (jq-visible) builtin name + arity to its `BuiltinId`. Single

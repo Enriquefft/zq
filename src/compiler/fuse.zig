@@ -462,6 +462,20 @@ fn childArity(ctx: *const WalkCtx, node: ir.Node) struct { u8, u8 } {
         // `break_` is a leaf (no children — the var_id reference is in
         // `extra_data`). `computed_index` is unary — key expr at `children[0]`.
         .try_, .neg, .path_begin, .label, .computed_index => .{ 0, 1 },
+        // `computed_slice` carries up to two child expressions
+        // (`from_expr` at children[0], `to_expr` at children[1]) gated
+        // by flag bits 2 and 3 in `extra_data[extra+2]`. Unused slots
+        // hold sentinel `0` and must be skipped during the copy walk
+        // so a stray ref to node 0 isn't introduced.
+        .computed_slice => blk: {
+            const flags: u32 = ctx.src.extra_data.items[node.extra + 2];
+            const has_from_expr = (flags & 4) != 0;
+            const has_to_expr = (flags & 8) != 0;
+            if (has_from_expr and has_to_expr) break :blk .{ 0, 2 };
+            if (has_from_expr) break :blk .{ 0, 1 };
+            if (has_to_expr) break :blk .{ 1, 2 };
+            break :blk .{ 0, 0 };
+        },
         .update_assign => blk: {
             const kind: ir.UpdateOpKind = @enumFromInt(ctx.src.extra_data.items[node.extra]);
             break :blk if (kind == .general) .{ 0, 2 } else .{ 1, 2 }; // skip slot 0 (sentinel) for fast path

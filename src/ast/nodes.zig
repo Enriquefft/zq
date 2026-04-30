@@ -166,6 +166,11 @@ pub const Node = struct {
         from: i32,
         has_to: bool,
         to: i32,
+        /// Computed-bound expressions for `.[expr1:expr2]`. When present, the
+        /// emitter routes through `slice_computed`; when null, the literal
+        /// `from`/`to` fields are used by the legacy `slice` opcode.
+        from_expr: ?*Node = null,
+        to_expr: ?*Node = null,
     };
 
     pub const Literal = union(enum) {

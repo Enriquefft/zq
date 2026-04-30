@@ -706,6 +706,13 @@ pub const SliceArgs = extern struct {
     to: i32 = 0,
     has_from: bool = false,
     has_to: bool = false,
+    /// Slice-computed-only: the corresponding bound is provided via
+    /// `value_stack` rather than the `from` / `to` literal fields.
+    /// Always `false` for the legacy `slice` opcode. The two extra
+    /// bytes fit within the existing 12-byte aligned SliceArgs slot
+    /// without growing the `Operand` union.
+    has_from_expr: bool = false,
+    has_to_expr: bool = false,
 };
 
 // ─── Function Definition ─────────────────────────────────────────────────────
@@ -841,6 +848,17 @@ pub const Instruction = extern struct {
         /// Handles .[from:to], .[from:], .[:to], .[:] patterns.
         /// Negative indices count from the end; bounds are clamped to [0, length].
         slice,
+        /// Computed-bound slice (`.[expr1:expr2]` where either bound is
+        /// an arbitrary expression rather than an integer literal).
+        /// operand.slice_args carries only the has_from / has_to flags;
+        /// the integer fields are unused. The base value is popped from
+        /// `if_stack` (saved by the surrounding capture pipeline before
+        /// the bound expressions are evaluated). The bound values are
+        /// popped from `value_stack` in reverse push order: `to` if
+        /// has_to, then `from` if has_from. Each bound must be an
+        /// integer (jq: float-truncate; null is treated as the literal
+        /// default — 0 for `from`, length for `to`).
+        slice_computed,
 
         // Update assignment (|=, +=, -=, *=, /=, %=, //=)
         /// Navigate to object field for update: sets current to field value without
@@ -1000,6 +1018,7 @@ pub const Instruction = extern struct {
                 .load_computed,
                 .load_path,
                 .slice,
+                .slice_computed,
                 .navigate_key,
                 .navigate_index,
                 .pipe,
@@ -1104,6 +1123,7 @@ pub const Instruction = extern struct {
                 .navigate_key,
                 .navigate_index,
                 .slice,
+                .slice_computed,
                 // Restoring a saved input discards any derived value that
                 // only existed inside a predicate / if-branch scope.
                 .restore_input,
