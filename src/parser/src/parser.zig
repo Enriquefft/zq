@@ -42,7 +42,7 @@ const NumSubState = enum(u8) {
     exp, // digits in exponent
 };
 
-const KeywordKind = enum(u3) { kw_true, kw_false, kw_null, kw_infinity, kw_nan, kw_neg_infinity, kw_neg_nan };
+const KeywordKind = enum(u4) { kw_true, kw_false, kw_null, kw_infinity, kw_nan, kw_neg_infinity, kw_neg_nan, kw_nan_lower, kw_neg_nan_lower };
 
 const StateTag = enum(u8) {
     want_value,
@@ -538,6 +538,13 @@ pub const Parser = struct {
                     p.kw_pos = 1;
                     p.state = .in_keyword;
                 },
+                'n' => {
+                    // -nan (lowercase): abandon number state, switch to keyword.
+                    p.num_buf.clearRetainingCapacity();
+                    p.kw_kind = .kw_neg_nan_lower;
+                    p.kw_pos = 1;
+                    p.state = .in_keyword;
+                },
                 else => return error.InvalidNumber,
             },
             .leading_zero => switch (byte) {
@@ -610,6 +617,17 @@ pub const Parser = struct {
     }
 
     fn onInKeyword(p: *Parser, byte: u8) (ZqError || error{OutOfMemory})!void {
+        // Special disambiguation: 'n' in onWantValue starts kw_null.
+        // If the second byte is 'a' instead of 'u', switch to kw_nan_lower.
+        // jq accepts lowercase "nan" as a NaN literal.
+        if (p.kw_kind == .kw_null and p.kw_pos == 1) {
+            if (byte == 'a') {
+                // 'n' + 'a' → NaN branch (lowercase "nan").
+                p.kw_kind = .kw_nan_lower;
+                p.kw_pos = 2; // consumed 'n' (pos 0) and 'a' (pos 1), need 'n' (pos 2)
+                return;
+            }
+        }
         const kw = keywordBytes(p.kw_kind);
         if (p.kw_pos >= kw.len or byte != kw[p.kw_pos]) return error.UnexpectedToken;
         p.kw_pos += 1;
@@ -623,6 +641,8 @@ pub const Parser = struct {
                 .kw_nan => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = std.math.nan(f64) } }),
                 .kw_neg_infinity => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = -std.math.inf(f64) } }),
                 .kw_neg_nan => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = -std.math.nan(f64) } }),
+                .kw_nan_lower => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = std.math.nan(f64) } }),
+                .kw_neg_nan_lower => try p.tape_buf.append(p.allocator, .{ .tag = .float, .payload = .{ .float = -std.math.nan(f64) } }),
             }
             p.transitionAfterValue();
         }
@@ -787,6 +807,12 @@ pub const Parser = struct {
             // kw_pos starts at 1, so match from index 1 of the full keyword.
             .kw_infinity, .kw_neg_infinity => "Infinity",
             .kw_nan, .kw_neg_nan => "NaN",
+            // kw_nan_lower: 'n' consumed by onWantValue, 'a' consumed by
+            // onInKeyword disambiguation; kw_pos=2 so match from index 2 of "nan".
+            .kw_nan_lower => "nan",
+            // kw_neg_nan_lower: '-' consumed by onWantValue→neg state, 'n' consumed
+            // by onInNumber neg branch; kw_pos=1 so match from index 1 of "nan".
+            .kw_neg_nan_lower => "nan",
         };
     }
 };

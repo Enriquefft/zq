@@ -9930,10 +9930,89 @@ const JsonParser = struct {
             '[' => try self.writeArray(),
             't' => try self.writeLiteral("true", .true_val),
             'f' => try self.writeLiteral("false", .false_val),
-            'n' => try self.writeLiteral("null", .null_val),
+            // 'n' may begin "null" or case-insensitive "nan" / "NaN" etc.
+            'n' => try self.writeNullOrNan(),
+            // 'N' begins case-insensitive "NaN".
+            'N' => try self.writeNanLiteral(false),
             '-', '0'...'9' => try self.writeNumber(),
             else => return error.TypeError,
         }
+    }
+
+    /// Disambiguate 'n': accepts "null" or case-insensitive "nan".
+    /// jq accepts "nan" (all lowercase) as a NaN literal.
+    fn writeNullOrNan(self: *JsonParser) ZqError!void {
+        // Peek at the second character to decide.
+        if (self.pos + 1 < self.src.len and
+            (self.src[self.pos + 1] == 'a' or self.src[self.pos + 1] == 'A'))
+        {
+            // Starts with 'n' followed by 'a'/'A' → NaN branch.
+            return self.writeNanLiteral(false);
+        }
+        // Otherwise fall through to "null".
+        return self.writeLiteral("null", .null_val);
+    }
+
+    /// Parse a NaN literal (case-insensitive "nan" / "NaN" / "Nan" etc.)
+    /// or "-NaN" / "-nan" (negated; `negated` is true when '-' was already consumed).
+    /// After consuming exactly 3 chars (n-a-n or N-a-N etc.), any trailing
+    /// non-whitespace / non-structural character makes the literal invalid and
+    /// generates a jq-compatible error message, e.g.:
+    ///   "Invalid numeric literal at EOF at line 1,column 4 (while parsing 'NaN1')"
+    fn writeNanLiteral(self: *JsonParser, negated: bool) ZqError!void {
+        const literal_start = if (negated) self.pos - 1 else self.pos;
+        // Expect exactly 3 characters: first letter already seen as 'n'/'N',
+        // second must be 'a'/'A', third must be 'n'/'N'.
+        if (self.pos + 3 > self.src.len) return self.nanError();
+        const b0 = self.src[self.pos]; // 'n' or 'N'
+        const b1 = self.src[self.pos + 1];
+        const b2 = self.src[self.pos + 2];
+        if ((b0 != 'n' and b0 != 'N') or
+            (b1 != 'a' and b1 != 'A') or
+            (b2 != 'n' and b2 != 'N'))
+        {
+            return self.nanError();
+        }
+        self.pos += 3;
+        // Check that nothing invalid follows (whitespace / structural chars are ok).
+        if (self.pos < self.src.len) {
+            const next = self.src[self.pos];
+            // Valid terminators: whitespace, ']', '}', ',', end-of-container.
+            const is_term = (next == ' ' or next == '\t' or next == '\n' or
+                next == '\r' or next == ']' or next == '}' or next == ',');
+            if (!is_term) {
+                return self.nanErrorAt(literal_start);
+            }
+        }
+        const nan_val = if (negated) -std.math.nan(f64) else std.math.nan(f64);
+        _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+            .tag = .float,
+            .payload = .{ .float = nan_val },
+        });
+    }
+
+    /// Build and set a NaN-parse error detail matching jq's format, then return TypeError.
+    /// `literal_start` is the index of the first char of the whole literal (including '-').
+    /// jq reports the column as the length of the full input string (EOF position),
+    /// and the "while parsing" fragment is the entire remaining input from literal_start.
+    fn nanErrorAt(self: *JsonParser, literal_start: usize) ZqError {
+        const col = self.src.len; // jq: EOF column = length of the input token
+        const literal = self.src[literal_start..]; // full literal from start (e.g. "NaN1")
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(self.it.alloc);
+        buf.writer(self.it.alloc).print(
+            "Invalid numeric literal at EOF at line 1,column {d} (while parsing '{s}')",
+            .{ col, literal },
+        ) catch return error.TypeError;
+        const str_ref = self.it.runtime_tape.internString(self.it.alloc, buf.items) catch return error.TypeError;
+        self.it.type_error_detail = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.TypeError;
+    }
+
+    /// NaN error with no trailing char info (e.g. premature EOF during nan parsing).
+    fn nanError(self: *JsonParser) ZqError {
+        _ = self;
+        return error.TypeError;
     }
 
     fn writeLiteral(self: *JsonParser, expected: []const u8, tag: Tape.Tag) ZqError!void {
@@ -9948,7 +10027,15 @@ const JsonParser = struct {
 
     fn writeNumber(self: *JsonParser) ZqError!void {
         const start = self.pos;
-        if (self.pos < self.src.len and self.src[self.pos] == '-') self.pos += 1;
+        if (self.pos < self.src.len and self.src[self.pos] == '-') {
+            self.pos += 1;
+            // jq accepts -NaN and -nan as negated NaN literals.
+            if (self.pos < self.src.len and
+                (self.src[self.pos] == 'N' or self.src[self.pos] == 'n'))
+            {
+                return self.writeNanLiteral(true);
+            }
+        }
         while (self.pos < self.src.len and self.src[self.pos] >= '0' and self.src[self.pos] <= '9') {
             self.pos += 1;
         }
