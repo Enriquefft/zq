@@ -8,16 +8,6 @@ Last verified: 2026-04-30.
 
 ## Active
 
-### SSOT: VM int→float coercion duplicated
-
-`src/vm/root.zig` has `toFloat(val: StackValue)` (the canonical
-StackValue → f64 coercion) but arithmetic ops open-code
-`@floatFromInt(i)` 25+ times instead of calling it. Sites include
-L2726, L2731, L2901, L2905, L3165, L3173, L3397, L3401, L3408, L3453,
-L3458, L5350, L5355, L5427, L5432, L5437, L5601, L5606, L5654, L5659,
-L5664, L7452, L7493, L7501, L7608, L7618. Route every int→float coercion
-through `toFloat` so type semantics live in one place.
-
 ### SSOT: LSP server bypasses typed protocol structs
 
 `src/lsp/protocol.zig` defines `TextDocumentItem`,
@@ -34,4 +24,3 @@ builtins flat regardless of context. `src/lsp/builtins.zig:byCategory`
 is the correct primitive for category-aware filtering but is never
 called. Wire `byCategory` (or richer scoring) into completion so
 results match the cursor context.
-
