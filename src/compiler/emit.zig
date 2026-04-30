@@ -1594,13 +1594,19 @@ fn appendRebasedInstrs(em: *Emitter, captured: CapturedInstrs) error{OutOfMemory
 /// jq bytecode uses absolute IPs only, so we recompute every relevant
 /// `.index` operand. Conservative: every op carrying an `.index`
 /// operand that the VM treats as an instruction pointer is shifted.
+///
+/// Special case: `fork_try` with `operand.index == 0` is the
+/// no-handler sentinel emitted by `try E` (no catch arm).  Zero is NOT
+/// an instruction pointer — it encodes "suppress errors silently".
+/// Rebasing it would produce a non-zero value that `handleError`
+/// misinterprets as a valid catch-handler IP, routing execution to an
+/// arbitrary instruction (root cause of L2381).  Leave it as-is.
 fn rebaseInstrs(buf: []types_mod.Instruction, offset: i64) void {
     for (buf) |*instr| {
         switch (instr.op) {
             .jump,
             .jump_if_false,
             .fork,
-            .fork_try,
             .fork_alt,
             .array_collect_start,
             .limit_start,
@@ -1608,6 +1614,16 @@ fn rebaseInstrs(buf: []types_mod.Instruction, offset: i64) void {
             .label_begin,
             => {
                 if (offset != 0) {
+                    const cur: i64 = @intCast(instr.operand.index);
+                    instr.operand = .{ .index = @intCast(cur + offset) };
+                }
+            },
+            .fork_try => {
+                // Rebase only when the operand is a real catch-handler IP
+                // (handler form: `try E catch H`).  The no-handler form
+                // (`try E` / `E?`) uses operand == 0 as a "suppress" sentinel;
+                // adding the offset would corrupt it into a spurious handler IP.
+                if (offset != 0 and instr.operand.index != 0) {
                     const cur: i64 = @intCast(instr.operand.index);
                     instr.operand = .{ .index = @intCast(cur + offset) };
                 }
