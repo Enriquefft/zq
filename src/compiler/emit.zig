@@ -2042,6 +2042,16 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
             // preserves the original array on the if_stack so the
             // builtin can pair keys with elements.
             //
+            // By-key family (`sort_by`/`group_by`/`min_by`/`max_by`/
+            // `unique_by`): per jq, the key for an element is the array
+            // of every value `f` produces for it. We wrap `<f>` in an
+            // inner `array_collect_start`/`yield_output`/`array_collect_end`
+            // so the outer keys array contains one sub-array per
+            // element (1:1 with elements, regardless of how many
+            // outputs `f` produces). Single-output `f` yields a
+            // single-element array and lexicographic comparison still
+            // gives the same ordering, so existing tests are unaffected.
+            //
             // `add(f)` special case: `add` evaluates `f` once over the
             // current input (no `each` iteration) and the resulting
             // array is fed straight to `add`. We emit `pipe` (the new
@@ -2051,16 +2061,36 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
             // built by `arr_ctor` inside `f` is the only place
             // `empty` can backtrack to — the `add` arm itself does
             // not introduce another forkpoint.
+            //
+            // `map_values(f)` keeps the flat shape: each `f` output
+            // replaces the slot, so per-element wrapping would change
+            // its semantics.
             const is_add = std.mem.eql(u8, name, "add");
+            const is_by_key = std.mem.eql(u8, name, "sort_by") or
+                std.mem.eql(u8, name, "group_by") or
+                std.mem.eql(u8, name, "min_by") or
+                std.mem.eql(u8, name, "max_by") or
+                std.mem.eql(u8, name, "unique_by");
             try em.pushInstr(.save_input, .{ .none = {} }, node);
             const start_pos = em.instructions.items.len;
             try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
             if (!is_add) {
                 try em.pushInstr(.each, .{ .none = {} }, node);
             }
+            var inner_start_pos: usize = 0;
+            if (is_by_key) {
+                inner_start_pos = em.instructions.items.len;
+                try em.pushInstr(.array_collect_start, .{ .index = 0 }, node);
+            }
             const arg_idx = em.ir_obj.extra_children.items[node.span_start];
             try emitNode(em, arg_idx);
             try em.pushInstr(.yield_output, .{ .none = {} }, node);
+            if (is_by_key) {
+                const inner_end_ip: u32 = @intCast(em.instructions.items.len);
+                try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
+                em.instructions.items[inner_start_pos].operand = .{ .index = inner_end_ip };
+                try em.pushInstr(.yield_output, .{ .none = {} }, node);
+            }
             const end_ip: u32 = @intCast(em.instructions.items.len);
             try em.pushInstr(.array_collect_end, .{ .none = {} }, node);
             em.instructions.items[start_pos].operand = .{ .index = end_ip };
