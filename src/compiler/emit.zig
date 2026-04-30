@@ -2165,6 +2165,10 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // as_pattern + reduce + path + setpath/getpath IR nodes. A
         // call_builtin node carrying this class must never reach emit.
         .pick_desugar1 => unreachable,
+        // `with_entries(f)` is fully resolved at lower time into a pipe
+        // chain of `to_entries | map(f) | from_entries`. A call_builtin
+        // node carrying this class must never reach emit.
+        .with_entries_desugar1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
