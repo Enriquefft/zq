@@ -3844,7 +3844,17 @@ fn emitInputScopeReseed(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void
 /// clobbered by re-entrant calls).
 fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
     const node = ir_obj.nodes.items[node_idx];
-    if (node.op == .iterate) return true;
+    // Treat `computed_index` like a generator for the purposes of the
+    // arith/cmp/logical "non-generator vs generator" path selection: its
+    // emission ends with `load_computed`, which writes the result to
+    // `it.current` rather than pushing to the value stack. The
+    // non-generator op layout (lhs;rhs;op) assumes both operands push to
+    // the stack, so without this detection the second operand would
+    // overwrite `current` and the op would consume the same value twice
+    // (or hit a stack-empty TypeError on one side). The lhs-temp idiom
+    // taken by the generator path captures the RHS via a variable before
+    // re-running the LHS, so it's correct for any current-sink subtree.
+    if (node.op == .iterate or node.op == .computed_index) return true;
     // Two fixed children.
     if (node.children[0] != 0 and subtreeHasIterate(ir_obj, node.children[0])) return true;
     if (node.children[1] != 0 and subtreeHasIterate(ir_obj, node.children[1])) return true;

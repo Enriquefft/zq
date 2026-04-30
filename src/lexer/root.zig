@@ -131,6 +131,22 @@ pub const Lexer = struct {
                     l.pos += 1;
                     return .{ .tag = .dot_dot, .offset = start, .len = 2 };
                 }
+                // Leading-dot float literal (e.g. `.5`, `.00005`) — jq accepts
+                // these as float literals, not `.` followed by an index.
+                if (l.pos < l.src.len and std.ascii.isDigit(l.src[l.pos])) {
+                    while (l.pos < l.src.len and std.ascii.isDigit(l.src[l.pos]))
+                        l.pos += 1;
+                    if (l.pos < l.src.len and (l.src[l.pos] == 'e' or l.src[l.pos] == 'E')) {
+                        l.pos += 1;
+                        if (l.pos < l.src.len and (l.src[l.pos] == '+' or l.src[l.pos] == '-'))
+                            l.pos += 1;
+                        if (l.pos >= l.src.len or !std.ascii.isDigit(l.src[l.pos]))
+                            return error.QuerySyntaxError;
+                        while (l.pos < l.src.len and std.ascii.isDigit(l.src[l.pos]))
+                            l.pos += 1;
+                    }
+                    return .{ .tag = .float_lit, .offset = start, .len = l.pos - start };
+                }
                 return .{ .tag = .dot, .offset = start, .len = 1 };
             },
             '|' => {
