@@ -4567,7 +4567,10 @@ pub const ResultIterator = struct {
             .float => |f| @as(i64, @intFromFloat(@round(f))),
             else => return error.TypeError,
         };
-        if (depth < 0) return error.TypeError;
+        // jq prelude: `if $d < 0 then error("flatten depth must not be negative")`
+        // fires before the input-type check. UserError class so `try ... catch .`
+        // surfaces the message string.
+        if (depth < 0) return try it.raiseUserError("flatten depth must not be negative");
         switch (it.current) {
             .array => |span| {
                 var elems = std.ArrayList(Value){};
