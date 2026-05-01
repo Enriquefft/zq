@@ -3,13 +3,13 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-30 (post error-format/VM/parser orchestration wave — closed L1802 L2084 L2088 L2096 L2107 L2112 L2116 L2130 L2134 L2138; deleted dead `toFloat` + `builtinIsempty`).
+Last verified: 2026-04-30 (post finish-the-domain orchestration wave — closed L2121 L2126 L2299 L2306 L2310 L2315 L2328 L2332 L2345 L2350 L2381 L2394 L2398 L2402 L2407; fold-2 unmask exposed walk/1 then walk/2 + float-slice cluster).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1134/1177 pass, 23 fail, 20 skipped. Net pass count dropped from 1144 because the L2080→L2084→L2088→L2130 abort-slot chain unmasks downstream latent failures with each fix. Next abort slot (signal 6) is L2332 `debug` builtin; its abort masks any further downstream tests.
+Current baseline: `zig build test` → 1118/1177 pass, 35 fail, 24 skipped. Wave closed 15 tags; fold-3 unmask (left for next wave) revealed 12 latent regression-suite failures (walk/2, float-index slices, fromjson try, large-reduce tojson, strflocaltime, regex n-flag empty pattern, repeat nested-limit) that were masked by the prior `walk_desugar1` abort slot. Per wave protocol (max 2 fold-iterations) these are deferred.
 
 ### Imports / modulemeta (G11 — out of scope this wave)
 
@@ -18,19 +18,23 @@ Current baseline: `zig build test` → 1134/1177 pass, 23 fail, 20 skipped. Net 
 | L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 | `import "x" as foo` / `include "x"` syntax errors | parser/imports — module import & include not implemented |
 | L1960 / L1964 / L1968 | `modulemeta` lookupKeyInValue abort | builtin — `modulemeta` not implemented (segfault on lookup) |
 
-### In-domain unmasked (next wave candidates)
+### In-domain unmasked (next wave candidates — fold-3 from finish-the-domain wave)
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
-| L2121 | `(.a as $x \| .b) = _b_` output mismatch | path-LHS update with as-binding | path/assign | `as`-binding inside path expression — assign rewrites need to honor binding scope; LHS path-walk likely loses binding frame across `=` rewrite. |
-| L2126 | `(.. \| select(type == _object_ and has(_b_) and (.b \| type ...)))` | recursive descent + `has` | builtin/recursion | `has/1` over a stream from `..` — likely missing recursive-descent binding or `has` arity-1 dispatch over array/object distinction. |
 | L2195 | `(13911860366432393 == 13911860366432392) \| . == if have_decnum then ... else ... end` | i64 equality near precision boundary | numeric | gated on decnum support (jq decimal numbers feature flag). Skip until decnum domain opened. |
-| L2299 | `1 as $x \| _2_ as $y \| _3_ as $z \| { $x, as, $y: 4, ($z): ... }` | object literal with `as`-keyed shorthand | parser/object_ctor | `$y` shorthand inside object literal rewriting key from `2` to `as` — object-shorthand key lookup uses raw string of bind name instead of bound value's source key. |
-| L2306 | `fromjson \| isnan` | parsing literal `NaN` | builtin/parser | `fromjson` `parseJsonToStackValue` rejects `NaN` literal (`writeLiteral` only accepts `null`/`true`/`false`); jq accepts `NaN`/`Infinity`. Add NaN/Infinity branches to writeLiteral or pre-parser. |
-| L2310 | `tojson \| fromjson` round-trip | feed parser rejects `NaN` | parser/keyword | parser's `in_keyword` state aborts on `NaN`/`Infinity` tokens — symmetric defect to L2306 in the input-side parser. |
-| L2315 | `.[] \| try (fromjson \| isnan) catch .` | try/catch wraps NaN-parse error | error-class | `fromjson` raises bare `TypeError` instead of catchable jq-shaped error string when feeding `NaN`; once L2306 fixed, this likely passes. |
-| L2328 | `try input catch .` | empty input stream | builtin | `input/0` returns 0 rows where jq returns 1 (`error("No more inputs")`); needs `input` builtin to raise catchable end-of-stream. |
-| L2332 | `debug` builtin signal-6 abort | `debug` | builtin (next abort slot) | `debug/0` not implemented — VM dispatch likely panics with `.not_implemented => unreachable`. Masks any further downstream tests in the suite. |
+| L2416 | `[walk(.,1)]` | walk/2 arity | builtin | walk/2 is a 2-arity variant in later jq prelude; only walk/1 lowering exists. Add walk/2 desugar (or accept jq's optional-arg form). |
+| L2426 / L2430 / L2434 | `[range(10)] \| .[1.2:3.5]` etc | float slice indices | slice/index | jq accepts non-integer slice bounds (rounds toward 0); zq's slice arm rejects float bounds via TypeError. Coerce bounds via `@floatFromInt`-aware path. |
+| L2438 / L2442 | `.[1.7:4294967295]` / `.[1.7:-4294967296]` | large/negative slice bounds | slice | overflow on i64 conversion; jq clamps to len. |
+| L2458 | `[range(3)] \| .[1:nan]` | NaN slice bound | slice | jq treats NaN as 0 / no-op; zq raises TypeError. |
+| L2466 | `try ([range(3)] \| .[nan] = 9) catch .` | NaN index assign | assign/index | should produce catchable error; currently shape mismatch. |
+| L2470 / L2474 / L2478 | `try (_foobar_ \| .[1.5:3.5] = _xyz_) catch .` etc | float slice/index in assign path | assign | assign-LHS path validation for non-integer indices/slices. |
+| L2489 | `try fromjson catch .` | fromjson on null input | error-class | error message shape mismatch on `fromjson` over null/non-string input. |
+| L2524 | `try [_OK_, setpath([[1]]; 1)] catch [_KO_, .]` | setpath nested-array path | builtin/setpath | setpath path-element type validation; jq raises specific error shape. |
+| L2539 | `strflocaltime(__ \| ., @uri)` | strflocaltime + format-string filter arg | builtin/datetime | strflocaltime/1 over a generator argument — likely missing fork-on-arg. |
+| L2549 / L2554 / L2559 | `reduce range(9999) as $_ ([];[.]) \| tojson \| fromjson` etc | large-reduce + tojson roundtrip | builtin | tojson on deeply-nested array — output buffer growth or recursion limit. |
+| regex.test.jq:n-flag empty-only pattern | `match(_x*_; _n_)` when pattern matches only empty | regex | builtin/regex | n-flag should drop empty-only matches. |
+| repeat_builtin nested limits | `[limit(2; limit(3; repeat(.+1)))]` | nested limit ordering | repeat | outer limit truncates first; reorder fork-frame interaction. |
 
 ### Decnum domain (gated on `have_decnum` flag)
 
@@ -41,6 +45,20 @@ Current baseline: `zig build test` → 1134/1177 pass, 23 fail, 20 skipped. Net 
 | L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique == if have_decnum then ...` |
 
 All three guard on `have_decnum` for the precise-decimal branch. Park until decnum support is decided.
+
+### Fixed in finish-the-domain wave (15)
+
+Merged 2026-04-30:
+- L2332 (commit d657abb): `debug/0` builtin — added to `isZeroArgBuiltin` in lower.zig + `nameToBuiltinId` mapping in emit.zig. Was the next abort-slot panic.
+- L2299 (commit e028d48): `$y` shorthand inside object literals — added `.dollar_ident` ObjectKey AST variant; runtime dereference of variable to bound value's source key.
+- L2328 (commit 54b7535): `try input catch .` — `input/0` raises catchable `UserError` on EOF instead of returning zero rows.
+- L2394 + L2398 + L2402 (commit cd28a2e): `implode` U+FFFD substitution for invalid surrogates + `load_computed` type-error detail; `map(try implode catch .)` now passes.
+- L2306 + L2310 + L2315 (commit 5148a3e): `NaN`/`Infinity` literals in `fromjson` (writeValue NaN arm) + JSON parser's `in_keyword` state; round-trip `tojson \| fromjson` of NaN now works.
+- L2381 (commit 4aad5c9): `fork_try` zero-sentinel preservation across `rebaseInstrs` in emit (update-each path).
+- L2121 (commit 063ca3c): suspend path-recording for `as`-binding LHS in path-context — added `path_suspend`/`path_resume` opcodes. `(.a as $x \| .b) = _b_` now produces correct path frames.
+- L2126 (commit 56ba371): `and`/`or` short-circuit via if-then-else AST desugar; fixes path pollution in if conditions.
+- L2345 + L2350 (commit 47f7af7): generator-aware `try_handler` deferral in `pop_try` + partial-output collection in test helper (`it.next() catch null`).
+- L2407 (commit a626191): `walk/1` desugar to jq canonical prelude form via synthesized `func_def` AST. Object arm uses `to_entries \| map(.value \|= walk(f)) \| from_entries` instead of jq's `reduce keys[]` to avoid pre-existing reduce pattern-var-clobbering bug. Adds `bodyReferencesSelf` detection of `builtin_call` self-references for recursive desugar bodies.
 
 ### Fixed in error-format/VM/parser wave (10)
 
@@ -109,6 +127,10 @@ L48, L122, L661, L674, L1045.
 ### `first(...) // fallback` VM bug
 
 `limit_start` exits via `ip = instructions.len`, leaving `fork_alt` frames on the fork stack. G4's `lowerAnyAllDesugar` and G5's `lowerPickDesugar` both work around this by using array-wrap (`[first(...)]`) instead of jq's literal `first(...) // fallback` desugar form. Worth fixing the underlying VM behavior to allow direct `first(...) // fallback` use.
+
+### `reduce` pattern-var-clobbering across recursive calls (LATENT)
+
+Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with `as $key` pattern variables clobbers `$key`/`$in` slots across recursive `call_function` invocations — the inner recursive call overwrites the outer call's pattern-var slot. Walk/1's desugar (commit a626191) avoided this by using `to_entries | map(.value |= walk(f)) | from_entries` instead of jq's canonical `reduce keys[] as $key ({}; ...)` form. Reduce works correctly for non-recursive bodies; the bug surfaces only when a recursive self-call lives inside `reduce`'s update body. Fix would address pattern-var slot allocation in `emitReduce` to scope per-frame rather than per-fn_id.
 
 ### Bug residuals from prior orchestration (not in current scope)
 
