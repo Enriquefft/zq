@@ -1859,6 +1859,20 @@ pub const BuiltinClass = enum {
     /// node and recurses via lowerNode — no new VM opcode required; the
     /// first_arg1 path handles the generated first/1 call (limit(1; ...)).
     isempty_desugar1,
+    /// `walk(f)` (1-arity). Desugars to the canonical jq prelude form:
+    ///   def walk(f):
+    ///     . as $in
+    ///     | if type == "object" then
+    ///         reduce keys[] as $key
+    ///           ({}; . + { ($key): ($in[$key] | walk(f)) })
+    ///       elif type == "array" then
+    ///         map(walk(f))
+    ///       else . end
+    ///     | f;
+    /// Synthesizes the full recursive func_def AST and recurses via lowerNode.
+    /// No new VM opcode required — reduce/map/if/as_pattern/object_construct
+    /// are all supported IR primitives.
+    walk_desugar1,
     /// Names that lower-time cannot handle in this phase.
     not_implemented,
 };
@@ -1977,6 +1991,12 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     // in any value/filter bucket and must not fall through to
     // `.not_implemented`.
     if (arity == 1 and std.mem.eql(u8, name, "isempty")) return .isempty_desugar1;
+
+    // `walk(f)` (1-arity) — pure AST desugar synthesizing the jq canonical
+    // recursive prelude form. Routed before the generic arity tables because
+    // `walk` does not appear in any value/filter bucket and must not fall
+    // through to `.not_implemented`.
+    if (arity == 1 and std.mem.eql(u8, name, "walk")) return .walk_desugar1;
 
     // Cat-18 — `any(f)` / `any(g;f)` / `all(f)` / `all(g;f)`.
     // Dispatched before the generic 0-arity table because the 0-arity
@@ -2441,6 +2461,11 @@ fn lowerBuiltinCall(
         // via AST synthesis + recursive lowerNode call.
         .isempty_desugar1 => {
             return lowerIsemptyDesugar1(ctx, bc, src_start, src_len);
+        },
+        // `walk(f)` (1-arity). Desugared to the jq canonical recursive
+        // prelude form via func_def AST synthesis + recursive lowerNode call.
+        .walk_desugar1 => {
+            return lowerWalkDesugar1(ctx, bc, src_start, src_len);
         },
         // Post-cutover: every builtin name the AST parser accepts has
         // a real class arm above. `.not_implemented` only escapes
@@ -4179,6 +4204,203 @@ fn lowerIsemptyDesugar1(
     return lowerNode(ctx, first_node);
 }
 
+// ── `walk(f)` desugar ────────────────────────────────────────────────────────
+//
+// Desugars to an alternative form that avoids `reduce` (which has a VM-level
+// variable-scoping bug that clobbers pattern vars across recursive calls).
+// The object arm uses `to_entries | map(.value |= walk(f)) | from_entries`:
+//
+//   def walk(f):
+//     if type == "object" then
+//       to_entries | map(.value |= walk(f)) | from_entries
+//     elif type == "array" then
+//       map(walk(f))
+//     else . end
+//     | f;
+//
+// The `.value |= walk(f)` form is a `update_assign` with path=[.key("value")],
+// op=pipe_eq, rhs=walk(f). This avoids the `reduce` + pattern-var pop bug that
+// causes recursive walk to clobber `$key`/`$in` across recursive calls.
+//
+// `builtin_call { name="walk" }` is used for self-references (not `func_call`)
+// so `lookupRecursiveSelf` bypasses the lex-scope hidden range. The
+// `bodyReferencesSelf` fix detects these `builtin_call` self-references and
+// sets `is_recursive=true` on the FuncDef entry, which pushes fn_id onto
+// `expanding_stack` during `inlineUserCall`.
+fn lowerWalkDesugar1(
+    ctx: *Lowerer,
+    bc: *const ast.Node.BuiltinCall,
+    src_start: u32,
+    src_len: u32,
+) LowerError!u32 {
+    _ = src_start;
+    _ = src_len;
+    const alloc = ctx.arena.allocator();
+
+    // The user-supplied filter arg.
+    const f_arg: *ast.Node = bc.args[0];
+
+    // ── Helper: build a `field_access { name = "f" }` node representing
+    //    the filter param `f` as a bare ident inside the def body.
+    //    During body re-walk, `lookupFilterArgBinding("f")` resolves it
+    //    to the caller's substituted AST.
+    const mk_f_ref = struct {
+        fn call(a: std.mem.Allocator) !*ast.Node {
+            const n = try a.create(ast.Node);
+            n.* = .{ .kind = .{ .field_access = .{ .name = "f" } }, .span = ast.Span.empty() };
+            return n;
+        }
+    }.call;
+
+    // ── Helper: `walk(f)` builtin_call node (self-recursive reference).
+    //    `builtin_call` is used so the dispatch arm in lowerNode checks
+    //    `lookupRecursiveSelf` first — this bypasses the lex-scope hidden
+    //    range that hides the walk fn_id during body re-walk.
+    const mk_walk_f = struct {
+        fn call(a: std.mem.Allocator) !*ast.Node {
+            const f_ref_inner = try a.create(ast.Node);
+            f_ref_inner.* = .{ .kind = .{ .field_access = .{ .name = "f" } }, .span = ast.Span.empty() };
+            const args = try a.alloc(*ast.Node, 1);
+            args[0] = f_ref_inner;
+            const n = try a.create(ast.Node);
+            n.* = .{
+                .kind = .{ .builtin_call = .{ .name = "walk", .args = args } },
+                .span = ast.Span.empty(),
+            };
+            return n;
+        }
+    }.call;
+
+    // ── type == "object" ───────────────────────────────────────────────
+    const type_call_obj = try alloc.create(ast.Node);
+    type_call_obj.* = .{ .kind = .{ .builtin_call = .{ .name = "type", .args = &.{} } }, .span = ast.Span.empty() };
+    const obj_str = try alloc.create(ast.Node);
+    obj_str.* = .{ .kind = .{ .literal = .{ .string = "object" } }, .span = ast.Span.empty() };
+    const cmp_obj = try alloc.create(ast.Node);
+    cmp_obj.* = .{
+        .kind = .{ .comparison = .{ .op = .eq, .left = type_call_obj, .right = obj_str } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── .value |= walk(f) ─────────────────────────────────────────────
+    // `update_assign { path=[.key("value")], op=pipe_eq, rhs=walk(f) }`
+    // This is the filter passed to `map` in the object arm.
+    const walk_f_for_value = try mk_walk_f(alloc);
+    const path_steps_value = try alloc.alloc(ast.Node.PathStep, 1);
+    path_steps_value[0] = .{ .key = "value" };
+    const update_value = try alloc.create(ast.Node);
+    update_value.* = .{
+        .kind = .{ .update_assign = .{
+            .path = path_steps_value,
+            .op = .pipe_eq,
+            .rhs = walk_f_for_value,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── map(.value |= walk(f)) ────────────────────────────────────────
+    const map_update_args = try alloc.alloc(*ast.Node, 1);
+    map_update_args[0] = update_value;
+    const map_update = try alloc.create(ast.Node);
+    map_update.* = .{
+        .kind = .{ .builtin_call = .{ .name = "map", .args = map_update_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── to_entries ────────────────────────────────────────────────────
+    const to_entries_call = try alloc.create(ast.Node);
+    to_entries_call.* = .{ .kind = .{ .builtin_call = .{ .name = "to_entries", .args = &.{} } }, .span = ast.Span.empty() };
+
+    // ── from_entries ──────────────────────────────────────────────────
+    const from_entries_call = try alloc.create(ast.Node);
+    from_entries_call.* = .{ .kind = .{ .builtin_call = .{ .name = "from_entries", .args = &.{} } }, .span = ast.Span.empty() };
+
+    // ── to_entries | map(.value |= walk(f)) | from_entries ───────────
+    const to_map = try alloc.create(ast.Node);
+    to_map.* = .{
+        .kind = .{ .pipe = .{ .left = to_entries_call, .right = map_update } },
+        .span = ast.Span.empty(),
+    };
+    const obj_arm = try alloc.create(ast.Node);
+    obj_arm.* = .{
+        .kind = .{ .pipe = .{ .left = to_map, .right = from_entries_call } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── type == "array" ───────────────────────────────────────────────
+    const type_call_arr = try alloc.create(ast.Node);
+    type_call_arr.* = .{ .kind = .{ .builtin_call = .{ .name = "type", .args = &.{} } }, .span = ast.Span.empty() };
+    const arr_str = try alloc.create(ast.Node);
+    arr_str.* = .{ .kind = .{ .literal = .{ .string = "array" } }, .span = ast.Span.empty() };
+    const cmp_arr = try alloc.create(ast.Node);
+    cmp_arr.* = .{
+        .kind = .{ .comparison = .{ .op = .eq, .left = type_call_arr, .right = arr_str } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── map(walk(f)) ─────────────────────────────────────────────────
+    const walk_f_for_map = try mk_walk_f(alloc);
+    const map_args = try alloc.alloc(*ast.Node, 1);
+    map_args[0] = walk_f_for_map;
+    const map_walk = try alloc.create(ast.Node);
+    map_walk.* = .{
+        .kind = .{ .builtin_call = .{ .name = "map", .args = map_args } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── else: . ──────────────────────────────────────────────────────
+    const identity_else = try alloc.create(ast.Node);
+    identity_else.* = .{ .kind = .identity, .span = ast.Span.empty() };
+
+    // ── if type == "object" then to_entries | map(.value |= walk(f)) | from_entries
+    //    elif type == "array" then map(walk(f))
+    //    else . end ─────────────────────────────────────────────────
+    const elif_chains = try alloc.alloc(ast.Node.ElifChain, 1);
+    elif_chains[0] = .{ .cond = cmp_arr, .body = map_walk };
+    const if_node = try alloc.create(ast.Node);
+    if_node.* = .{
+        .kind = .{ .if_expr = .{
+            .cond = cmp_obj,
+            .then_body = obj_arm,
+            .elif_chains = elif_chains,
+            .else_body = identity_else,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── <if_node> | f ─────────────────────────────────────────────────
+    const f_ref_pipe = try mk_f_ref(alloc);
+    const body_node = try alloc.create(ast.Node);
+    body_node.* = .{
+        .kind = .{ .pipe = .{ .left = if_node, .right = f_ref_pipe } },
+        .span = ast.Span.empty(),
+    };
+
+    // ── def walk(f): <body_node>; walk(f_arg) ─────────────────────────
+    const call_args = try alloc.alloc(*ast.Node, 1);
+    call_args[0] = f_arg;
+    const call_walk = try alloc.create(ast.Node);
+    call_walk.* = .{
+        .kind = .{ .builtin_call = .{ .name = "walk", .args = call_args } },
+        .span = ast.Span.empty(),
+    };
+
+    const walk_params = try alloc.alloc(ast.Node.FuncParam, 1);
+    walk_params[0] = .{ .name = "f", .is_filter = true, .span = ast.Span.empty() };
+    const func_def_node = try alloc.create(ast.Node);
+    func_def_node.* = .{
+        .kind = .{ .func_def = .{
+            .name = "walk",
+            .params = walk_params,
+            .body = body_node,
+            .rest = call_walk,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    return lowerNode(ctx, func_def_node);
+}
+
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────
 //
 // Both ops share the same skeleton: allocate two hidden var_ids
@@ -4993,6 +5215,13 @@ fn bodyReferencesSelf(node: *const Node, name: []const u8, arity: u32) bool {
             return false;
         },
         .builtin_call => |bc| {
+            // A synthesized builtin_call whose name matches the function
+            // under analysis is a self-reference (e.g. `walk(f)` desugared
+            // inside the walk def body). This mirrors the func_call arm so
+            // bodyReferencesSelf correctly detects recursion when the
+            // desugar emits builtin_call rather than func_call for the
+            // self-recursive references.
+            if (std.mem.eql(u8, bc.name, name) and bc.args.len == arity) return true;
             for (bc.args) |a| if (bodyReferencesSelf(a, name, arity)) return true;
             return false;
         },

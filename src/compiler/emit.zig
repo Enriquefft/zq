@@ -2277,6 +2277,11 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
         // `first/1` + `comma` + `pipe` + `false`/`true` literal IR nodes.
         // A call_builtin node carrying this class must never reach emit.
         .isempty_desugar1 => unreachable,
+        // `walk(f)` is fully resolved at lower time into a `func_def` AST
+        // (registered as a user function with a recursive body) plus a
+        // call to `walk(f)` as the continuation. A call_builtin node
+        // carrying this class must never reach emit.
+        .walk_desugar1 => unreachable,
         // ── Regex builtins (cat-11) ─────────────────────────────────
         // The lowerer wrote a 4-slot `extra_data` payload `(name_off,
         // name_len, pool_idx, n_flag)`; emit packs `(bid, pool_idx,
