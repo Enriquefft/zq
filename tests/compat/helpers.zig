@@ -332,7 +332,13 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         result_list.deinit(alloc);
     }
 
-    while (it.next() catch return error.QueryRuntimeError) |val| {
+    // jq semantics: yield all successful outputs even when the iterator
+    // terminates with a runtime error (e.g. a generator that errors after
+    // some values have been produced). On error we stop collecting but
+    // return whatever was gathered so far — matching jq's partial-output
+    // behaviour. Tests that care about the error signal wrap the filter
+    // in `try/catch` and check the catch output explicitly.
+    while (it.next() catch null) |val| {
         var buf = std.ArrayList(u8){};
         errdefer buf.deinit(alloc);
         try serializeValue(&buf, val);

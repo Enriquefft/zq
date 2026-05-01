@@ -1679,11 +1679,45 @@ pub const ResultIterator = struct {
 
             .pop_try => {
                 // Scan fork_stack backwards for nearest try_handler or alt_handler and remove it.
+                //
+                // Generator-aware deferral: when a try_handler is found, check whether
+                // any active generator frame (each, range, fork/comma, repeat, scan, etc.)
+                // sits between the handler and the top of the stack. Such frames were
+                // pushed *inside* the try body and represent iterations that have not
+                // completed yet. Removing the handler now would leave those future
+                // iterations without an error catcher — the handler must persist until
+                // the generators exhaust or an error fires. In that case we skip the
+                // removal; backtrackToDepth will pop the handler naturally once the
+                // last generator frame below it is gone.
+                //
+                // alt_handler (the `//` operator) does not require this treatment: its
+                // semantics are falsy-suppression on a per-value basis rather than
+                // spanning multiple generator iterations.
                 var idx = it.fork_stack.items.len;
                 while (idx > 0) {
                     idx -= 1;
                     switch (it.fork_stack.items[idx].aux) {
-                        .try_handler, .alt_handler => {
+                        .try_handler => {
+                            // If any generator frame sits above this handler (i.e. was
+                            // pushed after it, inside the try body), leave the handler in
+                            // place so it can catch errors from subsequent iterations.
+                            var has_gen_above = false;
+                            for (it.fork_stack.items[idx + 1 ..]) |frame| {
+                                switch (frame.aux) {
+                                    .each, .range, .normal, .repeat, .scan, .match_g, .splits, .limit, .skip, .path_scope, .label => {
+                                        has_gen_above = true;
+                                        break;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            if (has_gen_above) break; // defer to backtrackToDepth
+                            const removed = it.fork_stack.orderedRemove(idx);
+                            if (removed.saved_stack) |snap| it.alloc.free(snap);
+                            if (removed.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
+                            break;
+                        },
+                        .alt_handler => {
                             const removed = it.fork_stack.orderedRemove(idx);
                             if (removed.saved_stack) |snap| it.alloc.free(snap);
                             if (removed.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
