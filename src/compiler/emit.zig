@@ -936,6 +936,9 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         .while_ => try emitWhile(em, node),
         .until_ => try emitUntil(em, node),
 
+        // ── Cat-16 — walk(f) using walk_start/walk_end opcodes ────────
+        .walk1 => try emitWalk1(em, node),
+
         // ── Cat-4 — `expr as PATTERN | body` (as_bind wrapper) ────────
         .as_bind => try emitAsBind(em, node),
 
@@ -3580,6 +3583,44 @@ fn emitUntil(em: *Emitter, node: ir.Node) EmitError!void {
     em.instructions.items[jmp_done_pos].operand = .{ .index = loop_done };
 
     try em.pushInstr(.push_current, .{ .none = {} }, node);
+}
+
+// ── Cat-16 — `walk(f)` using walk_start/walk_end opcodes ─────────────
+//
+// Bytecode layout:
+//   walk_start(exit_ip)   — recursively walks children bottom-up via
+//                           walkApplyBody (sub-loop, takes first output
+//                           per step, no call_function frame push)
+//   [body instructions]   — f runs on the walked result with full
+//                           fork/backtrack so generator f yields
+//                           multiple outputs normally at top level
+//   walk_end              — at exit_ip-1; terminates walkApplyBody loop
+//   exit_ip:              — first instruction after walk_end
+//
+// Using walk_start/walk_end avoids the func_def desugar which relied on
+// call_function for recursive invocations. When f is a generator (e.g.
+// `(.,1)`), call_function-based recursion lets the fork escape the call
+// boundary: the second fork branch executes return_function which pops
+// the already-popped outer call frame, causing infinite recursion and
+// value_stack overflow. The walk_start opcode's walkApplyBody sub-loop
+// prevents this by never pushing a call frame for recursive child walks.
+fn emitWalk1(em: *Emitter, node: ir.Node) EmitError!void {
+    std.debug.assert(node.span_len == 1);
+    const body_idx = em.ir_obj.extra_children.items[node.span_start];
+
+    // Emit walk_start with a placeholder exit_ip (backpatched below).
+    const ws_pos: usize = em.instructions.items.len;
+    try em.pushInstr(.walk_start, .{ .index = 0 }, node);
+
+    // Emit the body (f).
+    try emitNode(em, body_idx);
+
+    // Emit walk_end; record its position as exit_ip-1.
+    const we_pos: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(.walk_end, .{ .none = {} }, node);
+
+    // Backpatch walk_start: exit_ip = we_pos + 1 (instruction after walk_end).
+    em.instructions.items[ws_pos].operand = .{ .index = we_pos + 1 };
 }
 
 // ── Cat-4 — `as_bind` wrapper ──────────────────────────────────────

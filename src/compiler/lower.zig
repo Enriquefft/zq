@@ -4233,172 +4233,27 @@ fn lowerWalkDesugar1(
     src_start: u32,
     src_len: u32,
 ) LowerError!u32 {
-    _ = src_start;
-    _ = src_len;
     const alloc = ctx.arena.allocator();
 
-    // The user-supplied filter arg.
-    const f_arg: *ast.Node = bc.args[0];
+    // Lower the user-supplied filter arg (f) as the body child.
+    // The walk1 IR node stores it via extra_children (span_len=1).
+    // At emit time, walk_start(exit_ip) + [f body] + walk_end is
+    // produced; walkApplyBody runs f's IR in a sub-loop per recursive
+    // child, taking only the FIRST output per step without call_function
+    // frames — generator f args (e.g. `(.,1)`) cannot escape the
+    // call boundary and corrupt the parent frame.
+    const body_idx = try lowerNode(ctx, bc.args[0]);
 
-    // ── Helper: build a `field_access { name = "f" }` node representing
-    //    the filter param `f` as a bare ident inside the def body.
-    //    During body re-walk, `lookupFilterArgBinding("f")` resolves it
-    //    to the caller's substituted AST.
-    const mk_f_ref = struct {
-        fn call(a: std.mem.Allocator) !*ast.Node {
-            const n = try a.create(ast.Node);
-            n.* = .{ .kind = .{ .field_access = .{ .name = "f" } }, .span = ast.Span.empty() };
-            return n;
-        }
-    }.call;
+    const span_start: u32 = @intCast(ctx.out.extra_children.items.len);
+    try ctx.out.extra_children.append(alloc, body_idx);
 
-    // ── Helper: `walk(f)` builtin_call node (self-recursive reference).
-    //    `builtin_call` is used so the dispatch arm in lowerNode checks
-    //    `lookupRecursiveSelf` first — this bypasses the lex-scope hidden
-    //    range that hides the walk fn_id during body re-walk.
-    const mk_walk_f = struct {
-        fn call(a: std.mem.Allocator) !*ast.Node {
-            const f_ref_inner = try a.create(ast.Node);
-            f_ref_inner.* = .{ .kind = .{ .field_access = .{ .name = "f" } }, .span = ast.Span.empty() };
-            const args = try a.alloc(*ast.Node, 1);
-            args[0] = f_ref_inner;
-            const n = try a.create(ast.Node);
-            n.* = .{
-                .kind = .{ .builtin_call = .{ .name = "walk", .args = args } },
-                .span = ast.Span.empty(),
-            };
-            return n;
-        }
-    }.call;
-
-    // ── type == "object" ───────────────────────────────────────────────
-    const type_call_obj = try alloc.create(ast.Node);
-    type_call_obj.* = .{ .kind = .{ .builtin_call = .{ .name = "type", .args = &.{} } }, .span = ast.Span.empty() };
-    const obj_str = try alloc.create(ast.Node);
-    obj_str.* = .{ .kind = .{ .literal = .{ .string = "object" } }, .span = ast.Span.empty() };
-    const cmp_obj = try alloc.create(ast.Node);
-    cmp_obj.* = .{
-        .kind = .{ .comparison = .{ .op = .eq, .left = type_call_obj, .right = obj_str } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── .value |= walk(f) ─────────────────────────────────────────────
-    // `update_assign { path=[.key("value")], op=pipe_eq, rhs=walk(f) }`
-    // This is the filter passed to `map` in the object arm.
-    const walk_f_for_value = try mk_walk_f(alloc);
-    const path_steps_value = try alloc.alloc(ast.Node.PathStep, 1);
-    path_steps_value[0] = .{ .key = "value" };
-    const update_value = try alloc.create(ast.Node);
-    update_value.* = .{
-        .kind = .{ .update_assign = .{
-            .path = path_steps_value,
-            .op = .pipe_eq,
-            .rhs = walk_f_for_value,
-        } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── map(.value |= walk(f)) ────────────────────────────────────────
-    const map_update_args = try alloc.alloc(*ast.Node, 1);
-    map_update_args[0] = update_value;
-    const map_update = try alloc.create(ast.Node);
-    map_update.* = .{
-        .kind = .{ .builtin_call = .{ .name = "map", .args = map_update_args } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── to_entries ────────────────────────────────────────────────────
-    const to_entries_call = try alloc.create(ast.Node);
-    to_entries_call.* = .{ .kind = .{ .builtin_call = .{ .name = "to_entries", .args = &.{} } }, .span = ast.Span.empty() };
-
-    // ── from_entries ──────────────────────────────────────────────────
-    const from_entries_call = try alloc.create(ast.Node);
-    from_entries_call.* = .{ .kind = .{ .builtin_call = .{ .name = "from_entries", .args = &.{} } }, .span = ast.Span.empty() };
-
-    // ── to_entries | map(.value |= walk(f)) | from_entries ───────────
-    const to_map = try alloc.create(ast.Node);
-    to_map.* = .{
-        .kind = .{ .pipe = .{ .left = to_entries_call, .right = map_update } },
-        .span = ast.Span.empty(),
-    };
-    const obj_arm = try alloc.create(ast.Node);
-    obj_arm.* = .{
-        .kind = .{ .pipe = .{ .left = to_map, .right = from_entries_call } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── type == "array" ───────────────────────────────────────────────
-    const type_call_arr = try alloc.create(ast.Node);
-    type_call_arr.* = .{ .kind = .{ .builtin_call = .{ .name = "type", .args = &.{} } }, .span = ast.Span.empty() };
-    const arr_str = try alloc.create(ast.Node);
-    arr_str.* = .{ .kind = .{ .literal = .{ .string = "array" } }, .span = ast.Span.empty() };
-    const cmp_arr = try alloc.create(ast.Node);
-    cmp_arr.* = .{
-        .kind = .{ .comparison = .{ .op = .eq, .left = type_call_arr, .right = arr_str } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── map(walk(f)) ─────────────────────────────────────────────────
-    const walk_f_for_map = try mk_walk_f(alloc);
-    const map_args = try alloc.alloc(*ast.Node, 1);
-    map_args[0] = walk_f_for_map;
-    const map_walk = try alloc.create(ast.Node);
-    map_walk.* = .{
-        .kind = .{ .builtin_call = .{ .name = "map", .args = map_args } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── else: . ──────────────────────────────────────────────────────
-    const identity_else = try alloc.create(ast.Node);
-    identity_else.* = .{ .kind = .identity, .span = ast.Span.empty() };
-
-    // ── if type == "object" then to_entries | map(.value |= walk(f)) | from_entries
-    //    elif type == "array" then map(walk(f))
-    //    else . end ─────────────────────────────────────────────────
-    const elif_chains = try alloc.alloc(ast.Node.ElifChain, 1);
-    elif_chains[0] = .{ .cond = cmp_arr, .body = map_walk };
-    const if_node = try alloc.create(ast.Node);
-    if_node.* = .{
-        .kind = .{ .if_expr = .{
-            .cond = cmp_obj,
-            .then_body = obj_arm,
-            .elif_chains = elif_chains,
-            .else_body = identity_else,
-        } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── <if_node> | f ─────────────────────────────────────────────────
-    const f_ref_pipe = try mk_f_ref(alloc);
-    const body_node = try alloc.create(ast.Node);
-    body_node.* = .{
-        .kind = .{ .pipe = .{ .left = if_node, .right = f_ref_pipe } },
-        .span = ast.Span.empty(),
-    };
-
-    // ── def walk(f): <body_node>; walk(f_arg) ─────────────────────────
-    const call_args = try alloc.alloc(*ast.Node, 1);
-    call_args[0] = f_arg;
-    const call_walk = try alloc.create(ast.Node);
-    call_walk.* = .{
-        .kind = .{ .builtin_call = .{ .name = "walk", .args = call_args } },
-        .span = ast.Span.empty(),
-    };
-
-    const walk_params = try alloc.alloc(ast.Node.FuncParam, 1);
-    walk_params[0] = .{ .name = "f", .is_filter = true, .span = ast.Span.empty() };
-    const func_def_node = try alloc.create(ast.Node);
-    func_def_node.* = .{
-        .kind = .{ .func_def = .{
-            .name = "walk",
-            .params = walk_params,
-            .body = body_node,
-            .rest = call_walk,
-        } },
-        .span = ast.Span.empty(),
-    };
-
-    return lowerNode(ctx, func_def_node);
+    return ctx.pushNode(.{
+        .op = .walk1,
+        .span_start = span_start,
+        .span_len = 1,
+        .src_start = src_start,
+        .src_len = src_len,
+    });
 }
 
 // ── Cat-14 — `reduce` / `foreach` lowering ────────────────────────
