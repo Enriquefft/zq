@@ -126,3 +126,40 @@ test "repeat: body inside an array constructor — saved_collect_len cleanup" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("[[9,9],[9,9],[9,9]]", results[0]);
 }
+
+test "repeat: inner array with multi-yield body — range inside repeat" {
+    // `[range(2)]` inside repeat: each iteration must see a fresh collect
+    // frame so the inner array is `[0,1]` every time, not a growing list.
+    const results = try h.runFilter("[limit(3; repeat([range(2)]))]", "0");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[0,1],[0,1],[0,1]]", results[0]);
+}
+
+test "repeat: inner array with literal multi-element body" {
+    // Body `[1,2,3]` is a constant array; every iteration must yield an
+    // independent `[1,2,3]`, not an ever-growing concatenation.
+    const results = try h.runFilter("[limit(2; repeat([1,2,3]))]", "null");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[1,2,3],[1,2,3]]", results[0]);
+}
+
+test "repeat: inner array uses input-derived elements" {
+    // Body `[.,.+1]` exercises the collect-frame cleanup with input-
+    // dependent values so any cross-iteration leak would show as wrong
+    // element values, not just wrong array length.
+    const results = try h.runFilter("[limit(2; repeat([.,.+1]))]", "0");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[0,1],[0,1]]", results[0]);
+}
