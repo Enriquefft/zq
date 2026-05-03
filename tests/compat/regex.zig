@@ -23,9 +23,52 @@
 const std = @import("std");
 const h = @import("helpers.zig");
 const regex = @import("regex");
+const parser_mod = @import("parser");
+const query_mod = @import("query");
 
 fn requireRegex() !void {
     if (!regex.enabled) return error.SkipZigTest;
+}
+
+/// Strict-iteration variant of `h.runFilter`: propagates iterator errors
+/// instead of swallowing them via `it.next() catch null`. Tests that need
+/// to assert "no runtime error AND empty output" use this so a regression
+/// to the TypeError path can't masquerade as a passing result. Mirrors the
+/// CLI's exit-code contract: a raised error here is what the CLI prints
+/// to stderr and exits non-zero on.
+fn runFilterStrict(filter: []const u8, input_json: []const u8) ![][]const u8 {
+    var p = try parser_mod.Parser.init(h.alloc);
+    defer p.deinit();
+
+    const tape = switch (try p.feed(input_json, true)) {
+        .done => |d| d.tape,
+        .need_more => return error.ParseIncomplete,
+    };
+
+    const result = try query_mod.CompiledQuery.compile(filter, .{}, h.alloc);
+    var q = switch (result) {
+        .ok => |cq| cq,
+        .err => return error.QuerySyntaxError,
+    };
+    defer q.deinit();
+
+    var it = try q.execute(tape, &.{}, h.alloc);
+    defer it.deinit();
+
+    var result_list = std.ArrayList([]const u8){};
+    errdefer {
+        for (result_list.items) |s| h.alloc.free(s);
+        result_list.deinit(h.alloc);
+    }
+
+    while (try it.next()) |val| {
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(h.alloc);
+        try h.serializeValue(&buf, val);
+        try result_list.append(h.alloc, try buf.toOwnedSlice(h.alloc));
+    }
+
+    return result_list.toOwnedSlice(h.alloc);
 }
 
 // ── capture: named groups ────────────────────────────────────────────────────
@@ -400,10 +443,47 @@ test "jq:n-flag match(g) filters zero-width matches" {
 test "jq:n-flag match drops empty-only pattern to no-match" {
     try requireRegex();
     // match(""; "n") on "" — the only match is zero-width (empty pattern),
-    // which n-flag filters out. The VM raises TypeError internally; the
-    // harness absorbs it and returns zero outputs, matching jq's behaviour
-    // of producing no output for this expression.
-    const results = try h.runFilter("match(\"\"; \"n\")", "\"\"");
+    // n-flag filters it out, and jq emits *no output* with exit 0.
+    // We use the strict runner so a raised error here would FAIL the test
+    // (the catch-null in `runFilter` would otherwise mask the TypeError
+    // that R-pass observed via the CLI repro).
+    const results = try runFilterStrict("match(\"\"; \"n\")", "\"\"");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:n-flag match empty pattern on non-empty string emits nothing" {
+    try requireRegex();
+    // R-pass MISS (regex:n-flag-empty-pattern):
+    //   `match(""; "n")` on `"abc"` raised TypeError → stderr + exit 4
+    //   under the previous slot-only fix. jq-1.8.1 emits nothing, exit 0.
+    const results = try runFilterStrict("match(\"\"; \"n\")", "\"abc\"");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:n-flag match noncapturing-empty group on non-empty string emits nothing" {
+    try requireRegex();
+    // Sibling probe to the R-pass MISS — `(?:)` is the noncapturing-empty
+    // form of the empty pattern. Same parity: zero output, exit 0.
+    const results = try runFilterStrict("match(\"(?:)\"; \"n\")", "\"abc\"");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "jq:n-flag capture empty pattern on non-empty string emits nothing" {
+    try requireRegex();
+    // Same fix lands in builtinCapture's n-flag exhaustion path.
+    const results = try runFilterStrict("capture(\"\"; \"n\")", "\"abc\"");
     defer {
         for (results) |s| h.alloc.free(s);
         h.alloc.free(results);
