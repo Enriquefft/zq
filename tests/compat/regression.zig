@@ -232,7 +232,7 @@ test "jq:L2485 try [_ok_, setpath([1]; 1)] catch [_ko_, .]" {
 test "jq:L2489 try fromjson catch ." {
     const results = try h.runFilter(
         "try fromjson catch .",
-        "\"{'a': 123}\"",
+        "\"{'a':123}\"",
     );
     defer {
         for (results) |s| h.alloc.free(s);

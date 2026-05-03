@@ -10433,6 +10433,56 @@ const JsonParser = struct {
         return error.TypeError;
     }
 
+    /// Build and set a string-literal parse error matching jq's format, then return TypeError.
+    /// Called when we expect `"` but find a different character at `bad_pos`.
+    /// Format: `Invalid string literal; expected ",but got X at line 1,column N (while parsing 'FRAGMENT')`
+    /// Column N: jq scans past the bad "token" (treating `'` as a matching close-quote) and
+    /// reports the 1-based column of the first character after it.
+    fn stringLiteralError(self: *JsonParser, bad_pos: usize) ZqError {
+        if (bad_pos >= self.src.len) return error.TypeError;
+        const bad_char = self.src[bad_pos];
+        // Scan forward to compute column: find the exclusive end of the bad token.
+        var scan = bad_pos + 1; // skip the bad_char itself
+        if (bad_char == '\'') {
+            // jq treats the single-quote as an opening delimiter and scans for the closing one.
+            while (scan < self.src.len) {
+                const c = self.src[scan];
+                scan += 1;
+                if (c == '\'') break; // closing quote found; scan now points past it
+                // Structural characters terminate the scan (do not consume).
+                if (c == ',' or c == ':' or c == '[' or c == ']' or
+                    c == '{' or c == '}' or
+                    c == ' ' or c == '\t' or c == '\n' or c == '\r')
+                {
+                    scan -= 1; // put it back; column points at this structural char
+                    break;
+                }
+            }
+        } else {
+            // For other bad chars, scan until structural char or whitespace.
+            while (scan < self.src.len) {
+                const c = self.src[scan];
+                if (c == ',' or c == ':' or c == '[' or c == ']' or
+                    c == '{' or c == '}' or c == '"' or c == '\'' or
+                    c == ' ' or c == '\t' or c == '\n' or c == '\r')
+                {
+                    break;
+                }
+                scan += 1;
+            }
+        }
+        const col = scan + 1; // 1-based column of first char after the scanned token
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(self.it.alloc);
+        buf.writer(self.it.alloc).print(
+            "Invalid string literal; expected \",but got {c} at line 1,column {d} (while parsing '{s}')",
+            .{ bad_char, col, self.src },
+        ) catch return error.TypeError;
+        const str_ref = self.it.runtime_tape.internString(self.it.alloc, buf.items) catch return error.TypeError;
+        self.it.type_error_detail = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.TypeError;
+    }
+
     fn writeLiteral(self: *JsonParser, expected: []const u8, tag: Tape.Tag) ZqError!void {
         if (self.pos + expected.len > self.src.len) return error.TypeError;
         if (!std.mem.eql(u8, self.src[self.pos..][0..expected.len], expected)) return error.TypeError;
@@ -10589,7 +10639,8 @@ const JsonParser = struct {
             while (true) {
                 self.skipWhitespace();
                 // Parse key (must be a string)
-                if (self.pos >= self.src.len or self.src[self.pos] != '"') return error.TypeError;
+                if (self.pos >= self.src.len) return error.TypeError;
+                if (self.src[self.pos] != '"') return self.stringLiteralError(self.pos);
                 const key_bytes = try self.parseStringBytes();
                 const key_ref = try self.it.runtime_tape.internString(self.it.alloc, key_bytes);
                 self.it.alloc.free(key_bytes);
