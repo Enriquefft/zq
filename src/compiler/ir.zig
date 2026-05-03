@@ -304,6 +304,18 @@ pub const Op = enum(u8) {
     ///     push_current
     until_,
 
+    /// `walk(f)` (1-arity). One child carried via `extra_children`
+    /// (span_len=1): the filter body IR node. Emitted as:
+    ///   walk_start(exit_ip)   — recursively walks children, sets current
+    ///   [body instructions]   — f runs on the walked result
+    ///   walk_end              — at exit_ip-1; marks body boundary
+    ///   exit_ip:              — next instruction after walk_end
+    /// `walkApplyBody` takes the FIRST output per recursive child step
+    /// without using call_function, avoiding fork-escape issues with
+    /// generator f args. The top-level body runs with full fork/backtrack
+    /// so generator f (e.g. `(.,1)`) yields multiple outputs normally.
+    walk1,
+
     // ── EmitOp namespace (produced by fuse, consumed by emit) ─────────────
     // Plan §1.3 row 6 / §3 R3 step 8: chained `.a | .b | .c` field loads
     // collapse to a single `load_path` whose payload is the dot-joined key
@@ -723,6 +735,16 @@ fn dumpAst(
                 try writer.writeAll("\n");
                 try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
                 try dumpAst(ir_obj, bc.args[1], source, depth + 1, writer);
+                return;
+            }
+            // Cat-16 — `walk(f)` (1-arity) lowers to the dedicated SemOp
+            // `walk1`. Render in the IR-level shape so snapshot diffs
+            // match the lowered tree.
+            if (bc.args.len == 1 and std.mem.eql(u8, bc.name, "walk")) {
+                try writer.writeAll("walk1");
+                try writeSpan(writer, node.span);
+                try writer.writeAll("\n");
+                try dumpAst(ir_obj, bc.args[0], source, depth + 1, writer);
                 return;
             }
             // `__computed_access(expr)` is the parser's synthesized form
@@ -1855,6 +1877,7 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
         },
         .while_ => try writer.writeAll("while"),
         .until_ => try writer.writeAll("until"),
+        .walk1 => try writer.writeAll("walk1"),
 
         // EmitOp namespace: same string-buf encoding as load_field.
         .load_path => {

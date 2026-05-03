@@ -7270,8 +7270,12 @@ pub const ResultIterator = struct {
                 const end = span.end - 1;
                 while (pos < end) {
                     const elem = tapeEntryToValue(span.tape, pos);
-                    const walked_elem = try it.walkApplyBody(elem, body_start, body_end, depth + 1);
-                    try walked_elems.append(it.alloc, walked_elem);
+                    // walkApplyBody returns null when f produced no output for
+                    // this child (e.g. `select(false)` / empty). Skip null
+                    // results so filter-f like `select` drops elements.
+                    if (try it.walkApplyBody(elem, body_start, body_end, depth + 1)) |walked_elem| {
+                        try walked_elems.append(it.alloc, walked_elem);
+                    }
                     pos = skipEntry(span.tape.*, pos);
                 }
 
@@ -7295,8 +7299,12 @@ pub const ResultIterator = struct {
                 const end = span.end - 1;
                 while (pos < end) {
                     const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    const walked_val = try it.walkApplyBody(child_val, body_start, body_end, depth + 1);
-                    try pairs.append(it.alloc, .{ .key_pos = pos, .val = walked_val });
+                    // walkApplyBody returns null when f produced no output for
+                    // this child value. Skip null results so filter-f like
+                    // `select` drops keys from the walked object.
+                    if (try it.walkApplyBody(child_val, body_start, body_end, depth + 1)) |walked_val| {
+                        try pairs.append(it.alloc, .{ .key_pos = pos, .val = walked_val });
+                    }
                     pos = skipEntry(span.tape.*, pos + 1);
                 }
 
@@ -7329,10 +7337,12 @@ pub const ResultIterator = struct {
         }
     }
 
-    /// Execute walk(f) on a value and return the first output.
-    /// This recursively walks children, then executes the body f, capturing
-    /// only the first result. Used by walkChildren for recursive child processing.
-    fn walkApplyBody(it: *ResultIterator, val: Value, body_start: u32, body_end: u32, depth: u32) ZqError!Value {
+    /// Execute walk(f) on a child value and return the first output of f, or
+    /// null if f produced no output (e.g. `select(false)` / empty).
+    /// Recursively walks children first, then executes body f in a sub-loop
+    /// (no call_function frame), taking only the first output. Null enables
+    /// `walkChildren` to drop filtered children from the walked structure.
+    fn walkApplyBody(it: *ResultIterator, val: Value, body_start: u32, body_end: u32, depth: u32) ZqError!?Value {
         // First, recursively walk children of this value.
         const walked = try it.walkChildren(val, body_start, body_end, depth);
 
@@ -7401,8 +7411,33 @@ pub const ResultIterator = struct {
             }
         }
 
-        if (result == null and it.value_stack.items.len > saved_value_len) {
-            result = try stackValueToValue(try it.popValue());
+        // Determine if f produced an output. Three exit paths:
+        //
+        // 1. yield_output fired in normal mode: execOne returned Some(v),
+        //    loop broke early, result is set, ip is inside body range.
+        //
+        // 2. f completed normally: ip advanced to body_end (the walk_end
+        //    instruction). result is null but `it.current` holds the output.
+        //    Also check value_stack in case the last instruction pushed there.
+        //
+        // 3. f backtracked (empty): ip jumped to instructions.len without
+        //    reaching body_end. result is null; return null to signal "no
+        //    output" so walkChildren can drop this element/key.
+        //
+        // Path 2 occurs for filters like `select(true_cond)`, `not`, `type`,
+        // etc. that leave their output in `it.current` without yield_output.
+        const body_reached_end = (it.ip == body_end);
+
+        if (result == null) {
+            if (it.value_stack.items.len > saved_value_len) {
+                // Value was pushed onto stack (e.g. by push_current or an
+                // expression that pushes before the final output).
+                result = try stackValueToValue(try it.popValue());
+            } else if (body_reached_end) {
+                // f completed normally — capture current as the output.
+                result = it.current;
+            }
+            // else: f backtracked (empty) — result stays null.
         }
 
         while (it.collect_stack.items.len > saved_collect_len) {
@@ -7423,7 +7458,10 @@ pub const ResultIterator = struct {
         it.input_value = saved_input;
         it.done = false;
 
-        return result orelse walked;
+        // Return null when f produced no output (e.g. `select(false)`, empty).
+        // `walkChildren` skips null entries so filter-f like `select` correctly
+        // drops elements/keys from the walked structure.
+        return result;
     }
 
     /// Build a path array (e.g. ["a", 0, "b", {"start":2,"end":4}]) on the
