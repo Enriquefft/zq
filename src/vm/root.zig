@@ -6372,23 +6372,36 @@ pub const ResultIterator = struct {
             .object => |slice_span| {
                 // Slice path component: {"start": int|null, "end": int|null}.
                 // Splice new_val (must be array) into base[from..to].
-                const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse Value.null_val;
-                const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse Value.null_val;
-
+                // jq dispatches the error message by base type: array/null/
+                // string treat the component as a slice (bad slice indices ->
+                // "Array/string slice indices must be integers"), other base
+                // types report "Cannot index <T> with object".
+                // Check base type first: object/number/boolean bases yield
+                // "Cannot index <T> with object" before any slice validation
+                // (per jq oracle).  Slice-shaped bases (array/null/string)
+                // proceed to the slice-key checks below.
                 const base_span: Value.TapeSpan = switch (base) {
                     .array => |s| s,
-                    else => return error.TypeError,
+                    .null_val, .string => return try it.setpathRaiseSliceIndexError(),
+                    else => return try it.setpathRaiseIndexError(base, "object"),
                 };
+                // jq requires both "start" and "end" keys to be present on
+                // the slice object — missing either yields the slice-indices
+                // error.  See oracle: `setpath([{"a":1}]; [9])` on `[1,2,3]`.
+                const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse
+                    return try it.setpathRaiseSliceIndexError();
+                const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse
+                    return try it.setpathRaiseSliceIndexError();
                 const arr_len: i64 = @intCast(arrayLength(base_span.tape, base_span));
                 const from_raw: i64 = switch (from_val) {
                     .int => |v| v,
                     .null_val => 0,
-                    else => return error.TypeError,
+                    else => return try it.setpathRaiseSliceIndexError(),
                 };
                 const to_raw: i64 = switch (to_val) {
                     .int => |v| v,
                     .null_val => arr_len,
-                    else => return error.TypeError,
+                    else => return try it.setpathRaiseSliceIndexError(),
                 };
                 // Clamp bounds to [0, arr_len] and ensure from <= to.
                 const from_resolved: i64 = if (from_raw < 0) @max(0, arr_len + from_raw) else @min(from_raw, arr_len);
@@ -6453,11 +6466,45 @@ pub const ResultIterator = struct {
                 } };
             },
             .array => {
-                it.user_error_msg = .{ .string = "Cannot update field at array index of array" };
-                return error.UserError;
+                // jq emits a special UserError for array-base + array-pc and
+                // the generic "Cannot index <T> with array" for everything
+                // else.  Keeping these as TypeError-class with detail (or
+                // UserError for the special case) matches jq's catchable
+                // surface.
+                if (base == .array) {
+                    it.user_error_msg = .{ .string = "Cannot update field at array index of array" };
+                    return error.UserError;
+                }
+                return try it.setpathRaiseIndexError(base, "array");
             },
+            .bool_val => return try it.setpathRaiseIndexError(base, "boolean"),
+            .null_val => return try it.setpathRaiseIndexError(base, "null"),
             else => return error.TypeError,
         }
+    }
+
+    /// Build "Cannot index <base_type> with <pc_type>" and stash it as the
+    /// catchable TypeError detail for setpath path-component dispatch.  Used
+    /// when the path component's type does not match the base type's expected
+    /// component shape.  The string is interned so it lives as long as the
+    /// iterator (mirrors `buildTypeErrorMsg`).
+    fn setpathRaiseIndexError(it: *ResultIterator, base: Value, pc_type: []const u8) ZqError!Value {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(it.alloc);
+        try buf.appendSlice(it.alloc, "Cannot index ");
+        try buf.appendSlice(it.alloc, baseTypeName(base));
+        try buf.appendSlice(it.alloc, " with ");
+        try buf.appendSlice(it.alloc, pc_type);
+        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
+        it.type_error_detail = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.TypeError;
+    }
+
+    /// jq's slice-indices error: emitted when a slice path component on an
+    /// array/null/string base has a non-integer "start"/"end" key.
+    fn setpathRaiseSliceIndexError(it: *ResultIterator) ZqError!Value {
+        it.type_error_detail = .{ .string = "Array/string slice indices must be integers" };
+        return error.TypeError;
     }
 
     /// `delpaths(PATHS)`: delete multiple paths. Paths is an array of path arrays.
