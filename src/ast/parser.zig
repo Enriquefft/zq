@@ -682,10 +682,8 @@ pub const Parser = struct {
                     const after = p.peek() orelse return error.ParseFailed;
                     if (after.tag == .colon) {
                         _ = p.advance();
-                        if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
-                            return p.makeError("index out of range", Span.from(start, p.lex.pos));
-                        }
-                        return p.parseSliceTail(start, true, @intCast(n), null);
+                        const from_clamped: i32 = @intCast(std.math.clamp(n, std.math.minInt(i32), std.math.maxInt(i32)));
+                        return p.parseSliceTail(start, true, from_clamped, null);
                     }
                     if (after.tag == .rbracket) {
                         _ = p.advance();
@@ -754,10 +752,7 @@ pub const Parser = struct {
                 const after = p.peek() orelse return error.ParseFailed;
                 if (after.tag == .rbracket) {
                     has_to = true;
-                    if (n < std.math.minInt(i32) or n > std.math.maxInt(i32)) {
-                        return p.makeError("slice index out of range", Span.from(start, p.lex.pos));
-                    }
-                    to = @intCast(n);
+                    to = @intCast(std.math.clamp(n, std.math.minInt(i32), std.math.maxInt(i32)));
                 } else {
                     p.lex.pos = saved_pos;
                     has_to = true;
