@@ -2585,35 +2585,51 @@ pub const ResultIterator = struct {
                     }
                 }
 
-                // Check limit counter via fork_stack.
+                // Check limit counters via fork_stack.
+                // Walk innermost→outermost: decrement every limit frame whose
+                // IP range contains this yield and whose saved_collect_len
+                // matches the current collect depth (output is escaping to
+                // that limit's level). Stop propagating when a collect frame
+                // was opened inside the limit body (output is captured there,
+                // not escaping further; outer limits must not count it yet).
+                // If any limit exhausts, finalize it after all outer limits
+                // whose collect-depth guard passes have been decremented.
                 {
                     const output_ip = it.ip;
+                    var exhausted_at: ?usize = null;
                     var li: usize = it.fork_stack.items.len;
                     while (li > 0) {
                         li -= 1;
-                        if (it.fork_stack.items[li].aux == .limit) {
-                            var lstate = &it.fork_stack.items[li].aux.limit;
-                            if (output_ip > lstate.body_start_ip and output_ip < lstate.exit_ip) {
-                                if (it.collect_stack.items.len > lstate.saved_collect_len) {
-                                    break;
-                                }
-                                lstate.remaining -= 1;
-                                if (lstate.remaining == 0) {
-                                    // Exhausted: unwind fork stack to this limit.
-                                    it.truncateForkStack(li);
-                                    if (it.collect_stack.items.len > 0) {
-                                        const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                                        try cf.buffer.append(it.alloc, try valueToStackValue(val));
-                                        it.value_stack.items.len = cf.outer_value_depth;
-                                        it.ip = @intCast(it.instructions.len);
-                                        return null;
-                                    } else {
-                                        it.ip = @intCast(it.instructions.len);
-                                        return val;
-                                    }
-                                }
-                                break;
-                            }
+                        if (it.fork_stack.items[li].aux != .limit) continue;
+                        const lstate = &it.fork_stack.items[li].aux.limit;
+                        if (output_ip <= lstate.body_start_ip or output_ip >= lstate.exit_ip) continue;
+                        // Output is inside this limit's body IP range.
+                        if (it.collect_stack.items.len > lstate.saved_collect_len) {
+                            // A collect frame opened inside this limit body is
+                            // buffering the output; it has not escaped to this
+                            // limit's level. Stop propagating — outer limits
+                            // (which have an even lower saved_collect_len) also
+                            // cannot see this output yet.
+                            break;
+                        }
+                        lstate.remaining -= 1;
+                        if (lstate.remaining == 0) {
+                            exhausted_at = li;
+                            break;
+                        }
+                    }
+                    if (exhausted_at) |li_ex| {
+                        // Innermost exhausted limit: unwind fork stack to it.
+                        it.truncateForkStack(li_ex);
+                        if (it.collect_stack.items.len > 0) {
+                            const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
+                            try cf.buffer.append(it.alloc, try valueToStackValue(val));
+                            it.value_stack.items.len = cf.outer_value_depth;
+                            it.ip = @intCast(it.instructions.len);
+                            return null;
+                        } else {
+                            it.ip = @intCast(it.instructions.len);
+                            return val;
                         }
                     }
                 }
