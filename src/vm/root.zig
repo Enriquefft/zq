@@ -1402,6 +1402,12 @@ pub const ResultIterator = struct {
                             break :blk lookupIndex(span.tape, span, resolved_idx) orelse .null_val;
                         },
                         .null_val => if (it.nullAllowed()) @as(Value, .null_val) else return error.TypeError,
+                        .string => {
+                            // jq: indexing a string with a float raises a catchable
+                            // UserError "Cannot index string with number (<f>)".
+                            it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_number_float = f });
+                            return error.TypeError;
+                        },
                         else => return error.TypeError,
                     },
                     // jq: null index on anything returns null. Path tracking
@@ -1474,7 +1480,10 @@ pub const ResultIterator = struct {
                     if (it.value_stack.items.len == 0) return error.TypeError;
                     const to_sv = try it.popValue();
                     resolved.to = try it.sliceBoundFromStackValue(to_sv, .to_bound);
-                    resolved.has_to = to_sv != .null_val;
+                    // NaN to-bound is treated as absent (use len), matching jq's
+                    // behaviour: `.[1:nan]` on an array yields `.[1:]`.
+                    resolved.has_to = to_sv != .null_val and
+                        !(to_sv == .float and std.math.isNan(to_sv.float));
                 }
                 if (op_args.has_from_expr) {
                     if (it.value_stack.items.len == 0) return error.TypeError;
@@ -6384,6 +6393,16 @@ pub const ResultIterator = struct {
 
                 const base_span: Value.TapeSpan = switch (base) {
                     .array => |s| s,
+                    .string => {
+                        // jq: slice-assign on strings is not supported; raise a
+                        // catchable UserError with the canonical message.
+                        const str_ref = try it.runtime_tape.internString(
+                            it.alloc,
+                            "Cannot update string slices",
+                        );
+                        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                        return error.UserError;
+                    },
                     else => return error.TypeError,
                 };
                 const arr_len: i64 = @intCast(arrayLength(base_span.tape, base_span));
@@ -6458,6 +6477,22 @@ pub const ResultIterator = struct {
                     .start = result_start,
                     .end = result_end,
                 } };
+            },
+            .null_val => {
+                // A null path component arises from `path(.[nan])` → `[null]`.
+                // jq raises a catchable error when assigning through such a path
+                // on an array; mirror that with the canonical message.
+                switch (base) {
+                    .array => {
+                        const str_ref = try it.runtime_tape.internString(
+                            it.alloc,
+                            "Cannot set array element at NaN index",
+                        );
+                        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                        return error.UserError;
+                    },
+                    else => return error.TypeError,
+                }
             },
             else => return error.TypeError,
         }
@@ -8796,6 +8831,9 @@ pub const ResultIterator = struct {
         /// Numeric index with the actual index value included.
         /// Produces: "Cannot index <type> with number (<n>)"
         index_number_val: i64,
+        /// Float (non-integer) index with the actual value included.
+        /// Produces: "Cannot index <type> with number (<f>)"
+        index_number_float: f64,
         /// `.[]` iteration on a non-array/object/null.
         /// Produces: "Cannot iterate over <type> (<compact-json>)"
         iterate,
@@ -8902,6 +8940,13 @@ pub const ResultIterator = struct {
                 var num_buf: [32]u8 = undefined;
                 const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return null;
                 buf.appendSlice(it.alloc, num_str) catch return null;
+                buf.appendSlice(it.alloc, ")") catch return null;
+            },
+            .index_number_float => |f| {
+                buf.appendSlice(it.alloc, "Cannot index ") catch return null;
+                buf.appendSlice(it.alloc, type_name) catch return null;
+                buf.appendSlice(it.alloc, " with number (") catch return null;
+                appendCompactJsonTrunc(&buf, it.alloc, .{ .float = f }) catch return null;
                 buf.appendSlice(it.alloc, ")") catch return null;
             },
             .iterate => {
