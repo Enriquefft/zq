@@ -9428,9 +9428,11 @@ pub const ResultIterator = struct {
 
     /// `match(regex)`: full match-object (or raise TypeError if no match).
     ///
-    /// With jq's `n` flag, zero-width matches are skipped — the first match
-    /// returned is the first non-empty one; if only zero-width matches exist
-    /// the call surfaces a no-match TypeError.
+    /// With jq's `n` flag, zero-width matches are skipped. If the pattern has
+    /// only zero-width matches (e.g. empty pattern, or every alternative is
+    /// empty) jq emits **no output** — exit 0, empty stream — instead of
+    /// raising. We mirror that by terminating the value stream via the same
+    /// backtrack/ip-jump idiom used by empty-`range` and exhausted scanners.
     fn builtinMatch(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
@@ -9440,7 +9442,10 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        // Allocate at least 1 slot so that slot 0 (overall match span) is
+        // always readable even for zero-capture patterns (captureCount() == 0
+        // in a disabled-regex build; guarded() returning 0 on a NULL handle).
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
@@ -9448,11 +9453,17 @@ pub const ResultIterator = struct {
             if (!matched) return error.TypeError;
             return try it.buildMatchObject(regex, input, slots_buf);
         }
-        // n-flag path: iterate until a non-empty overall match lands.
+        // n-flag path: iterate until a non-empty overall match lands. If the
+        // iterator exhausts without one (only zero-width hits, or none at
+        // all) jq outputs nothing and exits cleanly — surface the same by
+        // terminating the value stream rather than raising TypeError.
         var cursor: usize = 0;
         while (true) {
             const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
-            if (!got) return error.TypeError;
+            if (!got) {
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
+                return null;
+            }
             if (slots_buf[0].end > slots_buf[0].start) {
                 return try it.buildMatchObject(regex, input, slots_buf);
             }
@@ -9475,7 +9486,9 @@ pub const ResultIterator = struct {
     /// `capture(regex)`: jq — object of NAMED groups only. Raises on no match.
     ///
     /// With jq's `n` flag, zero-width overall matches are skipped — see
-    /// `builtinMatch`'s doc comment for the precise semantics.
+    /// `builtinMatch`'s doc comment for the precise semantics. Same
+    /// empty-stream termination rule applies when only zero-width matches
+    /// exist.
     fn builtinCapture(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
@@ -9485,7 +9498,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
@@ -9496,7 +9509,10 @@ pub const ResultIterator = struct {
         var cursor: usize = 0;
         while (true) {
             const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
-            if (!got) return error.TypeError;
+            if (!got) {
+                if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
+                return null;
+            }
             if (slots_buf[0].end > slots_buf[0].start) {
                 return try it.buildCaptureObject(regex, input, slots_buf);
             }
@@ -9532,7 +9548,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
 
@@ -9581,7 +9597,7 @@ pub const ResultIterator = struct {
 
         const n_slots = handles.regexPtr().captureCount();
         const has_user_captures = n_slots > 1;
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
@@ -9670,7 +9686,7 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
@@ -9747,7 +9763,7 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
