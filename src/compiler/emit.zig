@@ -229,13 +229,17 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         // the call shape using the same (name, arity) classifier the
         // lowerer used — single source of truth, plan §1.3 row 5.
         //
-        // Five emission shapes (matching legacy):
+        // Six emission shapes (matching legacy):
         //   * 0-arg          → `call_builtin(bid)`
         //   * value_arg1     → `<arg> ; call_builtin(bid)` (no save/restore)
         //   * filter_arg1    → `save_input ; array_collect_start ; each ;
         //                       <f> ; yield_output ; array_collect_end ;
         //                       call_builtin(bid)` (mirrors
         //                       `compileFilterArgBuiltin`)
+        //   * math1          → capture($orig)+arg+reseed($orig) ; call_builtin(bid)
+        //                       (strftime/strflocaltime/strptime — preserves
+        //                       current around format-arg generator eval via
+        //                       variable, not if_stack, so forks survive)
         //   * math2          → save+arg+restore (twice) ; call_builtin(bid)
         //                       (mirrors `compileTwoArgMath` /
         //                       `compileSetpath`)
@@ -2028,6 +2032,7 @@ fn emitGeneralAlt(
 //   * 0-arg          → direct `call_builtin(bid)`
 //   * value_arg1     → `compileValueArgBuiltin1` simple-no-comma path
 //   * filter_arg1    → `compileFilterArgBuiltin`
+//   * math1          → `save_input ; <arg> ; restore_input ; call_builtin`
 //   * math2          → `compileTwoArgMath` / `compileSetpath`
 //   * math3          → `compileThreeArgMath`
 //
@@ -2192,6 +2197,40 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
             if (is_add) {
                 try em.pushInstr(.restore_input, .{ .none = {} }, node);
             }
+        },
+        .math1 => {
+            // `push_current ; capture_variable($orig) ; <arg> ;
+            //  load_variable($orig) ; pipe ; call_builtin(bid)`.
+            //
+            // Used by `strftime` / `strflocaltime` / `strptime`: the
+            // builtin pops the format-string argument from the value
+            // stack and reads `it.current` as its numeric/datetime input.
+            // If the arg is a generator expression (e.g. `"" | ., @uri`)
+            // it mutates `it.current` before the builtin runs; we must
+            // restore the original current for each generator output.
+            //
+            // Cannot use `save_input` / `restore_input` (if_stack-based):
+            // the if_stack entry is consumed on the first generator output,
+            // so subsequent outputs find an empty if_stack → VM panic.
+            // Variable store is NOT reset on fork-backtrack (comment in
+            // `emit.zig:843`), so `$orig` survives every generator branch.
+            //
+            // Shape: original is captured in $orig; arg evaluates with
+            // original still in current (arg sees the numeric input for its
+            // own pipes), producing format-string on value stack; then
+            // `load_variable($orig) ; pipe` restores current for the
+            // builtin. Each generator branch goes through the same
+            // load+pipe+call_builtin sequence independently.
+            const orig_var: u32 = em.allocVar();
+            const arg_idx = em.ir_obj.extra_children.items[node.span_start];
+            try emitInputScopeBracket(em, node, orig_var);
+            try emitNode(em, arg_idx);
+            try emitInputScopeReseed(em, node, orig_var);
+            try em.pushInstr(
+                .call_builtin,
+                .{ .index = @intFromEnum(bid) },
+                node,
+            );
         },
         .math2 => {
             // `save_input ; <a> ; restore_input ; save_input ; <b> ;

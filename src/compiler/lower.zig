@@ -1669,6 +1669,17 @@ pub const BuiltinClass = enum {
     value_arg1,
     /// 1-arg filter-arg builtin (`map`-shaped: array_collect + each).
     filter_arg1,
+    /// 1-arg math builtin that must restore `it.current` to the original
+    /// numeric/datetime input after evaluating the format-string arg.  If
+    /// the arg is a generator expression (e.g. `"" | ., @uri`) it mutates
+    /// `it.current`; this class ensures each generator output is followed
+    /// by a current restoration.  Shape (emit-side):
+    ///   `push_current ; capture_variable($orig) ; <arg> ;
+    ///    load_variable($orig) ; pipe ; call_builtin(bid)`.
+    /// Variable store survives fork-backtrack (unlike if_stack), so every
+    /// generator branch sees the correct numeric input.
+    /// Used by `strftime` / `strflocaltime` / `strptime`.
+    math1,
     /// 2-arg math/path builtin (save/restore bracketed eval).
     math2,
     /// 3-arg math builtin (`fma`).
@@ -2017,6 +2028,7 @@ pub fn classifyBuiltin(name: []const u8, arity: usize) BuiltinClass {
     }
     if (arity == 1 and isValueArg1Builtin(name)) return .value_arg1;
     if (arity == 1 and isFilterArg1Builtin(name)) return .filter_arg1;
+    if (arity == 1 and isMath1Builtin(name)) return .math1;
     if (arity == 2 and isMath2Builtin(name)) return .math2;
     if (arity == 3 and isMath3Builtin(name)) return .math3;
     return .not_implemented;
@@ -2235,9 +2247,6 @@ fn isValueArg1Builtin(name: []const u8) bool {
         std.mem.eql(u8, name, "getpath") or
         std.mem.eql(u8, name, "delpaths") or
         std.mem.eql(u8, name, "bsearch") or
-        std.mem.eql(u8, name, "strftime") or
-        std.mem.eql(u8, name, "strptime") or
-        std.mem.eql(u8, name, "strflocaltime") or
         std.mem.eql(u8, name, "flatten") or
         std.mem.eql(u8, name, "has") or
         std.mem.eql(u8, name, "contains") or
@@ -2261,6 +2270,20 @@ fn isFilterArg1Builtin(name: []const u8) bool {
         std.mem.eql(u8, name, "unique_by") or
         std.mem.eql(u8, name, "map_values") or
         std.mem.eql(u8, name, "add");
+}
+
+/// Names accepted as 1-arg math builtins that require current-isolation around
+/// arg evaluation (`math1` class). These builtins read `it.current` as the
+/// numeric/datetime input *after* evaluating their format-string argument; if
+/// the arg expression is a generator (e.g. `"" | ., @uri`) it would mutate
+/// `it.current` before the builtin runs.  Emit wraps the arg with
+/// `push_current ; capture_variable($orig)` (before) and
+/// `load_variable($orig) ; pipe` (after) so the original input is restored
+/// via variable (survives fork-backtrack, unlike if_stack).
+fn isMath1Builtin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "strftime") or
+        std.mem.eql(u8, name, "strflocaltime") or
+        std.mem.eql(u8, name, "strptime");
 }
 
 /// Names accepted as 2-arg math/path builtins (legacy
@@ -2350,7 +2373,7 @@ fn lowerBuiltinCall(
                 .src_len = src_len,
             });
         },
-        .value_arg1, .filter_arg1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path, .map_arg1, .select_arg1, .repeat_arg1 => {
+        .value_arg1, .filter_arg1, .math1, .math2, .math3, .range_gen1, .range_gen2, .range_gen3, .limit_skip_nth, .first_arg1, .last_arg1, .error_arg1, .value_arg1_gen, .del_path, .map_arg1, .select_arg1, .repeat_arg1 => {
             // Lower every arg first into a scratch buffer — recursive
             // lowering of nested calls (or ctors) writes to
             // `extra_children`, so building our span via direct append
