@@ -1473,13 +1473,13 @@ pub const ResultIterator = struct {
                 if (op_args.has_to_expr) {
                     if (it.value_stack.items.len == 0) return error.TypeError;
                     const to_sv = try it.popValue();
-                    resolved.to = try it.sliceBoundFromStackValue(to_sv);
+                    resolved.to = try it.sliceBoundFromStackValue(to_sv, .to_bound);
                     resolved.has_to = to_sv != .null_val;
                 }
                 if (op_args.has_from_expr) {
                     if (it.value_stack.items.len == 0) return error.TypeError;
                     const from_sv = try it.popValue();
-                    resolved.from = try it.sliceBoundFromStackValue(from_sv);
+                    resolved.from = try it.sliceBoundFromStackValue(from_sv, .from_bound);
                     resolved.has_from = from_sv != .null_val;
                 }
                 if (it.if_stack.items.len == 0) return error.TypeError;
@@ -2710,7 +2710,9 @@ pub const ResultIterator = struct {
     ///   caller flips `has_from` / `has_to` off to fall back to the
     ///   length default in `doSlice`)
     /// - anything else → TypeError
-    fn sliceBoundFromStackValue(it: *ResultIterator, sv: StackValue) ZqError!i32 {
+    const SliceBoundKind = enum { from_bound, to_bound };
+
+    fn sliceBoundFromStackValue(it: *ResultIterator, sv: StackValue, kind: SliceBoundKind) ZqError!i32 {
         _ = it;
         return switch (sv) {
             .int => |n| blk: {
@@ -2722,7 +2724,12 @@ pub const ResultIterator = struct {
                 if (std.math.isNan(f)) break :blk 0;
                 if (f >= @as(f64, @floatFromInt(std.math.maxInt(i32)))) break :blk std.math.maxInt(i32);
                 if (f <= @as(f64, @floatFromInt(std.math.minInt(i32)))) break :blk std.math.minInt(i32);
-                break :blk @as(i32, @intFromFloat(@trunc(f)));
+                // jq rounds from-bound toward -inf (floor) and to-bound toward +inf (ceil)
+                const rounded = switch (kind) {
+                    .from_bound => @floor(f),
+                    .to_bound => @ceil(f),
+                };
+                break :blk @as(i32, @intFromFloat(rounded));
             },
             .null_val => 0,
             else => error.TypeError,
