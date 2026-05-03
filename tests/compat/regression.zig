@@ -232,14 +232,14 @@ test "jq:L2485 try [_ok_, setpath([1]; 1)] catch [_ko_, .]" {
 test "jq:L2489 try fromjson catch ." {
     const results = try h.runFilter(
         "try fromjson catch .",
-        "\"{'a': 123}\"",
+        "\"{'a':123}\"",
     );
     defer {
         for (results) |s| h.alloc.free(s);
         h.alloc.free(results);
     }
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try h.expectJsonEqual("\"Invalid string literal; expected \\\",but got ' at line 1,column 5 (while parsing '{'a':123}')\"", results[0]);
+    try h.expectJsonEqual("\"Invalid string literal; expected \\\", but got ' at line 1, column 5 (while parsing '{'a':123}')\"", results[0]);
 }
 
 test "jq:L2495 try ltrimstr(1) catch _x_, try rtrimstr(1) catch _x_ | _ok_" {
