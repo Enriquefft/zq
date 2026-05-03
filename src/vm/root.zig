@@ -6452,6 +6452,10 @@ pub const ResultIterator = struct {
                     .end = result_end,
                 } };
             },
+            .array => {
+                it.user_error_msg = .{ .string = "Cannot update field at array index of array" };
+                return error.UserError;
+            },
             else => return error.TypeError,
         }
     }
