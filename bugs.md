@@ -3,13 +3,13 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-04-30 (post finish-the-domain orchestration wave — closed L2121 L2126 L2299 L2306 L2310 L2315 L2328 L2332 L2345 L2350 L2381 L2394 L2398 L2402 L2407; fold-2 unmask exposed walk/1 then walk/2 + float-slice cluster).
+Last verified: 2026-05-03 (post wave-2 fold-3 closure — closed L2416 L2421 L2426 L2430 L2434 L2438 L2442 L2458 L2466 L2470 L2474 L2478 L2489 L2524 L2539 + regex:n-flag + repeat:nested-limit + saved_collect_len).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1118/1177 pass, 35 fail, 24 skipped. Wave closed 15 tags; fold-3 unmask (left for next wave) revealed 12 latent regression-suite failures (walk/2, float-index slices, fromjson try, large-reduce tojson, strflocaltime, regex n-flag empty pattern, repeat nested-limit) that were masked by the prior `walk_desugar1` abort slot. Per wave protocol (max 2 fold-iterations) these are deferred.
+Current baseline: `zig build test` → 1140/1183 pass, 19 fail, 24 skipped. Wave-2 fold-3 closed 17 tags. Remaining failures: 12 imports/modulemeta (G11, out of scope), 4 decnum-gated (L2195 L2223 L2262 L2266), 3 large-reduce tojson roundtrip (L2549 L2554 L2559 — parked, refined hypothesis below).
 
 ### Imports / modulemeta (G11 — out of scope this wave)
 
@@ -18,23 +18,12 @@ Current baseline: `zig build test` → 1118/1177 pass, 35 fail, 24 skipped. Wave
 | L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 | `import "x" as foo` / `include "x"` syntax errors | parser/imports — module import & include not implemented |
 | L1960 / L1964 / L1968 | `modulemeta` lookupKeyInValue abort | builtin — `modulemeta` not implemented (segfault on lookup) |
 
-### In-domain unmasked (next wave candidates — fold-3 from finish-the-domain wave)
+### In-domain (parked: large-reduce tojson roundtrip)
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
 | L2195 | `(13911860366432393 == 13911860366432392) \| . == if have_decnum then ... else ... end` | i64 equality near precision boundary | numeric | gated on decnum support (jq decimal numbers feature flag). Skip until decnum domain opened. |
-| L2416 | `[walk(.,1)]` | walk/2 arity | builtin | walk/2 is a 2-arity variant in later jq prelude; only walk/1 lowering exists. Add walk/2 desugar (or accept jq's optional-arg form). |
-| L2426 / L2430 / L2434 | `[range(10)] \| .[1.2:3.5]` etc | float slice indices | slice/index | jq accepts non-integer slice bounds (rounds toward 0); zq's slice arm rejects float bounds via TypeError. Coerce bounds via `@floatFromInt`-aware path. |
-| L2438 / L2442 | `.[1.7:4294967295]` / `.[1.7:-4294967296]` | large/negative slice bounds | slice | overflow on i64 conversion; jq clamps to len. |
-| L2458 | `[range(3)] \| .[1:nan]` | NaN slice bound | slice | jq treats NaN as 0 / no-op; zq raises TypeError. |
-| L2466 | `try ([range(3)] \| .[nan] = 9) catch .` | NaN index assign | assign/index | should produce catchable error; currently shape mismatch. |
-| L2470 / L2474 / L2478 | `try (_foobar_ \| .[1.5:3.5] = _xyz_) catch .` etc | float slice/index in assign path | assign | assign-LHS path validation for non-integer indices/slices. |
-| L2489 | `try fromjson catch .` | fromjson on null input | error-class | error message shape mismatch on `fromjson` over null/non-string input. |
-| L2524 | `try [_OK_, setpath([[1]]; 1)] catch [_KO_, .]` | setpath nested-array path | builtin/setpath | setpath path-element type validation; jq raises specific error shape. |
-| L2539 | `strflocaltime(__ \| ., @uri)` | strflocaltime + format-string filter arg | builtin/datetime | strflocaltime/1 over a generator argument — likely missing fork-on-arg. |
-| L2549 / L2554 / L2559 | `reduce range(9999) as $_ ([];[.]) \| tojson \| fromjson` etc | large-reduce + tojson roundtrip | builtin | tojson on deeply-nested array — output buffer growth or recursion limit. |
-| regex.test.jq:n-flag empty-only pattern | `match(_x*_; _n_)` when pattern matches only empty | regex | builtin/regex | n-flag should drop empty-only matches. |
-| repeat_builtin nested limits | `[limit(2; limit(3; repeat(.+1)))]` | nested limit ordering | repeat | outer limit truncates first; reorder fork-frame interaction. |
+| L2549 / L2554 / L2559 | `reduce range(9999+) as $_ ([];[.]) \| tojson \| fromjson` etc | large-reduce + tojson roundtrip | builtin/tape | **PARKED** — refined hypothesis (2026-05-03): tape compaction in `reduce`. Quadratic tape growth via `copyTapeSpanToRuntimeTape` in `reduce range(N) as $_ ([];[.])` body saturates `RuntimeTape.max_entries=4*1024*1024` before serialize/parse hits limit. Out of wave-2 scope. Original depth-gating attempt (commit 0a049c4 in discarded `wave2-depth-limit` worktree) was correct in isolation but dead-code: upstream tape OOM kills the run before the depth-gated codepath is reached. Fix requires per-iteration tape compaction in the reduce loop's update-arm, not depth gating. |
 
 ### Decnum domain (gated on `have_decnum` flag)
 
@@ -45,6 +34,20 @@ Current baseline: `zig build test` → 1118/1177 pass, 35 fail, 24 skipped. Wave
 | L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique == if have_decnum then ...` |
 
 All three guard on `have_decnum` for the precise-decimal branch. Park until decnum support is decided.
+
+### Fixed in wave-2 fold-3 closure (17)
+
+Merged 2026-05-03:
+- repeat:nested-limit (commit b4be0ee, Phase 1a): `yield_output` propagates limit decrements outward — `[limit(2; limit(3; repeat(.+1)))]` and similar nested-limit forms now respect outermost truncation correctly.
+- L2438 / L2442 (commits 49719e7 + 0046231): parser slice-bound literals clamp i64-overflow values to i32 range. `.[99999999999999999999:]` no longer panics; literal bounds saturate at i32 ±limits matching jq.
+- L2489 (commit c050207 via merge): `fromjson` error message reshape — invalid JSON input now raises catchable error with jq-canonical shape.
+- L2426 / L2430 / L2434 (commit 260b745 via merge): float slice-bound rounding. `sliceBoundFromStackValue` adds `SliceBoundKind` enum so from/to bounds round per jq semantics (toward 0); `.[1.5:3.5]` on `[1..5]` yields `[2,3,4]` matching jq.
+- L2458 / L2466 / L2470 / L2474 / L2478 (commit a90150b via merge of wave2-nan-slice-errors): NaN slice bounds treated as absent; `.[1:nan]` on array yields `.[1:]`. setpath through `null` path-component on array raises canonical UserError "Cannot set array element at NaN index". load_computed `.string` arm under non-integer index emits "Cannot index string with number (<f>)" via new `index_number_float: f64` TypeErrorKind variant. setpath slice-arm on string base raises UserError "Cannot update string slices".
+- L2524 (commit b1691e8 via merge of wave2-setpath-array): setpath base × path-component matrix dispatch. New helpers `setpathRaiseIndexError` / `setpathRaiseSliceIndexError` produce jq-canonical "Cannot index <T> with <pc>" and "Array/string slice indices must be integers" messages across all base/pc combos. Special-case "Cannot update field at array index of array" UserError preserved. Hand-merged with NaN+errors at `.null_val` arm: array-base → NaN error wins, else → setpathRaiseIndexError(base, "null").
+- L2539 (commit c0b9df8 via merge of wave2-strftime-save): `strftime` / `strflocaltime` save-input across format-string filter argument. Adds `BuiltinClass` enum (lower.zig L1669-1681), `isMath1Builtin` classifier, math1 emit arm (emit.zig L2201-2233) so the filter-arg generator no longer pollutes outer input.
+- L2416 / L2421 (commit 9d616b6 via merge of wave2-update-assign-gen): walk/1 generator-aware update-assign. New `walk1` SemOp in IR enum, `lowerWalkDesugar1` reduced 170→20 lines via direct emit handler (`emitWalk1`), `walkApplyBody` return type ZqError!Value → ZqError!?Value with `walkChildren` skip-null path. `[walk(.,1)]` on `{x:0}` → `[{x:0},1]`; `walk(select(IN({},[]) | not))` on `{a:1,b:[]}` → `{a:1}`.
+- saved_collect_len (commit 0638062 via merge of wave2-repeat-collect-cleanup): tests-only wave (+37 lines, 3 oracle-probe coverage tests) — `RepeatState` already snapshots/restores collect-stack depth correctly; coverage tests pin the contract. Merger note: original commit subject overstates scope (claims VM fix); body discloses honestly. Acceptable as-is.
+- regex:n-flag (commit bf778c0 via merge of wave2-regex-n-flag): `match(""; "n")` and similar empty-only-pattern matches with `n` flag now drop to no-match (empty stdout, exit 0) per jq. Adds `runFilterStrict` test helper for empty-stream coverage; reverts incorrect prior fixture; 3 sibling tests added. 6 sites in `builtinMatch`/`builtinCapture` exhaustion arms updated with `@max(n_slots, 1)` saturation.
 
 ### Fixed in finish-the-domain wave (15)
 
