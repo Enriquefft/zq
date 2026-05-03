@@ -10475,7 +10475,7 @@ const JsonParser = struct {
         var buf = std.ArrayList(u8){};
         defer buf.deinit(self.it.alloc);
         buf.writer(self.it.alloc).print(
-            "Invalid string literal; expected \",but got {c} at line 1,column {d} (while parsing '{s}')",
+            "Invalid string literal; expected \", but got {c} at line 1, column {d} (while parsing '{s}')",
             .{ bad_char, col, self.src },
         ) catch return error.TypeError;
         const str_ref = self.it.runtime_tape.internString(self.it.alloc, buf.items) catch return error.TypeError;
