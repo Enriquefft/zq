@@ -692,6 +692,25 @@ pub const Parser = struct {
                     // Not `]` or `:` — unwind and dispatch (slice or computed access).
                     p.lex.pos = saved_pos;
                 } else {
+                    // `tryParseInt` returns null for magnitudes exceeding i64.
+                    // For exact `.[<bigint>:]` shape (slice from-bound), jq
+                    // silently clamps to i32 range; use the bound-specific
+                    // helper which handles arbitrary digit counts. Any other
+                    // shape (e.g. `.[<bigint>]` index access) remains a parse
+                    // error since `index_access.index` is i64 and there is no
+                    // canonical clamping there.
+                    p.lex.pos = saved_pos;
+                    if (p.tryParseSliceBoundLiteral()) |n| {
+                        const after = p.peek() orelse {
+                            p.lex.pos = saved_pos;
+                            return error.ParseFailed;
+                        };
+                        if (after.tag == .colon) {
+                            _ = p.advance();
+                            return p.parseSliceTail(start, true, n, null);
+                        }
+                        p.lex.pos = saved_pos;
+                    }
                     p.lex.pos = saved_pos;
                     return error.ParseFailed;
                 }
@@ -748,11 +767,11 @@ pub const Parser = struct {
         } else {
             // Try integer-literal fast path for exact `<int>]` shape only.
             const saved_pos = p.lex.pos;
-            if (p.tryParseInt()) |n| {
+            if (p.tryParseSliceBoundLiteral()) |n| {
                 const after = p.peek() orelse return error.ParseFailed;
                 if (after.tag == .rbracket) {
                     has_to = true;
-                    to = @intCast(std.math.clamp(n, std.math.minInt(i32), std.math.maxInt(i32)));
+                    to = n;
                 } else {
                     p.lex.pos = saved_pos;
                     has_to = true;
@@ -799,6 +818,62 @@ pub const Parser = struct {
             return null;
         }
         return null;
+    }
+
+    /// Slice-bound literal parser: consumes `(minus)? int_lit` and returns the
+    /// value clamped to the i32 range. Returns null without consuming if the
+    /// next tokens are not a literal integer. Unlike `tryParseInt`, this never
+    /// fails on magnitudes exceeding i64 — jq silently clamps oversized
+    /// literal slice bounds, so accept any digit run and clamp to MIN/MAX.
+    fn tryParseSliceBoundLiteral(p: *Parser) ?i32 {
+        const tok = p.peek() orelse return null;
+        if (tok.tag == .int_lit) {
+            _ = p.advance();
+            return clampDigitsToI32(p.tokenSlice(tok), false);
+        }
+        if (tok.tag == .minus) {
+            const saved = p.lex.pos;
+            _ = p.advance();
+            const next = p.peek() orelse {
+                p.lex.pos = saved;
+                return null;
+            };
+            if (next.tag == .int_lit) {
+                _ = p.advance();
+                return clampDigitsToI32(p.tokenSlice(next), true);
+            }
+            p.lex.pos = saved;
+            return null;
+        }
+        return null;
+    }
+
+    /// Convert a base-10 digit string (lexer-validated `[0-9]+`) to i32,
+    /// clamping to maxInt(i32) / minInt(i32) on overflow. `negative` applies
+    /// the sign before clamping.
+    fn clampDigitsToI32(digits: []const u8, negative: bool) i32 {
+        const max_i32: i64 = std.math.maxInt(i32);
+        const min_i32: i64 = std.math.minInt(i32);
+        var acc: i64 = 0;
+        for (digits) |c| {
+            const d: i64 = @intCast(c - '0');
+            // Detect i64-domain overflow with @mulWithOverflow / @addWithOverflow;
+            // on overflow, short-circuit to the saturated bound.
+            const mul = @mulWithOverflow(acc, 10);
+            if (mul[1] != 0) return if (negative) @intCast(min_i32) else @intCast(max_i32);
+            const add = @addWithOverflow(mul[0], d);
+            if (add[1] != 0) return if (negative) @intCast(min_i32) else @intCast(max_i32);
+            acc = add[0];
+            // Early clamp: once magnitude already exceeds the i32 bound, no
+            // further digits can bring it back into range.
+            if (negative) {
+                if (-acc < min_i32) return @intCast(min_i32);
+            } else {
+                if (acc > max_i32) return @intCast(max_i32);
+            }
+        }
+        const signed: i64 = if (negative) -acc else acc;
+        return @intCast(std.math.clamp(signed, min_i32, max_i32));
     }
 
     fn parseVariableRef(p: *Parser, dollar_tok: Token) error{ParseFailed}!*Node {
