@@ -9302,7 +9302,10 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        // Allocate at least 1 slot so that slot 0 (overall match span) is
+        // always readable even for zero-capture patterns (captureCount() == 0
+        // in a disabled-regex build; guarded() returning 0 on a NULL handle).
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
@@ -9347,7 +9350,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
@@ -9394,7 +9397,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         defer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
 
@@ -9443,7 +9446,7 @@ pub const ResultIterator = struct {
 
         const n_slots = handles.regexPtr().captureCount();
         const has_user_captures = n_slots > 1;
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
@@ -9532,7 +9535,7 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
@@ -9609,7 +9612,7 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, n_slots);
+        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         errdefer it.alloc.free(slots_buf);
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;

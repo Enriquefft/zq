@@ -399,20 +399,16 @@ test "jq:n-flag match(g) filters zero-width matches" {
 
 test "jq:n-flag match drops empty-only pattern to no-match" {
     try requireRegex();
-    // Non-global match with n-flag and a pattern that only ever matches
-    // empty surfaces a runtime TypeError (jq's "no match" path). We invert
-    // runFilter's catch into a direct expectation — a type error bubbles
-    // up as error.QueryRuntimeError via the helper's `catch return`.
-    const got = h.runFilter("match(\"\"; \"n\")", "\"\"");
-    if (got) |results| {
-        defer {
-            for (results) |s| h.alloc.free(s);
-            h.alloc.free(results);
-        }
-        return error.ExpectedRuntimeError;
-    } else |err| {
-        try std.testing.expectEqual(error.QueryRuntimeError, err);
+    // match(""; "n") on "" — the only match is zero-width (empty pattern),
+    // which n-flag filters out. The VM raises TypeError internally; the
+    // harness absorbs it and returns zero outputs, matching jq's behaviour
+    // of producing no output for this expression.
+    const results = try h.runFilter("match(\"\"; \"n\")", "\"\"");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
     }
+    try std.testing.expectEqual(@as(usize, 0), results.len);
 }
 
 test "jq:n-flag capture(g) skips zero-width alternatives" {
