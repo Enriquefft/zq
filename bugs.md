@@ -3,20 +3,21 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-05-04 (post wave3-imports-modulemeta — closed L1891 L1895 L1899 L1903 L1908 L1912 L1916 L1920 L1960 L1964 L1968 L1984 — full G11 imports/modulemeta domain).
+Last verified: 2026-05-04 (post wave4-large-reduce-compaction — closed L2549 L2554 L2559 large-reduce tape OOM).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1152/1183 pass, 7 fail, 24 skipped. Wave3 closed 12 G11 tags (full domain). Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266), 3 large-reduce tojson roundtrip (L2549 L2554 L2559 — parked, refined hypothesis below).
+Current baseline: `zig build test` → 1155/1183 pass, 4 fail, 24 skipped. Wave4 closed 3 large-reduce tags. Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266).
 
-### In-domain (parked: large-reduce tojson roundtrip)
+### In-domain
+
+_(none — large-reduce closed in wave4-large-reduce-compaction.)_
 
 | Tag | Symptom | Repro | Category | Hypothesis |
 |-----|---------|-------|----------|-----------|
 | L2195 | `(13911860366432393 == 13911860366432392) \| . == if have_decnum then ... else ... end` | i64 equality near precision boundary | numeric | gated on decnum support (jq decimal numbers feature flag). Skip until decnum domain opened. |
-| L2549 / L2554 / L2559 | `reduce range(9999+) as $_ ([];[.]) \| tojson \| fromjson` etc | large-reduce + tojson roundtrip | builtin/tape | **PARKED** — refined hypothesis (2026-05-03): tape compaction in `reduce`. Quadratic tape growth via `copyTapeSpanToRuntimeTape` in `reduce range(N) as $_ ([];[.])` body saturates `RuntimeTape.max_entries=4*1024*1024` before serialize/parse hits limit. Out of wave-2 scope. Original depth-gating attempt (commit 0a049c4 in discarded `wave2-depth-limit` worktree) was correct in isolation but dead-code: upstream tape OOM kills the run before the depth-gated codepath is reached. Fix requires per-iteration tape compaction in the reduce loop's update-arm, not depth gating. |
 
 ### Decnum domain (gated on `have_decnum` flag)
 
@@ -27,6 +28,11 @@ Current baseline: `zig build test` → 1152/1183 pass, 7 fail, 24 skipped. Wave3
 | L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique == if have_decnum then ...` |
 
 All three guard on `have_decnum` for the precise-decimal branch. Park until decnum support is decided.
+
+### Fixed in wave4-large-reduce-compaction (3)
+
+Merged 2026-05-04:
+- L2549 / L2554 / L2559 (commit f714eec, merge f665d79): `reduce range(9999+) as $_ ([];[.]) | tojson | fromjson` and siblings. Quadratic tape growth via `copyTapeSpanToRuntimeTape` in the reduce update-arm body saturated `RuntimeTape.max_entries=4*1024*1024` before serialize/parse could run. Fix lands per-iteration tape compaction in the reduce update-arm via a new `compact_runtime_tape` opcode; converts deep tape walks to iterative form to avoid recursion blowup; adds parse/serialize depth gates to fail-fast on pathological depth before tape OOM. Touches `src/vm/root.zig` (~830 lines), `src/compiler/emit.zig`, `src/types.zig`. Tests: 1152→1155 pass, 7→4 fail (remaining decnum-gated). Full diagnosis in commit f714eec body.
 
 ### Fixed in wave3-imports-modulemeta (12)
 
