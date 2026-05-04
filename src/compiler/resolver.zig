@@ -103,13 +103,8 @@ pub const Resolver = struct {
 
     fn findJqAbsPath(self: *Resolver, relpath: []const u8) ResolverError!?[]const u8 {
         const arena_alloc = self.arena.allocator();
-        // Build candidate roots: explicit search path first, then cwd.
-        const candidates_per_root = [_][2][]const u8{
-            .{ "{s}/{s}.jq", "" },
-            .{ "{s}/{s}/{s}.jq", "" },
-        };
-        _ = candidates_per_root;
-
+        // Try each search root: first `<root>/<relpath>.jq`, then the
+        // dir-named-after-module convention `<root>/<relpath>/<relpath>.jq`.
         for (self.explicit_L) |root| {
             const a = std.fmt.allocPrint(arena_alloc, "{s}/{s}.jq", .{ root, relpath }) catch return error.OutOfMemory;
             if (fileExists(a)) return a;
