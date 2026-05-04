@@ -3,20 +3,13 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-05-03 (post wave-2 fold-3 closure — closed L2416 L2421 L2426 L2430 L2434 L2438 L2442 L2458 L2466 L2470 L2474 L2478 L2489 L2524 L2539 + regex:n-flag + repeat:nested-limit + saved_collect_len).
+Last verified: 2026-05-04 (post wave3-imports-modulemeta — closed L1891 L1895 L1899 L1903 L1908 L1912 L1916 L1920 L1960 L1964 L1968 L1984 — full G11 imports/modulemeta domain).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1140/1183 pass, 19 fail, 24 skipped. Wave-2 fold-3 closed 17 tags. Remaining failures: 12 imports/modulemeta (G11, out of scope), 4 decnum-gated (L2195 L2223 L2262 L2266), 3 large-reduce tojson roundtrip (L2549 L2554 L2559 — parked, refined hypothesis below).
-
-### Imports / modulemeta (G11 — out of scope this wave)
-
-| Tag | Symptom | Category |
-|-----|---------|----------|
-| L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 | `import "x" as foo` / `include "x"` syntax errors | parser/imports — module import & include not implemented |
-| L1960 / L1964 / L1968 | `modulemeta` lookupKeyInValue abort | builtin — `modulemeta` not implemented (segfault on lookup) |
+Current baseline: `zig build test` → 1152/1183 pass, 7 fail, 24 skipped. Wave3 closed 12 G11 tags (full domain). Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266), 3 large-reduce tojson roundtrip (L2549 L2554 L2559 — parked, refined hypothesis below).
 
 ### In-domain (parked: large-reduce tojson roundtrip)
 
@@ -34,6 +27,12 @@ Current baseline: `zig build test` → 1140/1183 pass, 19 fail, 24 skipped. Wave
 | L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique == if have_decnum then ...` |
 
 All three guard on `have_decnum` for the precise-decimal branch. Park until decnum support is decided.
+
+### Fixed in wave3-imports-modulemeta (12)
+
+Merged 2026-05-04:
+- L1891 / L1895 / L1899 / L1903 / L1908 / L1912 / L1916 / L1920 / L1984 (commit 82821b2, Phase 2a): jq module system parser + resolver. `import "x" as foo` and `include "x"` syntax now parses; new `src/module_resolver/root.zig` (renamed from `src/compiler/resolver.zig`) walks `JQ_LIBRARY_PATH` + relative paths to load and link module ASTs into the consuming program. Module fixtures under `tests/compat/fixtures/modules/` exercise import-then-call, include-then-call, and `as $alias::name` referencing.
+- L1960 / L1964 / L1968 (commit 79979e7, Phase 2b): `modulemeta` builtin. Replaces the prior `lookupKeyInValue` abort on `modulemeta` with a real implementation in `src/vm/root.zig` (~302 LOC) that returns the module's `{name, deps, ...}` metadata object as jq does. `meta` keys flow through the resolver's per-module record; `deps` enumerates resolved imports/includes; `BuiltinClass`/dispatch wired through `lower.zig`+`emit.zig`+`types.zig`.
 
 ### Fixed in wave-2 fold-3 closure (17)
 
