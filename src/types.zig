@@ -100,12 +100,19 @@ pub const RuntimeTape = struct {
     /// appendEntry/internString so it always reflects the current backing
     /// buffer — eliminates stale-pointer bugs after ArrayList reallocations.
     view: Tape,
+    /// Live-entry count last observed by `compactRuntimeTape`. Used to
+    /// gate compaction so it only fires after the entry count has at
+    /// least doubled past `compact_min_threshold`. Without this gate
+    /// every reduce iteration would walk the entire tape to compact
+    /// O(1)-fresh waste, turning O(N) folds into O(N²).
+    compact_live_baseline: u32,
 
     pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!RuntimeTape {
         var rt_tape: RuntimeTape = .{
             .entries = std.ArrayList(Tape.Entry){},
             .string_buf = std.ArrayList(u8){},
             .view = .{ .entries = &.{}, .string_buf = &.{} },
+            .compact_live_baseline = 0,
         };
         // Pre-allocate capacity for typical object construction
         try rt_tape.entries.ensureTotalCapacity(allocator, 256);
@@ -136,6 +143,10 @@ pub const RuntimeTape = struct {
     /// Max entries in a runtime tape. Prevents quadratic blowup from deeply
     /// nested constructions like `reduce range(N) as $_ ([];[.])`.
     pub const max_entries = 4 * 1024 * 1024; // ~4M entries ≈ ~64 MB
+
+    /// Minimum live-entry count before `compactRuntimeTape` does any work.
+    /// Below this threshold the compaction overhead exceeds the savings.
+    pub const compact_min_threshold = 1024;
 
     /// Append an entry and return its index.
     pub fn appendEntry(self: *RuntimeTape, allocator: std.mem.Allocator, entry: Tape.Entry) error{OutOfMemory}!u32 {
@@ -794,6 +805,17 @@ pub const Instruction = extern struct {
         /// Pop variable from scope. operand.index = variable id.
         pop_variable,
 
+        /// Compact the runtime tape in place: discards entries below the
+        /// minimum live tape index and rebases all surviving spans/skip
+        /// pointers. Emitted at the tail of each `reduce` body iteration to
+        /// bound `O(N^2)` tape growth from accumulator-rewriting bodies like
+        /// `reduce range(N) as $_ ([];[.])`. The handler scans every live
+        /// root (current/value_stack/variable_store/if_stack/collect_stack/
+        /// object_construct/fork_stack) for runtime-tape spans and shifts
+        /// from `min_start` to position 0, so any reference into the
+        /// compacted region remains valid through the rebase. No operand.
+        compact_runtime_tape,
+
         // Function operations
         /// Define function at compile time. operand.index = function id.
         def_function,
@@ -1056,6 +1078,9 @@ pub const Instruction = extern struct {
                 // not break the path). Accepted gap: user-written
                 // `$x | path($x.a)` won't raise, matching a subset of jq.
                 .load_variable,
+                // Tape compaction is a memory-management op that preserves
+                // every live value bit-for-bit; it cannot break a path frame.
+                .compact_runtime_tape,
                 .def_function,
                 .call_function,
                 .return_function,

@@ -3774,6 +3774,16 @@ fn emitReduce(em: *Emitter, node: ir.Node) EmitError!void {
     try em.pushInstr(.pipe, .{ .none = {} }, node);
     try emitNode(em, update_idx);
     try em.pushInstr(.capture_variable, .{ .index = acc_id }, node);
+    // Bound runtime-tape growth from accumulator-rewriting bodies (e.g.
+    // `[];[.]`-shape, where every iteration structurally re-copies the prior
+    // accumulator into a fresh container). Without this, the runtime tape
+    // accumulates ~N²/2 dead entries per N iterations and saturates
+    // `RuntimeTape.max_entries` near N≈2046 (regression cluster
+    // wave4-large-reduce-compaction at tests/compat/regression.zig:348-385).
+    // The handler walks every live root and shifts entries down by the
+    // minimum live `start`, so the only memory that survives is what the
+    // accumulator (and any other live span) actually references.
+    try em.pushInstr(.compact_runtime_tape, .{ .none = {} }, node);
     try em.pushInstr(.backtrack, .{ .none = {} }, node);
 
     const l_done: u32 = @intCast(em.instructions.items.len);
