@@ -388,6 +388,30 @@ fn formatNode(node: *const ast.Node, buf: *std.ArrayList(u8), alloc: std.mem.All
             formatNode(da.body, buf, alloc, indent);
         },
         .error_node => buf.appendSlice(alloc, "/* error */") catch {},
+        .program => |prog| {
+            // Phase 2a — Program wrapper. Emit module/import/include
+            // directives in source order, then the body. Per-directive
+            // formatting skipped; LSP formatting on directives is best-
+            // effort and can be filled in once stable.
+            if (prog.module_meta != null) {
+                buf.appendSlice(alloc, "module {}; ") catch {};
+            }
+            for (prog.directives) |dir| {
+                if (dir.kind == .import_) {
+                    buf.appendSlice(alloc, "import \"") catch {};
+                    buf.appendSlice(alloc, dir.relpath) catch {};
+                    buf.appendSlice(alloc, "\" as ") catch {};
+                    if (dir.is_data) buf.append(alloc, '$') catch {};
+                    if (dir.alias) |a| buf.appendSlice(alloc, a) catch {};
+                    buf.appendSlice(alloc, "; ") catch {};
+                } else {
+                    buf.appendSlice(alloc, "include \"") catch {};
+                    buf.appendSlice(alloc, dir.relpath) catch {};
+                    buf.appendSlice(alloc, "\"; ") catch {};
+                }
+            }
+            formatNode(prog.body, buf, alloc, indent);
+        },
         .slice => |sl| {
             buf.appendSlice(alloc, ".[") catch {};
             if (sl.from_expr) |fe| {

@@ -34,7 +34,7 @@ pub const Parser = struct {
     pub fn parse(source: []const u8, alloc: std.mem.Allocator) ParseResult {
         var p = Parser.create(source, alloc);
 
-        const root = p.parseFilter() catch p.makeError("parse failed", Span.empty());
+        const root = p.parseProgram() catch p.makeError("parse failed", Span.empty());
 
         // Check for trailing tokens
         if (p.peek()) |tok| {
@@ -50,6 +50,161 @@ pub const Parser = struct {
             .errors = errors,
             .arena = p.arena,
             .alloc = alloc,
+        };
+    }
+
+    /// Top-level program parser. Detects optional leading `module {meta};`
+    /// then a sequence of `import "x" as <alias>;` / `include "x";`
+    /// directives, then falls through to `parseFilter` for the body.
+    /// Returns either a `program` Node (when directives or module meta
+    /// are present) or the bare filter (no wrapping when none present).
+    fn parseProgram(p: *Parser) error{ParseFailed}!*Node {
+        const start_pos = p.lex.pos;
+
+        // Optional `module {meta};` — must be const-object literal.
+        var module_meta: ?*const Node = null;
+        if (p.peek()) |t| {
+            if (t.tag == .module_kw) {
+                _ = p.advance(); // consume module
+                const meta_start_pos = p.lex.pos;
+                const meta_node = p.parseAlternative() catch {
+                    p.addError("expected '{...}' after module", Span.from(t.offset, t.offset + t.len));
+                    return error.ParseFailed;
+                };
+                _ = meta_start_pos;
+                if (!isConstObjectLiteral(meta_node)) {
+                    p.addError("module metadata must be a constant object literal", meta_node.span);
+                    return error.ParseFailed;
+                }
+                if (p.expect(.semicolon) == null) {
+                    p.addError("expected ';' after module metadata", Span.from(p.lex.pos, p.lex.pos));
+                    return error.ParseFailed;
+                }
+                module_meta = meta_node;
+            }
+        }
+
+        // Sequence of directives.
+        var directives = std.ArrayList(Node.Directive){};
+        while (true) {
+            const t = p.peek() orelse break;
+            if (t.tag != .import_kw and t.tag != .include_kw) break;
+            const dir = p.parseDirective() catch return error.ParseFailed;
+            directives.append(p.arena.allocator(), dir) catch break;
+        }
+
+        // Body — falls through to parseFilter (which handles `def` chains).
+        const body = try p.parseFilter();
+
+        if (module_meta == null and directives.items.len == 0) {
+            return body;
+        }
+
+        const dirs_slice = directives.toOwnedSlice(p.arena.allocator()) catch &[_]Node.Directive{};
+        return p.createNode(.{ .program = .{
+            .module_meta = module_meta,
+            .directives = dirs_slice,
+            .body = body,
+        } }, Span.from(start_pos, body.span.end));
+    }
+
+    /// Parse one `import "x" as <alias> [{meta}];` or `include "x";`.
+    fn parseDirective(p: *Parser) error{ParseFailed}!Node.Directive {
+        const kw_tok = p.advance() orelse return error.ParseFailed;
+        const start = kw_tok.offset;
+        const is_import = kw_tok.tag == .import_kw;
+
+        // Relative path string literal.
+        const path_tok = p.peek() orelse {
+            p.addError("expected string literal after directive keyword", Span.from(kw_tok.offset, kw_tok.offset + kw_tok.len));
+            return error.ParseFailed;
+        };
+        if (path_tok.tag != .string_lit) {
+            p.addError("expected string literal after directive keyword", Span.from(path_tok.offset, path_tok.offset + path_tok.len));
+            return error.ParseFailed;
+        }
+        _ = p.advance();
+        const raw = p.tokenSlice(path_tok);
+        const inner = raw[1 .. raw.len - 1];
+        // jq rejects relpaths with backslash escapes (the lexer already
+        // accepted `"\\(a)"` etc); reject any backslash to mirror jq.
+        if (std.mem.indexOfScalar(u8, inner, '\\') != null) {
+            p.addError("invalid module path", Span.from(path_tok.offset, path_tok.offset + path_tok.len));
+            return error.ParseFailed;
+        }
+        const relpath = p.internName(inner);
+
+        var alias: ?[]const u8 = null;
+        var is_data = false;
+        var meta: ?*const Node = null;
+
+        if (is_import) {
+            if (p.expect(.as_kw) == null) {
+                p.addError("expected 'as' after import path", Span.from(p.lex.pos, p.lex.pos));
+                return error.ParseFailed;
+            }
+            const after_as = p.peek() orelse return error.ParseFailed;
+            if (after_as.tag == .dollar) {
+                _ = p.advance(); // consume $
+                const var_tok = p.advance() orelse return error.ParseFailed;
+                if (!isVarNameToken(var_tok.tag)) {
+                    p.addError("expected variable name after '$'", Span.from(var_tok.offset, var_tok.offset + var_tok.len));
+                    return error.ParseFailed;
+                }
+                alias = p.internName(p.tokenSlice(var_tok));
+                is_data = true;
+            } else if (isVarNameToken(after_as.tag)) {
+                _ = p.advance();
+                alias = p.internName(p.tokenSlice(after_as));
+                is_data = false;
+            } else {
+                p.addError("expected alias after 'as'", Span.from(after_as.offset, after_as.offset + after_as.len));
+                return error.ParseFailed;
+            }
+
+            // Optional `{...}` metadata after alias.
+            const next = p.peek();
+            if (next != null and next.?.tag == .lbrace) {
+                const meta_node = try p.parseAlternative();
+                if (!isConstObjectLiteral(meta_node)) {
+                    p.addError("import metadata must be a constant object literal", meta_node.span);
+                    return error.ParseFailed;
+                }
+                meta = meta_node;
+            }
+        } else {
+            // `include`: an optional `{...}` metadata may follow per jq grammar
+            // (parser.y `Imports : Import ';' | Import ';' Imports`,
+            //  `Import : ... ImportWhat ';' | ... ImportWhat ImportFrom ';'`).
+            // Negative tests expect `include "a" (.+1); 0` and `include "a" [];
+            // 0` to fail to compile — `(.+1)` and `[]` are NOT const-object
+            // literals, so route any non-`;` non-keyword token through
+            // parseAlternative + isConstObjectLiteral check. This rejects
+            // `(.+1)` / `[]` while still allowing `include "x" {a:1};`.
+            const next = p.peek();
+            if (next != null and next.?.tag != .semicolon) {
+                const meta_node = try p.parseAlternative();
+                if (!isConstObjectLiteral(meta_node)) {
+                    p.addError("include metadata must be a constant object literal", meta_node.span);
+                    return error.ParseFailed;
+                }
+                meta = meta_node;
+            }
+        }
+
+        const semi = p.expect(.semicolon);
+        if (semi == null) {
+            p.addError("expected ';' to terminate directive", Span.from(p.lex.pos, p.lex.pos));
+            return error.ParseFailed;
+        }
+
+        return .{
+            .kind = if (is_import) .import_ else .include_,
+            .relpath = relpath,
+            .alias = alias,
+            .is_data = is_data,
+            .meta = meta,
+            .span = Span.from(start, p.lex.pos),
         };
     }
 
@@ -569,6 +724,32 @@ pub const Parser = struct {
             return p.parseForeach(tok);
         }
 
+        // Namespaced ident `foo::bar` — consume `::`, expect ident,
+        // produce a func_call with the qualified name. This shape comes
+        // from the jq module system: a namespaced reference resolves
+        // against the module bound to alias `foo` at lower-time.
+        if (p.peek()) |colcol| {
+            if (colcol.tag == .coloncolon) {
+                _ = p.advance(); // consume ::
+                const id_tok = p.advance() orelse return error.ParseFailed;
+                if (!isVarNameToken(id_tok.tag)) {
+                    return p.makeError("expected identifier after '::'", Span.from(id_tok.offset, id_tok.offset + id_tok.len));
+                }
+                const qualified = p.makeQualifiedName(name, p.tokenSlice(id_tok));
+                const qspan = Span.from(tok.offset, id_tok.offset + id_tok.len);
+                const peek_after = p.peek();
+                if (peek_after != null and peek_after.?.tag == .lparen) {
+                    return p.parseCallExpr(qualified, Token{ .tag = .ident, .offset = tok.offset, .len = id_tok.offset + id_tok.len - tok.offset });
+                }
+                // Zero-arg form: produce a func_call (lower-time resolves
+                // it as a UDF — namespaced names never resolve to builtins).
+                return p.createNode(.{ .func_call = .{
+                    .name = qualified,
+                    .args = &[_]*Node{},
+                } }, qspan);
+            }
+        }
+
         // Check for function/builtin call with args
         const next = p.peek() orelse return p.createFieldOrBuiltin(name, span);
         if (next.tag == .lparen) {
@@ -576,6 +757,16 @@ pub const Parser = struct {
         }
 
         return p.createFieldOrBuiltin(name, span);
+    }
+
+    /// Build a `<ns>::<name>` interned string in the arena.
+    fn makeQualifiedName(p: *Parser, ns: []const u8, name: []const u8) []const u8 {
+        const buf = p.arena.allocator().alloc(u8, ns.len + 2 + name.len) catch return name;
+        @memcpy(buf[0..ns.len], ns);
+        buf[ns.len] = ':';
+        buf[ns.len + 1] = ':';
+        @memcpy(buf[ns.len + 2 ..], name);
+        return buf;
     }
 
     fn createFieldOrBuiltin(p: *Parser, name: []const u8, span: Span) *Node {
@@ -882,6 +1073,24 @@ pub const Parser = struct {
             return p.makeError("expected variable name after '$'", Span.from(dollar_tok.offset, dollar_tok.offset + dollar_tok.len));
         }
         const name = p.tokenSlice(ident);
+        // Namespaced var `$foo::name` — the data import `import "data" as $d`
+        // binds BOTH `$d` AND `$d::d` to the wrapped value. The qualified
+        // form is parsed here so callers reading `$d::d` get a single
+        // variable_ref carrying the qualified name. Lower-time looks up
+        // the qualified name in the var_table directly.
+        if (p.peek()) |colcol| {
+            if (colcol.tag == .coloncolon) {
+                _ = p.advance(); // consume ::
+                const id_tok = p.advance() orelse return error.ParseFailed;
+                if (!isVarNameToken(id_tok.tag)) {
+                    return p.makeError("expected identifier after '$ns::'", Span.from(id_tok.offset, id_tok.offset + id_tok.len));
+                }
+                const qualified = p.makeQualifiedName(name, p.tokenSlice(id_tok));
+                return p.createNode(.{ .variable_ref = .{
+                    .name = qualified,
+                } }, Span.from(dollar_tok.offset, id_tok.offset + id_tok.len));
+            }
+        }
         return p.createNode(.{ .variable_ref = .{
             .name = p.internName(name),
         } }, Span.from(dollar_tok.offset, ident.offset + ident.len));
@@ -1398,7 +1607,17 @@ pub const Parser = struct {
 
         _ = p.expectOrError(.semicolon, "expected ';' after function body");
 
-        const rest = p.parseFilter() catch return error.ParseFailed;
+        // Module-body shape: a `.jq` file imported via `import "x" as y;`
+        // contains only `def` chains with no trailing body expression. If
+        // the next token is EOF, materialize `identity` as the rest so the
+        // chain terminates without erroring. Inline filters that end with
+        // a `def` followed by EOF parse the same way (jq tolerates the
+        // omission and produces identity at the tail).
+        const next_tok = p.peek();
+        const rest = if (next_tok == null or next_tok.?.tag == .eof)
+            p.createNode(.identity, Span.from(p.lex.pos, p.lex.pos))
+        else
+            p.parseFilter() catch return error.ParseFailed;
 
         const params_slice = params.toOwnedSlice(p.arena.allocator()) catch &[_]Node.FuncParam{};
         return p.createNode(.{ .func_def = .{
@@ -1801,7 +2020,43 @@ fn isVarNameToken(tag: Token.Tag) bool {
         tag == .def_kw or tag == .as_kw or tag == .reduce_kw or
         tag == .if_kw or tag == .then_kw or tag == .elif_kw or
         tag == .else_kw or tag == .end_kw or tag == .try_kw or
-        tag == .catch_kw or tag == .label_kw or tag == .break_kw;
+        tag == .catch_kw or tag == .label_kw or tag == .break_kw or
+        tag == .import_kw or tag == .include_kw or tag == .module_kw;
+}
+
+/// Const-object-literal check used by module/import metadata validation.
+/// Accepts `{...}` whose every value is a const literal (recursively).
+/// Rejects `(.+1)`, `[]`, `null`, etc. — only object literals containing
+/// const literals (numbers/strings/bools/null/arrays/objects) qualify.
+fn isConstObjectLiteral(n: *Node) bool {
+    return switch (n.kind) {
+        .object_construct => |oc| blk: {
+            for (oc.fields) |f| {
+                if (!isConstLiteralExpr(f.value)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+/// Recursive const-literal check. Used by `isConstObjectLiteral` to walk
+/// nested values; standalone literal arrays/objects are also accepted.
+fn isConstLiteralExpr(n: *Node) bool {
+    return switch (n.kind) {
+        .literal => true,
+        .array_construct => |ac| if (ac.expr) |e| isConstLiteralCommaSeq(e) else true,
+        .object_construct => isConstObjectLiteral(n),
+        else => false,
+    };
+}
+
+/// Comma-separated const literal sequence (array element check).
+fn isConstLiteralCommaSeq(n: *Node) bool {
+    return switch (n.kind) {
+        .comma => |c| isConstLiteralCommaSeq(c.left) and isConstLiteralCommaSeq(c.right),
+        else => isConstLiteralExpr(n),
+    };
 }
 
 fn isZeroArgBuiltin(name: []const u8) bool {

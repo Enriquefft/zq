@@ -43,6 +43,7 @@ pub const Token = struct {
         // Variable/function syntax
         dollar, // $
         colon, // :
+        coloncolon, // ::
         semicolon, // ;
         comma, // ,
 
@@ -55,6 +56,9 @@ pub const Token = struct {
         def_kw, // def
         as_kw, // as
         reduce_kw, // reduce
+        module_kw, // module
+        import_kw, // import
+        include_kw, // include
 
         // Conditional keywords
         if_kw, // if
@@ -263,6 +267,10 @@ pub const Lexer = struct {
             },
             ':' => {
                 l.pos += 1;
+                if (l.pos < l.src.len and l.src[l.pos] == ':') {
+                    l.pos += 1;
+                    return .{ .tag = .coloncolon, .offset = start, .len = 2 };
+                }
                 return .{ .tag = .colon, .offset = start, .len = 1 };
             },
             ';' => {
@@ -387,6 +395,12 @@ pub const Lexer = struct {
             .label_kw
         else if (std.mem.eql(u8, slice, "break"))
             .break_kw
+        else if (std.mem.eql(u8, slice, "module"))
+            .module_kw
+        else if (std.mem.eql(u8, slice, "import"))
+            .import_kw
+        else if (std.mem.eql(u8, slice, "include"))
+            .include_kw
         else
             .ident;
 

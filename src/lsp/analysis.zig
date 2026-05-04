@@ -315,6 +315,12 @@ pub const SemanticModel = struct {
                 if (sl.to_expr) |te| self.walkNode(te, scope_id);
             },
             .identity, .recurse, .field_access, .index_access, .iterate, .literal, .error_node => {},
+            .program => |prog| {
+                // Phase 2a — module-system Program wrapper. Walk the body
+                // for symbol resolution; directive-side bindings are
+                // resolved at lower-time, not in the LSP semantic model.
+                self.walkNode(prog.body, scope_id);
+            },
         }
     }
 

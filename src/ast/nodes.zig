@@ -21,6 +21,7 @@ pub const Node = struct {
 
     pub const Kind = union(enum) {
         // ── Composition ──────────────────────────────────────────────
+        program: Program,
         pipe: Pipe,
         comma: Comma,
         func_def: FuncDef,
@@ -92,6 +93,33 @@ pub const Node = struct {
     };
 
     // ── Node payload types ──────────────────────────────────────────
+
+    /// Top-level program wrapper (jq module system, Phase 2a).
+    /// Wraps the body with optional `module {meta};` and a sequence of
+    /// `import "x" as foo;` / `include "x";` directives. Lower-time
+    /// processes directives in order before lowering `body`.
+    pub const Program = struct {
+        module_meta: ?*const Node,
+        directives: []const Directive,
+        body: *Node,
+    };
+
+    /// One module-system directive (`import` or `include`).
+    pub const Directive = struct {
+        kind: DirectiveKind,
+        relpath: []const u8,
+        /// Alias for `import "x" as <alias>`. Null for `include`.
+        /// For `import "data" as $name`, alias is the variable name and
+        /// `is_data` is true.
+        alias: ?[]const u8,
+        /// True when the import binds a JSON file to a variable (`as $name`).
+        is_data: bool,
+        /// Optional `{search:"..."}` const-object metadata.
+        meta: ?*const Node,
+        span: Span,
+    };
+
+    pub const DirectiveKind = enum { import_, include_ };
 
     pub const Pipe = struct {
         left: *Node,

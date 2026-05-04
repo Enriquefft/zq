@@ -44,6 +44,14 @@ pub const Opts = struct {
 
     /// External variable declarations to pre-declare in the root scope.
     external_vars: []const ExternalVarDecl = &.{},
+
+    /// Module search path (jq `-L` equivalent). Each entry is a directory
+    /// to look up `import "x" as foo;` / `include "x";` paths in.
+    module_search_path: []const []const u8 = &.{},
+
+    /// Directory of the importing file. Used as the final fallback after
+    /// explicit search paths exhaust.
+    current_file_dir: ?[]const u8 = null,
 };
 
 /// Immutable compiled filter. Thread-safe for concurrent execute() calls.
@@ -91,7 +99,11 @@ pub const CompiledQuery = struct {
 
         // Phase 2R cutover: the compiler covers every operator category;
         // unhandled cases panic inside the compiler. Only OOM propagates.
-        const result = try new_compiler.compile(src, ext_decls, allocator);
+        const module_opts: new_compiler.ModuleOpts = .{
+            .module_search_path = opts.module_search_path,
+            .current_file_dir = opts.current_file_dir,
+        };
+        const result = try new_compiler.compile(src, ext_decls, module_opts, allocator);
         switch (result) {
             .ok => |compiled| return .{ .ok = CompiledQuery{
                 .allocator = allocator,

@@ -23,6 +23,8 @@ const err_mod = @import("error");
 const ir = @import("ir.zig");
 const regex_mod = @import("regex");
 const types_mod = @import("types");
+const resolver_mod = @import("resolver.zig");
+const json_to_ast = @import("json_to_ast.zig");
 
 const Node = ast.Node;
 const Span = ast.Span;
@@ -127,6 +129,14 @@ pub const FunctionEntry = struct {
     /// outer-def whose body inlines an inner-def call_user that emit
     /// resolves AFTER the defer pops).
     out_of_scope: bool = false,
+    /// Phase 2a — module-private imports. When this entry's body is
+    /// re-walked at a call site, the lowerer first processes these
+    /// directives (registering aliased UDFs into the function_table)
+    /// so identifiers like `foo::a` resolve against the imported
+    /// module's view, not the outer query's. Marked out_of_scope after
+    /// the body walk so the outer query never sees them. Empty for
+    /// non-imported defs.
+    module_imports: []const ast.Node.Directive = &.{},
 };
 
 /// Sentinel for `FunctionEntry.body_ir_root` meaning "not yet
@@ -135,6 +145,16 @@ pub const FunctionEntry = struct {
 /// this value, it triggers the body lowering (recursive functions
 /// only).
 pub const BODY_IR_NOT_LOWERED: u32 = std.math.maxInt(u32);
+
+/// Side-channel entry pairing a synthesized `as_pattern` node (from a
+/// data-import directive) with its alias names. Phase 2a — lets the
+/// as_pattern arm register the dual `<alias>::<alias>` form pointing
+/// at the same var_id as the simple `<alias>` binding.
+pub const DataAliasEntry = struct {
+    ap_ptr: *const Node,
+    alias: []const u8,
+    dual_alias: []const u8,
+};
 
 /// Recursive-descent lowering context. Owns nothing — the IR's arena
 /// owns every node, child span, extra-data scalar, and string-buf byte.
@@ -212,6 +232,28 @@ pub const Lowerer = struct {
     /// Mirrors legacy `Ctx.label_var_ids`
     /// (`src/query/src/compiler.zig:3641`).
     label_var_ids: std.ArrayListUnmanaged(u32) = .{},
+
+    // ── Phase 2a — module system ──────────────────────────────────
+    /// Search path for `import "x" as foo;` / `include "x";`. Each
+    /// entry is a directory (no trailing slash). The compiler picks
+    /// the first directory that contains `<root>/<relpath>.jq` or
+    /// `<root>/<relpath>/<relpath>.jq`.
+    module_search_path: []const []const u8 = &.{},
+    /// Importing-file directory used as a fallback after explicit
+    /// search paths exhaust.
+    current_file_dir: ?[]const u8 = null,
+    /// Lazy-init resolver. Owns parsed module ASTs for the duration
+    /// of one top-level compile so a module imported under multiple
+    /// aliases parses once. Lives in the IR arena.
+    resolver: ?resolver_mod.Resolver = null,
+    /// Side-channel populated by `synthDataBindingNode` when a `import
+    /// "x" as $alias;` data import builds a synthesized as_pattern AST
+    /// node. Each entry binds the simple alias `$alias` AND the dual
+    /// `$alias::alias` to the same var_id. The as_pattern arm scans
+    /// this list (keyed by AST node pointer) right after
+    /// `declarePatternVars` and registers the dual alias name → same
+    /// var_id in `var_table`. Lives in the IR arena.
+    data_alias_aliases: std.ArrayListUnmanaged(DataAliasEntry) = .{},
 
     /// Append a node and return its index. Plan §1.3 row 3 — children
     /// are u32 indices, never pointers.
@@ -334,6 +376,17 @@ pub const Lowerer = struct {
         return regex_mod.RegexPool.init(alloc);
     }
 
+    /// Free the resolver and every parsed module it cached. The cache
+    /// owns ParseResult arenas allocated by `arena.child_allocator`,
+    /// independent of the lowering arena, so they need explicit deinit.
+    /// Idempotent.
+    pub fn deinitResolver(self: *Lowerer) void {
+        if (self.resolver) |*r| {
+            r.deinit();
+            self.resolver = null;
+        }
+    }
+
     /// Free the regex pool if it was lazily initialized but not
     /// taken. Idempotent — safe to call on an already-taken or
     /// never-allocated Lowerer. The snapshot test and regen tool
@@ -401,6 +454,14 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
     const sp = Lowerer.span(node);
 
     switch (node.kind) {
+        // ── Top-level program with module-system directives (Phase 2a) ─
+        // The program node wraps the body with optional `module {meta};`
+        // and a sequence of `import`/`include` directives. We process
+        // directives in order, registering imported defs as namespaced
+        // UDFs (or unnamespaced for `include`), data imports as `as $d
+        // | <body>` synthesized bindings, then lower the body.
+        .program => |prog| return lowerProgram(ctx, &prog, sp.start),
+
         // ── Literals (category 1) ─────────────────────────────────
         .literal => |lit| {
             const alloc = ctx.arena.allocator();
@@ -1323,6 +1384,20 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         .as_pattern => |ap| {
             const expr_idx = try lowerNode(ctx, ap.expr);
             try declarePatternVars(ctx, ap.pattern);
+            // Phase 2a — data-import side-channel. `synthDataBindingNode`
+            // populates `data_alias_aliases` with (ap_ptr, alias, dual_alias)
+            // triples for synthesized `<value> as $alias | inner` nodes.
+            // After the simple `$alias` var_id is declared, look up the
+            // matching ap_ptr and register `$alias::alias` to point at the
+            // SAME var_id so both surface forms resolve to the binding.
+            for (ctx.data_alias_aliases.items) |entry| {
+                if (entry.ap_ptr == node) {
+                    if (ctx.var_table.get(entry.alias)) |vid| {
+                        try ctx.var_table.put(ctx.arena.allocator(), entry.dual_alias, vid);
+                    }
+                    break;
+                }
+            }
             const dx_idx = try lowerPattern(ctx, ap.pattern, ap.expr.span);
             const body_idx = try lowerNode(ctx, ap.body);
 
@@ -4752,6 +4827,18 @@ fn inlineUserCall(
 
     const func_table_save: u32 = @intCast(ctx.function_table.items.len);
 
+    // Phase 2a — module-private import scope. If this function came
+    // from a `.jq` module with non-data import directives, install
+    // them now so identifiers like `foo::a` inside the body resolve
+    // against the module's own view, NOT the outer query's. Entries
+    // registered here live above `func_table_save` and get marked
+    // `out_of_scope` by the cleanup loop below.
+    if (ctx.function_table.items[fn_id].module_imports.len > 0) {
+        for (ctx.function_table.items[fn_id].module_imports) |mdir| {
+            try processCodeDirective(ctx, mdir);
+        }
+    }
+
     const body_idx = try lowerNode(ctx, entry.body);
 
     // Record the lowered body IR root for recursive functions on the
@@ -5142,4 +5229,303 @@ fn bodyReferencesSelf(node: *const Node, name: []const u8, arity: u32) bool {
         .assign_general => |ag| return bodyReferencesSelf(ag.lhs, name, arity) or bodyReferencesSelf(ag.rhs, name, arity),
         else => return false,
     }
+}
+
+// ── Phase 2a: module-system lowering ──────────────────────────────
+
+/// Lower a top-level Program node (jq module system).
+///
+/// Steps in order:
+///   1. Process every directive: register imported UDFs as
+///      `<alias>::<name>` (or unnamespaced for `include`), bind data
+///      imports to fresh `as $alias | ...` chains.
+///   2. Lower the body into the IR; data import bindings wrap the body
+///      via synthesized `as_pattern` chains.
+///
+/// `module_meta` is parser-validated as a const object literal but not
+/// otherwise consulted at lower-time (Phase 2b will add modulemeta).
+fn lowerProgram(ctx: *Lowerer, prog: *const ast.Node.Program, src_start: u32) LowerError!u32 {
+    _ = src_start;
+    // First, process function-import / include directives — they
+    // register UDFs into ctx.function_table that the body can call.
+    // Data imports synthesize as_pattern wrappers around the body
+    // and are processed after the function imports so their bindings
+    // are visible to the entire body.
+    for (prog.directives) |dir| {
+        if (dir.kind == .import_ and dir.is_data) continue;
+        try processCodeDirective(ctx, dir);
+    }
+
+    // Build a chain of as_pattern wrappers for data imports. Innermost
+    // is the body; outermost is the first data import. Each wraps:
+    //   <data_value> as $alias | <inner>
+    // and we manually register `<alias>::<alias>` as the same var_id
+    // after declarePatternVars but before lowering inner.
+    var inner: *const Node = prog.body;
+    // Iterate directives from last to first to build the chain.
+    var i: usize = prog.directives.len;
+    while (i > 0) {
+        i -= 1;
+        const dir = prog.directives[i];
+        if (!(dir.kind == .import_ and dir.is_data)) continue;
+        inner = try synthDataBindingNode(ctx, dir, inner);
+    }
+
+    // Lower the resulting tree. Data-binding wrappers are lowered as
+    // `data_as_bind` synthetic nodes — handled below.
+    return lowerNode(ctx, @constCast(inner));
+}
+
+/// Pull `func_def` chain off a parsed module's root and register each
+/// top-level def under `qualifier::<name>` (or just `<name>` for
+/// include). `module_imports` is the imported module's own non-data
+/// import/include directives; each registered FunctionEntry borrows
+/// the slice so the lowerer can re-establish the module's import scope
+/// before re-walking the body at call sites. Nested data imports are
+/// IGNORED here (Phase 2a — only the top-level query's data imports
+/// participate; modules cannot bind data to caller scope).
+fn registerImportedDefs(
+    ctx: *Lowerer,
+    root: *const Node,
+    qualifier: ?[]const u8,
+) LowerError!void {
+    // Capture the imported module's nested code directives. They run
+    // at body re-walk time so identifiers like `foo::a` inside this
+    // module's defs resolve against the module's own import view,
+    // never against the outer query's.
+    var cur: *const Node = root;
+    var module_imports_slice: []const ast.Node.Directive = &.{};
+    if (cur.kind == .program) {
+        const prog = cur.kind.program;
+        // Filter out data imports — Phase 2a confines data binding to
+        // the top-level query's body scope.
+        const arena_alloc = ctx.arena.allocator();
+        var tmp: std.ArrayListUnmanaged(ast.Node.Directive) = .{};
+        defer tmp.deinit(arena_alloc);
+        for (prog.directives) |nested| {
+            if (nested.kind == .import_ and nested.is_data) continue;
+            try tmp.append(arena_alloc, nested);
+        }
+        module_imports_slice = try arena_alloc.dupe(ast.Node.Directive, tmp.items);
+        cur = prog.body;
+    }
+
+    // Walk the def-chain registering each into the OUTER function_table.
+    while (true) {
+        switch (cur.kind) {
+            .func_def => |fd| {
+                try registerOneDef(ctx, &fd, qualifier, module_imports_slice);
+                cur = fd.rest;
+            },
+            else => break,
+        }
+    }
+}
+
+/// Register a single `def name(params): body;` in ctx.function_table.
+/// `module_imports` is the slice of the originating module's nested
+/// non-data import directives; the lowerer re-establishes them as
+/// in-scope UDFs immediately before re-walking this function's body
+/// at each call site (Phase 2a — module-private import semantics).
+fn registerOneDef(
+    ctx: *Lowerer,
+    fd: *const ast.Node.FuncDef,
+    qualifier: ?[]const u8,
+    module_imports: []const ast.Node.Directive,
+) LowerError!void {
+    const alloc = ctx.arena.allocator();
+    var params: std.ArrayListUnmanaged(ParamInfo) = .{};
+    defer params.deinit(alloc);
+    for (fd.params) |p| {
+        if (p.is_filter) {
+            try params.append(alloc, .{
+                .name = p.name,
+                .is_filter = true,
+                .var_id = 0,
+            });
+        } else {
+            const var_id = ctx.next_var_id;
+            ctx.next_var_id += 1;
+            try params.append(alloc, .{
+                .name = p.name,
+                .is_filter = false,
+                .var_id = var_id,
+            });
+        }
+    }
+    const final_name: []const u8 = if (qualifier) |q|
+        try qualifyName(ctx, q, fd.name)
+    else
+        fd.name;
+    const is_recursive = bodyReferencesSelf(fd.body, fd.name, @intCast(fd.params.len));
+    const params_owned = try alloc.dupe(ParamInfo, params.items);
+    const func_table_snapshot: u32 = @intCast(ctx.function_table.items.len);
+    try ctx.function_table.append(alloc, .{
+        .name = final_name,
+        .params = params_owned,
+        .body = fd.body,
+        .is_recursive = is_recursive,
+        .body_ir_root = BODY_IR_NOT_LOWERED,
+        .func_table_snapshot = func_table_snapshot,
+        .module_imports = module_imports,
+    });
+}
+
+fn qualifyName(ctx: *Lowerer, ns: []const u8, name: []const u8) error{OutOfMemory}![]const u8 {
+    const alloc = ctx.arena.allocator();
+    const buf = try alloc.alloc(u8, ns.len + 2 + name.len);
+    @memcpy(buf[0..ns.len], ns);
+    buf[ns.len] = ':';
+    buf[ns.len + 1] = ':';
+    @memcpy(buf[ns.len + 2 ..], name);
+    return buf;
+}
+
+/// Process one `import "x" as foo;` (non-data) or `include "x";`
+/// directive: load the module, register its top-level defs.
+fn processCodeDirective(ctx: *Lowerer, dir: ast.Node.Directive) LowerError!void {
+    const resolved = loadJqModuleOrFail(ctx, dir.relpath, dir.span) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            ctx.compile_err = .{
+                .kind = .query_syntax_error,
+                .offset = dir.span.start,
+                .len = if (dir.span.end >= dir.span.start) dir.span.end - dir.span.start else 0,
+            };
+            return error.LowerDiagnostic;
+        },
+    };
+    if (resolved.parse_result.hasErrors()) {
+        // Bubble up as a compile error anchored at the directive span.
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = dir.span.start,
+            .len = if (dir.span.end >= dir.span.start) dir.span.end - dir.span.start else 0,
+        };
+        return error.LowerDiagnostic;
+    }
+    const qualifier: ?[]const u8 = if (dir.kind == .import_) dir.alias else null;
+    try registerImportedDefs(ctx, resolved.parse_result.root, qualifier);
+}
+
+fn loadJqModuleOrFail(
+    ctx: *Lowerer,
+    relpath: []const u8,
+    span: ast.Span,
+) !*resolver_mod.ResolvedModule {
+    _ = span;
+    const r = try ensureResolver(ctx);
+    return r.loadJq(relpath);
+}
+
+fn ensureResolver(ctx: *Lowerer) error{OutOfMemory}!*resolver_mod.Resolver {
+    if (ctx.resolver != null) return &ctx.resolver.?;
+    ctx.resolver = resolver_mod.Resolver.init(
+        ctx.arena,
+        ctx.arena.child_allocator,
+        ctx.module_search_path,
+        ctx.current_file_dir,
+    );
+    return &ctx.resolver.?;
+}
+
+/// Synthesize `<value> as $<alias> | <inner>` AST for a data import,
+/// where the value is the JSON file content wrapped in a single-element
+/// array, and the binding also makes `$<alias>::<alias>` resolve to
+/// the same value.
+fn synthDataBindingNode(
+    ctx: *Lowerer,
+    dir: ast.Node.Directive,
+    inner: *const Node,
+) LowerError!*const Node {
+    const alloc = ctx.arena.allocator();
+    const r = try ensureResolver(ctx);
+    const json_bytes = r.loadJsonBytes(dir.relpath) catch {
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = dir.span.start,
+            .len = if (dir.span.end >= dir.span.start) dir.span.end - dir.span.start else 0,
+        };
+        return error.LowerDiagnostic;
+    };
+    const value_node = json_to_ast.parse(json_bytes, alloc) catch {
+        ctx.compile_err = .{
+            .kind = .query_syntax_error,
+            .offset = dir.span.start,
+            .len = if (dir.span.end >= dir.span.start) dir.span.end - dir.span.start else 0,
+        };
+        return error.LowerDiagnostic;
+    };
+    // Wrap as `[value]`.
+    const arr_node = try alloc.create(Node);
+    arr_node.* = .{ .kind = .{ .array_construct = .{ .expr = value_node } }, .span = ast.Span.empty() };
+
+    // Build a custom Program-style data binding using a func_def-like
+    // shape. We can't use as_pattern directly because the pattern only
+    // declares ONE name and we need both `alias` and `alias::alias`.
+    // We use a synthetic carrier node that the lowerer recognizes. The
+    // simplest path: build an as_pattern on the alias name only and
+    // also add a manual entry in ctx.var_table for `alias::alias` after
+    // declaring the as-pattern var. We carry the alias via a special
+    // marker AST kind — but we can't add new AST kinds without churn.
+    //
+    // Workaround: produce a synthesized func_def node `def __data_<alias>:
+    // <arr>; <inner>` is not enough because UDFs aren't bindings. So
+    // route through as_pattern + a sibling alias-registration via a
+    // wrapper kind.
+    //
+    // Cleaner: we build a `pipe(arr_node, pipe(__data_alias_marker,
+    // inner))` shape — but we have no marker kind.
+    //
+    // The pragmatic path: register `alias::alias` directly in
+    // ctx.var_table to point at the as-pattern's var_id BEFORE
+    // lowering inner. We hook this by inserting a stub func_call
+    // wrapper that lowerNode recognizes as a binding-aliasing
+    // directive. Use an unambiguous synthetic name not parseable from
+    // user source.
+    //
+    // ─── Implementation: synthesized as_pattern that the lowerer's
+    // `as_pattern` arm later detects via a marker on the binding name.
+    // We use the canonical `alias::alias` qualifier and register it
+    // by name during lowering (see `data_alias_marker`).
+
+    // Build a pattern + body. The pattern simple-binds `alias`. After
+    // declarePatternVars in the as_pattern arm runs we'll detect the
+    // marker and add `alias::alias` to var_table.
+    const dual_alias = try qualifyName(ctx, dir.alias.?, dir.alias.?);
+
+    // We embed the dual alias into the body via a `data_alias_marker`
+    // wrapper. Build an array of marker-fields whose first element is
+    // a sentinel indicating to the lowerer: "after declaring var
+    // `<dir.alias>`, also register `<dual_alias>` as an alias for it".
+    // Implementation: synth a func_def-like wrapper isn't right; we
+    // exploit the `paren` Node shape — the only side-effect-free
+    // wrapper available — and tag it via a sibling string literal we
+    // intercept.
+    //
+    // Simplest working approach: create the as_pattern AST node and
+    // make the LOWERER's `.as_pattern` arm look up `__data_alias_<n>`
+    // in a side-channel set on Lowerer. We push the dual_alias name
+    // into a stack on Lowerer keyed by the as-pattern node pointer,
+    // and the as_pattern arm consults that stack.
+
+    // Push the alias-pair onto the side-channel.
+    const ap_node = try alloc.create(Node);
+    ap_node.* = .{ .kind = .{ .as_pattern = .{
+        .expr = arr_node,
+        .pattern = .{ .simple = dir.alias.? },
+        .body = @constCast(inner),
+    } }, .span = ast.Span.empty() };
+
+    // Stash the alias-pair (binding-name, dual-alias) in a thread-
+    // local-style list on the Lowerer keyed by the as_pattern node
+    // pointer so the as_pattern lowerer arm can register the dual
+    // alias right after declaring the simple var.
+    try ctx.data_alias_aliases.append(ctx.arena.allocator(), .{
+        .ap_ptr = ap_node,
+        .alias = dir.alias.?,
+        .dual_alias = dual_alias,
+    });
+
+    return ap_node;
 }

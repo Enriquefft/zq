@@ -54,6 +54,15 @@ pub const Compiled = ctypes.Compiled;
 pub const CompileResult = ctypes.CompileResult;
 pub const ExternalVarDecl = ctypes.ExternalVarDecl;
 
+/// Module-system options threaded into `compile()`. The fixture-root
+/// `module_search_path` plus optional `current_file_dir` together feed
+/// the resolver's lookup chain. Callers that don't use the module
+/// system pass `.{}`.
+pub const ModuleOpts = struct {
+    module_search_path: []const []const u8 = &.{},
+    current_file_dir: ?[]const u8 = null,
+};
+
 /// Compile a filter source string with the VM-semantics compiler.
 ///
 /// On success, returns `.ok` carrying owned bytecode + auxiliary
@@ -63,6 +72,7 @@ pub const ExternalVarDecl = ctypes.ExternalVarDecl;
 pub fn compile(
     src: []const u8,
     external_vars: []const ExternalVarDecl,
+    module_opts: ModuleOpts,
     allocator: std.mem.Allocator,
 ) error{OutOfMemory}!CompileResult {
     // Stage 1: parse. Always succeeds; errors live in `parse_result.errors`.
@@ -98,8 +108,11 @@ pub fn compile(
         .out = ir_mod.IR.init(&arena),
         .opts = .{},
         .pool_alloc = allocator,
+        .module_search_path = module_opts.module_search_path,
+        .current_file_dir = module_opts.current_file_dir,
     };
     defer lowerer.deinitRegexPool();
+    defer lowerer.deinitResolver();
 
     // Pre-declare external variables in the root scope (var ids 0..N-1).
     // Required so cat-4 `$external_var` references resolve to the correct

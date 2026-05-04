@@ -16,6 +16,13 @@ const Tape = types.Tape;
 
 pub const alloc = std.testing.allocator;
 
+/// Module-system fixture root. Phase 2a tests at `tests/compat/datetime.zig`
+/// L1891–L1984 use `import "..."` / `include "..."` directives that must
+/// resolve against this directory tree. Both runners thread it as the
+/// search path AND the current-file dir so every directive lookup hits
+/// the fixtures regardless of which entry was cited as `-L` vs cwd.
+pub const FIXTURE_ROOT = "tests/compat/fixtures/modules";
+
 // ââ Tape helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 pub fn entryToValue(tape: *const Tape, idx: u32) Value {
@@ -316,7 +323,10 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
         .need_more => return error.ParseIncomplete,
     };
 
-    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    const result = try CompiledQuery.compile(filter, .{
+        .module_search_path = &.{FIXTURE_ROOT},
+        .current_file_dir = FIXTURE_ROOT,
+    }, alloc);
     var q = switch (result) {
         .ok => |cq| cq,
         .err => return error.QuerySyntaxError,
@@ -350,7 +360,10 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
 
 /// Verify that compiling `filter` returns a compile error (%%FAIL tests).
 pub fn expectCompileError(filter: []const u8) !void {
-    const result = try CompiledQuery.compile(filter, .{}, alloc);
+    const result = try CompiledQuery.compile(filter, .{
+        .module_search_path = &.{FIXTURE_ROOT},
+        .current_file_dir = FIXTURE_ROOT,
+    }, alloc);
     switch (result) {
         .ok => |cq| {
             var q = cq;
