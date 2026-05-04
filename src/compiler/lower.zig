@@ -23,7 +23,7 @@ const err_mod = @import("error");
 const ir = @import("ir.zig");
 const regex_mod = @import("regex");
 const types_mod = @import("types");
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("module_resolver");
 const json_to_ast = @import("json_to_ast.zig");
 
 const Node = ast.Node;
@@ -2302,7 +2302,10 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "all") or
         // `debug/0` passes input through unchanged after writing
         // `["DEBUG:",.]` JSON to stderr — VM dispatch at root.zig:3790.
-        std.mem.eql(u8, name, "debug");
+        std.mem.eql(u8, name, "debug") or
+        // `modulemeta/0` (Phase 2b) — input string is a module relpath;
+        // VM resolves it via the search path and returns metadata.
+        std.mem.eql(u8, name, "modulemeta");
 }
 
 /// Names accepted as 1-arg value-arg builtins. Mirrors the
@@ -5460,56 +5463,14 @@ fn synthDataBindingNode(
     const arr_node = try alloc.create(Node);
     arr_node.* = .{ .kind = .{ .array_construct = .{ .expr = value_node } }, .span = ast.Span.empty() };
 
-    // Build a custom Program-style data binding using a func_def-like
-    // shape. We can't use as_pattern directly because the pattern only
-    // declares ONE name and we need both `alias` and `alias::alias`.
-    // We use a synthetic carrier node that the lowerer recognizes. The
-    // simplest path: build an as_pattern on the alias name only and
-    // also add a manual entry in ctx.var_table for `alias::alias` after
-    // declaring the as-pattern var. We carry the alias via a special
-    // marker AST kind — but we can't add new AST kinds without churn.
-    //
-    // Workaround: produce a synthesized func_def node `def __data_<alias>:
-    // <arr>; <inner>` is not enough because UDFs aren't bindings. So
-    // route through as_pattern + a sibling alias-registration via a
-    // wrapper kind.
-    //
-    // Cleaner: we build a `pipe(arr_node, pipe(__data_alias_marker,
-    // inner))` shape — but we have no marker kind.
-    //
-    // The pragmatic path: register `alias::alias` directly in
-    // ctx.var_table to point at the as-pattern's var_id BEFORE
-    // lowering inner. We hook this by inserting a stub func_call
-    // wrapper that lowerNode recognizes as a binding-aliasing
-    // directive. Use an unambiguous synthetic name not parseable from
-    // user source.
-    //
-    // ─── Implementation: synthesized as_pattern that the lowerer's
-    // `as_pattern` arm later detects via a marker on the binding name.
-    // We use the canonical `alias::alias` qualifier and register it
-    // by name during lowering (see `data_alias_marker`).
-
-    // Build a pattern + body. The pattern simple-binds `alias`. After
-    // declarePatternVars in the as_pattern arm runs we'll detect the
-    // marker and add `alias::alias` to var_table.
+    // jq exposes a data import as both `$alias` and `$alias::alias`.
+    // An `as_pattern` only declares the simple name, so we synthesize
+    // an as_pattern for `$alias` and stash the dual-alias in a
+    // side-channel keyed by the node pointer. The `as_pattern` lowering
+    // arm consults this side-channel and registers `alias::alias` as
+    // an extra var_table entry pointing at the same var_id.
     const dual_alias = try qualifyName(ctx, dir.alias.?, dir.alias.?);
 
-    // We embed the dual alias into the body via a `data_alias_marker`
-    // wrapper. Build an array of marker-fields whose first element is
-    // a sentinel indicating to the lowerer: "after declaring var
-    // `<dir.alias>`, also register `<dual_alias>` as an alias for it".
-    // Implementation: synth a func_def-like wrapper isn't right; we
-    // exploit the `paren` Node shape — the only side-effect-free
-    // wrapper available — and tag it via a sibling string literal we
-    // intercept.
-    //
-    // Simplest working approach: create the as_pattern AST node and
-    // make the LOWERER's `.as_pattern` arm look up `__data_alias_<n>`
-    // in a side-channel set on Lowerer. We push the dual_alias name
-    // into a stack on Lowerer keyed by the as-pattern node pointer,
-    // and the as_pattern arm consults that stack.
-
-    // Push the alias-pair onto the side-channel.
     const ap_node = try alloc.create(Node);
     ap_node.* = .{ .kind = .{ .as_pattern = .{
         .expr = arr_node,

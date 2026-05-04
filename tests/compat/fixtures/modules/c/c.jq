@@ -1,8 +1,9 @@
+module {whatever:null};
 import "a" as foo;
-import "d" as d;
-import "d" as d2;
-import "e" as e;
-import "f" as f;
+import "d" as d {search:"./"};
+import "d" as d2 {search:"./"};
+import "e" as e {search:"./../lib/jq"};
+import "f" as f {search:"./../lib/jq"};
 import "data" as $d;
 
 def a: 0;

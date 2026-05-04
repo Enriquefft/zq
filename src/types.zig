@@ -409,6 +409,9 @@ pub const BuiltinId = enum(u16) {
     ltrim_, // ltrim — trim Unicode whitespace from left
     rtrim_, // rtrim — trim Unicode whitespace from right
 
+    // Module-system builtins (Phase 2b)
+    modulemeta_, // modulemeta — input string is a module relpath; returns metadata object
+
     const JqEntry = struct { name: []const u8, arity: u8 };
 
     /// Return the jq-visible "name/arity" entry for this builtin, or null for
@@ -557,6 +560,7 @@ pub const BuiltinId = enum(u16) {
             .trim_,
             .ltrim_,
             .rtrim_,
+            .modulemeta_,
             => 0,
 
             // 1-arity: one explicit argument

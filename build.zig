@@ -167,6 +167,17 @@ pub fn build(b: *std.Build) void {
     // Phase 2R compiler — production. Wired into every module that imports
     // `query` so `src/query/root.zig` dispatches directly to it. Imports
     // `ast` so the typed AST root flows in (plan §1.3 row 4 — no virtual
+    // Module-system resolver — shared between the compiler (for
+    // import/include resolution at lower-time) and the VM (for the
+    // `modulemeta` builtin which resolves at runtime). Single source of
+    // truth: one Resolver impl, one parse cache shape, two consumers.
+    const module_resolver_module = b.createModule(.{
+        .root_source_file = b.path("src/module_resolver/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module_resolver_module.addImport("ast", ast_module);
+
     // dispatch, switch on tag); imports `types`, `error`, `regex`, and
     // `prefilter` so the emit-side `Compiled` matches the bytecode shape
     // the VM consumes (plan §1.3 row 7).
@@ -180,6 +191,7 @@ pub fn build(b: *std.Build) void {
     compiler_module.addImport("error", error_module);
     compiler_module.addImport("regex", regex_module);
     compiler_module.addImport("prefilter", prefilter_module);
+    compiler_module.addImport("module_resolver", module_resolver_module);
 
     // VM (runtime executor) — consumes the bytecode produced by the
     // compiler and produces `ResultIterator`. Phase 2R cutover: relocated
@@ -194,6 +206,8 @@ pub fn build(b: *std.Build) void {
     vm_module.addImport("error", error_module);
     vm_module.addImport("types", types_module);
     vm_module.addImport("regex", regex_module);
+    vm_module.addImport("ast", ast_module);
+    vm_module.addImport("module_resolver", module_resolver_module);
 
     const query_module = b.createModule(.{
         .root_source_file = b.path("src/query/root.zig"),

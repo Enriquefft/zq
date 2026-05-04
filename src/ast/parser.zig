@@ -66,12 +66,10 @@ pub const Parser = struct {
         if (p.peek()) |t| {
             if (t.tag == .module_kw) {
                 _ = p.advance(); // consume module
-                const meta_start_pos = p.lex.pos;
                 const meta_node = p.parseAlternative() catch {
                     p.addError("expected '{...}' after module", Span.from(t.offset, t.offset + t.len));
                     return error.ParseFailed;
                 };
-                _ = meta_start_pos;
                 if (!isConstObjectLiteral(meta_node)) {
                     p.addError("module metadata must be a constant object literal", meta_node.span);
                     return error.ParseFailed;
