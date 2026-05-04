@@ -1978,6 +1978,12 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .compact_runtime_tape => {
+                it.compactRuntimeTape();
+                it.ip += 1;
+                return null;
+            },
+
             .def_function => {
                 // Function definitions are resolved at compile time
                 it.ip += 1;
@@ -3537,6 +3543,219 @@ pub const ResultIterator = struct {
                 .object_start, .array_start => {
                     const orig_skip = items[i].payload.skip;
                     items[i].payload.skip = base + (orig_skip - span.start);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// In-place compaction of `runtime_tape.entries` for the
+    /// `compact_runtime_tape` opcode. Identifies every live tape interval
+    /// reachable from VM roots (current, value_stack, variable_store,
+    /// if_stack, collect_stack, object_construct, fork_stack — the latter
+    /// including `saved_current`, `saved_stack`, `saved_object`, plus each
+    /// `EachState`'s `pos..end`), sorts/merges them into disjoint segments,
+    /// packs the surviving entries down to the front of the tape, rebases
+    /// every reference and `skip` pointer through a position-translation
+    /// table, then truncates. Drops dead entries between live intervals
+    /// (the gap between a half-consumed `range(N)` array and the
+    /// accumulator), which a single-shift compaction cannot reclaim.
+    ///
+    /// Conservative bail-out: skipped (no-op) whenever a fork frame holds
+    /// state we don't fully model — regex generator frames (`scan`/
+    /// `match_g`/`splits` borrow `hay` slices from runtime_tape's
+    /// `string_buf`) and recurse_path frames (cached `Value`/path
+    /// components) — or any active path frame (`PathFrame.components`/
+    /// `break_source`). Reduce bodies of the wave4 cluster never push
+    /// these frames during iteration, so this fast path applies and the
+    /// quadratic tape growth is shed.
+    ///
+    /// Strings are not relocated — `string_buf` keeps growing
+    /// monotonically. Reduce bodies that don't intern strings (the
+    /// worst-case targets, `[];[.]`-shape) therefore see flat memory.
+    /// Bodies that do intern strings still benefit from entry compaction;
+    /// their string-buf growth is independently bounded by
+    /// `RuntimeTape.max_entries`-driven OOM.
+    fn compactRuntimeTape(it: *ResultIterator) void {
+        if (it.path_stack.items.len != 0) return;
+        for (it.fork_stack.items) |fp| {
+            switch (fp.aux) {
+                .scan, .match_g, .splits, .recurse_path => return,
+                .each,
+                .normal,
+                .range,
+                .try_handler,
+                .alt_handler,
+                .label,
+                .limit,
+                .skip,
+                .repeat,
+                .path_scope,
+                => {},
+            }
+        }
+
+        const tape_ptr = &it.runtime_tape.view;
+        const len_now: u32 = @intCast(it.runtime_tape.entries.items.len);
+        if (len_now == 0) return;
+
+        // Amortization gate. Compaction is O(len_now); without a gate
+        // every reduce iteration would compact after a single fresh
+        // append and turn an O(N) fold into O(N²). Compact only once
+        // the entry count has grown by at least the absolute threshold
+        // *and* doubled the post-last-compaction baseline, so total
+        // compaction work over N iterations stays O(N).
+        const baseline = it.runtime_tape.compact_live_baseline;
+        const trigger = @max(
+            baseline + @as(u32, types.RuntimeTape.compact_min_threshold),
+            2 * baseline,
+        );
+        if (len_now < trigger) return;
+
+        // Phase 1: collect live half-open intervals on the runtime tape.
+        var intervals: std.ArrayList(LiveInterval) = .{};
+        defer intervals.deinit(it.alloc);
+        it.collectLiveIntervals(tape_ptr, &intervals) catch return;
+        if (intervals.items.len == 0) {
+            it.runtime_tape.entries.items.len = 0;
+            it.runtime_tape.refreshView();
+            it.runtime_tape.compact_live_baseline = 0;
+            return;
+        }
+
+        // Phase 2: sort + merge overlapping/adjacent intervals so we walk
+        // each surviving entry exactly once.
+        std.mem.sort(LiveInterval, intervals.items, {}, LiveInterval.lessThan);
+        var merged: std.ArrayList(LiveInterval) = .{};
+        defer merged.deinit(it.alloc);
+        var cur = intervals.items[0];
+        for (intervals.items[1..]) |iv| {
+            if (iv.start <= cur.end) {
+                if (iv.end > cur.end) cur.end = iv.end;
+            } else {
+                merged.append(it.alloc, cur) catch return;
+                cur = iv;
+            }
+        }
+        merged.append(it.alloc, cur) catch return;
+
+        // Phase 3: build position-translation table mapping every live
+        // (and one-past-each-interval) old index to its new packed index.
+        // `0` for unreferenced positions — the caller never queries those.
+        const translation = it.alloc.alloc(u32, @as(usize, len_now) + 1) catch return;
+        defer it.alloc.free(translation);
+        @memset(translation, 0);
+        var packed_len: u32 = 0;
+        for (merged.items) |iv| {
+            var old = iv.start;
+            while (old <= iv.end and old <= len_now) : (old += 1) {
+                translation[old] = packed_len + (old - iv.start);
+            }
+            packed_len += iv.end - iv.start;
+        }
+
+        // Phase 4: pack entries down. Walks merged intervals in order so
+        // copyForwards is always non-overlapping for any single source
+        // segment, and every prior write happens before reading the next.
+        const items = it.runtime_tape.entries.items;
+        var write: u32 = 0;
+        for (merged.items) |iv| {
+            const len = iv.end - iv.start;
+            if (write != iv.start) {
+                std.mem.copyForwards(Tape.Entry, items[write .. write + len], items[iv.start..iv.end]);
+            }
+            write += len;
+        }
+        it.runtime_tape.entries.items.len = packed_len;
+
+        // Phase 5: rebase container skip pointers (always point to a live
+        // position one-past their matching end marker, hence translation
+        // covers them via the `<= iv.end` upper bound above).
+        for (it.runtime_tape.entries.items) |*e| {
+            switch (e.tag) {
+                .object_start, .array_start => e.payload.skip = translation[e.payload.skip],
+                else => {},
+            }
+        }
+        it.runtime_tape.refreshView();
+
+        // Phase 6: rebase every live root through the translation.
+        it.rebaseLiveRoots(tape_ptr, translation);
+
+        // Update the amortization baseline so the next gate compares
+        // against the live-entry count we just produced.
+        it.runtime_tape.compact_live_baseline = packed_len;
+    }
+
+    /// Append every runtime-tape interval reachable from any live root to
+    /// `out` (raw, unsorted, possibly overlapping). Helper for
+    /// `compactRuntimeTape`.
+    fn collectLiveIntervals(
+        it: *ResultIterator,
+        target: *const Tape,
+        out: *std.ArrayList(LiveInterval),
+    ) error{OutOfMemory}!void {
+        try collectFromValue(it.alloc, out, it.current, target);
+        try collectFromValue(it.alloc, out, it.input_value, target);
+        for (it.value_stack.items) |v| try collectFromStackValue(it.alloc, out, v, target);
+        for (it.variable_store.items) |maybe_v| {
+            if (maybe_v) |v| try collectFromStackValue(it.alloc, out, v, target);
+        }
+        for (it.if_stack.items) |v| try collectFromValue(it.alloc, out, v, target);
+        for (it.collect_stack.items) |frame| {
+            for (frame.buffer.items) |v| try collectFromStackValue(it.alloc, out, v, target);
+        }
+        for (it.object_construct.items) |field| try collectFromStackValue(it.alloc, out, field.value, target);
+        for (it.fork_stack.items) |fp| {
+            try collectFromValue(it.alloc, out, fp.saved_current, target);
+            if (fp.saved_stack) |snap| {
+                for (snap) |v| try collectFromStackValue(it.alloc, out, v, target);
+            }
+            if (fp.saved_object) |snap| {
+                for (snap.fields) |field| try collectFromStackValue(it.alloc, out, field.value, target);
+                for (snap.input) |v| try collectFromValue(it.alloc, out, v, target);
+            }
+            switch (fp.aux) {
+                .each => |st| {
+                    if (st.tape == target and st.end > st.pos) {
+                        try out.append(it.alloc, .{ .start = st.pos, .end = st.end });
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Rebase every live tape reference through `translation`. Mirrors
+    /// `collectLiveIntervals` so any new root added there must be added
+    /// here too. Helper for `compactRuntimeTape`.
+    fn rebaseLiveRoots(it: *ResultIterator, target: *const Tape, translation: []const u32) void {
+        translateValueSpan(&it.current, target, translation);
+        translateValueSpan(&it.input_value, target, translation);
+        for (it.value_stack.items) |*v| translateStackValueSpan(v, target, translation);
+        for (it.variable_store.items) |*maybe_v| {
+            if (maybe_v.*) |*v| translateStackValueSpan(v, target, translation);
+        }
+        for (it.if_stack.items) |*v| translateValueSpan(v, target, translation);
+        for (it.collect_stack.items) |*frame| {
+            for (frame.buffer.items) |*v| translateStackValueSpan(v, target, translation);
+        }
+        for (it.object_construct.items) |*field| translateStackValueSpan(&field.value, target, translation);
+        for (it.fork_stack.items) |*fp| {
+            translateValueSpan(&fp.saved_current, target, translation);
+            if (fp.saved_stack) |snap| {
+                for (snap) |*v| translateStackValueSpan(v, target, translation);
+            }
+            if (fp.saved_object) |snap| {
+                for (snap.fields) |*field| translateStackValueSpan(&field.value, target, translation);
+                for (snap.input) |*v| translateValueSpan(v, target, translation);
+            }
+            switch (fp.aux) {
+                .each => |*st| {
+                    if (st.tape == target) {
+                        st.pos = translation[st.pos];
+                        st.end = translation[st.end];
+                    }
                 },
                 else => {},
             }
@@ -10768,14 +10987,38 @@ fn expandReplacement(
     }
 }
 
+/// jq-canonical container-nesting limit for JSON parsing (`fromjson`).
+/// Matches jq 1.8.1 (`MAX_PARSING_DEPTH = 10000` in `src/jv_parse.c`):
+/// once an open bracket would push nesting strictly beyond this, jq aborts
+/// with the message preserved below. Both the limit and the message must
+/// remain byte-identical for `try (fromjson) catch .` parity.
+const PARSE_DEPTH_LIMIT: u32 = 10000;
+const PARSE_DEPTH_LIMIT_MSG: []const u8 = "Exceeds depth limit for parsing";
+
+/// jq-canonical container-nesting limit for JSON serialisation (`tojson`).
+/// Once recursion reaches this depth (i.e. the call stack already represents
+/// `SERIALIZE_DEPTH_LIMIT` nested containers), the serializer emits the
+/// literal sentinel `<skipped: too deep>` in place of the subtree (matching
+/// jq's `jv_dump_recurse` output) and stops descending — preventing
+/// native-stack overflow on pathological inputs. With `[];[.]`-style
+/// nesting (depth = N+1 after `range(N)`), sentinel-emission therefore
+/// triggers at `range(10001)` (D = 10002, max call depth 10001) and not
+/// at `range(10000)` (D = 10001, max call depth 10000).
+const SERIALIZE_DEPTH_LIMIT: u32 = 10001;
+const SERIALIZE_DEPTH_SENTINEL: []const u8 = "<skipped: too deep>";
+
 /// Simple JSON parser for fromjson builtin.
 /// Parses a JSON string and builds entries in the ResultIterator's runtime tape.
 /// Uses a tape-first approach: all parsed values are written directly to the runtime
 /// tape. The top-level result is then read back as a StackValue.
 fn parseJsonToStackValue(it: *ResultIterator, json_str: []const u8) ZqError!StackValue {
-    var parser = JsonParser{ .src = json_str, .pos = 0, .it = it };
+    var parser = JsonParser{ .src = json_str, .pos = 0, .it = it, .depth = 0 };
     const start_idx: u32 = @intCast(it.runtime_tape.entries.items.len);
-    parser.writeValue() catch return error.TypeError;
+    // Propagate ZqError directly: UserError carries the depth-limit
+    // message (raised by `JsonParser.writeValue` once `depth >=
+    // PARSE_DEPTH_LIMIT`); TypeError carries any malformed-JSON detail
+    // set by the parser; OutOfMemory bubbles up untouched.
+    try parser.writeValue();
     return valueToStackValue(tapeEntryToValue(&it.runtime_tape.view, start_idx));
 }
 
@@ -10783,6 +11026,19 @@ const JsonParser = struct {
     src: []const u8,
     pos: usize,
     it: *ResultIterator,
+    /// Container-nesting depth — incremented on entry to every array/object,
+    /// decremented on exit. Compared against `PARSE_DEPTH_LIMIT` before
+    /// recursing further.
+    depth: u32,
+
+    /// Raise the jq-canonical depth-limit UserError. Sets `user_error_msg`
+    /// so that `try (fromjson) catch .` yields the literal
+    /// "Exceeds depth limit for parsing" string.
+    fn raiseDepthLimit(self: *JsonParser) ZqError {
+        const str_ref = self.it.runtime_tape.internString(self.it.alloc, PARSE_DEPTH_LIMIT_MSG) catch return error.OutOfMemory;
+        self.it.user_error_msg = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return error.UserError;
+    }
 
     fn skipWhitespace(self: *JsonParser) void {
         while (self.pos < self.src.len and
@@ -10793,23 +11049,175 @@ const JsonParser = struct {
         }
     }
 
-    /// Write a JSON value directly to the runtime tape.
+    /// Iteratively parse a JSON value into the runtime tape. Uses an
+    /// explicit container-frame stack so deeply nested input cannot blow
+    /// the native thread stack (workers run with `THREAD_STACK_SIZE = 2 MiB`,
+    /// while jq accepts up to `PARSE_DEPTH_LIMIT = 10000` levels of
+    /// nesting). Once `depth >= PARSE_DEPTH_LIMIT` the parser raises the
+    /// jq-canonical "Exceeds depth limit for parsing" UserError before
+    /// descending further, exactly as the original recursive form did.
     fn writeValue(self: *JsonParser) ZqError!void {
-        self.skipWhitespace();
-        if (self.pos >= self.src.len) return error.TypeError;
+        const Frame = struct {
+            /// Tape index of the matching `array_start` / `object_start`
+            /// entry so we can patch its skip pointer when we close.
+            start_idx: u32,
+            is_object: bool,
+            /// True until the first child has been emitted; flips to false
+            /// after the first element is parsed.
+            first: bool,
+        };
 
-        switch (self.src[self.pos]) {
-            '"' => try self.writeString(),
-            '{' => try self.writeObject(),
-            '[' => try self.writeArray(),
-            't' => try self.writeLiteral("true", .true_val),
-            'f' => try self.writeLiteral("false", .false_val),
-            // 'n' may begin "null" or case-insensitive "nan" / "NaN" etc.
-            'n' => try self.writeNullOrNan(),
-            // 'N' begins case-insensitive "NaN".
-            'N' => try self.writeNanLiteral(false),
-            '-', '0'...'9' => try self.writeNumber(),
-            else => return error.TypeError,
+        var stack = std.ArrayList(Frame){};
+        defer stack.deinit(self.it.alloc);
+
+        // Outer loop: each iteration parses exactly one element of the
+        // currently-open container, or the single root value when the
+        // stack is empty.
+        outer: while (true) {
+            self.skipWhitespace();
+            if (self.pos >= self.src.len) return error.TypeError;
+
+            // Inside a container, first decide whether we're closing or
+            // expecting a separator + next element. The very first call
+            // path (stack empty) always parses a value.
+            if (stack.items.len > 0) {
+                const top = &stack.items[stack.items.len - 1];
+                if (top.is_object) {
+                    if (top.first) {
+                        // Either '}' (empty object) or a string key.
+                        if (self.src[self.pos] == '}') {
+                            self.pos += 1;
+                            const end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                                .tag = .object_end,
+                                .payload = .{ .none = {} },
+                            });
+                            self.it.runtime_tape.entries.items[top.start_idx].payload.skip = end_idx + 1;
+                            _ = stack.pop();
+                            self.depth -= 1;
+                            if (stack.items.len == 0) return;
+                            continue :outer;
+                        }
+                    } else {
+                        // After at least one key:value pair: expect ',' or '}'.
+                        if (self.src[self.pos] == '}') {
+                            self.pos += 1;
+                            const end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                                .tag = .object_end,
+                                .payload = .{ .none = {} },
+                            });
+                            self.it.runtime_tape.entries.items[top.start_idx].payload.skip = end_idx + 1;
+                            _ = stack.pop();
+                            self.depth -= 1;
+                            if (stack.items.len == 0) return;
+                            continue :outer;
+                        }
+                        if (self.src[self.pos] != ',') return error.TypeError;
+                        self.pos += 1;
+                        self.skipWhitespace();
+                        if (self.pos >= self.src.len) return error.TypeError;
+                    }
+                    // Parse key (must be a string literal).
+                    if (self.src[self.pos] != '"') return self.stringLiteralError(self.pos);
+                    const key_bytes = try self.parseStringBytes();
+                    const key_ref = try self.it.runtime_tape.internString(self.it.alloc, key_bytes);
+                    self.it.alloc.free(key_bytes);
+                    _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                        .tag = .key,
+                        .payload = .{ .string = key_ref },
+                    });
+                    self.skipWhitespace();
+                    if (self.pos >= self.src.len or self.src[self.pos] != ':') return error.TypeError;
+                    self.pos += 1;
+                    self.skipWhitespace();
+                    if (self.pos >= self.src.len) return error.TypeError;
+                    top.first = false;
+                    // Fall through to value-parse below.
+                } else {
+                    // Array container.
+                    if (top.first) {
+                        if (self.src[self.pos] == ']') {
+                            self.pos += 1;
+                            const end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                                .tag = .array_end,
+                                .payload = .{ .none = {} },
+                            });
+                            self.it.runtime_tape.entries.items[top.start_idx].payload.skip = end_idx + 1;
+                            _ = stack.pop();
+                            self.depth -= 1;
+                            if (stack.items.len == 0) return;
+                            continue :outer;
+                        }
+                    } else {
+                        if (self.src[self.pos] == ']') {
+                            self.pos += 1;
+                            const end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                                .tag = .array_end,
+                                .payload = .{ .none = {} },
+                            });
+                            self.it.runtime_tape.entries.items[top.start_idx].payload.skip = end_idx + 1;
+                            _ = stack.pop();
+                            self.depth -= 1;
+                            if (stack.items.len == 0) return;
+                            continue :outer;
+                        }
+                        if (self.src[self.pos] != ',') return error.TypeError;
+                        self.pos += 1;
+                        self.skipWhitespace();
+                        if (self.pos >= self.src.len) return error.TypeError;
+                    }
+                    top.first = false;
+                    // Fall through to value-parse below.
+                }
+            }
+
+            // Parse one value. Containers push a new frame and continue;
+            // scalars finish here. The very first iteration arrives here
+            // with an empty stack and parses the root value.
+            switch (self.src[self.pos]) {
+                '"' => try self.writeString(),
+                '{' => {
+                    if (self.depth >= PARSE_DEPTH_LIMIT) return self.raiseDepthLimit();
+                    self.depth += 1;
+                    self.pos += 1;
+                    const obj_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                        .tag = .object_start,
+                        .payload = .{ .skip = 0 },
+                    });
+                    try stack.append(self.it.alloc, .{
+                        .start_idx = obj_start,
+                        .is_object = true,
+                        .first = true,
+                    });
+                    continue :outer;
+                },
+                '[' => {
+                    if (self.depth >= PARSE_DEPTH_LIMIT) return self.raiseDepthLimit();
+                    self.depth += 1;
+                    self.pos += 1;
+                    const arr_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
+                        .tag = .array_start,
+                        .payload = .{ .skip = 0 },
+                    });
+                    try stack.append(self.it.alloc, .{
+                        .start_idx = arr_start,
+                        .is_object = false,
+                        .first = true,
+                    });
+                    continue :outer;
+                },
+                't' => try self.writeLiteral("true", .true_val),
+                'f' => try self.writeLiteral("false", .false_val),
+                // 'n' may begin "null" or case-insensitive "nan" / "NaN" etc.
+                'n' => try self.writeNullOrNan(),
+                // 'N' begins case-insensitive "NaN".
+                'N' => try self.writeNanLiteral(false),
+                '-', '0'...'9' => try self.writeNumber(),
+                else => return error.TypeError,
+            }
+
+            // Scalar consumed. If we're at the root, we're done.
+            if (stack.items.len == 0) return;
+            // Otherwise loop to parse the next sibling / close the container.
         }
     }
 
@@ -11047,88 +11455,6 @@ const JsonParser = struct {
         self.pos += 1; // skip closing quote
         return try buf.toOwnedSlice(self.it.alloc);
     }
-
-    fn writeArray(self: *JsonParser) ZqError!void {
-        self.pos += 1; // skip '['
-        self.skipWhitespace();
-
-        const arr_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
-            .tag = .array_start,
-            .payload = .{ .skip = 0 },
-        });
-
-        if (self.pos < self.src.len and self.src[self.pos] == ']') {
-            self.pos += 1;
-        } else {
-            while (true) {
-                try self.writeValue();
-                self.skipWhitespace();
-                if (self.pos >= self.src.len) return error.TypeError;
-                if (self.src[self.pos] == ']') {
-                    self.pos += 1;
-                    break;
-                }
-                if (self.src[self.pos] != ',') return error.TypeError;
-                self.pos += 1;
-            }
-        }
-
-        const arr_end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
-            .tag = .array_end,
-            .payload = .{ .none = {} },
-        });
-        self.it.runtime_tape.entries.items[arr_start].payload.skip = arr_end_idx + 1;
-    }
-
-    fn writeObject(self: *JsonParser) ZqError!void {
-        self.pos += 1; // skip '{'
-        self.skipWhitespace();
-
-        const obj_start = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
-            .tag = .object_start,
-            .payload = .{ .skip = 0 },
-        });
-
-        if (self.pos < self.src.len and self.src[self.pos] == '}') {
-            self.pos += 1;
-        } else {
-            while (true) {
-                self.skipWhitespace();
-                // Parse key (must be a string)
-                if (self.pos >= self.src.len) return error.TypeError;
-                if (self.src[self.pos] != '"') return self.stringLiteralError(self.pos);
-                const key_bytes = try self.parseStringBytes();
-                const key_ref = try self.it.runtime_tape.internString(self.it.alloc, key_bytes);
-                self.it.alloc.free(key_bytes);
-                _ = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
-                    .tag = .key,
-                    .payload = .{ .string = key_ref },
-                });
-
-                self.skipWhitespace();
-                if (self.pos >= self.src.len or self.src[self.pos] != ':') return error.TypeError;
-                self.pos += 1;
-
-                // Parse value directly into tape
-                try self.writeValue();
-
-                self.skipWhitespace();
-                if (self.pos >= self.src.len) return error.TypeError;
-                if (self.src[self.pos] == '}') {
-                    self.pos += 1;
-                    break;
-                }
-                if (self.src[self.pos] != ',') return error.TypeError;
-                self.pos += 1;
-            }
-        }
-
-        const obj_end_idx = try self.it.runtime_tape.appendEntry(self.it.alloc, .{
-            .tag = .object_end,
-            .payload = .{ .none = {} },
-        });
-        self.it.runtime_tape.entries.items[obj_start].payload.skip = obj_end_idx + 1;
-    }
 };
 
 /// Deep equality for StackValues (used by array subtraction).
@@ -11355,24 +11681,50 @@ const ValueKeyPair = struct {
 };
 
 /// Flatten nested arrays up to `depth` levels, appending non-array elements to `out`.
+/// Flatten an array up to `depth` levels into `out`. Iterative explicit-
+/// stack walk; each frame remembers how many further levels of arrays
+/// should still be unwrapped (`remaining`). Same stack-safety rationale
+/// as `flattenRecursive`.
 fn flattenNLevels(span: Value.TapeSpan, out: *std.ArrayList(Value), alloc: std.mem.Allocator, depth: u32) error{OutOfMemory}!void {
-    var pos = span.start + 1;
-    const end = span.end - 1;
-    while (pos < end) {
-        const elem = tapeEntryToValue(span.tape, pos);
+    const Frame = struct {
+        tape: *const Tape,
+        pos: u32,
+        end: u32,
+        remaining: u32,
+    };
+    var stack = std.ArrayList(Frame){};
+    defer stack.deinit(alloc);
+    try stack.append(alloc, .{
+        .tape = span.tape,
+        .pos = span.start + 1,
+        .end = span.end - 1,
+        .remaining = depth,
+    });
+
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.pos >= top.end) {
+            _ = stack.pop();
+            continue;
+        }
+        const elem = tapeEntryToValue(top.tape, top.pos);
+        const remaining = top.remaining;
+        top.pos = skipEntry(top.tape.*, top.pos);
         switch (elem) {
             .array => |inner_span| {
-                if (depth > 0) {
-                    try flattenNLevels(inner_span, out, alloc, depth - 1);
+                if (remaining > 0) {
+                    try stack.append(alloc, .{
+                        .tape = inner_span.tape,
+                        .pos = inner_span.start + 1,
+                        .end = inner_span.end - 1,
+                        .remaining = remaining - 1,
+                    });
                 } else {
                     try out.append(alloc, elem);
                 }
             },
-            else => {
-                try out.append(alloc, elem);
-            },
+            else => try out.append(alloc, elem),
         }
-        pos = skipEntry(span.tape.*, pos);
     }
 }
 
@@ -11481,20 +11833,43 @@ fn hexDigitVal(c: u8) ?u8 {
     return null;
 }
 
+/// Flatten an array fully (no depth bound) into `out`. Uses an explicit
+/// stack of cursor frames so deeply nested input cannot overflow the
+/// native thread stack — required because workers run with
+/// `THREAD_STACK_SIZE = 2 MiB` while jq accepts arrays nested up to
+/// `PARSE_DEPTH_LIMIT = 10000` levels.
 fn flattenRecursive(span: Value.TapeSpan, out: *std.ArrayList(Value), alloc: std.mem.Allocator) error{OutOfMemory}!void {
-    var pos = span.start + 1;
-    const end = span.end - 1;
-    while (pos < end) {
-        const elem = tapeEntryToValue(span.tape, pos);
+    const Frame = struct {
+        tape: *const Tape,
+        pos: u32,
+        end: u32,
+    };
+    var stack = std.ArrayList(Frame){};
+    defer stack.deinit(alloc);
+    try stack.append(alloc, .{
+        .tape = span.tape,
+        .pos = span.start + 1,
+        .end = span.end - 1,
+    });
+
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.pos >= top.end) {
+            _ = stack.pop();
+            continue;
+        }
+        const elem = tapeEntryToValue(top.tape, top.pos);
+        top.pos = skipEntry(top.tape.*, top.pos);
         switch (elem) {
             .array => |inner_span| {
-                try flattenRecursive(inner_span, out, alloc);
+                try stack.append(alloc, .{
+                    .tape = inner_span.tape,
+                    .pos = inner_span.start + 1,
+                    .end = inner_span.end - 1,
+                });
             },
-            else => {
-                try out.append(alloc, elem);
-            },
+            else => try out.append(alloc, elem),
         }
-        pos = skipEntry(span.tape.*, pos);
     }
 }
 
@@ -11527,7 +11902,118 @@ fn appendJsonString(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []cons
     try buf.append(alloc, '"');
 }
 
+/// Iterative compact serializer. Uses an explicit container-frame stack so
+/// deeply nested structures cannot overflow the native thread stack
+/// (worker threads run with `THREAD_STACK_SIZE = 2 MiB`, while jq accepts
+/// up to `SERIALIZE_DEPTH_LIMIT = 10001` levels of nesting). Once the
+/// effective container depth equals or exceeds `SERIALIZE_DEPTH_LIMIT`,
+/// emits the sentinel `<skipped: too deep>` in place of the offending
+/// container — matching jq's `jv_dump_recurse` truncation semantics —
+/// and continues without descending into it.
 fn serializeValueCompact(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value) error{OutOfMemory}!void {
+    // Fast path for scalars: avoid any heap allocation.
+    switch (val) {
+        .array, .object => {},
+        else => return writeScalar(buf, alloc, val),
+    }
+
+    const Frame = struct {
+        tape: *const Tape,
+        pos: u32,
+        end: u32,
+        is_object: bool,
+        first: bool,
+    };
+
+    var stack = std.ArrayList(Frame){};
+    defer stack.deinit(alloc);
+
+    // Push the root container.
+    switch (val) {
+        .array => |span| {
+            try buf.append(alloc, '[');
+            try stack.append(alloc, .{
+                .tape = span.tape,
+                .pos = span.start + 1,
+                .end = span.end - 1,
+                .is_object = false,
+                .first = true,
+            });
+        },
+        .object => |span| {
+            try buf.append(alloc, '{');
+            try stack.append(alloc, .{
+                .tape = span.tape,
+                .pos = span.start + 1,
+                .end = span.end - 1,
+                .is_object = true,
+                .first = true,
+            });
+        },
+        else => unreachable,
+    }
+
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.pos >= top.end) {
+            try buf.append(alloc, if (top.is_object) '}' else ']');
+            _ = stack.pop();
+            continue;
+        }
+        if (!top.first) try buf.append(alloc, ',');
+        top.first = false;
+
+        var child_pos = top.pos;
+        if (top.is_object) {
+            const key_str = top.tape.getString(top.tape.entries[child_pos].payload.string);
+            try buf.append(alloc, '"');
+            try buf.appendSlice(alloc, key_str);
+            try buf.appendSlice(alloc, "\":");
+            child_pos += 1; // step over key
+        }
+        const child_val = tapeEntryToValue(top.tape, child_pos);
+        // Advance the parent's pos past this child before any potential push,
+        // so when we return after the nested container closes we resume at
+        // the correct sibling.
+        top.pos = skipEntry(top.tape.*, child_pos);
+
+        switch (child_val) {
+            .array => |span| {
+                if (stack.items.len >= SERIALIZE_DEPTH_LIMIT) {
+                    try buf.appendSlice(alloc, SERIALIZE_DEPTH_SENTINEL);
+                } else {
+                    try buf.append(alloc, '[');
+                    try stack.append(alloc, .{
+                        .tape = span.tape,
+                        .pos = span.start + 1,
+                        .end = span.end - 1,
+                        .is_object = false,
+                        .first = true,
+                    });
+                }
+            },
+            .object => |span| {
+                if (stack.items.len >= SERIALIZE_DEPTH_LIMIT) {
+                    try buf.appendSlice(alloc, SERIALIZE_DEPTH_SENTINEL);
+                } else {
+                    try buf.append(alloc, '{');
+                    try stack.append(alloc, .{
+                        .tape = span.tape,
+                        .pos = span.start + 1,
+                        .end = span.end - 1,
+                        .is_object = true,
+                        .first = true,
+                    });
+                }
+            },
+            else => try writeScalar(buf, alloc, child_val),
+        }
+    }
+}
+
+/// Append a non-container value's compact JSON form. Containers are
+/// rejected by callers before reaching this helper.
+fn writeScalar(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value) error{OutOfMemory}!void {
     switch (val) {
         .null_val => try buf.appendSlice(alloc, "null"),
         .bool_val => |b| try buf.appendSlice(alloc, if (b) "true" else "false"),
@@ -11541,39 +12027,8 @@ fn serializeValueCompact(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val:
             try buf.appendSlice(alloc, formatted.slice());
         },
         .big_number => |bn| try buf.appendSlice(alloc, bn),
-        .string => |s| {
-            try appendJsonString(buf, alloc, s);
-        },
-        .array => |span| {
-            try buf.append(alloc, '[');
-            var pos = span.start + 1;
-            const end = span.end - 1;
-            var first = true;
-            while (pos < end) {
-                if (!first) try buf.append(alloc, ',');
-                first = false;
-                try serializeValueCompact(buf, alloc, tapeEntryToValue(span.tape, pos));
-                pos = skipEntry(span.tape.*, pos);
-            }
-            try buf.append(alloc, ']');
-        },
-        .object => |span| {
-            try buf.append(alloc, '{');
-            var pos = span.start + 1;
-            const end = span.end - 1;
-            var first = true;
-            while (pos < end) {
-                if (!first) try buf.append(alloc, ',');
-                first = false;
-                const key_str = span.tape.getString(span.tape.entries[pos].payload.string);
-                try buf.append(alloc, '"');
-                try buf.appendSlice(alloc, key_str);
-                try buf.appendSlice(alloc, "\":");
-                try serializeValueCompact(buf, alloc, tapeEntryToValue(span.tape, pos + 1));
-                pos = skipEntry(span.tape.*, pos + 1);
-            }
-            try buf.append(alloc, '}');
-        },
+        .string => |s| try appendJsonString(buf, alloc, s),
+        .array, .object => unreachable,
     }
 }
 
@@ -11677,6 +12132,81 @@ fn valueToStackValue(v: Value) ZqError!StackValue {
 }
 
 // ── Tape helpers ──────────────────────────────────────────────────────────────
+
+/// Half-open live runtime-tape interval used by `compactRuntimeTape` to
+/// describe reachable regions before merging and packing.
+const LiveInterval = struct {
+    start: u32,
+    end: u32,
+    fn lessThan(_: void, a: LiveInterval, b: LiveInterval) bool {
+        if (a.start != b.start) return a.start < b.start;
+        return a.end < b.end;
+    }
+};
+
+/// Append `[span.start, span.end)` to `out` if `sv` is a container span on
+/// `target`. Strings and scalars contribute no interval.
+fn collectFromValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(LiveInterval),
+    sv: Value,
+    target: *const Tape,
+) error{OutOfMemory}!void {
+    switch (sv) {
+        .object, .array => |s| {
+            if (s.tape == target and s.end > s.start) {
+                try out.append(alloc, .{ .start = s.start, .end = s.end });
+            }
+        },
+        else => {},
+    }
+}
+
+fn collectFromStackValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(LiveInterval),
+    v: StackValue,
+    target: *const Tape,
+) error{OutOfMemory}!void {
+    switch (v) {
+        .tape_value => |tv| try collectFromValue(alloc, out, tv, target),
+        else => {},
+    }
+}
+
+/// Translate a runtime-tape container span's `start`/`end` through the
+/// `compactRuntimeTape` mapping. Non-spans, strings, and spans on other
+/// tapes are left untouched.
+fn translateValueSpan(v: *Value, target: *const Tape, translation: []const u32) void {
+    switch (v.*) {
+        .object => |old| {
+            if (old.tape == target) {
+                v.* = .{ .object = .{
+                    .tape = target,
+                    .start = translation[old.start],
+                    .end = translation[old.end],
+                } };
+            }
+        },
+        .array => |old| {
+            if (old.tape == target) {
+                v.* = .{ .array = .{
+                    .tape = target,
+                    .start = translation[old.start],
+                    .end = translation[old.end],
+                } };
+            }
+        },
+        else => {},
+    }
+}
+
+fn translateStackValueSpan(v: *StackValue, target: *const Tape, translation: []const u32) void {
+    switch (v.*) {
+        .tape_value => |*tv| translateValueSpan(tv, target, translation),
+        else => {},
+    }
+}
 
 fn tapeEntryToValue(tape: *const Tape, pos: u32) Value {
     const e = tape.entries[pos];
