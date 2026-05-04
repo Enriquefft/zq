@@ -2,6 +2,8 @@ const std = @import("std");
 const ZqError = @import("error").ZqError;
 const types = @import("types");
 const regex_mod = @import("regex");
+const ast = @import("ast");
+const resolver_mod = @import("module_resolver");
 const Tape = types.Tape;
 const Value = types.Value;
 const Instruction = types.Instruction;
@@ -563,6 +565,14 @@ pub const ResultIterator = struct {
     /// string a second time. Only valid for the duration of a single builtin
     /// invocation. A single borrowed-pointer pair — no ownership.
     last_dynamic_entry: ?regex_mod.cache.DynamicEntry,
+    /// Module search path threaded from compile-time `Opts`. Used by the
+    /// `modulemeta` builtin to resolve its input-string argument against
+    /// the same search machinery the compiler uses for `import`/`include`.
+    /// Borrowed; lifetime tied to the parent `CompiledQuery.opts`.
+    module_search_path: []const []const u8,
+    /// Importer file directory (jq's analog of `-L .`). Borrowed; same
+    /// lifetime contract as `module_search_path`.
+    current_file_dir: ?[]const u8,
 
     pub fn init(
         instructions: []const Instruction,
@@ -573,6 +583,8 @@ pub const ResultIterator = struct {
         external_bindings: []const ExternalVarBinding,
         source_map: []const u32,
         regex_pool: ?*const regex_mod.RegexPool,
+        module_search_path: []const []const u8,
+        current_file_dir: ?[]const u8,
         allocator: std.mem.Allocator,
     ) error{OutOfMemory}!ResultIterator {
         var value_stack = std.ArrayList(StackValue){};
@@ -682,6 +694,8 @@ pub const ResultIterator = struct {
             .regex_clones = regex_clones,
             .dynamic_regex_cache = regex_mod.cache.LruCache(64).init(allocator),
             .last_dynamic_entry = null,
+            .module_search_path = module_search_path,
+            .current_file_dir = current_file_dir,
         };
     }
 
@@ -4035,6 +4049,7 @@ pub const ResultIterator = struct {
                 return null;
             },
             .env_ => return try it.builtinEnv(),
+            .modulemeta_ => return try it.builtinModulemeta(),
             .halt_ => {
                 it.ip = @intCast(it.instructions.len);
                 return null;
@@ -8692,6 +8707,293 @@ pub const ResultIterator = struct {
             .start = obj_start,
             .end = obj_end_idx + 1,
         } } };
+    }
+
+    /// `modulemeta` builtin — Phase 2b. Input value is a string giving a
+    /// module relpath (jq's convention); resolves it via the same search
+    /// machinery the compiler uses, parses the target module, and returns
+    /// `{<module_meta_fields...>, deps:[...], defs:[...]}`.
+    ///
+    /// `deps` mirrors the source-order import/include directives; entries
+    /// carry `as` (alias, omitted for `include`), `is_data`, `relpath`,
+    /// and `search` (only when the directive declared `{search:"..."}`).
+    /// `defs` lists the module's own top-level `def name(...): ...` chain
+    /// as `"name/arity"` strings — transitive imports are not included.
+    fn builtinModulemeta(it: *ResultIterator) ZqError!?StackValue {
+        const relpath = switch (it.current) {
+            .string => |s| s,
+            else => return error.TypeError,
+        };
+
+        // Per-call arena owns Resolver bookkeeping; module ParseResults
+        // attach to it.alloc and are dropped via resolver.deinit() before
+        // the arena tears down. All strings reaching runtime_tape are
+        // re-interned so parse-result lifetime ends here.
+        var arena = std.heap.ArenaAllocator.init(it.alloc);
+        defer arena.deinit();
+        var r = resolver_mod.Resolver.init(
+            &arena,
+            it.alloc,
+            it.module_search_path,
+            it.current_file_dir,
+        );
+        defer r.deinit();
+
+        const resolved = r.loadJq(relpath) catch return error.TypeError;
+        const root = resolved.parse_result.root;
+
+        // Extract module_meta + directives + def chain from the parsed
+        // root. A `program` node carries module_meta and directives;
+        // a bare-body root has neither (whatever-merge yields nothing).
+        var module_meta: ?*const ast.Node = null;
+        var directives: []const ast.Node.Directive = &.{};
+        var body: *const ast.Node = root;
+        if (root.kind == .program) {
+            const prog = root.kind.program;
+            module_meta = prog.module_meta;
+            directives = prog.directives;
+            body = prog.body;
+        }
+
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        // ── Spread module_meta fields verbatim ──────────────────────
+        if (module_meta) |meta_node| {
+            if (meta_node.kind == .object_construct) {
+                for (meta_node.kind.object_construct.fields) |f| {
+                    const key_str: []const u8 = switch (f.key) {
+                        .ident => |s| s,
+                        .string => |s| s,
+                        // Dollar / expr keys aren't const-object literals;
+                        // parser rejects them upstream so we'd never reach
+                        // here. Treat as a malformed module — error out.
+                        else => return error.TypeError,
+                    };
+                    try it.appendObjectKey(key_str);
+                    try it.appendConstLiteralNode(f.value);
+                }
+            }
+        }
+
+        // ── deps array ──────────────────────────────────────────────
+        try it.appendObjectKey("deps");
+        const deps_arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        for (directives) |dir| {
+            try it.appendDirectiveEntry(dir);
+        }
+        const deps_arr_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[deps_arr_start].payload.skip = deps_arr_end + 1;
+
+        // ── defs array (top-level `def name(...): ...` chain only) ──
+        try it.appendObjectKey("defs");
+        const defs_arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
+        var cur: *const ast.Node = body;
+        while (cur.kind == .func_def) {
+            const fd = cur.kind.func_def;
+            // Format "<name>/<arity>" — arity is the param count.
+            var buf: [256]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "{s}/{d}", .{ fd.name, fd.params.len }) catch return error.OutOfMemory;
+            const sref = try it.runtime_tape.internString(it.alloc, formatted);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .string,
+                .payload = .{ .string = sref },
+            });
+            cur = fd.rest;
+        }
+        const defs_arr_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[defs_arr_start].payload.skip = defs_arr_end + 1;
+
+        const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+        return .{ .tape_value = .{ .object = .{
+            .tape = &it.runtime_tape.view,
+            .start = obj_start,
+            .end = obj_end + 1,
+        } } };
+    }
+
+    /// Append a `key` tape entry interning the key string. Used by
+    /// `builtinModulemeta` to build the result object field-by-field.
+    fn appendObjectKey(it: *ResultIterator, key: []const u8) ZqError!void {
+        const sref = try it.runtime_tape.internString(it.alloc, key);
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .key,
+            .payload = .{ .string = sref },
+        });
+    }
+
+    /// Append one directive's `{as?, is_data, relpath, search?}` object.
+    /// The key order matches jq's `modulemeta` output: when `search` is
+    /// present it precedes `as`; `as` is omitted entirely for `include`.
+    fn appendDirectiveEntry(it: *ResultIterator, dir: ast.Node.Directive) ZqError!void {
+        const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_start,
+            .payload = .{ .skip = 0 },
+        });
+
+        // Extract optional `search` from the directive's const-object meta.
+        var search_str: ?[]const u8 = null;
+        if (dir.meta) |m| {
+            if (m.kind == .object_construct) {
+                for (m.kind.object_construct.fields) |f| {
+                    const key_str: []const u8 = switch (f.key) {
+                        .ident => |s| s,
+                        .string => |s| s,
+                        else => continue,
+                    };
+                    if (std.mem.eql(u8, key_str, "search")) {
+                        if (f.value.kind == .literal) {
+                            switch (f.value.kind.literal) {
+                                .string => |s| search_str = s,
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (search_str) |s| {
+            try it.appendObjectKey("search");
+            const sref = try it.runtime_tape.internString(it.alloc, s);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .string,
+                .payload = .{ .string = sref },
+            });
+        }
+
+        if (dir.alias) |alias| {
+            try it.appendObjectKey("as");
+            const sref = try it.runtime_tape.internString(it.alloc, alias);
+            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                .tag = .string,
+                .payload = .{ .string = sref },
+            });
+        }
+
+        try it.appendObjectKey("is_data");
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = if (dir.is_data) .true_val else .false_val,
+            .payload = .{ .none = {} },
+        });
+
+        try it.appendObjectKey("relpath");
+        const rref = try it.runtime_tape.internString(it.alloc, dir.relpath);
+        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .string,
+            .payload = .{ .string = rref },
+        });
+
+        const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .object_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+    }
+
+    /// Recursively materialize a const-literal AST subtree onto the
+    /// runtime tape. Const literals are: scalar literal, array of const
+    /// literals, or object with const-literal values (mirrors the parser's
+    /// `isConstLiteralExpr` shape — `modulemeta` is the only consumer).
+    fn appendConstLiteralNode(it: *ResultIterator, node: *const ast.Node) ZqError!void {
+        switch (node.kind) {
+            .literal => |lit| switch (lit) {
+                .null_val => _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .null_val,
+                    .payload = .{ .none = {} },
+                }),
+                .bool_val => |b| _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = if (b) .true_val else .false_val,
+                    .payload = .{ .none = {} },
+                }),
+                .int => |n| _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .int,
+                    .payload = .{ .int = n },
+                }),
+                .float => |f| _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .float,
+                    .payload = .{ .float = f },
+                }),
+                .big_number => |s| {
+                    const sref = try it.runtime_tape.internString(it.alloc, s);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .big_number,
+                        .payload = .{ .string = sref },
+                    });
+                },
+                .string => |s| {
+                    const sref = try it.runtime_tape.internString(it.alloc, s);
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .string,
+                        .payload = .{ .string = sref },
+                    });
+                },
+            },
+            .array_construct => |ac| {
+                const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_start,
+                    .payload = .{ .skip = 0 },
+                });
+                if (ac.expr) |elem| try it.appendConstLiteralCommaSeq(elem);
+                const arr_end = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .array_end,
+                    .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[arr_start].payload.skip = arr_end + 1;
+            },
+            .object_construct => |oc| {
+                const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_start,
+                    .payload = .{ .skip = 0 },
+                });
+                for (oc.fields) |f| {
+                    const key_str: []const u8 = switch (f.key) {
+                        .ident => |s| s,
+                        .string => |s| s,
+                        else => return error.TypeError,
+                    };
+                    try it.appendObjectKey(key_str);
+                    try it.appendConstLiteralNode(f.value);
+                }
+                const obj_end = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .object_end,
+                    .payload = .{ .none = {} },
+                });
+                it.runtime_tape.entries.items[obj_start].payload.skip = obj_end + 1;
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    /// Walk a comma-separated const-literal sequence (the body of an
+    /// array literal) and emit each element. Mirrors the parser's
+    /// `isConstLiteralCommaSeq` shape.
+    fn appendConstLiteralCommaSeq(it: *ResultIterator, node: *const ast.Node) ZqError!void {
+        switch (node.kind) {
+            .comma => |c| {
+                try it.appendConstLiteralCommaSeq(c.left);
+                try it.appendConstLiteralCommaSeq(c.right);
+            },
+            else => try it.appendConstLiteralNode(node),
+        }
     }
 
     fn builtinMapValues(it: *ResultIterator) ZqError!?StackValue {

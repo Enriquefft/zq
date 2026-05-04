@@ -148,6 +148,8 @@ pub const CompiledQuery = struct {
             external_bindings,
             q.source_map,
             &q.regex_pool,
+            q.opts.module_search_path,
+            q.opts.current_file_dir,
             allocator,
         );
     }

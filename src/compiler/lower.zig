@@ -23,7 +23,7 @@ const err_mod = @import("error");
 const ir = @import("ir.zig");
 const regex_mod = @import("regex");
 const types_mod = @import("types");
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("module_resolver");
 const json_to_ast = @import("json_to_ast.zig");
 
 const Node = ast.Node;
@@ -2302,7 +2302,10 @@ fn isZeroArgBuiltin(name: []const u8) bool {
         std.mem.eql(u8, name, "all") or
         // `debug/0` passes input through unchanged after writing
         // `["DEBUG:",.]` JSON to stderr — VM dispatch at root.zig:3790.
-        std.mem.eql(u8, name, "debug");
+        std.mem.eql(u8, name, "debug") or
+        // `modulemeta/0` (Phase 2b) — input string is a module relpath;
+        // VM resolves it via the search path and returns metadata.
+        std.mem.eql(u8, name, "modulemeta");
 }
 
 /// Names accepted as 1-arg value-arg builtins. Mirrors the

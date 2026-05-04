@@ -3185,6 +3185,7 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         if (std.mem.eql(u8, name, "fromdate")) return .fromdate_;
         if (std.mem.eql(u8, name, "todateiso8601")) return .todateiso8601_;
         if (std.mem.eql(u8, name, "fromdateiso8601")) return .fromdateiso8601_;
+        if (std.mem.eql(u8, name, "modulemeta")) return .modulemeta_;
         // 0-arity `any`/`all` — VM native builtins (root.zig:4111-4140).
         // The 1/2-arity forms are desugared in lowering and never reach here.
         if (std.mem.eql(u8, name, "any")) return .any;
