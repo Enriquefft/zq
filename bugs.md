@@ -142,6 +142,10 @@ L48, L122, L661, L674, L1045.
 
 `limit_start` exits via `ip = instructions.len`, leaving `fork_alt` frames on the fork stack. G4's `lowerAnyAllDesugar` and G5's `lowerPickDesugar` both work around this by using array-wrap (`[first(...)]`) instead of jq's literal `first(...) // fallback` desugar form. Worth fixing the underlying VM behavior to allow direct `first(...) // fallback` use.
 
+### `reduce` with streamed `limit/repeat` source emits vs folds (LATENT)
+
+Discovered 2026-05-05 during repeat(f) coverage review (wave-cleanup-hygiene, phase 3). zq's `reduce` treats a streamed `limit(N; repeat(...))` source as a scalar list emit-vs-fold rather than folding over the stream. Symptom: `reduce limit(1; repeat(.+1)) as $x (0; . + $x)` with input `5` emits `5` and `6` (each value alongside init) instead of folding to `11` as jq does. Root cause: reduce's generator arm loads the source stream but does not integrate with the fold-loop; each source emission triggers a separate update-arm evaluation instead of accumulating into the fold state. Fix would refactor reduce's streaming-source handling in `emitReduce` to thread through the accumulator across all source emissions (similar to `limit/skip` integration with `first`).
+
 ### `reduce` pattern-var-clobbering across recursive calls (LATENT)
 
 Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with `as $key` pattern variables clobbers `$key`/`$in` slots across recursive `call_function` invocations — the inner recursive call overwrites the outer call's pattern-var slot. Walk/1's desugar (commit a626191) avoided this by using `to_entries | map(.value |= walk(f)) | from_entries` instead of jq's canonical `reduce keys[] as $key ({}; ...)` form. Reduce works correctly for non-recursive bodies; the bug surfaces only when a recursive self-call lives inside `reduce`'s update body. Fix would address pattern-var slot allocation in `emitReduce` to scope per-frame rather than per-fn_id.
