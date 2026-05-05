@@ -682,6 +682,27 @@ pub fn build(b: *std.Build) void {
     const regex_tests = b.addTest(.{ .root_module = regex_test_mod });
     if (shim_build_step) |step| regex_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(regex_tests).step);
+
+    // ── CLI flag own-tests ───────────────────────────────────────────────
+    // Subprocess harness for argv-parser / I/O flags (--slurpfile,
+    // --rawfile, --unbuffered) whose semantics only manifest through the
+    // executable. Path-injects the freshly-built `zq` binary via
+    // `addOptionPath`, and pins the test step to the install graph so
+    // the binary is always present when the test runs.
+    const cli_test_options = b.addOptions();
+    cli_test_options.addOptionPath("zq_path", exe.getEmittedBin());
+
+    const cli_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cli_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_test_mod.addOptions("build_options", cli_test_options);
+
+    const cli_tests = b.addTest(.{ .root_module = cli_test_mod });
+    cli_tests.step.dependOn(&exe.step);
+    if (shim_build_step) |step| cli_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }
 
 /// Map a zig target to the rust target triple the Cargo crate is built against.

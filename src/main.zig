@@ -16,10 +16,19 @@ const EXIT_COMPILE = 3; // filter syntax/compilation error
 const EXIT_RUNTIME = 4; // TypeError, IndexOutOfBounds, UserError during query execution
 const EXIT_SYSTEM = 5; // OOM, I/O error, write failure
 
+/// Source classification for an external variable binding.
+/// Drives binding construction in main.zig: `string`/`json` carry the literal
+/// VALUE from argv; `slurpfile`/`rawfile` carry a filesystem path that must
+/// be loaded before binding. Replaces the old `is_json: bool` discriminant
+/// so adding new flag-driven sources is a one-arm extension.
+const ExternalVarKind = enum { string, json, slurpfile, rawfile };
+
 const ExternalVar = struct {
     name: []const u8,
+    /// For `.string`/`.json`: the raw VALUE token from argv.
+    /// For `.slurpfile`/`.rawfile`: the FILE path.
     value: []const u8,
-    is_json: bool,
+    kind: ExternalVarKind,
 };
 
 const Config = struct {
@@ -44,6 +53,11 @@ const Config = struct {
     describe_depth: u32 = 12,
     validate: bool = false,
     lsp_mode: bool = false,
+    /// --unbuffered: flush stdout after every emitted value. Matches jq's
+    /// flag of the same name. Pool-based execution still batches across
+    /// chunks, but each `BytesResult` (stdin/file pool) and each per-value
+    /// emit (null-input / slurp) is followed by an explicit flush.
+    unbuffered: bool = false,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -228,7 +242,7 @@ pub fn main() !u8 {
     var args_obj_start: u32 = 0;
 
     {
-        // Temporary parser for --argjson values.
+        // Temporary parser for --argjson and --slurpfile values.
         var argjson_parser = parser_mod.Parser.init(allocator) catch {
             printErr("zq: out of memory\n");
             return EXIT_SYSTEM;
@@ -236,70 +250,103 @@ pub fn main() !u8 {
         defer argjson_parser.deinit();
 
         for (config.external_vars, 0..) |ev, i| {
-            if (ev.is_json) {
-                // --argjson: parse the JSON value
-                const parse_result = argjson_parser.feed(ev.value, true) catch {
-                    printErr("zq: --argjson: invalid JSON for $");
-                    printErr(ev.name);
-                    printErr("\n");
-                    return EXIT_USAGE;
-                };
-                const tape = switch (parse_result) {
-                    .done => |d| blk: {
-                        if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
-                            printErr("zq: --argjson: trailing garbage for $");
-                            printErr(ev.name);
-                            printErr("\n");
-                            return EXIT_USAGE;
-                        }
-                        break :blk d.tape;
-                    },
-                    .need_more => {
-                        printErr("zq: --argjson: incomplete JSON for $");
+            switch (ev.kind) {
+                .json => {
+                    // --argjson: parse the JSON value
+                    const parse_result = argjson_parser.feed(ev.value, true) catch {
+                        printErr("zq: --argjson: invalid JSON for $");
                         printErr(ev.name);
                         printErr("\n");
                         return EXIT_USAGE;
-                    },
-                };
-                const entry = tape.entries[0];
-                switch (entry.tag) {
-                    .null_val => {
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
-                    },
-                    .true_val => {
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .bool_val = true } };
-                    },
-                    .false_val => {
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .bool_val = false } };
-                    },
-                    .int => {
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .int = entry.payload.int } };
-                    },
-                    .float => {
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .float = entry.payload.float } };
-                    },
-                    else => {
-                        // String, array, or object: copy into RuntimeTape.
-                        const rt_start: u32 = @intCast(argjson_rt.entries.items.len);
-                        argjson_rt.copyFrom(tape, allocator) catch {
+                    };
+                    const tape = switch (parse_result) {
+                        .done => |d| blk: {
+                            if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
+                                printErr("zq: --argjson: trailing garbage for $");
+                                printErr(ev.name);
+                                printErr("\n");
+                                return EXIT_USAGE;
+                            }
+                            break :blk d.tape;
+                        },
+                        .need_more => {
+                            printErr("zq: --argjson: incomplete JSON for $");
+                            printErr(ev.name);
+                            printErr("\n");
+                            return EXIT_USAGE;
+                        },
+                    };
+                    const entry = tape.entries[0];
+                    switch (entry.tag) {
+                        .null_val => {
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
+                        },
+                        .true_val => {
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .bool_val = true } };
+                        },
+                        .false_val => {
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .bool_val = false } };
+                        },
+                        .int => {
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .int = entry.payload.int } };
+                        },
+                        .float => {
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .{ .float = entry.payload.float } };
+                        },
+                        else => {
+                            // String, array, or object: copy into RuntimeTape.
+                            const rt_start: u32 = @intCast(argjson_rt.entries.items.len);
+                            argjson_rt.copyFrom(tape, allocator) catch {
+                                printErr("zq: out of memory\n");
+                                return EXIT_SYSTEM;
+                            };
+                            // Placeholder value; will be resolved below.
+                            ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
+                            compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
+                                printErr("zq: out of memory\n");
+                                return EXIT_SYSTEM;
+                            };
+                        },
+                    }
+                    argjson_parser.reset();
+                },
+                .slurpfile => {
+                    // --slurpfile: read FILE; wrap top-level values into one array.
+                    const rt_start = loadSlurpfile(ev.value, &argjson_rt, &argjson_parser, ev.name, allocator) catch |e| switch (e) {
+                        error.OutOfMemory => {
                             printErr("zq: out of memory\n");
                             return EXIT_SYSTEM;
-                        };
-                        // Placeholder value; will be resolved below.
-                        ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
-                        compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
+                        },
+                        error.UsageError => return EXIT_USAGE,
+                    };
+                    ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
+                    compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                },
+                .rawfile => {
+                    // --rawfile: read FILE bytes verbatim into a JSON string.
+                    const rt_start = loadRawfile(ev.value, &argjson_rt, ev.name, allocator) catch |e| switch (e) {
+                        error.OutOfMemory => {
                             printErr("zq: out of memory\n");
                             return EXIT_SYSTEM;
-                        };
-                    },
-                }
-                argjson_parser.reset();
-            } else {
-                // --arg: string value
-                ext_bindings_buf[i] = .{
-                    .var_id = cq.external_var_ids[i],
-                    .value = .{ .tape_value = .{ .string = ev.value } },
-                };
+                        },
+                        error.UsageError => return EXIT_USAGE,
+                    };
+                    ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
+                    compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
+                        printErr("zq: out of memory\n");
+                        return EXIT_SYSTEM;
+                    };
+                },
+                .string => {
+                    // --arg: string value
+                    ext_bindings_buf[i] = .{
+                        .var_id = cq.external_var_ids[i],
+                        .value = .{ .tape_value = .{ .string = ev.value } },
+                    };
+                },
             }
         }
 
@@ -400,7 +447,11 @@ pub fn main() !u8 {
                 return EXIT_SYSTEM;
             };
 
-            // Populate named args from --arg/--argjson
+            // Populate named args from --arg / --argjson / --slurpfile / --rawfile.
+            // Mirrors per-binding semantics from the loop above; later-wins for
+            // duplicate names falls out of map-style key emission (jq drops the
+            // earlier key when serialised, but we mirror the source order — the
+            // VM resolves $NAME via var_id, which already implements last-wins).
             for (config.external_vars) |ev| {
                 // key
                 const k_ref = argjson_rt.internString(allocator, ev.name) catch {
@@ -411,42 +462,72 @@ pub fn main() !u8 {
                     printErr("zq: out of memory\n");
                     return EXIT_SYSTEM;
                 };
-                if (ev.is_json) {
-                    // Parse and copy into RT
-                    const parse_result = argjson_parser.feed(ev.value, true) catch {
-                        // Already validated during binding construction, but handle gracefully
-                        _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
-                        continue;
-                    };
-                    const tape = switch (parse_result) {
-                        .done => |d| blk: {
-                            if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
-                                _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
-                                argjson_parser.reset();
-                                continue;
-                            }
-                            break :blk d.tape;
-                        },
-                        .need_more => {
+                switch (ev.kind) {
+                    .json => {
+                        // Parse and copy into RT
+                        const parse_result = argjson_parser.feed(ev.value, true) catch {
+                            // Already validated during binding construction, but handle gracefully
                             _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
                             continue;
-                        },
-                    };
-                    argjson_rt.copyFrom(tape, allocator) catch {
-                        printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
-                    };
-                    argjson_parser.reset();
-                } else {
-                    // String value
-                    const v_ref = argjson_rt.internString(allocator, ev.value) catch {
-                        printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
-                    };
-                    _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = v_ref } }) catch {
-                        printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
-                    };
+                        };
+                        const tape = switch (parse_result) {
+                            .done => |d| blk: {
+                                if (std.mem.trim(u8, ev.value[d.consumed..], " \t\r\n").len != 0) {
+                                    _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                                    argjson_parser.reset();
+                                    continue;
+                                }
+                                break :blk d.tape;
+                            },
+                            .need_more => {
+                                _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                                continue;
+                            },
+                        };
+                        argjson_rt.copyFrom(tape, allocator) catch {
+                            printErr("zq: out of memory\n");
+                            return EXIT_SYSTEM;
+                        };
+                        argjson_parser.reset();
+                    },
+                    .slurpfile => {
+                        // Re-load — first load already succeeded, so file open
+                        // failure here is a TOCTOU race; degrade to null rather
+                        // than abort the query that's already partially set up.
+                        _ = loadSlurpfile(ev.value, &argjson_rt, &argjson_parser, ev.name, allocator) catch |e| switch (e) {
+                            error.OutOfMemory => {
+                                printErr("zq: out of memory\n");
+                                return EXIT_SYSTEM;
+                            },
+                            error.UsageError => {
+                                _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                                continue;
+                            },
+                        };
+                    },
+                    .rawfile => {
+                        _ = loadRawfile(ev.value, &argjson_rt, ev.name, allocator) catch |e| switch (e) {
+                            error.OutOfMemory => {
+                                printErr("zq: out of memory\n");
+                                return EXIT_SYSTEM;
+                            },
+                            error.UsageError => {
+                                _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
+                                continue;
+                            },
+                        };
+                    },
+                    .string => {
+                        // String value
+                        const v_ref = argjson_rt.internString(allocator, ev.value) catch {
+                            printErr("zq: out of memory\n");
+                            return EXIT_SYSTEM;
+                        };
+                        _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = v_ref } }) catch {
+                            printErr("zq: out of memory\n");
+                            return EXIT_SYSTEM;
+                        };
+                    },
                 }
             }
 
@@ -526,7 +607,7 @@ pub fn main() !u8 {
 
     if (config.null_input) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &diag) catch |e| {
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -574,6 +655,10 @@ pub fn main() !u8 {
                 printErr("zq: write error\n");
                 return EXIT_SYSTEM;
             };
+            if (config.unbuffered) writer.flush() catch {
+                printErr("zq: write error\n");
+                return EXIT_SYSTEM;
+            };
             last_was_false_or_null = result.last_was_false_or_null;
         }
     } else {
@@ -588,7 +673,7 @@ pub fn main() !u8 {
 
             var diag = QueryDiag{};
             defer diag.deinit(allocator);
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &diag) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
                 err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -622,6 +707,7 @@ fn processFile(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     raw_input: bool,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
@@ -648,6 +734,7 @@ fn processFile(
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
         try writer.writeSlice(result.data);
+        if (unbuffered) try writer.flush();
         last_was_false_or_null = result.last_was_false_or_null;
     }
 
@@ -726,7 +813,7 @@ fn processSlurpJson(
     const tape = rt.asTape();
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 /// Read all JSON values from a file/stdin using Source + Parser, copying each
@@ -865,7 +952,7 @@ fn processSlurpRaw(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 fn readAllBytes(
@@ -900,6 +987,7 @@ fn processNullInput(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
@@ -913,7 +1001,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, unbuffered, diag);
 }
 
 /// Process --validate mode: compile filter only, report success or error.
@@ -1171,6 +1259,7 @@ fn writeRecord(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     if (opt_it.*) |*it| {
@@ -1196,6 +1285,7 @@ fn writeRecord(
         if (format != .jsonl and format != .join) {
             try writer.write_value(.{ .string = "\n" }, .raw, null, .{});
         }
+        if (unbuffered) try writer.flush();
         last_was_false_or_null = switch (val) {
             .null_val => true,
             .bool_val => |b| !b,
@@ -1219,6 +1309,135 @@ fn hasNoColor() bool {
 
 fn openFile(path: []const u8) !std.fs.File {
     return std.fs.cwd().openFile(path, .{}) catch return error.IoError;
+}
+
+// ── --slurpfile / --rawfile loaders ──────────────────────────────────────────
+
+const ExtFileLoadError = error{ OutOfMemory, UsageError };
+
+/// Cap on bytes we will read from a single --slurpfile / --rawfile argument.
+/// Mirrors the filter-file cap (1 MiB scaled for data files) — generous for
+/// real-world configs, tight enough to fail fast on a `/dev/zero` mishap.
+const ext_file_max_bytes: usize = 256 * 1024 * 1024;
+
+fn printExtFileOpenError(flag: []const u8, name: []const u8, path: []const u8) void {
+    printErr("zq: ");
+    printErr(flag);
+    printErr(": could not open ");
+    printErr(path);
+    printErr(" for $");
+    printErr(name);
+    printErr("\n");
+}
+
+/// --slurpfile NAME FILE: parse FILE as one or more top-level JSON values
+/// (NDJSON-style stream allowed), wrap them in a single array, and append
+/// the array span to `rt`. Always wraps — a single value becomes a 1-elem
+/// array (jq spec verified against jq-1.8.1).
+///
+/// Returns the rt index of the array_start entry (the span’s rt_start).
+fn loadSlurpfile(
+    path: []const u8,
+    rt: *types.RuntimeTape,
+    parser: *parser_mod.Parser,
+    name: []const u8,
+    allocator: std.mem.Allocator,
+) ExtFileLoadError!u32 {
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        printExtFileOpenError("--slurpfile", name, path);
+        return error.UsageError;
+    };
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, ext_file_max_bytes) catch {
+        printErr("zq: --slurpfile: could not read ");
+        printErr(path);
+        printErr(" for $");
+        printErr(name);
+        printErr("\n");
+        return error.UsageError;
+    };
+    defer allocator.free(bytes);
+
+    const arr_start: u32 = @intCast(rt.entries.items.len);
+    _ = try rt.appendEntry(allocator, .{ .tag = .array_start, .payload = .{ .skip = 0 } });
+
+    // Stream-parse top-level values. Trim leading whitespace between values
+    // so NDJSON / pretty-printed concatenations both work.
+    parser.reset();
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        // Skip whitespace between values.
+        while (cursor < bytes.len) : (cursor += 1) {
+            const c = bytes[cursor];
+            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') break;
+        }
+        if (cursor >= bytes.len) break;
+
+        const result = parser.feed(bytes[cursor..], true) catch {
+            printErr("zq: --slurpfile: invalid JSON in ");
+            printErr(path);
+            printErr(" for $");
+            printErr(name);
+            printErr("\n");
+            return error.UsageError;
+        };
+        switch (result) {
+            .done => |d| {
+                const value_tape = d.tape;
+                // Copy each entry's span. The parsed tape always describes a
+                // single value, so copyFrom (entire tape) is safe.
+                try rt.copyFrom(value_tape, allocator);
+                cursor += d.consumed;
+                parser.reset();
+            },
+            .need_more => {
+                // EOF was already passed (is_eof=true). need_more here means
+                // the input ended mid-value.
+                printErr("zq: --slurpfile: incomplete JSON in ");
+                printErr(path);
+                printErr(" for $");
+                printErr(name);
+                printErr("\n");
+                return error.UsageError;
+            },
+        }
+    }
+
+    const arr_end_idx: u32 = @intCast(rt.entries.items.len);
+    _ = try rt.appendEntry(allocator, .{ .tag = .array_end, .payload = .{ .none = {} } });
+    rt.entries.items[arr_start].payload.skip = arr_end_idx + 1;
+    rt.refreshView();
+    return arr_start;
+}
+
+/// --rawfile NAME FILE: read FILE bytes verbatim (including trailing
+/// newline, if present) into a JSON string entry on `rt`. Returns the rt
+/// index of the string entry.
+fn loadRawfile(
+    path: []const u8,
+    rt: *types.RuntimeTape,
+    name: []const u8,
+    allocator: std.mem.Allocator,
+) ExtFileLoadError!u32 {
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        printExtFileOpenError("--rawfile", name, path);
+        return error.UsageError;
+    };
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, ext_file_max_bytes) catch {
+        printErr("zq: --rawfile: could not read ");
+        printErr(path);
+        printErr(" for $");
+        printErr(name);
+        printErr("\n");
+        return error.UsageError;
+    };
+    defer allocator.free(bytes);
+
+    const str_ref = try rt.internString(allocator, bytes);
+    const str_idx: u32 = @intCast(rt.entries.items.len);
+    _ = try rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = str_ref } });
+    return str_idx;
 }
 
 // ── Arg Parsing ──────────────────────────────────────────────────────────────
@@ -1350,7 +1569,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             i += 1;
             const val_duped = try allocator.dupe(u8, args[i]);
             try ext_var_strs.append(allocator, val_duped);
-            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .is_json = false });
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .kind = .string });
         } else if (std.mem.eql(u8, arg, "--argjson")) {
             if (i + 2 >= args.len) {
                 printErr("zq: --argjson requires name and value\n");
@@ -1362,7 +1581,31 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             i += 1;
             const val_duped = try allocator.dupe(u8, args[i]);
             try ext_var_strs.append(allocator, val_duped);
-            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .is_json = true });
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .kind = .json });
+        } else if (std.mem.eql(u8, arg, "--slurpfile")) {
+            if (i + 2 >= args.len) {
+                printErr("zq: --slurpfile requires name and file path\n");
+                return error.UsageError;
+            }
+            i += 1;
+            const name_duped = try allocator.dupe(u8, args[i]);
+            try ext_var_strs.append(allocator, name_duped);
+            i += 1;
+            const path_duped = try allocator.dupe(u8, args[i]);
+            try ext_var_strs.append(allocator, path_duped);
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = path_duped, .kind = .slurpfile });
+        } else if (std.mem.eql(u8, arg, "--rawfile")) {
+            if (i + 2 >= args.len) {
+                printErr("zq: --rawfile requires name and file path\n");
+                return error.UsageError;
+            }
+            i += 1;
+            const name_duped = try allocator.dupe(u8, args[i]);
+            try ext_var_strs.append(allocator, name_duped);
+            i += 1;
+            const path_duped = try allocator.dupe(u8, args[i]);
+            try ext_var_strs.append(allocator, path_duped);
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = path_duped, .kind = .rawfile });
         } else if (std.mem.eql(u8, arg, "--from-file")) {
             i += 1;
             if (i >= args.len) {
@@ -1384,6 +1627,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             break;
         } else if (std.mem.eql(u8, arg, "--json-errors")) {
             config.json_errors = true;
+        } else if (std.mem.eql(u8, arg, "--unbuffered")) {
+            config.unbuffered = true;
         } else if (std.mem.eql(u8, arg, "--lsp")) {
             config.lsp_mode = true;
         } else if (std.mem.eql(u8, arg, "--validate")) {
@@ -1556,9 +1801,12 @@ fn printUsage() void {
         \\  --indent N            Use N spaces for indentation
         \\  --arg NAME VALUE      Set $NAME to string VALUE
         \\  --argjson NAME VALUE  Set $NAME to parsed JSON VALUE
+        \\  --slurpfile NAME FILE Set $NAME to FILE's JSON values, wrapped in an array
+        \\  --rawfile NAME FILE   Set $NAME to FILE's raw bytes as a string
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
+        \\  --unbuffered          Flush output after every emitted value
     ++ (if (@import("lsp").enabled)
         "\n  --lsp                 Start Language Server Protocol server on stdin/stdout"
     else

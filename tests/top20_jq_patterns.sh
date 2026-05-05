@@ -108,6 +108,21 @@ check "19. select + pipeline" "$ARR" '[.[] | select(.type == "x") | .name]'
 # 20. reduce
 check "20. reduce" "$NUMS" 'reduce .[] as $x (0; . + $x)'
 
+# 21. --slurpfile
+SLURPFILE="$(mktemp -t zq_top20_slurp_XXXX.json)"
+trap 'rm -f "$SLURPFILE"' EXIT
+printf '{"x":1}\n{"x":2}\n' > "$SLURPFILE"
+check "21. --slurpfile" "null" '$X' --null-input --slurpfile X "$SLURPFILE"
+
+# 22. --rawfile
+RAWFILE="$(mktemp -t zq_top20_raw_XXXX.txt)"
+trap 'rm -f "$SLURPFILE" "$RAWFILE"' EXIT
+printf 'hello\n' > "$RAWFILE"
+check "22. --rawfile" "null" '$Y' --null-input --rawfile Y "$RAWFILE"
+
+# 23. --unbuffered
+check "23. --unbuffered" "$NUMS" '.[]' --unbuffered
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed (out of $((PASS + FAIL))) ==="
 
