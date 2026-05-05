@@ -3,13 +3,13 @@
 A record of non-obvious active bugs. Fixed entries are pruned; check git
 history / commit messages for resolved incidents.
 
-Last verified: 2026-05-04 (post wave4-large-reduce-compaction — closed L2549 L2554 L2559 large-reduce tape OOM).
+Last verified: 2026-05-05 (post wave-cleanup-hygiene — RepeatState saved_call_len snapshot + dead-arm cleanup, setpath errors via TypeErrorKind SSOT, +4 hand-written repeat coverage tests).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1155/1183 pass, 4 fail, 24 skipped. Wave4 closed 3 large-reduce tags. Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266).
+Current baseline: `zig build test` → 1173/1201 pass, 4 fail, 24 skipped. Wave4 closed 3 large-reduce tags; wave-cleanup-hygiene added 4 repeat tests. Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266).
 
 ### In-domain
 
@@ -175,12 +175,12 @@ Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with
 
 Cleanup items from the post-merge review of `feat/repeat-builtin` (3a4a350). Implementation is semantically correct vs jq 1.8.1 and passes 10 compat tests with zero leaks under 1M-iteration stress. These are latent quality issues, not active failures.
 
-| Severity | Location | Issue | Fix |
-|----------|----------|-------|-----|
-| MEDIUM | `src/vm/root.zig:6956-6967` | `.repeat` backtrack arm has `if (fp.saved_stack)` and `if (fp.saved_object)` branches, but `.repeat_start` (1792-1802) never populates either field. Dead code. | Drop both branches — fall through to `value_stack.items.len = fp.saved_value_stack_len`. Iteration semantics don't need stack/object snapshots. |
-| LOW | `src/vm/root.zig:137-141` | `RepeatState` lacks `saved_call_len`. try_handler/alt_handler/label all carry it. Repeat re-enters body each iteration; a body with `label $L \| ...break $L` inside a partially-popped recursive def could leave call_stack unbalanced across iterations. No reproducer found. | Add `saved_call_len: u32` to `RepeatState`; capture at `.repeat_start` push, restore in backtrack arm. |
-| LOW | `tests/compat/repeat_builtin.zig` | Coverage gaps: `try/catch` mid-body assertion, `label/break` interaction, `reduce limit(N; repeat(.+1)) as $x (init; ...)`, `[limit(0; repeat(.))]`, `path(repeat(...))`, 1M-iteration stress. | Add cases. The label/break case would surface the LOW-severity row above. |
-| NIT | `src/vm/root.zig:1786-1789` | Comment "backtrack_ip is unused" is technically true but `backtrack_ip = exit_ip` is set "for diagnostic symmetry". Confusing for readers modeling fork-frame transitions. | Either set `backtrack_ip = body_start_ip` (encodes actual re-entry target) or add explicit `// unused; symmetry only` marker. |
-| NIT | `src/compiler/emit.zig:2264-2278` | `emitRepeat` and `emitLimitSkipNth` share scaffolding (`<op_start exit_ip> <body> yield_output backtrack <op_end>`). | Factor into `emitStreamingFrame(start_op, end_op, body_idx)` for the next streaming-generator builtin. |
+| Severity | Location | Issue | Status |
+|----------|----------|-------|--------|
+| ~~MEDIUM~~ | `src/vm/root.zig` `.repeat` backtrack arm | `fp.saved_stack` / `fp.saved_object` branches were unreachable (`.repeat_start` never populated either). | Resolved in wave-cleanup-hygiene Commit 1 — dead branches dropped. |
+| ~~LOW~~ | `src/vm/root.zig` `RepeatState` | Missing `saved_call_len` (try_handler/alt_handler/label all carry it). | Resolved in wave-cleanup-hygiene Commit 1 — captured at `.repeat_start` push, restored in backtrack arm. |
+| ~~LOW~~ | `tests/compat/repeat_builtin.zig` | Coverage gaps: try/catch, label/break, reduce-as-init, `[limit(0; repeat(.))]`, path. | Mostly resolved in wave-cleanup-hygiene Commit 2 — 4 of 5 added (try/catch, label/break, empty-limit array, path). The `reduce limit(N; repeat(.+1)) as $x` case parked — zq's reduce currently emits the streamed values instead of folding them when the source is `limit/repeat`; bug is wider than this wave's cleanup scope. |
+| ~~NIT~~ | `src/vm/root.zig` `.repeat_start` comment | "backtrack_ip is unused" was technically true but the field was set to `exit_ip` for symmetry; comment was confusing. | Resolved in wave-cleanup-hygiene Commit 1 — comment reworded to make the unused-but-symmetric assignment explicit. |
+| NIT | `src/compiler/emit.zig:2264-2278` | `emitRepeat` and `emitLimitSkipNth` share scaffolding (`<op_start exit_ip> <body> yield_output backtrack <op_end>`). | Parked — factor into `emitStreamingFrame(start_op, end_op, body_idx)` for the next streaming-generator builtin. |
 
-Discovered: 2026-04-29.
+Discovered: 2026-04-29. Resolved (most): 2026-05-05.

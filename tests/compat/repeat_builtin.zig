@@ -163,3 +163,52 @@ test "repeat: inner array uses input-derived elements" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("[[0,1],[0,1]]", results[0]);
 }
+
+test "repeat: try/catch inside body catches each iteration" {
+    const results = try h.runFilter(
+        "[limit(3; repeat(try error(\"e\") catch \"caught\"))]",
+        "null",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[\"caught\",\"caught\",\"caught\"]", results[0]);
+}
+
+test "repeat: label/break terminates each iteration cleanly" {
+    const results = try h.runFilter(
+        "[limit(4; repeat(label $L | ., (.+10), break $L))]",
+        "0",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[0,10,0,10]", results[0]);
+}
+
+test "repeat: limit(0; repeat(.)) wrapped in array yields []" {
+    const results = try h.runFilter("[limit(0; repeat(.))]", "42");
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[]", results[0]);
+}
+
+test "repeat: path(.a) inside body — per-iteration path stream" {
+    const results = try h.runFilter(
+        "[limit(3; repeat(path(.a)))]",
+        "{\"a\":1}",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("[[\"a\"],[\"a\"],[\"a\"]]", results[0]);
+}

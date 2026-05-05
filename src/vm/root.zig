@@ -207,6 +207,7 @@ const RepeatState = struct {
     body_start_ip: u32,
     exit_ip: u32,
     saved_collect_len: u32,
+    saved_call_len: u32,
 };
 
 /// State for one active `scan(pattern)` generator iteration. The fork frame
@@ -2186,10 +2187,10 @@ pub const ResultIterator = struct {
                 // outputs ad infinitum. Termination is delegated to an
                 // enclosing `limit_start` whose counter, decremented at each
                 // `yield_output` inside the body's IP range, will truncate
-                // the fork stack past us once it hits zero. backtrack_ip is
-                // unused (the .repeat backtrack arm always re-enters at
-                // body_start_ip), so we set it to the exit_ip operand for
-                // diagnostic symmetry with `limit_start`.
+                // the fork stack past us once it hits zero. `backtrack_ip`
+                // is unused for `.repeat` (the backtrack arm always re-enters
+                // at `body_start_ip`); we set it to `exit_ip` for diagnostic
+                // symmetry with `limit_start`.
                 const exit_ip: u32 = @intCast(instr.operand.index);
                 const body_start_ip: u32 = it.ip + 1;
                 it.fork_stack.appendAssumeCapacity(.{
@@ -2200,6 +2201,7 @@ pub const ResultIterator = struct {
                         .body_start_ip = body_start_ip,
                         .exit_ip = exit_ip,
                         .saved_collect_len = @intCast(it.collect_stack.items.len),
+                        .saved_call_len = @intCast(it.call_stack.items.len),
                     } },
                     .saved_path = it.snapshotPathState(),
                 });
@@ -6642,26 +6644,42 @@ pub const ResultIterator = struct {
                         it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
                         return error.UserError;
                     },
-                    .null_val => return try it.setpathRaiseSliceIndexError(),
-                    else => return try it.setpathRaiseIndexError(base, "object"),
+                    .null_val => {
+                        it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_slice = {} });
+                        return error.TypeError;
+                    },
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_index = .{ .base = base, .pc_type = "object" } });
+                        return error.TypeError;
+                    },
                 };
                 // jq requires both "start" and "end" keys to be present on
                 // the slice object — missing either yields the slice-indices
                 // error.  See oracle: `setpath([{"a":1}]; [9])` on `[1,2,3]`.
-                const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse
-                    return try it.setpathRaiseSliceIndexError();
-                const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse
-                    return try it.setpathRaiseSliceIndexError();
+                const from_val = lookupKey(slice_span.tape, slice_span, "start") orelse {
+                    it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_slice = {} });
+                    return error.TypeError;
+                };
+                const to_val = lookupKey(slice_span.tape, slice_span, "end") orelse {
+                    it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_slice = {} });
+                    return error.TypeError;
+                };
                 const arr_len: i64 = @intCast(arrayLength(base_span.tape, base_span));
                 const from_raw: i64 = switch (from_val) {
                     .int => |v| v,
                     .null_val => 0,
-                    else => return try it.setpathRaiseSliceIndexError(),
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_slice = {} });
+                        return error.TypeError;
+                    },
                 };
                 const to_raw: i64 = switch (to_val) {
                     .int => |v| v,
                     .null_val => arr_len,
-                    else => return try it.setpathRaiseSliceIndexError(),
+                    else => {
+                        it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_slice = {} });
+                        return error.TypeError;
+                    },
                 };
                 // Clamp bounds to [0, arr_len] and ensure from <= to.
                 const from_resolved: i64 = if (from_raw < 0) @max(0, arr_len + from_raw) else @min(from_raw, arr_len);
@@ -6735,9 +6753,13 @@ pub const ResultIterator = struct {
                     it.user_error_msg = .{ .string = "Cannot update field at array index of array" };
                     return error.UserError;
                 }
-                return try it.setpathRaiseIndexError(base, "array");
+                it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_index = .{ .base = base, .pc_type = "array" } });
+                return error.TypeError;
             },
-            .bool_val => return try it.setpathRaiseIndexError(base, "boolean"),
+            .bool_val => {
+                it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_index = .{ .base = base, .pc_type = "boolean" } });
+                return error.TypeError;
+            },
             .null_val => switch (base) {
                 .array => {
                     // A null path component arises from `path(.[nan])` → `[null]`.
@@ -6750,34 +6772,13 @@ pub const ResultIterator = struct {
                     it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
                     return error.UserError;
                 },
-                else => return try it.setpathRaiseIndexError(base, "null"),
+                else => {
+                    it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_index = .{ .base = base, .pc_type = "null" } });
+                    return error.TypeError;
+                },
             },
             else => return error.TypeError,
         }
-    }
-
-    /// Build "Cannot index <base_type> with <pc_type>" and stash it as the
-    /// catchable TypeError detail for setpath path-component dispatch.  Used
-    /// when the path component's type does not match the base type's expected
-    /// component shape.  The string is interned so it lives as long as the
-    /// iterator (mirrors `buildTypeErrorMsg`).
-    fn setpathRaiseIndexError(it: *ResultIterator, base: Value, pc_type: []const u8) ZqError!Value {
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(it.alloc);
-        try buf.appendSlice(it.alloc, "Cannot index ");
-        try buf.appendSlice(it.alloc, baseTypeName(base));
-        try buf.appendSlice(it.alloc, " with ");
-        try buf.appendSlice(it.alloc, pc_type);
-        const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.type_error_detail = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
-        return error.TypeError;
-    }
-
-    /// jq's slice-indices error: emitted when a slice path component on an
-    /// array/null/string base has a non-integer "start"/"end" key.
-    fn setpathRaiseSliceIndexError(it: *ResultIterator) ZqError!Value {
-        it.type_error_detail = .{ .string = "Array/string slice indices must be integers" };
-        return error.TypeError;
     }
 
     /// `delpaths(PATHS)`: delete multiple paths. Paths is an array of path arrays.
@@ -8181,33 +8182,14 @@ pub const ResultIterator = struct {
                     it.restorePathState(saved_path);
                 },
                 .repeat => |state| {
-                    // Body's generator chain exhausted — restore the captured
-                    // input and re-enter the body at body_start_ip. The frame
-                    // stays on the stack: `repeat(f)` is infinite, so it's
-                    // popped only by an enclosing scope (typically `limit`
-                    // truncating via `truncateForkStack`, or `repeat_end`).
-                    //
-                    // Tear down any collect frames the body opened mid-
-                    // iteration so the next iteration starts with the same
-                    // collect-stack depth as the first. Without this, an
-                    // unbalanced `[ ... ]` inside the body would leak buffers
-                    // across iterations.
                     while (it.collect_stack.items.len > state.saved_collect_len) {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.restoreValueStackFromSnapshot(snap);
-                        fp.saved_stack = try it.snapshotValueStackForFork();
-                    } else {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
-                    }
+                    it.call_stack.items.len = state.saved_call_len;
+                    it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
                     it.restorePathState(fp.saved_path);
-                    if (fp.saved_object) |snap| {
-                        it.restoreObjectConstructState(snap);
-                        fp.saved_object = try it.snapshotObjectConstructState();
-                    }
                     it.ip = state.body_start_ip;
                     return true;
                 },
@@ -9455,6 +9437,16 @@ pub const ResultIterator = struct {
         /// operands are numeric and rhs is exactly zero.
         /// `val` is unused for this kind; operand values live in the payload.
         binary_arith: struct { lhs: Value, rhs: Value, op: BinaryArithOp },
+        /// `setpath` path-component type-mismatch on a non-slice base.
+        /// Produces: "Cannot index <baseTypeName(base)> with <pc_type>"
+        /// `pc_type` is the static label (`"object"`, `"array"`, `"boolean"`,
+        /// `"null"`) of the offending path-component shape.
+        /// `val` is unused; the base lives in the payload so the message
+        /// uses `baseTypeName` rather than the parenthesized boolean form.
+        setpath_index: struct { base: Value, pc_type: []const u8 },
+        /// `setpath` slice path component with non-integer "start"/"end".
+        /// Produces: "Array/string slice indices must be integers"
+        setpath_slice,
     };
 
     /// Base jq type name for `<type> (<compact-json>)`-style messages.
@@ -9591,6 +9583,15 @@ pub const ResultIterator = struct {
                 if ((ba.op == .divide or ba.op == .modulo) and isNumber(ba.lhs) and isNumericZero(ba.rhs)) {
                     buf.appendSlice(it.alloc, " because the divisor is zero") catch return null;
                 }
+            },
+            .setpath_index => |sp| {
+                buf.appendSlice(it.alloc, "Cannot index ") catch return null;
+                buf.appendSlice(it.alloc, baseTypeName(sp.base)) catch return null;
+                buf.appendSlice(it.alloc, " with ") catch return null;
+                buf.appendSlice(it.alloc, sp.pc_type) catch return null;
+            },
+            .setpath_slice => {
+                buf.appendSlice(it.alloc, "Array/string slice indices must be integers") catch return null;
             },
         }
         // Store in the runtime tape so the string lives as long as the iterator.
