@@ -208,7 +208,9 @@ Fixed-size worker pool. Orchestrates io → parser → query → output in paral
 
 **Sequencer**: fixed-size ring buffer. `post()` is a direct array write at `chunk_id % capacity`. `next_in_order()` is a direct array read. Zero dynamic allocations in hot path.
 
-**InFlightLimiter**: feeder thread acquires a slot before enqueuing each chunk, blocks when `IN_FLIGHT_FACTOR × n_threads` chunks are live. `collect()` releases slots on arena free. Caps peak RSS to a bounded function of thread count, not file size.
+**Stream-mode partial publish** (infinite-generator unblock): each stream-mode Job reserves `STREAM_SEQ_RANGE = 8` consecutive sub-ids `[seq_base .. seq_base + N)`. When `process_line_serialized` accumulates more than `STREAM_FLUSH_THRESHOLD = 64 KiB` of output for a single record at a value-boundary, the worker calls `partial_flush`: posts the current arena/buf/meta to the Sequencer with `end_of_range = false`, allocates a fresh arena, and continues the iterator drain into the next sub-id. The Job's final post sets `end_of_range = true` so the Sequencer skips any unused trailing sub-ids in the reservation (preserving the dense `next_chunk_id` advance invariant). File-mode Jobs use `seq_range_size = 1` and a single post — behavior unchanged. This unblocks downstream consumers for `repeat(.+1) | head -100` and similar infinite-generator pipelines that previously emitted zero bytes.
+
+**InFlightLimiter**: feeder thread acquires a slot before enqueuing each chunk, blocks when `IN_FLIGHT_FACTOR × n_threads` chunks are live. `collect()` releases slots on arena free. Stream-mode workers acquire one extra slot per partial flush so peak in-flight memory stays bounded across sub-id partials. Caps peak RSS to a bounded function of thread count, not file size.
 
 **Raw input mode**: when `raw_input=true`, workers skip JSON parsing and construct a synthetic tape from each raw line via `make_raw_tape()` — zero-copy, zero-allocation. Each line becomes a string value in the tape.
 
