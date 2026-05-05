@@ -35,6 +35,7 @@ test "jq:L2219 -. | tojson == if have_decnum then _0.1234567890123456789..." {
 }
 
 test "jq:L2223 [1E+1000,-1E+1000 | tojson] == if have_decnum then [_1E+1..." {
+    if (!@import("zq_features.zig").have_decnum) return error.SkipZigTest;
     const results = try h.runFilter(
         "[1E+1000,-1E+1000 | tojson] == if have_decnum then [\"1E+1000\",\"-1E+1000\"] else [\"1.7976931348623157e+308\",\"-1.7976931348623157e+308\"] end",
         "null",
@@ -143,6 +144,7 @@ test "jq:L2258 map(abs)" {
 }
 
 test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {
+    if (!@import("zq_features.zig").have_decnum) return error.SkipZigTest;
     const results = try h.runFilter(
         "[1E+1000,-1E+1000 | abs | tojson] | unique == if have_decnum then [\"1E+1000\"] else [\"1.7976931348623157e+308\"] end",
         "null",
@@ -156,6 +158,7 @@ test "jq:L2262 [1E+1000,-1E+1000 | abs | tojson] | unique == if have_dec..." {
 }
 
 test "jq:L2266 [1E+1000,-1E+1000 | length | tojson] | unique == if have_..." {
+    if (!@import("zq_features.zig").have_decnum) return error.SkipZigTest;
     const results = try h.runFilter(
         "[1E+1000,-1E+1000 | length | tojson] | unique == if have_decnum then [\"1E+1000\"] else [\"1.7976931348623157e+308\"] end",
         "null",

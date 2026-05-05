@@ -328,6 +328,7 @@ test "jq:L2191 .x | tojson | . == if have_decnum then _13911860366432393..." {
 }
 
 test "jq:L2195 (13911860366432393 == 13911860366432392) | . == if have_d..." {
+    if (!@import("zq_features.zig").have_decnum) return error.SkipZigTest;
     const results = try h.runFilter(
         "(13911860366432393 == 13911860366432392) | . == if have_decnum then false else true end",
         "null",
