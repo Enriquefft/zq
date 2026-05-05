@@ -212,3 +212,76 @@ test "repeat: path(.a) inside body — per-iteration path stream" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("[[\"a\"],[\"a\"],[\"a\"]]", results[0]);
 }
+
+// ── reduce fold-vs-emit when source streams via yield_output ──────────────────
+// Pins the wave-streaming-generators C2 fix: `reduce <SRC> as $x (INIT; UPDATE)`
+// where `<SRC>` is a streaming generator (limit / repeat / first / comma /
+// range) emitting via `yield_output`. The `reduce_source_start/end` wrap routes
+// each emission into the destructure/update arm so the fold accumulates
+// instead of escaping to user output. Reference outputs verified against
+// jq 1.8.1.
+
+test "reduce: limit(1; repeat(.+1)) on 5 folds as 0+6 = 6" {
+    const results = try h.runFilter(
+        "reduce limit(1; repeat(.+1)) as $x (0; . + $x)",
+        "5",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("6", results[0]);
+}
+
+test "reduce: limit(3; repeat(5)) folds as 10+5+5+5 = 25" {
+    const results = try h.runFilter(
+        "reduce limit(3; repeat(5)) as $x (10; . + $x)",
+        "5",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("25", results[0]);
+}
+
+test "reduce: limit(3; .,.,.) folds as 10+5+5+5 = 25 (comma generator)" {
+    const results = try h.runFilter(
+        "reduce limit(3; .,.,.) as $x (10; . + $x)",
+        "5",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("25", results[0]);
+}
+
+test "reduce: first(repeat(5)) emits one value, fold yields 10+5 = 15" {
+    const results = try h.runFilter(
+        "reduce first(repeat(5)) as $x (10; . + $x)",
+        "5",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("15", results[0]);
+}
+
+test "reduce: range(0;3) folds as 10+0+1+2 = 13 (range via yield_output)" {
+    const results = try h.runFilter(
+        "reduce range(0;3) as $x (10; . + $x)",
+        "5",
+    );
+    defer {
+        for (results) |s| h.alloc.free(s);
+        h.alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("13", results[0]);
+}

@@ -783,6 +783,51 @@ test "serialized: raw format for string" {
     try std.testing.expectEqualStrings("hello\n", result.data);
 }
 
+// ── Infinite-generator partial-publish (bugs.md #143 / wave C3) ───────────────
+
+test "serialized: infinite-generator stream-mode partial flush unblocks consumer" {
+    // Pre-fix: `repeat(.+1)` buffered into chunk_buf forever and never published
+    // because the iterator never returns null → downstream consumer received 0
+    // bytes. Post-fix: STREAM_FLUSH_THRESHOLD triggers `partial_flush` mid-
+    // iterator inside the Job's reserved sub-id range so partial output flows
+    // out as it accumulates. The test reads a bounded prefix and stops.
+    var cq = try compile("repeat(.+1)");
+    defer cq.deinit();
+
+    const pipe_fds = try std.posix.pipe();
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+
+    _ = try std.posix.write(write_fd, "0\n");
+    std.posix.close(write_fd);
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = read_fd }, alloc);
+    defer src.deinit();
+    defer std.posix.close(read_fd);
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
+
+    // Read until we've collected at least 100 records, then stop.  If the
+    // partial-flush were broken (pre-C3 behavior), `collect_bytes` would
+    // block forever waiting on the in-progress chunk that never publishes.
+    var record_count: usize = 0;
+    while (record_count < 100) {
+        const r = (try p.collect_bytes()) orelse break;
+        // Each record is "1\n" (input 0, .+1 → 1).  Count by occurrences.
+        var i: usize = 0;
+        while (i < r.data.len) : (i += 1) {
+            if (r.data[i] == '\n') record_count += 1;
+        }
+    }
+
+    try std.testing.expect(record_count >= 100);
+    // Pool.deinit triggers shutdown so the worker stops streaming.
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ── MemoryBudget / computeParams tests ────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
