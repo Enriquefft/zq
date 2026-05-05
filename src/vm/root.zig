@@ -207,6 +207,7 @@ const RepeatState = struct {
     body_start_ip: u32,
     exit_ip: u32,
     saved_collect_len: u32,
+    saved_call_len: u32,
 };
 
 /// State for one active `scan(pattern)` generator iteration. The fork frame
@@ -2186,10 +2187,10 @@ pub const ResultIterator = struct {
                 // outputs ad infinitum. Termination is delegated to an
                 // enclosing `limit_start` whose counter, decremented at each
                 // `yield_output` inside the body's IP range, will truncate
-                // the fork stack past us once it hits zero. backtrack_ip is
-                // unused (the .repeat backtrack arm always re-enters at
-                // body_start_ip), so we set it to the exit_ip operand for
-                // diagnostic symmetry with `limit_start`.
+                // the fork stack past us once it hits zero. `backtrack_ip`
+                // is unused for `.repeat` (the backtrack arm always re-enters
+                // at `body_start_ip`); we set it to `exit_ip` for diagnostic
+                // symmetry with `limit_start`.
                 const exit_ip: u32 = @intCast(instr.operand.index);
                 const body_start_ip: u32 = it.ip + 1;
                 it.fork_stack.appendAssumeCapacity(.{
@@ -2200,6 +2201,7 @@ pub const ResultIterator = struct {
                         .body_start_ip = body_start_ip,
                         .exit_ip = exit_ip,
                         .saved_collect_len = @intCast(it.collect_stack.items.len),
+                        .saved_call_len = @intCast(it.call_stack.items.len),
                     } },
                     .saved_path = it.snapshotPathState(),
                 });
@@ -8181,33 +8183,14 @@ pub const ResultIterator = struct {
                     it.restorePathState(saved_path);
                 },
                 .repeat => |state| {
-                    // Body's generator chain exhausted — restore the captured
-                    // input and re-enter the body at body_start_ip. The frame
-                    // stays on the stack: `repeat(f)` is infinite, so it's
-                    // popped only by an enclosing scope (typically `limit`
-                    // truncating via `truncateForkStack`, or `repeat_end`).
-                    //
-                    // Tear down any collect frames the body opened mid-
-                    // iteration so the next iteration starts with the same
-                    // collect-stack depth as the first. Without this, an
-                    // unbalanced `[ ... ]` inside the body would leak buffers
-                    // across iterations.
                     while (it.collect_stack.items.len > state.saved_collect_len) {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.restoreValueStackFromSnapshot(snap);
-                        fp.saved_stack = try it.snapshotValueStackForFork();
-                    } else {
-                        it.value_stack.items.len = fp.saved_value_stack_len;
-                    }
+                    it.call_stack.items.len = state.saved_call_len;
+                    it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
                     it.restorePathState(fp.saved_path);
-                    if (fp.saved_object) |snap| {
-                        it.restoreObjectConstructState(snap);
-                        fp.saved_object = try it.snapshotObjectConstructState();
-                    }
                     it.ip = state.body_start_ip;
                     return true;
                 },
