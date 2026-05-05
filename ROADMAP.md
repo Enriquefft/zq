@@ -585,7 +585,7 @@ behavior is considered a bug, a footgun, or a missed opportunity.
 | Error output | Human-readable text only | `--json-errors` for structured JSON errors | Agent integration. |
 | Null propagation | Silent null on missing fields | `--strict` errors on null field access | Agent reliability. |
 | Regex engine | Oniguruma (archived 2025; ReDoS-vulnerable) | `regex-automata` (linear-time, unicode-aware, panic-safe) | Security, maintenance trajectory. |
-| Number representation (decnum edge cases) | Arbitrary-precision via optional decnum build | f64 everywhere. ~4 compat tests (L593, L661, L674, L2195) produce different output on extreme magnitudes. `have_decnum`/`have_literal_numbers` report `false`. | Performance and memory footprint. Ruled out by design; not a TODO. |
+| Number representation (decnum edge cases) | Arbitrary-precision via optional decnum build | f64 everywhere. ~4 compat tests (L593, L661, L674, L2195) produce different output on extreme magnitudes. `have_decnum`/`have_literal_numbers` report `false`. Generator emits `error.SkipZigTest` for tests in the `%SKIP_DECNUM_GATED` allowlist (L2195, L2223, L2262, L2266) whose `if have_decnum/have_literal_numbers then … else … end` branches encode lossy f64 expectations zq deliberately doesn't emit. SSOT: `tests/compat/zq_features.zig` (mirrors `src/vm/root.zig:4176`). | Performance and memory footprint. Ruled out by design; not a TODO. |
 
 ---
 
