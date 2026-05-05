@@ -28,17 +28,16 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-04-28)
+## Quick Status (Updated 2026-05-05)
 
-**Last updated:** Phase 2R AST-walk pipeline shipped (e4ef917, ee3d62f): AST → lower → fuse → emit → VM replaces the old single-pass recursive-descent compiler. K2 regression fixes landed: def-scope close-after-rest + recursive-self shadow guard asymmetry (5abfab2), expanding_stack push gated on is_recursive (ec21f78), Fix-C multi-element bracket access (7bcef99), Fix-D while(cond;update) inside arr_ctor fork-chain (464966b).
+**Last updated:** wave-cleanup-hygiene merged: repeat per-iteration call_stack snapshot + dead-arm cleanup (Commit 1), 4 hand-written compat tests for repeat coverage (Commit 2), setpath errors routed through TypeErrorKind SSOT (Commit 3). Prior waves through Phase 2R AST-walk pipeline (e4ef917, ee3d62f) and wave5-cli-flags-12 (--unbuffered, --slurpfile, --rawfile, ExternalVarKind) remain in place.
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
-Compat tests:       426/533 passing (80.0%)   <- jq compatibility suite
-  +-- 107 failing, 3 skipped
-Own tests:          443/443 passing (100%)    <- internal regression suite
+Compat tests:       581/589 passing (98.6%)   <- jq compat suite (533 L-tests + 56 hand-written)
+  +-- 4 failing (decnum), 4 skipped (regex-runtime gated)
 Top-20 agent patterns: 20/20 (100%)            <- usage-weighted compat
-Total:              869/976 passing (89.0%)
+Total:              1173/1201 passing (97.7%)  <- including own + compat + cli + lsp + fuzz harnesses
 Startup:            ~2.4 ms (1.5x faster than jq)
 Cold start:         sub-3ms
 
