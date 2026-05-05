@@ -72,6 +72,26 @@ sub section_for_line {
     return $stem;
 }
 
+# ── Deliberate-deviation skip allowlist ───────────────────────────────────────
+# Tests deliberately skipped: jq's predicate else-branch assumes f64-collapse
+# semantics that zq's hybrid i64+big_number model rejects.
+# See ROADMAP.md "Deliberate Deviations — Number representation" and
+# bugs.md "Skipped via generator (Deliberate Deviation: decnum)". Each tag's
+# filter contains `if have_decnum/have_literal_numbers then ... else ... end`,
+# but the else-branch bakes in lossy f64 behavior zq deliberately doesn't
+# emit. Triage classification (per-tag, hand-verified) is the SSOT for the
+# skip set — adding a new decnum-gated jq test requires an explicit edit
+# here, so the deliberate-deviation decision surfaces per tag rather than
+# being inferred by an over-broad regex.
+#
+# Detection rationale: the broad shape `if have_decnum then … else … end`
+# also appears in tests that currently pass (e.g., L2005, L2187, L2191,
+# L2215, L2219) — zq's f64 output happens to match the else-branch there.
+# A regex would over-skip; the hardcoded allowlist is narrow and reviewable.
+my %SKIP_DECNUM_GATED = map { $_ => 1 } qw(
+    L2195 L2223 L2262 L2266
+);
+
 # ── Parse all test cases ──────────────────────────────────────────────────────
 
 open my $fh, '<:utf8', $jq_test or die "Cannot open $jq_test: $!\n";
@@ -617,6 +637,11 @@ ZIG
             $src .= "    // %%FAIL: filter should not compile\n";
             $src .= "    try h.expectCompileError(\"${filter}\");\n";
         } else {
+            # Deliberate-deviation skip: see %SKIP_DECNUM_GATED above.
+            if ($SKIP_DECNUM_GATED{"L${fl}"}) {
+                $src .= "    if (!\@import(\"zq_features.zig\").have_decnum) return error.SkipZigTest;\n";
+            }
+
             my $n = scalar @outs;
             $src .= "    const results = try h.runFilter(\n";
             $src .= "        \"${filter}\",\n";
