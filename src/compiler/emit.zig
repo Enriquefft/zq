@@ -2473,6 +2473,75 @@ fn emitRange(em: *Emitter, node: ir.Node) EmitError!void {
     try em.pushInstr(.each, .{ .none = {} }, node);
 }
 
+/// Result of `emitStreamingFrame`: the IP of the start opcode (for
+/// callers that need to backpatch additional inner frames whose
+/// `exit_ip` coincides with the outer frame's, e.g. `nth`'s inner
+/// `limit_start(1)`) and the resolved `exit_ip` itself.
+const StreamingFrame = struct {
+    frame_ip: u32,
+    exit_ip: u32,
+};
+
+/// Shared scaffolding for the three streaming-frame builtins
+/// (`limit`/`skip`/`nth`, `first(f)`, `repeat(f)`):
+///
+///   frame_ip: <start_op 0>
+///   <body_emit>
+///   yield_output
+///   [backtrack]              ; only when has_backtrack
+///   exit_ip:
+///   [end_op]                 ; only when end_op != null
+///
+/// `start_op`'s `operand.index` is backpatched to `exit_ip`. Returns
+/// both IPs so callers may backpatch additional inner streaming
+/// frames whose exit IP coincides with this one (`nth`).
+fn emitStreamingFrame(
+    em: *Emitter,
+    node: ir.Node,
+    start_op: types_mod.Instruction.Op,
+    end_op: ?types_mod.Instruction.Op,
+    has_backtrack: bool,
+    body_ctx: anytype,
+    comptime body_emit: fn (em: *Emitter, ctx: @TypeOf(body_ctx)) EmitError!void,
+) EmitError!StreamingFrame {
+    const frame_ip: u32 = @intCast(em.instructions.items.len);
+    try em.pushInstr(start_op, .{ .index = 0 }, node);
+
+    try body_emit(em, body_ctx);
+    try em.pushInstr(.yield_output, .{ .none = {} }, node);
+    if (has_backtrack) try em.pushInstr(.backtrack, .{ .none = {} }, node);
+
+    const exit_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[frame_ip].operand = .{ .index = exit_ip };
+
+    if (end_op) |op| try em.pushInstr(op, .{ .none = {} }, node);
+
+    return .{ .frame_ip = frame_ip, .exit_ip = exit_ip };
+}
+
+const PlainBodyCtx = struct {
+    body_idx: u32,
+};
+
+fn emitPlainBody(em: *Emitter, ctx: PlainBodyCtx) EmitError!void {
+    try emitNode(em, ctx.body_idx);
+}
+
+const NthBodyCtx = struct {
+    body_idx: u32,
+    node: ir.Node,
+    inner_limit_ip: *u32,
+};
+
+fn emitNthBody(em: *Emitter, ctx: NthBodyCtx) EmitError!void {
+    // Inner `limit_start(1)` wraps the body so post-skip exactly one
+    // output is taken. Mirrors `compileNth` (`compiler.zig:4954-4957`).
+    try em.pushInstr(.push_int, .{ .int = 1 }, ctx.node);
+    ctx.inner_limit_ip.* = @intCast(em.instructions.items.len);
+    try em.pushInstr(.limit_start, .{ .index = 0 }, ctx.node);
+    try emitNode(em, ctx.body_idx);
+}
+
 /// Emit `limit(n; f)`, `skip(n; f)`, or `nth(n; f)`. The three share
 /// an identical scaffold — only the streaming-frame opcode differs
 /// (`limit_start` / `skip_start` / `nth_start`), and `nth` further
@@ -2511,33 +2580,21 @@ fn emitLimitSkipNth(em: *Emitter, node: ir.Node, name: []const u8) EmitError!voi
     try em.pushInstr(.load_variable, .{ .index = input_var }, node);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
 
-    // Streaming frame opcode — pops n from value_stack, sets up
-    // counter; backpatched with the IP past the body's yield_output.
-    const frame_ip: u32 = @intCast(em.instructions.items.len);
-    try em.pushInstr(frame_op, .{ .index = 0 }, node);
-
-    // For nth, an inner limit_start(1) wraps the body so post-skip
-    // exactly one output is taken. Mirrors `compileNth`
-    // (`compiler.zig:4954-4957`).
-    var inner_limit_ip: ?u32 = null;
     if (frame_op == .nth_start) {
-        try em.pushInstr(.push_int, .{ .int = 1 }, node);
-        inner_limit_ip = @intCast(em.instructions.items.len);
-        try em.pushInstr(.limit_start, .{ .index = 0 }, node);
+        var inner_limit_ip: u32 = 0;
+        const frame = try emitStreamingFrame(em, node, frame_op, null, false, NthBodyCtx{
+            .body_idx = body_idx,
+            .node = node,
+            .inner_limit_ip = &inner_limit_ip,
+        }, emitNthBody);
+        // Backpatch inner limit_start(1) to share outer frame's exit_ip —
+        // mirrors `compileNth` (`compiler.zig:4969-4972`).
+        em.instructions.items[inner_limit_ip].operand = .{ .index = frame.exit_ip };
+    } else {
+        _ = try emitStreamingFrame(em, node, frame_op, null, false, PlainBodyCtx{
+            .body_idx = body_idx,
+        }, emitPlainBody);
     }
-
-    // Body.
-    try emitNode(em, body_idx);
-    try em.pushInstr(.yield_output, .{ .none = {} }, node);
-
-    // Backpatch frame exit IPs. For nth, both inner limit and outer
-    // skip frames target the same end-of-body IP — mirrors
-    // `compileNth` (`compiler.zig:4969-4972`).
-    const exit_ip: u32 = @intCast(em.instructions.items.len);
-    if (inner_limit_ip) |ip| {
-        em.instructions.items[ip].operand = .{ .index = exit_ip };
-    }
-    em.instructions.items[frame_ip].operand = .{ .index = exit_ip };
 
     // Pop the captured input — undoes the push_current at the top.
     // Intentional divergence from legacy compileLimit/Skip/Nth
@@ -2565,14 +2622,9 @@ fn emitFirst(em: *Emitter, node: ir.Node) EmitError!void {
 
     // Push n=1 then start streaming-limit frame.
     try em.pushInstr(.push_int, .{ .int = 1 }, node);
-    const limit_ip: u32 = @intCast(em.instructions.items.len);
-    try em.pushInstr(.limit_start, .{ .index = 0 }, node);
-
-    try emitNode(em, body_idx);
-    try em.pushInstr(.yield_output, .{ .none = {} }, node);
-
-    const exit_ip: u32 = @intCast(em.instructions.items.len);
-    em.instructions.items[limit_ip].operand = .{ .index = exit_ip };
+    _ = try emitStreamingFrame(em, node, .limit_start, null, false, PlainBodyCtx{
+        .body_idx = body_idx,
+    }, emitPlainBody);
 }
 
 /// Emit `repeat(f)` — jq's infinite generator
@@ -2602,17 +2654,9 @@ fn emitFirst(em: *Emitter, node: ir.Node) EmitError!void {
 fn emitRepeat(em: *Emitter, node: ir.Node) EmitError!void {
     std.debug.assert(node.span_len == 1);
     const body_idx = em.ir_obj.extra_children.items[node.span_start];
-
-    const repeat_ip: u32 = @intCast(em.instructions.items.len);
-    try em.pushInstr(.repeat_start, .{ .index = 0 }, node);
-
-    try emitNode(em, body_idx);
-    try em.pushInstr(.yield_output, .{ .none = {} }, node);
-    try em.pushInstr(.backtrack, .{ .none = {} }, node);
-
-    const exit_ip: u32 = @intCast(em.instructions.items.len);
-    em.instructions.items[repeat_ip].operand = .{ .index = exit_ip };
-    try em.pushInstr(.repeat_end, .{ .none = {} }, node);
+    _ = try emitStreamingFrame(em, node, .repeat_start, .repeat_end, true, PlainBodyCtx{
+        .body_idx = body_idx,
+    }, emitPlainBody);
 }
 
 /// Emit `last` / `last(f)`. The 0-arg form lowers to `.[-1]`
