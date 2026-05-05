@@ -16,10 +16,19 @@ const EXIT_COMPILE = 3; // filter syntax/compilation error
 const EXIT_RUNTIME = 4; // TypeError, IndexOutOfBounds, UserError during query execution
 const EXIT_SYSTEM = 5; // OOM, I/O error, write failure
 
+/// Source classification for an external variable binding.
+/// Drives binding construction in main.zig: `string`/`json` carry the literal
+/// VALUE from argv; `slurpfile`/`rawfile` carry a filesystem path that must
+/// be loaded before binding. Replaces the old `is_json: bool` discriminant
+/// so adding new flag-driven sources is a one-arm extension.
+const ExternalVarKind = enum { string, json, slurpfile, rawfile };
+
 const ExternalVar = struct {
     name: []const u8,
+    /// For `.string`/`.json`: the raw VALUE token from argv.
+    /// For `.slurpfile`/`.rawfile`: the FILE path.
     value: []const u8,
-    is_json: bool,
+    kind: ExternalVarKind,
 };
 
 const Config = struct {
@@ -236,7 +245,7 @@ pub fn main() !u8 {
         defer argjson_parser.deinit();
 
         for (config.external_vars, 0..) |ev, i| {
-            if (ev.is_json) {
+            if (ev.kind == .json) {
                 // --argjson: parse the JSON value
                 const parse_result = argjson_parser.feed(ev.value, true) catch {
                     printErr("zq: --argjson: invalid JSON for $");
@@ -411,7 +420,7 @@ pub fn main() !u8 {
                     printErr("zq: out of memory\n");
                     return EXIT_SYSTEM;
                 };
-                if (ev.is_json) {
+                if (ev.kind == .json) {
                     // Parse and copy into RT
                     const parse_result = argjson_parser.feed(ev.value, true) catch {
                         // Already validated during binding construction, but handle gracefully
@@ -1350,7 +1359,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             i += 1;
             const val_duped = try allocator.dupe(u8, args[i]);
             try ext_var_strs.append(allocator, val_duped);
-            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .is_json = false });
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .kind = .string });
         } else if (std.mem.eql(u8, arg, "--argjson")) {
             if (i + 2 >= args.len) {
                 printErr("zq: --argjson requires name and value\n");
@@ -1362,7 +1371,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             i += 1;
             const val_duped = try allocator.dupe(u8, args[i]);
             try ext_var_strs.append(allocator, val_duped);
-            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .is_json = true });
+            try ext_vars.append(allocator, .{ .name = name_duped, .value = val_duped, .kind = .json });
         } else if (std.mem.eql(u8, arg, "--from-file")) {
             i += 1;
             if (i >= args.len) {
