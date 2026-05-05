@@ -105,9 +105,9 @@ Ranked by observed agent usage.
 
 | | Feature | Detail |
 |---|---------|--------|
-| [ ] | `--slurpfile NAME FILE` | Read file into variable as array. |
-| [ ] | `--rawfile NAME FILE` | Read file into variable as string. |
-| [ ] | `--unbuffered` | Flush after each value. |
+| [x] | `--slurpfile NAME FILE` | Read file into variable as array. |
+| [x] | `--rawfile NAME FILE` | Read file into variable as string. |
+| [x] | `--unbuffered` | Flush after each value. |
 
 ### 1.3 Drop-in foundation — already shipped
 

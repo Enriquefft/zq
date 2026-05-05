@@ -29,6 +29,12 @@ _(none — large-reduce closed in wave4-large-reduce-compaction.)_
 
 All three guard on `have_decnum` for the precise-decimal branch. Park until decnum support is decided.
 
+## Intentional jq divergences
+
+Documented, internally-coherent deviations from jq's observable behavior. Not bugs.
+
+- **Duplicate `--arg` / `--argjson` / `--slurpfile` / `--rawfile` NAME collision** (wave5-cli-flags-12): when the same `NAME` is bound by multiple CLI bindings, zq resolves **last-wins** (the final occurrence on the command line shadows earlier ones). jq resolves **first-wins**. zq's behavior is consistent across all four binding flags and matches the natural shell-override intuition (`--arg x 1 --arg x 2` ⇒ `$x == "2"`). Documented; not slated for change.
+
 ### Fixed in wave4-large-reduce-compaction (3)
 
 Merged 2026-05-04:
