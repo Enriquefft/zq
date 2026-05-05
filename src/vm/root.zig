@@ -33,7 +33,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, path_scope, scan, match_g, splits, recurse_path };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, reduce_source, path_scope, scan, match_g, splits, recurse_path };
 
 const EachState = struct {
     pos: u32,
@@ -210,6 +210,20 @@ const RepeatState = struct {
     saved_call_len: u32,
 };
 
+/// State for a `reduce_source_start` wrap — see opcode doc-comment.
+/// `body_start_ip` is the first instruction of the wrapped source
+/// expression; `exit_ip` is the IP of the matching `reduce_source_end`.
+/// `yield_output` consults innermost-out: if its emission IP lies in
+/// `(body_start_ip, exit_ip)`, the value is routed into `current` and
+/// `ip` advances to `exit_ip + 1` (past `reduce_source_end`), so the
+/// destructure/update arm of the enclosing reduce runs as if the
+/// source had produced the value via the natural per-iteration flow.
+const ReduceSourceState = struct {
+    body_start_ip: u32,
+    exit_ip: u32,
+    saved_collect_len: u32,
+};
+
 /// State for one active `scan(pattern)` generator iteration. The fork frame
 /// owns the `slots` slice (allocated at push, freed at pop).
 ///
@@ -336,6 +350,12 @@ const ForkAux = union(ForkType) {
     /// `limit` truncates the fork stack past us, or when `repeat_end`
     /// runs (only reachable via that truncation).
     repeat: RepeatState,
+    /// State for `reduce_source_start` — see `ReduceSourceState` doc.
+    /// On backtrack into the frame the wrap is simply popped (the
+    /// enclosing `reduce`'s outer `fork L_done` is the real iteration
+    /// driver; the wrap only routes streaming-source values into the
+    /// destructure arm).
+    reduce_source: ReduceSourceState,
     /// Sentinel forkpoint pushed by `path_begin`. Holds no extra state — its
     /// sole purpose is to pop the matching path frame when execution
     /// backtracks past the path() expression scope.
@@ -2226,6 +2246,44 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .reduce_source_start => {
+                // Push a wrap forkpoint covering the reduce source IP range.
+                // `yield_output` inside that range routes the emitted value
+                // back into the destructure arm via `current` (see the
+                // yield_output dispatch). The frame's backtrack_ip is the
+                // exit_ip; on natural fork-stack unwind it pops cleanly.
+                const exit_ip: u32 = @intCast(instr.operand.index);
+                const body_start_ip: u32 = it.ip;
+                it.fork_stack.appendAssumeCapacity(.{
+                    .saved_value_stack_len = @intCast(it.value_stack.items.len),
+                    .saved_current = it.current,
+                    .backtrack_ip = exit_ip,
+                    .aux = .{ .reduce_source = .{
+                        .body_start_ip = body_start_ip,
+                        .exit_ip = exit_ip,
+                        .saved_collect_len = @intCast(it.collect_stack.items.len),
+                    } },
+                    .saved_path = it.snapshotPathState(),
+                });
+                it.ip += 1;
+                return null;
+            },
+            .reduce_source_end => {
+                // Source completed without firing `yield_output` (natural
+                // each/comma/range flow): pop the wrap frame; the
+                // destructure arm consumes the value already in `current`.
+                var idx = it.fork_stack.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (it.fork_stack.items[idx].aux == .reduce_source) {
+                        _ = it.fork_stack.orderedRemove(idx);
+                        break;
+                    }
+                }
+                it.ip += 1;
+                return null;
+            },
+
             .skip_start, .nth_start => {
                 const is_nth = instr.op == .nth_start;
                 const n_sv = try it.popValue();
@@ -2591,6 +2649,41 @@ pub const ResultIterator = struct {
                 else
                     it.current;
 
+                // Check reduce_source wrap via fork_stack (innermost-out).
+                // If a wrap frame's IP range contains this yield, route the
+                // emitted value into the enclosing reduce's destructure arm
+                // by setting `current` and advancing `ip` past
+                // `reduce_source_end`. Skip/limit frames inside the source
+                // (e.g. `limit(N; repeat(f))`) take precedence — they fire
+                // first below and may suppress / truncate this output. The
+                // wrap routing only applies to outputs that survive those
+                // checks. We detect the wrap here, but defer the actual
+                // routing until after skip/limit decrements below.
+                //
+                // Routing only fires when no collect frame opened inside
+                // the wrap is buffering the yield: an internal yield emitted
+                // by a sub-expression's `[arg]` collection (e.g. `[n_arg]`
+                // in `limit(n; f)`) is captured by its `array_collect_end`
+                // and must NOT be treated as a source value.
+                var reduce_wrap_idx: ?usize = null;
+                {
+                    const output_ip = it.ip;
+                    var ri: usize = it.fork_stack.items.len;
+                    while (ri > 0) {
+                        ri -= 1;
+                        if (it.fork_stack.items[ri].aux == .reduce_source) {
+                            const rs = &it.fork_stack.items[ri].aux.reduce_source;
+                            if (output_ip > rs.body_start_ip and
+                                output_ip < rs.exit_ip and
+                                it.collect_stack.items.len <= rs.saved_collect_len)
+                            {
+                                reduce_wrap_idx = ri;
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 // Check skip counter via fork_stack.
                 // If a skip frame is active and counter > 0, suppress this output.
                 {
@@ -2652,6 +2745,18 @@ pub const ResultIterator = struct {
                     if (exhausted_at) |li_ex| {
                         // Innermost exhausted limit: unwind fork stack to it.
                         it.truncateForkStack(li_ex);
+                        // If a reduce_source wrap is still active and outside
+                        // the truncated range, route the final value into the
+                        // destructure arm. Otherwise return to the caller.
+                        if (reduce_wrap_idx) |rw_idx| {
+                            if (rw_idx < li_ex) {
+                                const rs = &it.fork_stack.items[rw_idx].aux.reduce_source;
+                                it.current = val;
+                                it.value_stack.items.len = it.fork_stack.items[rw_idx].saved_value_stack_len;
+                                it.ip = rs.exit_ip + 1;
+                                return null;
+                            }
+                        }
                         if (it.collect_stack.items.len > 0) {
                             const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
                             try cf.buffer.append(it.alloc, try valueToStackValue(val));
@@ -2663,6 +2768,19 @@ pub const ResultIterator = struct {
                             return val;
                         }
                     }
+                }
+
+                // Reduce-source wrap: route the emitted value into the
+                // enclosing reduce's destructure/update arm. The wrap is
+                // still on the fork stack (limit-exhaustion above did not
+                // truncate it), so re-entering the source for the next
+                // iteration happens via the body's trailing `backtrack`.
+                if (reduce_wrap_idx) |rw_idx| {
+                    const rs = &it.fork_stack.items[rw_idx].aux.reduce_source;
+                    it.current = val;
+                    it.value_stack.items.len = it.fork_stack.items[rw_idx].saved_value_stack_len;
+                    it.ip = rs.exit_ip + 1;
+                    return null;
                 }
 
                 if (it.collect_stack.items.len > 0) {
@@ -3592,6 +3710,7 @@ pub const ResultIterator = struct {
                 .limit,
                 .skip,
                 .repeat,
+                .reduce_source,
                 .path_scope,
                 => {},
             }
@@ -8176,6 +8295,21 @@ pub const ResultIterator = struct {
                 },
                 .label, .limit, .skip => {
                     // Label/limit/skip scope completed — just pop.
+                    const saved_path = fp.saved_path;
+                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
+                    _ = it.fork_stack.pop();
+                    it.restorePathState(saved_path);
+                },
+                .reduce_source => |state| {
+                    // The wrap is passive scaffolding for routing — when
+                    // we backtrack into it, the source is exhausted (no
+                    // inner generator advanced). Pop and continue
+                    // unwinding so the enclosing reduce's `fork L_done`
+                    // can fire its alternative arm.
+                    while (it.collect_stack.items.len > state.saved_collect_len) {
+                        var cf = it.collect_stack.pop().?;
+                        cf.buffer.deinit(it.alloc);
+                    }
                     const saved_path = fp.saved_path;
                     if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();

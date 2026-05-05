@@ -3812,7 +3812,20 @@ fn emitReduce(em: *Emitter, node: ir.Node) EmitError!void {
     const fork_pos = em.instructions.items.len;
     try em.pushInstr(.fork, .{ .index = 0 }, node);
 
+    // Wrap the source in a reduce_source frame so any `yield_output`
+    // fired by a streaming source (`limit`/`skip`/`first`/`repeat`)
+    // inside <EXPR> routes the emitted value into the destructure/update
+    // arm via `current` instead of escaping to the caller. Natural
+    // (each/comma/range) sources do not fire `yield_output`; they reach
+    // `reduce_source_end` with the value already in `current`, so the
+    // wrap is a transparent no-op for them.
+    const rss_ip = em.instructions.items.len;
+    try em.pushInstr(.reduce_source_start, .{ .index = 0 }, node);
     try emitNode(em, expr_idx);
+    const rse_ip: u32 = @intCast(em.instructions.items.len);
+    em.instructions.items[rss_ip].operand = .{ .index = rse_ip };
+    try em.pushInstr(.reduce_source_end, .{ .none = {} }, node);
+
     try emitNode(em, pattern_idx);
     try em.pushInstr(.load_variable, .{ .index = acc_id }, node);
     try em.pushInstr(.pipe, .{ .none = {} }, node);
