@@ -53,6 +53,11 @@ const Config = struct {
     describe_depth: u32 = 12,
     validate: bool = false,
     lsp_mode: bool = false,
+    /// --unbuffered: flush stdout after every emitted value. Matches jq's
+    /// flag of the same name. Pool-based execution still batches across
+    /// chunks, but each `BytesResult` (stdin/file pool) and each per-value
+    /// emit (null-input / slurp) is followed by an explicit flush.
+    unbuffered: bool = false,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -602,7 +607,7 @@ pub fn main() !u8 {
 
     if (config.null_input) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &diag) catch |e| {
+        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -650,6 +655,10 @@ pub fn main() !u8 {
                 printErr("zq: write error\n");
                 return EXIT_SYSTEM;
             };
+            if (config.unbuffered) writer.flush() catch {
+                printErr("zq: write error\n");
+                return EXIT_SYSTEM;
+            };
             last_was_false_or_null = result.last_was_false_or_null;
         }
     } else {
@@ -664,7 +673,7 @@ pub fn main() !u8 {
 
             var diag = QueryDiag{};
             defer diag.deinit(allocator);
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, &diag) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
                 err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -698,6 +707,7 @@ fn processFile(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     raw_input: bool,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     const n_threads = std.Thread.getCpuCount() catch 4;
@@ -724,6 +734,7 @@ fn processFile(
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
         try writer.writeSlice(result.data);
+        if (unbuffered) try writer.flush();
         last_was_false_or_null = result.last_was_false_or_null;
     }
 
@@ -802,7 +813,7 @@ fn processSlurpJson(
     const tape = rt.asTape();
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 /// Read all JSON values from a file/stdin using Source + Parser, copying each
@@ -941,7 +952,7 @@ fn processSlurpRaw(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 fn readAllBytes(
@@ -976,6 +987,7 @@ fn processNullInput(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     var parser = try parser_mod.Parser.init(allocator);
@@ -989,7 +1001,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, unbuffered, diag);
 }
 
 /// Process --validate mode: compile filter only, report success or error.
@@ -1247,6 +1259,7 @@ fn writeRecord(
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
+    unbuffered: bool,
     diag: *QueryDiag,
 ) !bool {
     if (opt_it.*) |*it| {
@@ -1272,6 +1285,7 @@ fn writeRecord(
         if (format != .jsonl and format != .join) {
             try writer.write_value(.{ .string = "\n" }, .raw, null, .{});
         }
+        if (unbuffered) try writer.flush();
         last_was_false_or_null = switch (val) {
             .null_val => true,
             .bool_val => |b| !b,
@@ -1613,6 +1627,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             break;
         } else if (std.mem.eql(u8, arg, "--json-errors")) {
             config.json_errors = true;
+        } else if (std.mem.eql(u8, arg, "--unbuffered")) {
+            config.unbuffered = true;
         } else if (std.mem.eql(u8, arg, "--lsp")) {
             config.lsp_mode = true;
         } else if (std.mem.eql(u8, arg, "--validate")) {
@@ -1790,6 +1806,7 @@ fn printUsage() void {
         \\  --args                Remaining args are string values
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
+        \\  --unbuffered          Flush output after every emitted value
     ++ (if (@import("lsp").enabled)
         "\n  --lsp                 Start Language Server Protocol server on stdin/stdout"
     else
