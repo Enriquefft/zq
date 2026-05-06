@@ -1271,6 +1271,66 @@ test "unary negation: TypeError on non-numeric field" {
     try std.testing.expectError(error.TypeError, it.next());
 }
 
+test "unary negation: negate positive big_number prepends minus sign" {
+    // input: null  →  -1E+1000  →  big_number "-1E+1000"
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("-1E+1000");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("-1E+1000", vals.items[0].big_number);
+}
+
+test "unary negation: negate negative big_number drops leading minus sign" {
+    // input: null  →  (-1E+1000) | -.  →  big_number "1E+1000"
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("(-1E+1000) | -.");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("1E+1000", vals.items[0].big_number);
+}
+
+test "length: positive big_number returns byte count of source slice" {
+    // input: null  →  1E+1000 | length  →  7
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("1E+1000 | length");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 7), vals.items[0].int);
+}
+
+test "length: negative big_number returns byte count including minus sign" {
+    // input: null  →  -1E+1000 | length  →  8
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("-1E+1000 | length");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 8), vals.items[0].int);
+}
+
 // ── Conditionals ──────────────────────────────────────────────────────────────
 
 test "if/then/else: true condition takes then-branch" {

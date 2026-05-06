@@ -48,18 +48,6 @@ Documented, internally-coherent deviations from jq's observable behavior. Not bu
 
 Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with `as $key` pattern variables clobbers `$key`/`$in` slots across recursive `call_function` invocations — the inner recursive call overwrites the outer call's pattern-var slot. Walk/1's desugar (commit a626191) avoided this by using `to_entries | map(.value |= walk(f)) | from_entries` instead of jq's canonical `reduce keys[] as $key ({}; ...)` form. Reduce works correctly for non-recursive bodies; the bug surfaces only when a recursive self-call lives inside `reduce`'s update body. Fix would address pattern-var slot allocation in `emitReduce` to scope per-frame rather than per-fn_id.
 
-### big_number missing arms in negate + length (LATENT)
-
-| Field | Value |
-|-------|-------|
-| Symptom | `-(1E+1000)` and `1E+1000 \| length` produce wrong or error output |
-| Repro | `echo null \| zq '-1E+1000'` and `echo null \| zq '1E+1000 \| length'` |
-| Root cause | `src/vm/root.zig:1935-1953` negate switch lacks `.big_number` arm; `length` builtin has same gap |
-| Affects | Any filter that arithmetics or measures big_number values |
-| Severity | LOW today (no test coverage after decnum skip-guard), MEDIUM if Tier 4.3 literal-passthrough lands |
-| Fix sketch | Add `.big_number` arm to `negate` (negate source bytes' sign) + `length` (return UTF-8 byte count of source slice) |
-| Discovered | 2026-05-05 by wave-decnum-triage |
-
 ### Bug residuals from prior orchestration (not in current scope)
 
 | Tag | Status |

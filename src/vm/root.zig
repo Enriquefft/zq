@@ -1974,6 +1974,15 @@ pub const ResultIterator = struct {
                 const result: StackValue = switch (val) {
                     .int => |i| .{ .int = -i },
                     .float => |f| .{ .float = -f },
+                    .big_number => |bn| blk: {
+                        if (bn.len > 0 and bn[0] == '-') break :blk .{ .big_number = bn[1..] };
+                        var buf = std.ArrayList(u8){};
+                        defer buf.deinit(it.alloc);
+                        try buf.append(it.alloc, '-');
+                        try buf.appendSlice(it.alloc, bn);
+                        const sref = try it.runtime_tape.internString(it.alloc, buf.items);
+                        break :blk .{ .big_number = it.runtime_tape.view.string_buf[sref.offset..][0..sref.len] };
+                    },
                     else => {
                         it.type_error_detail = it.buildTypeErrorMsg(
                             try stackValueToValue(val),
@@ -4450,7 +4459,7 @@ pub const ResultIterator = struct {
             .bool_val => return error.TypeError,
             .int => |i| .{ .int = if (i < 0) -i else i },
             .float => |f| .{ .float = @abs(f) },
-            .big_number => return error.TypeError,
+            .big_number => |bn| .{ .int = @intCast(bn.len) },
             .string => |s| blk: {
                 // Count Unicode codepoints, not bytes.
                 var count: i64 = 0;
