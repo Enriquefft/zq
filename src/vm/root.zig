@@ -1324,8 +1324,15 @@ pub const ResultIterator = struct {
                 // Transfer the top of the value stack to it.current so that the
                 // right-hand side of a pipe (e.g. builtins, field access) receives
                 // the correct input value.  When the stack is empty the current
-                // value is already correct (e.g. after iterate or load_key which
-                // update it.current directly).
+                // value is already correct because the preceding op set it.current
+                // directly without pushing — namely: `each` (per-element on entry
+                // and on each backtrack via advanceEachForkpoint); fork-based
+                // generator builtins that drive iteration through `it.current`
+                // (range, recurse, paths, leaf_paths, scan, match (//g), splits,
+                // repeat); update-mode descents `navigate_key`/`navigate_index`;
+                // and `restore_input`. NOTE: as of B1/B6, `load_key`,
+                // `load_index`, `load_path`, and `load_computed` push their
+                // result and so always go through the popValue branch above.
                 if (it.value_stack.items.len > 0) {
                     it.current = try stackValueToValue(try it.popValue());
                 }
