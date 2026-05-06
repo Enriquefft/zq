@@ -1,5 +1,6 @@
 #!/bin/bash
-# Generate 15M diverse JSONL records with 7 deterministic shapes
+# Generate diverse JSONL records with 7 deterministic shapes.
+# Record count controlled by HUGE_LINES (default 15M).
 # Every record has an .id field. Shape selected by i % 7.
 #
 # Shapes:
@@ -11,12 +12,13 @@
 #   5: {id, a: {b: {c: N}}}                               — deep nesting
 #   6: {id, name, data, status, tags: [str,str]}           — multi-field + array
 
-awk 'BEGIN {
-    # Pre-build a 500-char base string for shape 3
+LINES="${HUGE_LINES:-15000000}"
+
+awk -v lines="$LINES" 'BEGIN {
     base = ""
     for (j = 1; j <= 50; j++) base = base "abcdefghij"
 
-    for (i = 1; i <= 15000000; i++) {
+    for (i = 1; i <= lines; i++) {
         shape = i % 7
         if (shape == 0) {
             printf "{\"id\":%d,\"tag\":\"s%d\"}\n", i, i % 100

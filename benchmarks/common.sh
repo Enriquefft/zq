@@ -26,15 +26,28 @@ else
     MEMORY_RUNS=3
 fi
 
-# Tool availability — sets HAVE_JQ, HAVE_JAQ, HAVE_GOJQ
+# BENCH_MODE selects which comparison tools participate.
+#   regression  — only zq + jq (jq used as noise-normalization baseline)
+#   comparison  — zq vs jq + jaq + gojq + yq (full marketing comparison)
+BENCH_MODE="${BENCH_MODE:-comparison}"
+
 HAVE_JQ=false
 HAVE_JAQ=false
 HAVE_GOJQ=false
+HAVE_YQ=false
 
 detect_tools() {
     command -v jq &>/dev/null && HAVE_JQ=true || echo "Warning: jq not found, skipping." >&2
+
+    if [ "$BENCH_MODE" = "regression" ]; then
+        # External tools are pinned and don't change between commits;
+        # running them every CI burns time without adding signal.
+        return
+    fi
+
     command -v jaq &>/dev/null && HAVE_JAQ=true || echo "Warning: jaq not found, skipping." >&2
     command -v gojq &>/dev/null && HAVE_GOJQ=true || echo "Warning: gojq not found, skipping." >&2
+    command -v yq &>/dev/null && HAVE_YQ=true || echo "Warning: yq not found, skipping." >&2
 }
 
 # Check that zq binary exists

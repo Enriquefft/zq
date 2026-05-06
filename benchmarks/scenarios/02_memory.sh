@@ -30,10 +30,8 @@ if ! command -v "$ZQ_BIN" &> /dev/null; then
     exit 1
 fi
 
-command -v jq  &> /dev/null || { echo "Warning: jq not found, skipping." >&2;  SKIP_JQ=true;  }
-command -v jaq &> /dev/null || { echo "Warning: jaq not found, skipping." >&2; SKIP_JAQ=true; }
-# yq does not support JSONL multi-record files — skip it here
-SKIP_YQ=true
+detect_tools
+# yq does not support JSONL multi-record files — never participates here.
 
 echo "# Scenario 2: Memory Efficiency" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
@@ -90,9 +88,9 @@ run_memory_test() {
     RSS_KB[$label]=$rss
 }
 
-[ "$SKIP_JQ"  != true ] && run_memory_test "jq"  jq  'select(.id > 500000)' "$DATA_FILE"
-[ "$SKIP_JAQ" != true ] && run_memory_test "jaq" jaq 'select(.id > 500000)' "$DATA_FILE"
-run_memory_test "zq" timeout 60 "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
+$HAVE_JQ  && run_memory_test "jq"  jq  'select(.id > 500000)' "$DATA_FILE"
+$HAVE_JAQ && run_memory_test "jaq" jaq 'select(.id > 500000)' "$DATA_FILE"
+run_memory_test "zq" "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
 
 # Write JSON export
 {

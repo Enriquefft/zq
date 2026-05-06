@@ -6,16 +6,30 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Benchmark mode (regression = zq+jq fast; comparison = full suite)'
+        required: true
+        default: 'comparison'
+        type: choice
+        options:
+          - regression
+          - comparison
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 6 AM UTC
 
+# Cancel in-progress runs only on PRs. Pushes to main must complete so the
+# baseline cache stays in sync with the latest commit.
 concurrency:
-  group: benchmark-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BENCH_MODE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'comparison')) && 'comparison' || 'regression' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -23,68 +37,90 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install tools
+      - name: Configure mode-dependent env
+        run: |
+          if [ "$BENCH_MODE" = "comparison" ]; then
+            echo "HUGE_LINES=15000000" >> "$GITHUB_ENV"
+            echo "ZQ_QUICK=0"          >> "$GITHUB_ENV"
+          else
+            echo "HUGE_LINES=1000000"  >> "$GITHUB_ENV"
+            echo "ZQ_QUICK=1"          >> "$GITHUB_ENV"
+          fi
+
+      - name: Install jq + hyperfine (always, pinned)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq bc
+          sudo apt-get install -y bc
 
-          # Install hyperfine (pinned version for --shell=none support)
+          JQ_VERSION="1.7.1"
+          curl -sSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64" -o /usr/local/bin/jq
+          chmod +x /usr/local/bin/jq
+
           HYPERFINE_VERSION="1.18.0"
           curl -sSL "https://github.com/sharkdp/hyperfine/releases/download/v${HYPERFINE_VERSION}/hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
           mv "hyperfine-v${HYPERFINE_VERSION}-x86_64-unknown-linux-musl/hyperfine" /usr/local/bin/hyperfine
           chmod +x /usr/local/bin/hyperfine
 
-          # Install jaq (pinned version for reproducibility)
+      - name: Install jaq + gojq (comparison only, pinned)
+        if: env.BENCH_MODE == 'comparison'
+        run: |
           JAQ_VERSION="2.1.0"
           curl -sSL "https://github.com/01mf02/jaq/releases/download/v${JAQ_VERSION}/jaq-x86_64-unknown-linux-musl" -o /usr/local/bin/jaq
           chmod +x /usr/local/bin/jaq
 
-          # Install gojq (pinned version for reproducibility)
           GOJQ_VERSION="0.12.17"
           curl -sSL "https://github.com/itchyny/gojq/releases/download/v${GOJQ_VERSION}/gojq_v${GOJQ_VERSION}_linux_amd64.tar.gz" | tar xz
           mv "gojq_v${GOJQ_VERSION}_linux_amd64/gojq" /usr/local/bin/gojq
           chmod +x /usr/local/bin/gojq
 
-      - name: Restore baseline from cache
+      - name: Restore baseline (regression only)
+        if: env.BENCH_MODE == 'regression'
         id: restore-baseline
         uses: actions/cache/restore@v4
         with:
           path: benchmarks/ci-baseline.json
-          key: benchmark-baseline-${{ github.ref_name }}-${{ github.run_id }}
+          key: benchmark-baseline-${{ github.ref_name }}-current
           restore-keys: |
             benchmark-baseline-${{ github.ref_name }}-
             benchmark-baseline-main-
+
+      - name: Cache test dataset
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: benchmarks/data/huge.jsonl
+          key: huge-jsonl-${{ hashFiles('benchmarks/data/huge.generator.sh') }}-${{ env.HUGE_LINES }}
 
       - name: Build zq
         run: zig build -Doptimize=ReleaseFast
 
       - name: Generate test data
+        if: steps.cache-data.outputs.cache-hit != 'true'
         run: |
           cd benchmarks/data
           bash huge.generator.sh
           ls -lh huge.jsonl
 
-      - name: Run benchmarks (quick mode)
+      - name: Run benchmarks
         run: |
           cd benchmarks
-          ZQ_QUICK=1 ./run_all.sh
-        env:
-          ZQ_QUICK: "1"
+          ./run_all.sh
 
       - name: Validate summary JSON
         run: jq . benchmarks/results/summary.json
 
       - name: Check regression
+        if: env.BENCH_MODE == 'regression'
         run: |
           cd benchmarks
           bash check_regression.sh results/summary.json ci-baseline.json
 
-      - name: Update baseline from current results
-        if: github.ref == 'refs/heads/main' && success()
+      - name: Update baseline (main, regression-mode only)
+        if: env.BENCH_MODE == 'regression' && github.ref == 'refs/heads/main' && success()
         run: cp benchmarks/results/summary.json benchmarks/ci-baseline.json
 
-      - name: Save baseline to cache
-        if: github.ref == 'refs/heads/main' && success()
+      - name: Save baseline
+        if: env.BENCH_MODE == 'regression' && github.ref == 'refs/heads/main' && success()
         uses: actions/cache/save@v4
         with:
           path: benchmarks/ci-baseline.json
@@ -93,5 +129,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: benchmark-results-${{ github.sha }}
+          name: benchmark-results-${{ env.BENCH_MODE }}-${{ github.sha }}
           path: benchmarks/results/

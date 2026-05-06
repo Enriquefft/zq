@@ -21,9 +21,15 @@ export ZQ_QUICK
 # Source progress utilities
 source "$BENCHMARK_DIR/progress.sh"
 
-TOTAL_SCENARIOS=5
+# Regression mode skips the memory scenario: it isn't consumed by
+# check_regression.sh, so running it on every PR adds time without signal.
+BENCH_MODE="${BENCH_MODE:-comparison}"
+if [ "$BENCH_MODE" = "regression" ]; then
+    TOTAL_SCENARIOS=4
+else
+    TOTAL_SCENARIOS=5
+fi
 
-# Initialize main progress bar
 init_main_progress
 
 echo "" >&2
@@ -107,60 +113,33 @@ echo "Running benchmarks..." >&2
 
 echo "" >> "$SUMMARY_FILE"
 
-# Scenario 1
-start_phase_timer "Multi-core Scalability"
-bash "$BENCHMARK_DIR/scenarios/01_parallelism.sh"
-end_phase_timer "Multi-core Scalability"
-update_main_progress 1 $TOTAL_SCENARIOS "Multi-core Scalability"
-echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 1: Multi-core Scalability" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Full results: [01_parallelism.md](01_parallelism.md)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+SCENARIO_IDX=0
 
-# Scenario 2
-start_phase_timer "Memory Efficiency"
-bash "$BENCHMARK_DIR/scenarios/02_memory.sh"
-end_phase_timer "Memory Efficiency"
-update_main_progress 2 $TOTAL_SCENARIOS "Memory Efficiency"
-echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 2: Memory Efficiency" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Full results: [02_memory.md](02_memory.md)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+run_scenario() {
+    local label="$1" script="$2" md="$3"
+    SCENARIO_IDX=$((SCENARIO_IDX + 1))
+    start_phase_timer "$label"
+    bash "$BENCHMARK_DIR/scenarios/$script"
+    end_phase_timer "$label"
+    update_main_progress $SCENARIO_IDX $TOTAL_SCENARIOS "$label"
+    {
+        echo ""
+        echo "## $label"
+        echo ""
+        echo "Full results: [$md]($md)"
+        echo ""
+    } >> "$SUMMARY_FILE"
+}
 
-# Scenario 3
-start_phase_timer "Startup Latency"
-bash "$BENCHMARK_DIR/scenarios/03_startup_latency.sh"
-end_phase_timer "Startup Latency"
-update_main_progress 3 $TOTAL_SCENARIOS "Startup Latency"
-echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 3: Startup Latency" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Full results: [03_startup_latency.md](03_startup_latency.md)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+run_scenario "Multi-core Scalability" "01_parallelism.sh" "01_parallelism.md"
 
-# Scenario 4
-start_phase_timer "Streaming Throughput"
-bash "$BENCHMARK_DIR/scenarios/04_streaming.sh"
-end_phase_timer "Streaming Throughput"
-update_main_progress 4 $TOTAL_SCENARIOS "Streaming Throughput"
-echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 4: Streaming/Pipe Throughput" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Full results: [04_streaming.md](04_streaming.md)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+if [ "$BENCH_MODE" != "regression" ]; then
+    run_scenario "Memory Efficiency" "02_memory.sh" "02_memory.md"
+fi
 
-# Scenario 5
-start_phase_timer "Complex Query"
-bash "$BENCHMARK_DIR/scenarios/05_complex_query.sh"
-end_phase_timer "Complex Query"
-update_main_progress 5 $TOTAL_SCENARIOS "Complex Query"
-echo "" >> "$SUMMARY_FILE"
-echo "## Scenario 5: Complex Query" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
-echo "Full results: [05_complex_query.md](05_complex_query.md)" >> "$SUMMARY_FILE"
-echo "" >> "$SUMMARY_FILE"
+run_scenario "Startup Latency"        "03_startup_latency.sh" "03_startup_latency.md"
+run_scenario "Streaming Throughput"   "04_streaming.sh"       "04_streaming.md"
+run_scenario "Complex Query"          "05_complex_query.sh"   "05_complex_query.md"
 
 echo "" >&2
 
