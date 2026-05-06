@@ -1433,7 +1433,15 @@ pub const ResultIterator = struct {
                 // Base: pop from if_stack (pushed by save_input before inner expr).
                 if (it.if_stack.items.len == 0) return error.TypeError;
                 const base = it.if_stack.pop().?;
-                it.current = switch (key_sv) {
+                // B6 fix: push the result onto value_stack (do NOT set
+                // it.current) so that `load_computed` behaves consistently
+                // with `load_key` / `load_path`. Without this, a `pipe`
+                // following `load_computed` inside an object-field value
+                // expression would pop the field KEY off the stack instead
+                // of the lookup result, because `load_computed` set
+                // it.current directly and left the key as top-of-stack.
+                // Mirrors the B1 fix for `load_path` at vm/root.zig:1546.
+                const result: Value = switch (key_sv) {
                     .tape_value => |tv| switch (tv) {
                         .string => |s| blk: {
                             // Record path component if path tracking is active
@@ -1539,6 +1547,7 @@ pub const ResultIterator = struct {
                     },
                     else => return error.TypeError,
                 };
+                it.pushValue(try valueToStackValue(result));
                 it.ip += 1;
                 return null;
             },

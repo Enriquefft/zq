@@ -1125,14 +1125,14 @@ fn emitPatternObject(em: *Emitter, node: ir.Node) EmitError!void {
                 node,
             );
         } else {
-            // Computed key: `save_input ; <expr> ; load_computed ;
-            // push_current` so the destructure target is reset to the
-            // current map for the sub-pattern. Mirrors legacy
+            // Computed key: `save_input ; <expr> ; load_computed`.
+            // After B6's load_computed push-semantics change (vm/root.zig:1419),
+            // load_computed itself pushes the result onto value_stack, matching
+            // the static-key load_key path above. Mirrors legacy
             // `compiler.zig:666-693`.
             try em.pushInstr(.save_input, .{ .none = {} }, node);
             try emitNode(em, key_idx);
             try em.pushInstr(.load_computed, .{ .none = {} }, node);
-            try em.pushInstr(.push_current, .{ .none = {} }, node);
         }
 
         try em.pushInstr(.pop_try, .{ .none = {} }, node);
@@ -1325,10 +1325,12 @@ fn emitPatternStrict(em: *Emitter, node_idx: u32) EmitError!void {
                         node,
                     );
                 } else {
+                    // load_computed itself pushes the result onto value_stack
+                    // after B6 (vm/root.zig:1419), aligning with the static-key
+                    // load_key path above.
                     try em.pushInstr(.save_input, .{ .none = {} }, node);
                     try emitNode(em, key_idx);
                     try em.pushInstr(.load_computed, .{ .none = {} }, node);
-                    try em.pushInstr(.push_current, .{ .none = {} }, node);
                 }
                 try emitPatternStrict(em, sub_idx);
                 try em.pushInstr(.restore_input, .{ .none = {} }, node);
@@ -4124,15 +4126,12 @@ fn emitInputScopeReseed(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void
 fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
     const node = ir_obj.nodes.items[node_idx];
     // Treat `computed_index` like a generator for the purposes of the
-    // arith/cmp/logical "non-generator vs generator" path selection: its
-    // emission ends with `load_computed`, which writes the result to
-    // `it.current` rather than pushing to the value stack. The
-    // non-generator op layout (lhs;rhs;op) assumes both operands push to
-    // the stack, so without this detection the second operand would
-    // overwrite `current` and the op would consume the same value twice
-    // (or hit a stack-empty TypeError on one side). The lhs-temp idiom
-    // taken by the generator path captures the RHS via a variable before
-    // re-running the LHS, so it's correct for any current-sink subtree.
+    // arith/cmp/logical "non-generator vs generator" path selection:
+    // generator-form keys/bases (e.g. `(0,2)`) inside the bracket fork
+    // and the per-iteration block re-runs `load_computed` for every
+    // yielded combination. The lhs-temp idiom taken by the generator
+    // path captures the RHS via a variable before re-running the LHS,
+    // so it's safe across these forks.
     if (node.op == .iterate or node.op == .computed_index) return true;
     // Two fixed children.
     if (node.children[0] != 0 and subtreeHasIterate(ir_obj, node.children[0])) return true;
