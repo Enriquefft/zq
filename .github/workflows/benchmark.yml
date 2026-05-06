@@ -73,16 +73,19 @@ jobs:
           mv "gojq_v${GOJQ_VERSION}_linux_amd64/gojq" /usr/local/bin/gojq
           chmod +x /usr/local/bin/gojq
 
+      # Baseline cache namespace. Bump the v<N> prefix to invalidate stored
+      # baselines when benchmark conditions change (dataset size, pinned
+      # tool versions, scenario set, etc.) so ratio comparisons stay valid.
       - name: Restore baseline (regression only)
         if: env.BENCH_MODE == 'regression'
         id: restore-baseline
         uses: actions/cache/restore@v4
         with:
           path: benchmarks/ci-baseline.json
-          key: benchmark-baseline-${{ github.ref_name }}-current
+          key: benchmark-baseline-v2-${{ github.ref_name }}-current
           restore-keys: |
-            benchmark-baseline-${{ github.ref_name }}-
-            benchmark-baseline-main-
+            benchmark-baseline-v2-${{ github.ref_name }}-
+            benchmark-baseline-v2-main-
 
       - name: Cache test dataset
         id: cache-data
@@ -124,7 +127,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: benchmarks/ci-baseline.json
-          key: benchmark-baseline-main-${{ github.run_id }}
+          key: benchmark-baseline-v2-main-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         if: always()
