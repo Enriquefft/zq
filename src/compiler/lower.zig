@@ -1513,6 +1513,23 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
         // `src/query/src/compiler.zig:1066`.
         .func_call => |fc| {
             const arity: u32 = @intCast(fc.args.len);
+            // Self-recursive call inside inline expansion: bypasses the
+            // hidden range (which spans this function's own entry) so a
+            // 1+arity recursive UDF can find itself during body re-walk.
+            // Mirrors the `.field_access` 0-arity arm at line 597 and the
+            // `.builtin_call` arm at line 1023 — `lookupRecursiveSelf`
+            // is the SSOT bypass primitive (lower.zig:5121).
+            if (lookupRecursiveSelf(ctx, fc.name, arity)) |fn_id| {
+                var lowered_args: std.ArrayListUnmanaged(u32) = .{};
+                defer lowered_args.deinit(ctx.arena.allocator());
+                const entry_for_args = ctx.function_table.items[fn_id];
+                for (entry_for_args.params, 0..) |param, pi| {
+                    if (param.is_filter) continue;
+                    const arg_idx = try lowerNode(ctx, fc.args[pi]);
+                    try lowered_args.append(ctx.arena.allocator(), arg_idx);
+                }
+                return synthCallUser(ctx, fn_id, lowered_args.items, sp.start, sp.len);
+            }
             const fn_id = ctx.lookupFunction(fc.name, arity) orelse {
                 ctx.compile_err = .{
                     .kind = .query_syntax_error,
@@ -1521,15 +1538,6 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                 };
                 return error.LowerDiagnostic;
             };
-            // Self-recursive call inside inline expansion: emit
-            // `call_user(fn_id, value_args)` IR. Value args are lowered
-            // here (each call captures into the function's canonical
-            // var_ids at emit time); filter args are recorded as
-            // bindings against the caller's AST so the body's
-            // load_var/field_access references resolve through them.
-            if (ctx.isExpanding(fn_id)) {
-                return synthRecursiveCall(ctx, fn_id, fc.args, sp.start, sp.len);
-            }
             return inlineUserCall(ctx, fn_id, fc.args, sp.start, sp.len);
         },
 
@@ -4942,44 +4950,6 @@ fn synthCallUserInline(
 /// stays trivially auditable.
 const CALL_USER_INLINE: u32 = 1;
 const CALL_USER_RECURSIVE: u32 = 0;
-
-/// Lower a self-recursive function call to `call_user(fn_id, value_args)`.
-/// Value args are lowered here (the call site's scope sees them) and
-/// recorded in the IR span; filter args are referenced inside the
-/// already-lowered recursive body via the `filter_arg_bindings` stack
-/// — when the body calls itself, the body's references to the
-/// recursive function's filter params still resolve through the
-/// bindings active at the inline-expansion call site (legacy's
-/// equivalent: filter-arg references in the body persist as
-/// `call_filter_arg` ops, which the recursive body's emit sees only
-/// at the top expansion's binding context).
-fn synthRecursiveCall(
-    ctx: *Lowerer,
-    fn_id: u32,
-    args: []const *Node,
-    src_start: u32,
-    src_len: u32,
-) LowerError!u32 {
-    const alloc = ctx.arena.allocator();
-    const entry = ctx.function_table.items[fn_id];
-    std.debug.assert(entry.params.len == args.len);
-
-    // Lower value args at the call site. Filter args don't lower into
-    // IR here — they're substituted textually when the body's
-    // bare-ident refs match a binding name at body-walk time. Since
-    // the body of a recursive function is lowered once at the OUTER
-    // expansion of that function, filter arg substitution happens
-    // there and the recursive body has the substitutions baked in.
-    var value_arg_idxs: std.ArrayListUnmanaged(u32) = .{};
-    defer value_arg_idxs.deinit(alloc);
-    for (entry.params, args) |param, arg_ast| {
-        if (param.is_filter) continue;
-        const arg_idx = try lowerNode(ctx, arg_ast);
-        try value_arg_idxs.append(alloc, arg_idx);
-    }
-
-    return synthCallUser(ctx, fn_id, value_arg_idxs.items, src_start, src_len);
-}
 
 /// Synthesize a `call_user(fn_id, span=value_args)` IR node. The
 /// variable-arity span carries the lowered value-arg IR-node indices
