@@ -811,9 +811,20 @@ test "serialized: infinite-generator stream-mode partial flush unblocks consumer
 
     p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
 
+    const deadline_ns: u64 = 5 * std.time.ns_per_s;
+    const deadline_thread = try std.Thread.spawn(.{}, struct {
+        fn run(pool_ptr: *Pool, ns: u64) void {
+            std.Thread.sleep(ns);
+            pool_ptr._shared.shutdown.store(true, .release);
+        }
+    }.run, .{ &p, deadline_ns });
+    defer deadline_thread.join();
+
     // Read until we've collected at least 100 records, then stop.  If the
     // partial-flush were broken (pre-C3 behavior), `collect_bytes` would
-    // block forever waiting on the in-progress chunk that never publishes.
+    // block forever waiting on the in-progress chunk that never publishes —
+    // the deadline thread above sets shutdown after 5 s so the worker
+    // releases its in-flight chunk and `collect_bytes` returns null.
     var record_count: usize = 0;
     while (record_count < 100) {
         const r = (try p.collect_bytes()) orelse break;
