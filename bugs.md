@@ -127,6 +127,10 @@ Documented, internally-coherent deviations from jq's observable behavior. Not bu
 
 ## Architectural follow-ups (parked, not in current scope)
 
+### B4b predicate-arity correction — bisect bookmark (2026-05-06, ed1d0c1)
+
+`subtreeHasIterate` / `subtreeRebindsCurrent` / `subtreeMayFork` previously skipped IR child indices equal to 0 (a `!= 0` guard treating index 0 as a sentinel). IR index 0 is a real node, so any `.arith` / `.cmp` / `.logical` / path-assign `.set` whose LHS lowered to index 0 (e.g. `.a = (.a | .)`, `.a = (.a + 1)`) had its predicate result silently flipped from true to false, routing through "raw" instead of save/restore reseed and producing type errors instead of jq-correct output. Fix at ed1d0c1 (D6 audit 2026-05-06: 23+ filter sweep, zero jq-compat regression vs parent 72eb07d on filters that worked PRE; baseline arith/cmp/logical (`.a + .b`, `.a == .b`, `(.a>0) and (.b>0)`) within ±1% noise on 200k inputs). Future bisects landing on an arith/cmp/logical/path-assign behavior change near this commit should consider the predicate as authoritative.
+
 ### `reduce` pattern-var-clobbering across recursive calls (LATENT)
 
 Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with `as $key` pattern variables clobbers `$key`/`$in` slots across recursive `call_function` invocations — the inner recursive call overwrites the outer call's pattern-var slot. Walk/1's desugar (commit a626191) avoided this by using `to_entries | map(.value |= walk(f)) | from_entries` instead of jq's canonical `reduce keys[] as $key ({}; ...)` form. Reduce works correctly for non-recursive bodies; the bug surfaces only when a recursive self-call lives inside `reduce`'s update body. Fix would address pattern-var slot allocation in `emitReduce` to scope per-frame rather than per-fn_id.
