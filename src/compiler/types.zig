@@ -36,8 +36,15 @@ pub const Compiled = struct {
         alloc.free(c.external_var_ids);
         c.regex_pool.deinit();
         if (c.prefilter) |*p| p.deinit();
-        // `function_table` is sliced from `string_buf` per plan §1.3 row 7
-        // — no separate free needed; mirrors legacy.
+        // `function_table` is owned by emit (one entry per fn_id), with a
+        // per-entry `write_set` slice. Frees a no-op for empty cat-9 case
+        // since the literal `&.{}` slice is static.
+        if (c.function_table.len > 0) {
+            for (c.function_table) |def| {
+                if (def.write_set.len > 0) alloc.free(def.write_set);
+            }
+            alloc.free(c.function_table);
+        }
     }
 };
 

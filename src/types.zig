@@ -737,6 +737,14 @@ pub const FunctionDef = struct {
     body_ip: u32,
     body_end: u32,
     param_count: u8,
+    /// Sorted, de-duplicated set of variable slot IDs written by the
+    /// recursive body (`capture_variable` / `pop_variable` operands).
+    /// `call_function` snapshots each slot onto `var_save_stack` before
+    /// jumping; `return_function` (and fork-backtrack truncation of
+    /// `call_stack`) restores them. Without this, recursive calls
+    /// clobber the outer call's pattern-var bindings (e.g. reduce
+    /// `as $key` self-recursion). Empty for non-recursive entries.
+    write_set: []const u32 = &.{},
 };
 
 // ─── Instruction ─────────────────────────────────────────────────────────────

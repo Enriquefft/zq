@@ -437,6 +437,32 @@ const CallFrame = struct {
     saved_collect_len: u32,
     /// Saved fork stack depth for unwinding on return.
     saved_fork_len: u32,
+    /// Saved `var_save_stack.items.len` BEFORE this call's write-set
+    /// snapshots were pushed. On return (or fork backtrack truncation
+    /// of call_stack), entries above this length are popped, restoring
+    /// each (id, prev) pair so the caller sees its pre-call slot values.
+    /// Without this, recursive bodies sharing the same compiled slot ids
+    /// (pattern vars in reduce/foreach, value-arg slots) clobber the
+    /// outer call's bindings.
+    saved_var_len: u32,
+    /// Caller's `value_stack` contents at call_function time. Owned slice.
+    /// On call entry the body sees an empty value_stack; on return (or
+    /// fork-unwind via truncateCallStackTo) the caller's stack is
+    /// restored verbatim. Without this, a body's `capture_variable` ops
+    /// pop pending operands the caller had stashed for an outer binary
+    /// op (e.g. the LHS of `(. + $i) + ($n-1 | rec)`), wrongly binding
+    /// pattern vars to caller residue. Bodies return their result via
+    /// `current` per the emitter convention, so any leftover on body's
+    /// own value_stack at return is discarded.
+    saved_stack: []StackValue,
+};
+
+/// A snapshot of one variable slot's value, taken at call_function time
+/// for each var_id in the called fn's write set. Stored on `var_save_stack`;
+/// indexed implicitly by `CallFrame.saved_var_len` boundaries.
+const SavedVar = struct {
+    id: u32,
+    prev: ?StackValue,
 };
 
 /// Resolve a slice bound (possibly negative) against collection length.
@@ -549,6 +575,12 @@ pub const ResultIterator = struct {
     collect_stack: std.ArrayList(CollectFrame),
     /// Active call frames for user-defined recursive function calls.
     call_stack: std.ArrayList(CallFrame),
+    /// Snapshot stack for variable slots saved across recursive call_function /
+    /// return_function pairs. Each CallFrame records the length-mark BEFORE
+    /// the call's write-set snapshots, so return (or fork-backtrack
+    /// truncation of call_stack) restores each saved slot in LIFO order.
+    /// See `CallFrame.saved_var_len` and `truncateCallStackTo`.
+    var_save_stack: std.ArrayList(SavedVar),
     /// Fork stack for unified backtracking (comma, iteration, range, try, alt, label, limit).
     fork_stack: std.ArrayList(Forkpoint),
     /// Path tracking stack for path(f). Pushed by path_begin, popped by path_end.
@@ -660,6 +692,12 @@ pub const ResultIterator = struct {
         errdefer call_stack.deinit(allocator);
         try call_stack.ensureTotalCapacity(allocator, 64);
 
+        // Per-frame variable snapshot side stack (B4: pattern-var clobbering
+        // across recursive reduce/foreach calls).
+        var var_save_stack = std.ArrayList(SavedVar){};
+        errdefer var_save_stack.deinit(allocator);
+        try var_save_stack.ensureTotalCapacity(allocator, 64);
+
         // Initialize fork stack for unified backtracking
         var fork_stack = std.ArrayList(Forkpoint){};
         errdefer fork_stack.deinit(allocator);
@@ -701,6 +739,7 @@ pub const ResultIterator = struct {
             .if_path_comps_stack = if_path_comps_stack,
             .collect_stack = collect_stack,
             .call_stack = call_stack,
+            .var_save_stack = var_save_stack,
             .fork_stack = fork_stack,
             .path_stack = path_stack,
             .next_break_token = 0,
@@ -765,7 +804,9 @@ pub const ResultIterator = struct {
         it.if_path_comps_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
+        for (it.call_stack.items) |*frame| it.alloc.free(frame.saved_stack);
         it.call_stack.deinit(it.alloc);
+        it.var_save_stack.deinit(it.alloc);
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
             if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
@@ -819,7 +860,9 @@ pub const ResultIterator = struct {
         it.if_path_comps_stack.clearRetainingCapacity();
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
+        for (it.call_stack.items) |*frame| it.alloc.free(frame.saved_stack);
         it.call_stack.clearRetainingCapacity();
+        it.var_save_stack.clearRetainingCapacity();
         for (it.fork_stack.items) |*fp| {
             if (fp.saved_stack) |snap| it.alloc.free(snap);
             if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
@@ -1042,6 +1085,43 @@ pub const ResultIterator = struct {
         }
     }
 
+    /// Truncate `call_stack` to `target_len`, restoring each popped frame's
+    /// variable-slot snapshots and value_stack contents in LIFO order.
+    /// Replaces direct `call_stack.items.len = X` writes wherever a
+    /// forkpoint backtrack or label/break unwind crosses a recursive call
+    /// boundary; without this, a recursive frame's saved slots would leak
+    /// on var_save_stack and the caller's value_stack would be lost.
+    ///
+    /// Capacity for value_stack is preserved across the call (clear-then-
+    /// restore reuses the same buffer), so `appendSliceAssumeCapacity`
+    /// cannot allocate. If a body grew the buffer, the saved slice still
+    /// fits; if it shrunk (no caller does), the caller's resize-up would
+    /// have failed earlier.
+    fn truncateCallStackTo(it: *ResultIterator, target_len: usize) void {
+        while (it.call_stack.items.len > target_len) {
+            const frame = it.call_stack.pop().?;
+            while (it.var_save_stack.items.len > frame.saved_var_len) {
+                const sv = it.var_save_stack.pop().?;
+                if (sv.id < it.variable_store.items.len) {
+                    it.variable_store.items[sv.id] = sv.prev;
+                }
+            }
+            it.value_stack.clearRetainingCapacity();
+            it.value_stack.ensureTotalCapacity(it.alloc, frame.saved_stack.len) catch {
+                // OOM here would only fire if the caller's previously-
+                // sized buffer was shrunk by something else mid-call,
+                // which no opcode does. Fall back to a best-effort
+                // restore: append what fits, drop the rest.
+                const fit = @min(it.value_stack.capacity, frame.saved_stack.len);
+                it.value_stack.appendSliceAssumeCapacity(frame.saved_stack[0..fit]);
+                it.alloc.free(frame.saved_stack);
+                continue;
+            };
+            it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
+            it.alloc.free(frame.saved_stack);
+        }
+    }
+
     /// Advance and return the next output value, or null when complete.
     pub fn next(it: *ResultIterator) ZqError!?Value {
         if (it.done) return null;
@@ -1134,7 +1214,7 @@ pub const ResultIterator = struct {
                 var cf = it.collect_stack.pop().?;
                 cf.buffer.deinit(it.alloc);
             }
-            it.call_stack.items.len = state.saved_call_len;
+            it.truncateCallStackTo(state.saved_call_len);
 
             if (state.catch_ip > 0) {
                 // Route to catch handler with error as current.
@@ -2035,27 +2115,78 @@ pub const ResultIterator = struct {
             },
 
             .call_function => {
-                // Recursive function call: push a call frame and jump to the body.
+                // Recursive function call. Two snapshots establish the
+                // body's isolation boundary:
+                //   1. var_save_stack: every slot the body may overwrite
+                //      (FunctionDef.write_set) records its caller value,
+                //      restored on return. Without this, recursive bodies
+                //      sharing compiled slot ids clobber outer bindings.
+                //   2. value_stack: caller's pending operands (e.g. the
+                //      LHS of an outer binary op) are duped onto the
+                //      frame and the live stack cleared. Without this,
+                //      a body's `capture_variable` (whose semantics are
+                //      "pop if non-empty, else use current") pops the
+                //      caller's residue and binds the wrong value.
+                // saved_var_len / saved_stack ownership is freed on
+                // return_function or truncateCallStackTo.
                 const max_recursion_depth = 10000;
                 if (it.call_stack.items.len >= max_recursion_depth) {
                     return error.TypeError;
                 }
-                const body_ip = @as(u32, @intCast(instr.operand.index));
+                const fn_id = @as(u32, @intCast(instr.operand.index));
+                const fn_def = it.function_table[fn_id];
+                const saved_var_len: u32 = @intCast(it.var_save_stack.items.len);
+                for (fn_def.write_set) |id| {
+                    const cur: ?StackValue = if (id < it.variable_store.items.len)
+                        it.variable_store.items[id]
+                    else
+                        null;
+                    try it.var_save_stack.append(it.alloc, .{ .id = id, .prev = cur });
+                }
+                const saved_stack = try it.alloc.dupe(StackValue, it.value_stack.items);
+                it.value_stack.clearRetainingCapacity();
                 try it.call_stack.append(it.alloc, CallFrame{
                     .return_ip = it.ip + 1,
-                    .saved_value_len = @intCast(it.value_stack.items.len),
+                    .saved_value_len = 0,
                     .saved_if_len = @intCast(it.if_stack.items.len),
                     .saved_collect_len = @intCast(it.collect_stack.items.len),
                     .saved_fork_len = @intCast(it.fork_stack.items.len),
+                    .saved_var_len = saved_var_len,
+                    .saved_stack = saved_stack,
                 });
-                it.ip = body_ip;
+                it.ip = fn_def.body_ip;
                 return null;
             },
 
             .return_function => {
-                // Return from a recursive function call.
+                // Return from a recursive function call. Restore variable
+                // snapshots pushed by call_function and re-instate the
+                // caller's value_stack. Calling convention: body leaves
+                // its return value on its own value_stack (the binop /
+                // pipe / capture sequence at the call site pops it). We
+                // forward that top-of-stack across the isolation boundary
+                // by re-pushing it onto the restored caller stack. If the
+                // body left no value on its stack it returned via
+                // `current` instead — both `0` and `1` produce-count
+                // bodies appear in compiled jq output (the latter is the
+                // common case, e.g. `1 + ($n-1 | rec)`).
                 if (it.call_stack.items.len > 0) {
                     const frame = it.call_stack.pop().?;
+                    while (it.var_save_stack.items.len > frame.saved_var_len) {
+                        const sv = it.var_save_stack.pop().?;
+                        if (sv.id < it.variable_store.items.len) {
+                            it.variable_store.items[sv.id] = sv.prev;
+                        }
+                    }
+                    const ret_val: ?StackValue = if (it.value_stack.items.len > 0)
+                        it.value_stack.items[it.value_stack.items.len - 1]
+                    else
+                        null;
+                    it.value_stack.clearRetainingCapacity();
+                    try it.value_stack.ensureTotalCapacity(it.alloc, frame.saved_stack.len + 1);
+                    it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
+                    if (ret_val) |v| it.value_stack.appendAssumeCapacity(v);
+                    it.alloc.free(frame.saved_stack);
                     it.ip = frame.return_ip;
                 } else {
                     // Should not happen — return without matching call.
@@ -2165,7 +2296,7 @@ pub const ResultIterator = struct {
                                     }
                                 }
                             }
-                            it.call_stack.items.len = state.saved_call_len;
+                            it.truncateCallStackTo(state.saved_call_len);
                             // Break produces empty — set ip past end for backtracking.
                             it.ip = @intCast(it.instructions.len);
                             return null;
@@ -8420,7 +8551,7 @@ pub const ResultIterator = struct {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
                     }
-                    it.call_stack.items.len = state.saved_call_len;
+                    it.truncateCallStackTo(state.saved_call_len);
                     it.ip = fp.backtrack_ip; // right side IP
                     const saved_path = fp.saved_path;
                     if (fp.saved_object) |snap| it.restoreObjectConstructState(snap);
@@ -8455,7 +8586,7 @@ pub const ResultIterator = struct {
                         var cf = it.collect_stack.pop().?;
                         cf.buffer.deinit(it.alloc);
                     }
-                    it.call_stack.items.len = state.saved_call_len;
+                    it.truncateCallStackTo(state.saved_call_len);
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
                     it.restorePathState(fp.saved_path);

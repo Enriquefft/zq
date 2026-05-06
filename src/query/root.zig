@@ -128,6 +128,12 @@ pub const CompiledQuery = struct {
         q.allocator.free(q.external_var_ids);
         q.regex_pool.deinit();
         if (q.prefilter) |*p| p.deinit();
+        if (q.function_table.len > 0) {
+            for (q.function_table) |def| {
+                if (def.write_set.len > 0) q.allocator.free(def.write_set);
+            }
+            q.allocator.free(q.function_table);
+        }
     }
 
     /// Bind `tape` to this query and allocate an iterator eval stack.

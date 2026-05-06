@@ -33,8 +33,12 @@ pub const EmitError = error{
 /// `FunctionEntry.recursive_body_ip` at `compiler.zig:209`.
 const FunctionBodyCache = struct {
     body_ip: u32 = 0,
+    /// One past the last instruction of the body (NOT including the
+    /// trailing `return_function`). Used after all emission completes
+    /// to derive the per-fn write_set by scanning [body_ip, body_end_ip).
+    body_end_ip: u32 = 0,
     /// Set once the body has been emitted. Subsequent call sites
-    /// short-circuit to `call_function(body_ip)` without re-emitting.
+    /// short-circuit to `call_function(fn_id)` without re-emitting.
     emitted: bool = false,
 };
 
@@ -74,6 +78,39 @@ const Emitter = struct {
         try self.source_map.append(self.allocator, node.src_start);
     }
 };
+
+/// Scan a slice of emitted instructions for every variable slot that the
+/// body writes (`capture_variable` / `pop_variable` operands) and return
+/// the sorted, deduped set. Caller owns the returned slice.
+///
+/// Used by `emitCallUser`'s recursive arm to derive the per-fn write set
+/// once the body is emitted; each call site then emits a `save_variable`
+/// for every id in that set, so `return_function` can restore the caller's
+/// pattern-var bindings on unwind.
+fn collectWriteSet(
+    allocator: std.mem.Allocator,
+    body: []const types_mod.Instruction,
+) error{OutOfMemory}![]const u32 {
+    if (body.len == 0) return &.{};
+    var seen: std.AutoArrayHashMapUnmanaged(u32, void) = .{};
+    defer seen.deinit(allocator);
+    for (body) |instr| {
+        switch (instr.op) {
+            .capture_variable, .pop_variable => {
+                const id: u32 = @intCast(instr.operand.index);
+                try seen.put(allocator, id, {});
+            },
+            else => {},
+        }
+    }
+    if (seen.count() == 0) return &.{};
+    const ids = try allocator.alloc(u32, seen.count());
+    var i: usize = 0;
+    var it = seen.iterator();
+    while (it.next()) |kv| : (i += 1) ids[i] = kv.key_ptr.*;
+    std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+    return ids;
+}
 
 /// Emit bytecode from `ir_obj`. The emitter walks the IR tree
 /// recursively from the root (the last-pushed node, since lowering
@@ -157,7 +194,45 @@ pub fn emit(
     const src_map_slice = try source_map.toOwnedSlice(allocator);
     errdefer allocator.free(src_map_slice);
 
-    const function_defs: []const types_mod.FunctionDef = &.{};
+    // Build the runtime function table, indexed by fn_id. `call_function`'s
+    // operand is now a fn_id; the VM resolves body_ip + write_set here.
+    // `write_set` is derived by scanning the emitted body span [body_ip,
+    // body_end_ip) for `capture_variable` / `pop_variable` operands, so
+    // every slot the body may overwrite is snapshotted on call entry and
+    // restored on return — fixing the recursive reduce / pattern-var
+    // clobber bug. Allocated AFTER all emission completes so a body's
+    // own self-recursion (which emits `call_function` before its body
+    // finishes walking) sees the final write set.
+    const function_defs: []types_mod.FunctionDef = if (fn_body_ip.len == 0)
+        &.{}
+    else
+        try allocator.alloc(types_mod.FunctionDef, fn_body_ip.len);
+    errdefer if (fn_body_ip.len > 0) {
+        for (function_defs) |*def| if (def.write_set.len > 0) allocator.free(def.write_set);
+        allocator.free(function_defs);
+    };
+    for (fn_body_ip, 0..) |cache, i| {
+        const param_count: u8 = blk: {
+            const fn_entry = function_table[i];
+            break :blk @intCast(fn_entry.params.len);
+        };
+        if (cache.emitted) {
+            const ws = try collectWriteSet(allocator, instr_slice[cache.body_ip..cache.body_end_ip]);
+            function_defs[i] = .{
+                .body_ip = cache.body_ip,
+                .body_end = cache.body_end_ip,
+                .param_count = param_count,
+                .write_set = ws,
+            };
+        } else {
+            function_defs[i] = .{
+                .body_ip = 0,
+                .body_end = 0,
+                .param_count = param_count,
+                .write_set = &.{},
+            };
+        }
+    }
 
     const ext_var_ids = try allocator.alloc(u32, external_var_count);
     errdefer allocator.free(ext_var_ids);
@@ -3456,12 +3531,19 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
 
         std.debug.assert(entry.body_ir_root != lower_mod.BODY_IR_NOT_LOWERED);
         try emitNode(em, entry.body_ir_root);
+        cache.body_end_ip = @intCast(em.instructions.items.len);
         try em.pushInstr(.return_function, .{ .none = {} }, node);
 
         em.instructions.items[jump_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
     }
 
-    try em.pushInstr(.call_function, .{ .index = @intCast(cache.body_ip) }, node);
+    // call_function carries fn_id (NOT body_ip) — VM looks up body_ip
+    // and the per-fn write_set from `function_table` populated post-emit
+    // (compile()) once every recursive body has been emitted. Per-call
+    // save_variable cannot live at the call site because a body's OWN
+    // self-recursion emits its call_function before the body finishes
+    // being walked; the write set is finalized only after.
+    try em.pushInstr(.call_function, .{ .index = @intCast(fn_id) }, node);
 
     var i: usize = num_value_args;
     while (i > 0) {
