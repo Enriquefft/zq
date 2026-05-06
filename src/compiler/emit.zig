@@ -4164,7 +4164,7 @@ fn emitInputScopeReseed(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void
 fn fixedChildArity(ir_obj: ir.IR, node: ir.Node) struct { lo: u8, hi: u8 } {
     return switch (node.op) {
         .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_, .computed_index => .{ .lo = 0, .hi = 2 },
-        .try_, .neg, .path_begin, .label => .{ .lo = 1, .hi = 2 },
+        .try_, .neg, .path_begin, .label => .{ .lo = 0, .hi = 1 },
         .update_assign => blk: {
             const kind: ir.UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
             break :blk if (kind == .general)
