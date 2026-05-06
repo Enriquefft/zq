@@ -1551,9 +1551,41 @@ fn emitFastPathUpdate(em: *Emitter, node: ir.Node, kind: ir.UpdateOpKind) EmitEr
             try emitUpdateChain(em, node, steps.items);
         },
         // `= rhs` — evaluate RHS against original input first, THEN
-        // navigate, THEN update.
+        // navigate, THEN update.  `emitNavigation` reads `it.current`
+        // via `save_input` + `navigate_key`, so the RHS must leave
+        // `it.current` equal to the outer input.  Three-tier dispatch
+        // mirrors `.arith`/`.cmp`/`.logical` (this file, :537-574 and
+        // friends), reusing the canonical `subtreeRebindsCurrent` /
+        // `subtreeMayFork` predicates rather than wrapping
+        // unconditionally.
         .set => {
-            try emitNode(em, rhs_idx);
+            const rhs_forks = subtreeMayFork(em.ir_obj, rhs_idx);
+            const rhs_rebinds = subtreeRebindsCurrent(em.ir_obj, rhs_idx);
+
+            if (rhs_forks) {
+                // Variable-capture path: forks survive variable slots
+                // but clobber `if_stack` frames, so stack-based
+                // reseed isn't safe here.
+                const orig_var = em.allocVar();
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.capture_variable, .{ .index = orig_var }, node);
+                try emitNode(em, rhs_idx);
+                try em.pushInstr(.load_variable, .{ .index = orig_var }, node);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+            } else if (rhs_rebinds) {
+                // Stack-based reseed: cheaper than var-capture; safe
+                // when no fork can backtrack across the
+                // `save_input`/`restore_input` pair.
+                try em.pushInstr(.save_input, .{ .none = {} }, node);
+                try emitNode(em, rhs_idx);
+                try em.pushInstr(.pipe, .{ .none = {} }, node);
+                try em.pushInstr(.push_current, .{ .none = {} }, node);
+                try em.pushInstr(.restore_input, .{ .none = {} }, node);
+            } else {
+                // RHS provably preserves `it.current` — emit raw.
+                try emitNode(em, rhs_idx);
+            }
+
             try emitNavigation(em, node, steps.items);
             try emitUpdateChain(em, node, steps.items);
         },
@@ -4123,6 +4155,27 @@ fn emitInputScopeReseed(em: *Emitter, node: ir.Node, var_id: u32) EmitError!void
 /// when generators are present) and the original value-stack path
 /// (safe for recursive functions where fixed variable IDs would be
 /// clobbered by re-entrant calls).
+/// Resolve which fixed-children slots of `node` hold real operand
+/// indices.  IR node 0 is NOT a sentinel — it is a valid IR-node index
+/// — so a `children[i] == 0` check would mis-skip the LHS of a binary
+/// op whose LHS happens to be the first lowered node (common: `.a`
+/// from `.a + 1`).  Arity table mirrors the dumper at
+/// `ir.zig:1955-1968`; both must stay in sync.
+fn fixedChildArity(ir_obj: ir.IR, node: ir.Node) struct { lo: u8, hi: u8 } {
+    return switch (node.op) {
+        .pipe, .comma, .arith, .cmp, .logical, .alt, .while_, .until_, .computed_index => .{ .lo = 0, .hi = 2 },
+        .try_, .neg, .path_begin, .label => .{ .lo = 1, .hi = 2 },
+        .update_assign => blk: {
+            const kind: ir.UpdateOpKind = @enumFromInt(ir_obj.extra_data.items[node.extra]);
+            break :blk if (kind == .general)
+                .{ .lo = 0, .hi = 2 }
+            else
+                .{ .lo = 1, .hi = 2 };
+        },
+        else => .{ .lo = 0, .hi = 0 },
+    };
+}
+
 fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
     const node = ir_obj.nodes.items[node_idx];
     // Treat `computed_index` like a generator for the purposes of the
@@ -4133,13 +4186,17 @@ fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
     // path captures the RHS via a variable before re-running the LHS,
     // so it's safe across these forks.
     if (node.op == .iterate or node.op == .computed_index) return true;
-    // Two fixed children.
-    if (node.children[0] != 0 and subtreeHasIterate(ir_obj, node.children[0])) return true;
-    if (node.children[1] != 0 and subtreeHasIterate(ir_obj, node.children[1])) return true;
-    // Variable-arity span children.
-    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
-    for (span) |child| {
-        if (child != 0 and subtreeHasIterate(ir_obj, child)) return true;
+    if (node.span_len > 0) {
+        const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+        for (span) |child| {
+            if (subtreeHasIterate(ir_obj, child)) return true;
+        }
+        return false;
+    }
+    const ar = fixedChildArity(ir_obj, node);
+    var i: u8 = ar.lo;
+    while (i < ar.hi) : (i += 1) {
+        if (subtreeHasIterate(ir_obj, node.children[i])) return true;
     }
     return false;
 }
@@ -4180,11 +4237,17 @@ fn subtreeRebindsCurrent(ir_obj: ir.IR, node_idx: u32) bool {
         else => false,
     };
     if (!stack_only) return true;
-    if (node.children[0] != 0 and subtreeRebindsCurrent(ir_obj, node.children[0])) return true;
-    if (node.children[1] != 0 and subtreeRebindsCurrent(ir_obj, node.children[1])) return true;
-    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
-    for (span) |child| {
-        if (child != 0 and subtreeRebindsCurrent(ir_obj, child)) return true;
+    if (node.span_len > 0) {
+        const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+        for (span) |child| {
+            if (subtreeRebindsCurrent(ir_obj, child)) return true;
+        }
+        return false;
+    }
+    const ar = fixedChildArity(ir_obj, node);
+    var i: u8 = ar.lo;
+    while (i < ar.hi) : (i += 1) {
+        if (subtreeRebindsCurrent(ir_obj, node.children[i])) return true;
     }
     return false;
 }
@@ -4218,11 +4281,17 @@ fn subtreeMayFork(ir_obj: ir.IR, node_idx: u32) bool {
         else => false,
     };
     if (forks) return true;
-    if (node.children[0] != 0 and subtreeMayFork(ir_obj, node.children[0])) return true;
-    if (node.children[1] != 0 and subtreeMayFork(ir_obj, node.children[1])) return true;
-    const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
-    for (span) |child| {
-        if (child != 0 and subtreeMayFork(ir_obj, child)) return true;
+    if (node.span_len > 0) {
+        const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+        for (span) |child| {
+            if (subtreeMayFork(ir_obj, child)) return true;
+        }
+        return false;
+    }
+    const ar = fixedChildArity(ir_obj, node);
+    var i: u8 = ar.lo;
+    while (i < ar.hi) : (i += 1) {
+        if (subtreeMayFork(ir_obj, node.children[i])) return true;
     }
     return false;
 }
