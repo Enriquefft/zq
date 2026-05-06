@@ -1464,6 +1464,19 @@ pub const ResultIterator = struct {
             },
 
             .load_path => {
+                // B1 fix: push the result onto value_stack (do NOT set
+                // it.current) so that `load_path` behaves consistently
+                // with `load_key`.  The pipe opcode that always follows
+                // `load_path` in the instruction stream (either from an
+                // explicit user `|` or from the binary-op save_input path)
+                // will pop the result into it.current for downstream
+                // consumers.  Without this change, `pipe` after `load_path`
+                // inside an object-field value expression would pop the
+                // field KEY off the stack instead of the path result,
+                // because `load_path` set it.current directly and left the
+                // key as the top-of-stack item.  Aligning with `load_key`
+                // semantics keeps the stack protocol uniform across all
+                // field-access opcodes.
                 const path = it.string_buf[instr.operand.str_ref.offset..][0..instr.operand.str_ref.len];
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
@@ -1474,7 +1487,8 @@ pub const ResultIterator = struct {
                         }
                     }
                 }
-                it.current = try it.doLoadPath(path);
+                const result = try it.doLoadPath(path);
+                it.pushValue(try valueToStackValue(result));
                 it.ip += 1;
                 return null;
             },

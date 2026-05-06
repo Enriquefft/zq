@@ -701,6 +701,138 @@ test "BUG-005 does not regress BUG-006: {a: (1,2,3)} still compiles" {
     defer q.deinit();
 }
 
+// ── B1 regression: multi-segment LHS in object-field value ───────────────────
+//
+// {k: .a.b | f} mis-evaluated: after fuse collapse the `load_path` opcode
+// sets it.current directly (no push), leaving the key string on value_stack.
+// A subsequent `pipe` in the value expression popped the key string off the
+// stack into it.current, so the RHS saw the field-name instead of .a.b.
+//
+// Fix: obj_ctor static-key branch now saves it.current before emitting the key
+// and restores it after, matching the computed-key branch's idiom.
+
+test "B1: {out: .a.b | tostring} on {\"a\":{\"b\":\"hi\"}} yields {\"out\":\"hi\"}" {
+    // input:  {"a": {"b": "hi"}}
+    // filter: {out: .a.b | tostring}
+    // jq:     .a.b == "hi"; tostring of a string is itself → {"out": "hi"}
+    var q = try compile("{out: .a.b | tostring}");
+    defer q.deinit();
+    const sb = "outabhi";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 3, .len = 1 } } }, // "a"
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 4, .len = 1 } } }, // "b"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 5, .len = 2 } } }, // "hi"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expect(vals.items[0] == .object);
+    const span = vals.items[0].object;
+    const rt = span.tape;
+    // Result tape: [object_start, key("out"), string("hi"), object_end]
+    try std.testing.expectEqualStrings("out", rt.getString(rt.entries[span.start + 1].payload.string));
+    try std.testing.expectEqualStrings("hi", rt.getString(rt.entries[span.start + 2].payload.string));
+}
+
+test "B1: {out: .a.b | length} on {\"a\":{\"b\":[1,2]}} yields {\"out\":2}" {
+    // input:  {"a": {"b": [1, 2]}}
+    // filter: {out: .a.b | length}
+    // jq:     .a.b == [1,2]; length == 2 → {"out": 2}
+    var q = try compile("{out: .a.b | length}");
+    defer q.deinit();
+    const sb = "outab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 10 } }, // [0] outer, end at [9]
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 3, .len = 1 } } }, // "a"
+        .{ .tag = .object_start, .payload = .{ .skip = 9 } }, // [2] inner, end at [8]
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 4, .len = 1 } } }, // "b"
+        .{ .tag = .array_start, .payload = .{ .skip = 8 } }, // [4] array, end at [7]
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } }, // [7]
+        .{ .tag = .object_end, .payload = .{ .none = {} } }, // [8]
+        .{ .tag = .object_end, .payload = .{ .none = {} } }, // [9]
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "out", 2);
+}
+
+test "B1: {out: .a.b.c | length} on {\"a\":{\"b\":{\"c\":\"yo\"}}} yields {\"out\":2}" {
+    // input:  {"a": {"b": {"c": "yo"}}}
+    // filter: {out: .a.b.c | length}
+    // jq:     .a.b.c == "yo"; length == 2 → {"out": 2}
+    var q = try compile("{out: .a.b.c | length}");
+    defer q.deinit();
+    const sb = "outabcyo";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 10 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 3, .len = 1 } } }, // "a"
+        .{ .tag = .object_start, .payload = .{ .skip = 9 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 4, .len = 1 } } }, // "b"
+        .{ .tag = .object_start, .payload = .{ .skip = 8 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 5, .len = 1 } } }, // "c"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 6, .len = 2 } } }, // "yo"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "out", 2);
+}
+
+test "B1: {out: .a.b | tostring | length} on {\"a\":{\"b\":\"hi\"}} yields {\"out\":2}" {
+    // input:  {"a": {"b": "hi"}}
+    // filter: {out: .a.b | tostring | length}
+    // jq:     .a.b == "hi"; tostring == "hi"; length == 2 → {"out": 2}
+    var q = try compile("{out: .a.b | tostring | length}");
+    defer q.deinit();
+    const sb = "outabhi";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 7 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 3, .len = 1 } } }, // "a"
+        .{ .tag = .object_start, .payload = .{ .skip = 6 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 4, .len = 1 } } }, // "b"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 5, .len = 2 } } }, // "hi"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "out", 2);
+}
+
+test "B1: {out: .a | length} on {\"a\":\"hi\"} yields {\"out\":2} (1-segment negative regression)" {
+    // 1-segment path — was already working before the fix. Ensures the new
+    // save/restore wrapper does not break the single-field path.
+    var q = try compile("{out: .a | length}");
+    defer q.deinit();
+    const sb = "outahi";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 3, .len = 1 } } }, // "a"
+        .{ .tag = .string, .payload = .{ .string = .{ .offset = 4, .len = 2 } } }, // "hi"
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try expectObjectWithIntField(vals.items[0], "out", 2);
+}
+
 // ── BUG-006: generator in object-value position ──────────────────────────────
 //
 // Pre-fix, any generator yielding N > 1 values inside `{a: <gen>}` raised a
