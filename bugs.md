@@ -2,20 +2,33 @@
 
 Active bugs and latent issues. Fixed entries are pruned; check git history / commit messages for resolved incidents.
 
-Last verified: 2026-05-05.
+Last verified: 2026-05-05, HEAD 14c3e71 (post wave-generator-decnum-conditional — 4 decnum-gated tests skipped via generator allowlist).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1173/1201 pass, 4 fail, 24 skipped. Remaining failures: 4 decnum-gated (L2195 L2223 L2262 L2266).
+Current baseline: `zig build test` → 1173 pass, 0 fail, 28 skipped. Zero active failures.
 
-| Tag | Symptom | Category | Note |
-|-----|---------|----------|------|
-| L2195 | `(13911860366432393 == 13911860366432392)` | numeric | i64 equality near precision boundary; gated on decnum support. |
-| L2223 | `[1E+1000,-1E+1000 \| tojson]` | decnum | Park until decnum support is decided. |
-| L2262 | `[1E+1000,-1E+1000 \| abs \| tojson] \| unique` | decnum | Park until decnum support is decided. |
-| L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique` | decnum | Park until decnum support is decided. |
+## Skipped via generator (Deliberate Deviation: decnum)
+
+The compat generator emits `error.SkipZigTest` for these four tests via the
+hardcoded `%SKIP_DECNUM_GATED` allowlist in `tests/scripts/generate_compat_tests.pl`.
+Each filter contains an `if have_decnum/have_literal_numbers then … else … end`
+shape; the else-branch encodes lossy f64 behavior zq deliberately doesn't
+emit (see ROADMAP.md → Deliberate Deviations → Number representation).
+SSOT for the `have_decnum` / `have_literal_numbers` truth value:
+`tests/compat/zq_features.zig`, mirrored from `src/vm/root.zig:4176`.
+
+| Tag | Filter |
+|-----|--------|
+| L2195 | `(13911860366432393 == 13911860366432392) \| . == if have_decnum then false else true end` |
+| L2223 | `[1E+1000,-1E+1000 \| tojson] == if have_decnum then [...] else [...] end` |
+| L2262 | `[1E+1000,-1E+1000 \| abs \| tojson] \| unique == if have_decnum then [...] else [...] end` |
+| L2266 | `[1E+1000,-1E+1000 \| length \| tojson] \| unique == if have_decnum then [...] else [...] end` |
+
+If decnum support ever lands, flip the constants in `tests/compat/zq_features.zig`
+and the skip guards become no-ops automatically; the allowlist can then be retired.
 
 ## Intentional jq divergences
 
