@@ -74,18 +74,20 @@ Discovered 2026-04-30 during walk/1 implementer work. A `reduce` expression with
 
 ---
 
-## Infinite generators: zero-output via pool streaming (HIGH)
+## Infinite generators: zero-output via pool streaming (RESOLVED)
 
 | Field | Value |
 |-------|-------|
 | Symptom | Bare infinite generator filters (e.g. `repeat(.+1)`, `range(1; 1_000_000_000)`) emit zero bytes to stdout/file/pipe. |
 | Repro | `echo 0 \| zq 'repeat(.+1)'` — hangs with no output (kill before OOM). Same with `zq 'range(1; 1_000_000_000)'`. |
-| Root cause | `src/pool/root.zig:822-836` (`process_line_serialized`) buffers an entire chunk's serialized output into `chunk_buf` **before** publishing to the sequencer. An infinite-generator iterator never returns null → chunk never publishes → no bytes ever flush. |
+| Root cause | `src/pool/root.zig` `process_line_serialized` buffered an entire chunk's serialized output into `chunk_buf` **before** publishing to the sequencer. An infinite-generator iterator never returns null → chunk never publishes → no bytes ever flush. |
 | Affects | Any filter that produces an unbounded result stream without an enclosing `limit/skip/first/last` short-circuit. |
 | Not affected | Bounded generators (`limit(N; repeat(.+1))`, `range(1; 100)`, finite filters) — all flush correctly. |
-| Severity | HIGH (correctness, but only on infinite filters which are themselves rare in agent workloads). |
-| Fix sketch | Stream output from `process_line_serialized` incrementally — flush partial `chunk_buf` to sequencer at a configurable byte/record threshold, rather than waiting for iterator exhaustion. |
+| Severity | HIGH (correctness). |
+| Resolution | Stream-mode partial-publish (wave-streaming-generators C3, 2026-05-05). `STREAM_FLUSH_THRESHOLD = 64 KiB` triggers `partial_flush` mid-iterator; each Job reserves `STREAM_SEQ_RANGE = 8` consecutive sub-ids and publishes up to N partial ChunkResults with the final one carrying `end_of_range = true` so the Sequencer skips unused slots. Sequencer ring scales to `(QUEUE_CAP + n_threads) × STREAM_SEQ_RANGE`. Per-partial `limiter.acquire()` keeps peak in-flight memory bounded. |
+| Verify | `echo 0 \| timeout 5 zq 'repeat(.+1)' \| head -100 \| wc -l` returns 100. |
 | Discovered | 2026-04-29, during `repeat(f)` builtin review. |
+| Resolved | 2026-05-05. |
 
 ---
 

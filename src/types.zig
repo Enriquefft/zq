@@ -939,6 +939,25 @@ pub const Instruction = extern struct {
         /// End of walk(f) scope. The VM jumps here after executing the body.
         walk_end,
 
+        /// Begin a `reduce <EXPR> as $p (INIT; UPDATE)` source-wrap scope.
+        /// `EXPR` may itself be a streaming generator built from
+        /// `limit`/`skip`/`first`/`repeat`, whose body terminates each
+        /// iteration with `yield_output`. Without this wrap, `yield_output`
+        /// would escape the value to the caller of `next()`, bypassing the
+        /// reduce's destructure/update arm. The wrap's frame on the
+        /// `fork_stack` is consulted by `yield_output`: when it fires inside
+        /// the wrap's IP range, the emitted value is routed into `current`
+        /// and `ip` is advanced past `reduce_source_end`, so the rest of the
+        /// reduce body runs as if the source had produced the value via the
+        /// natural (non-streaming) `each`/comma flow.
+        /// operand.index = exit_ip (IP of the matching `reduce_source_end`).
+        reduce_source_start,
+        /// End of a `reduce_source_start` scope. Pops the wrap frame.
+        /// Reached when the source completes without firing `yield_output`
+        /// (e.g. `range`, comma, or a single-value tail), in which case the
+        /// destructure arm consumes the value already in `current`.
+        reduce_source_end,
+
         /// Begin a repeat(f) scope — jq's `def repeat(exp): def _r: exp, _r; _r;`.
         /// operand.index = exit_ip (IP of the matching repeat_end + 1).
         /// Pushes a RepeatFrame fork that captures the current input. On
@@ -1019,6 +1038,7 @@ pub const Instruction = extern struct {
                 .nth_start,
                 .walk_start,
                 .repeat_start,
+                .reduce_source_start,
                 .path_begin,
                 .fork,
                 .call_function,
@@ -1101,6 +1121,8 @@ pub const Instruction = extern struct {
                 .walk_end,
                 .repeat_start,
                 .repeat_end,
+                .reduce_source_start,
+                .reduce_source_end,
                 .fork,
                 .backtrack,
                 .each,

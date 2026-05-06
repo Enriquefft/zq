@@ -188,6 +188,17 @@ const ChunkResult = struct {
     chunk_id: u64,
     /// Global sequence number of records[0] (informational; not used by collect()).
     seq_base: u64,
+    /// True when this chunk is the LAST partial within its Job's reserved sub-id
+    /// range `[seq_base .. seq_base + seq_range_size)`. The Sequencer skips any
+    /// trailing unused sub-ids in the range when delivering this chunk so the
+    /// dense-id invariant (next_chunk_id advances over delivered + skipped) is
+    /// preserved. Single-chunk Jobs (file mode, seq_range_size=1) always set
+    /// `end_of_range = true` with sub_id 0.
+    end_of_range: bool = true,
+    /// Worker-allocated reservation size for this chunk's Job. The Sequencer
+    /// uses (seq_base + seq_range_size) to skip unused trailing slots when
+    /// `end_of_range` is observed. Must equal Job.seq_range_size.
+    seq_range_size: u32 = 1,
     /// Path-specific payload.
     payload: union(enum) {
         /// Structured path: one RecordOutcome per record.
@@ -238,6 +249,14 @@ const Job = struct {
     raw_input: bool,
     /// External variable bindings, shared read-only across all workers.
     external_bindings: []const query_mod.ExternalVarBinding,
+    /// Sub-id range reserved for this Job's chunk publications.
+    /// File mode: 1 (one ChunkResult per Job, posted with end_of_range=true).
+    /// Stream mode: STREAM_SEQ_RANGE (the worker may publish multiple partial
+    /// ChunkResults with chunk_ids `seq_base + 0 .. seq_base + sub_id`, then a
+    /// final partial with `end_of_range = true` to release any unused slots).
+    /// The submitter must arrange chunk_id assignments so that ranges from
+    /// distinct Jobs do not overlap.
+    seq_range_size: u32 = 1,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -441,15 +460,25 @@ const Sequencer = struct {
         s.available.signal();
     }
 
+    /// Pin the total chunk count.  First-writer-wins: subsequent calls (e.g.
+    /// from `Pool.deinit` after the IO thread or last worker has already
+    /// pinned the value) are ignored so a late shutdown can't shrink the
+    /// total below the high-water mark of already-published chunk_ids.
     fn set_total_chunks(s: *Sequencer, total: u64) void {
         s.mutex.lock();
         defer s.mutex.unlock();
+        if (s.total_chunks != null) return;
         s.total_chunks = total;
         s.available.broadcast();
     }
 
     /// Block until the next in-order ChunkResult is available, then return it.
     /// Returns null when all chunks have been delivered.
+    ///
+    /// When the delivered chunk has `end_of_range = true`, advances
+    /// `next_chunk_id` to `seq_base + seq_range_size` so any unused trailing
+    /// sub-ids in the Job's reservation are skipped. For non-streaming Jobs
+    /// (seq_range_size = 1) this is identical to the simple +1 advance.
     fn next_in_order(s: *Sequencer) ?ChunkResult {
         s.mutex.lock();
         defer s.mutex.unlock();
@@ -460,7 +489,12 @@ const Sequencer = struct {
             const idx = s.next_chunk_id % s.slots.len;
             if (s.slots[idx]) |cr| {
                 s.slots[idx] = null;
-                s.next_chunk_id += 1;
+                if (cr.end_of_range) {
+                    // Skip any trailing reserved-but-unused sub-ids in the Job.
+                    s.next_chunk_id = cr.seq_base + cr.seq_range_size;
+                } else {
+                    s.next_chunk_id += 1;
+                }
                 return cr;
             }
             s.available.wait(&s.mutex);
@@ -473,8 +507,44 @@ const Sequencer = struct {
 const WorkerCtx = struct {
     queue: *JobQueue,
     sequencer: *Sequencer,
+    /// Stream-mode partial-flush backpressure: workers call `acquire` for each
+    /// partial publish beyond the first to keep peak in-flight memory bounded.
+    limiter: *InFlightLimiter,
+    /// Shared range allocator — workers `fetchAdd(STREAM_SEQ_RANGE)` mid-Job
+    /// to chain a fresh range when the current reservation fills.
+    next_seq_range_base: *std.atomic.Value(u64),
+    /// Hot-path cooperative shutdown signal observed in the streaming emit
+    /// loop.  Set by `Pool.deinit`; read by the worker every value-emit
+    /// iteration so consumer-close (closed pipe / SIGTERM) breaks out
+    /// promptly even inside an unbounded generator.
+    shutdown: *std.atomic.Value(bool),
+    /// Active stream-mode Jobs counter; the worker decrements after the
+    /// final partial post for each Job.  When the IO thread has signaled
+    /// `io_done` and this counter reaches zero, the worker pins
+    /// `total_chunks = next_seq_range_base` so a blocked collector unblocks.
+    active_stream_jobs: *std.atomic.Value(u64),
+    io_done: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 };
+
+/// Pin `Sequencer.total_chunks` iff (a) the IO thread has finished pushing
+/// Jobs and (b) no stream-mode Jobs are still in-flight — i.e. no further
+/// sub-id ranges will ever be claimed.  First-writer-wins inside
+/// `set_total_chunks`, so racing callers (last worker vs. IO thread vs.
+/// `Pool.deinit`) all converge on the same pinned value.  SSOT for the
+/// `(io_done && active_stream_jobs == 0)` invariant — invoked from both
+/// worker paths after their final per-Job `fetchSub` and from `io_thread_fn`
+/// after `io_done.store`.
+fn try_pin_total_chunks(
+    sequencer: *Sequencer,
+    next_seq_range_base: *std.atomic.Value(u64),
+    active_stream_jobs: *std.atomic.Value(u64),
+    io_done: *std.atomic.Value(bool),
+) void {
+    if (io_done.load(.acquire) and active_stream_jobs.load(.acquire) == 0) {
+        sequencer.set_total_chunks(next_seq_range_base.load(.monotonic));
+    }
+}
 
 fn worker_fn(ctx: WorkerCtx) void {
     // One parser per worker, reused across all chunks via reset().
@@ -503,13 +573,38 @@ fn worker_fn(ctx: WorkerCtx) void {
         // bounding mmap RSS to O(in_flight × chunk_size) instead of O(file_size).
         defer if (!job.owns_data) madvise_dontneed_chunk(job.data);
 
-        // Per-chunk arena: all OwnedValue / serialized-byte memory is allocated here.
-        // Freed atomically by collect()/collect_bytes() after the chunk is exhausted.
-        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        const aa = arena.allocator();
-
         if (job.format) |fmt| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
+            //
+            // Stream-mode Jobs may publish multiple partial ChunkResults inside
+            // their reserved sub-id range (`seq_base .. seq_base + seq_range_size`).
+            // File-mode Jobs always have seq_range_size = 1 → exactly one post.
+            //
+            // Per-chunk arena: all OwnedValue / serialized-byte memory is
+            // allocated here.  Freed atomically by collect_bytes() after the
+            // chunk is exhausted.  Each partial flush hands its arena off to
+            // the sequencer and starts a fresh one — see partial_flush.
+            var state = SerializeJobState{
+                .arena = std.heap.ArenaAllocator.init(ctx.allocator),
+                .aa = undefined,
+                .chunk_buf = std.ArrayList(u8){},
+                .meta_list = std.ArrayList(RecordMeta){},
+                .chunk_user_error_msg = null,
+                .sequencer = ctx.sequencer,
+                .limiter = ctx.limiter,
+                .next_seq_range_base = ctx.next_seq_range_base,
+                .shutdown = ctx.shutdown,
+                .pool_alloc = ctx.allocator,
+                .fmt = fmt,
+                .seq_base = job.seq_base,
+                .seq_range_size = job.seq_range_size,
+                .sub_id = 0,
+                // Threshold > 0 only when the Job was reserved with multiple
+                // sub-ids (stream mode).  File-mode Jobs run as before with
+                // a single arena and a single post.
+                .flush_threshold = if (job.seq_range_size > 1) STREAM_FLUSH_THRESHOLD else 0,
+            };
+            state.aa = state.arena.allocator();
 
             // Count records first so meta_list can be exactly pre-allocated.
             // This prevents interleaving: meta_list is allocated FIRST (exact,
@@ -523,24 +618,12 @@ fn worker_fn(ctx: WorkerCtx) void {
                 if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
                 break :blk count;
             };
-
-            var meta_list = std.ArrayList(RecordMeta){};
-            meta_list.ensureTotalCapacity(aa, record_count) catch {};
-
-            var chunk_buf = std.ArrayList(u8){};
+            state.meta_list.ensureTotalCapacity(state.aa, record_count) catch {};
             const buf_estimate: usize = switch (fmt) {
                 .pretty => job.data.len * 6,
                 .compact, .jsonl, .raw, .join => job.data.len,
             };
-            chunk_buf.ensureTotalCapacity(aa, buf_estimate) catch {};
-
-            // Per-chunk diagnostic slot. Populated (last-write-wins) whenever
-            // the VM raises an error with `user_error_msg` set — e.g. jq-style
-            // `error("msg")`, `"Invalid path expression ..."`, `limit` on a
-            // negative count. The collector reads this once per chunk and
-            // forwards it to `formatDiagnostic`. Strings are duped into the
-            // chunk arena so lifetime ties to the chunk.
-            var chunk_user_error_msg: ?[]const u8 = null;
+            state.chunk_buf.ensureTotalCapacity(state.aa, buf_estimate) catch {};
 
             var remaining: []const u8 = job.data;
             while (remaining.len > 0) {
@@ -552,67 +635,62 @@ fn worker_fn(ctx: WorkerCtx) void {
                 remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
                 if (line.len == 0 and !job.raw_input) continue;
 
-                const meta = process_line_serialized(
+                const meta_count_before = state.meta_list.items.len;
+
+                process_line_serialized(
                     line,
                     &parser,
                     &opt_it,
                     &current_query,
                     job.query,
                     ctx.allocator,
-                    aa,
-                    fmt,
                     job.color,
-                    &chunk_buf,
                     job.opts,
                     job.raw_input,
                     job.external_bindings,
+                    &state,
                 );
 
                 // Capture any VM-side user error message before the iterator
                 // is reset on the next record. Only VM errors (not parse
                 // errors) populate this; `process_line_serialized` leaves the
-                // iterator valid after such an error.
-                if (meta.is_error) {
+                // iterator valid after such an error.  We check whether any
+                // newly-appended meta in this line is_error.
+                var saw_error = false;
+                if (state.meta_list.items.len > meta_count_before) {
+                    const last = state.meta_list.items[state.meta_list.items.len - 1];
+                    saw_error = last.is_error;
+                }
+                if (saw_error) {
                     if (opt_it) |*it| {
                         if (it.user_error_msg) |msg| {
                             switch (msg) {
                                 .string => |s| {
-                                    const duped = aa.dupe(u8, s) catch null;
-                                    if (duped) |d| chunk_user_error_msg = d;
+                                    const duped = state.aa.dupe(u8, s) catch null;
+                                    if (duped) |d| state.chunk_user_error_msg = d;
                                 },
                                 else => {},
                             }
                         }
                     }
                 }
-
-                meta_list.append(aa, meta) catch {
-                    meta_list.append(aa, .{
-                        .end_offset = @intCast(chunk_buf.items.len),
-                        .last_was_false_or_null = false,
-                        .is_error = true,
-                        .error_code = @intFromError(@as(ZqError, error.IoError)),
-                    }) catch {};
-                };
             }
 
-            // Use .items directly — the arena owns the backing memory and
-            // toOwnedSlice would copy + leak the original pre-allocated buffer.
-            const data_slice = chunk_buf.items;
-            const meta_slice = meta_list.items;
+            // Final post for this Job (carries `end_of_range = true` so the
+            // Sequencer skips any unused trailing sub-ids in the reservation).
+            partial_flush(&state, true);
 
-            ctx.sequencer.post(ChunkResult{
-                .chunk_id = job.chunk_id,
-                .seq_base = job.seq_base,
-                .payload = .{ .serialized = .{
-                    .data = data_slice,
-                    .records = meta_slice,
-                } },
-                .user_error_msg = chunk_user_error_msg,
-                .arena = arena,
-            });
+            // Stream-mode Job accounting: this Job will not claim any more
+            // ranges.  File-mode Jobs (seq_range_size == 1) are tracked
+            // separately by `set_total_chunks` in `file_feeder_fn`.
+            if (job.seq_range_size > 1) {
+                _ = ctx.active_stream_jobs.fetchSub(1, .acq_rel);
+                try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
+            }
         } else {
             // ── Structured path: one RecordOutcome per record ─────────────────
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            const aa = arena.allocator();
             var records = std.ArrayList(RecordOutcome){};
 
             var remaining: []const u8 = job.data;
@@ -647,9 +725,19 @@ fn worker_fn(ctx: WorkerCtx) void {
             ctx.sequencer.post(ChunkResult{
                 .chunk_id = job.chunk_id,
                 .seq_base = job.seq_base,
+                .end_of_range = true,
+                .seq_range_size = job.seq_range_size,
                 .payload = .{ .structured = records_slice },
                 .arena = arena,
             });
+
+            // Stream-mode Job accounting (structured path mirror of the
+            // serialized branch above).  File-mode Jobs (seq_range_size==1)
+            // are tracked by `file_feeder_fn` and skip this path.
+            if (job.seq_range_size > 1) {
+                _ = ctx.active_stream_jobs.fetchSub(1, .acq_rel);
+                try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
+            }
         }
     }
 }
@@ -739,11 +827,110 @@ fn process_line(
     return outcome;
 }
 
+/// Per-Job mutable state for the serialized path.  Owned by `worker_fn` and
+/// passed by pointer through `process_line_serialized` so the per-line drain
+/// loop can publish partial ChunkResults when the buffer crosses the
+/// `STREAM_FLUSH_THRESHOLD`, then rebind the arena/buffers for the next
+/// partial.  See `partial_flush` and `STREAM_SEQ_RANGE`.
+const SerializeJobState = struct {
+    arena: std.heap.ArenaAllocator,
+    aa: std.mem.Allocator,
+    chunk_buf: std.ArrayList(u8),
+    meta_list: std.ArrayList(RecordMeta),
+    chunk_user_error_msg: ?[]const u8,
+
+    // Read-only references to the surrounding worker context.
+    sequencer: *Sequencer,
+    limiter: *InFlightLimiter,
+    /// Shared atomic counter for chaining a fresh sub-id range when this
+    /// Job's current reservation fills (infinite-generator support).
+    next_seq_range_base: *std.atomic.Value(u64),
+    /// Cooperative shutdown signal observed by `process_line_serialized`'s
+    /// per-iteration check.
+    shutdown: *std.atomic.Value(bool),
+    pool_alloc: std.mem.Allocator,
+    fmt: types.Format,
+
+    // Stream-mode partial-flush configuration for the current Job.
+    seq_base: u64,
+    seq_range_size: u32,
+    sub_id: u32,
+    flush_threshold: usize, // 0 disables partial flush
+};
+
+/// Publish the current accumulated chunk_buf + meta_list as a ChunkResult,
+/// then (unless `is_final`) reset the arena/buffers for the next partial.
+///
+/// Three flush kinds:
+///  - `is_final = true`:                end_of_range = true; Job is done.
+///  - mid-range  (sub_id + 1 < range):  end_of_range = false; bump sub_id.
+///  - range-end  (sub_id + 1 == range): end_of_range = true; chain a fresh
+///                                      range via `next_seq_range_base`
+///                                      (re-base seq_base, reset sub_id = 0).
+///
+/// Range chaining unblocks infinite generators: a worker can publish an
+/// arbitrary number of partials without ever exceeding STREAM_SEQ_RANGE
+/// in-flight per range.
+fn partial_flush(state: *SerializeJobState, is_final: bool) void {
+    const data_slice = state.chunk_buf.items;
+    const meta_slice = state.meta_list.items;
+
+    // The current range is exhausted iff the partial we're about to post
+    // occupies the last sub-id slot in `[seq_base, seq_base+seq_range_size)`.
+    // Setting `end_of_range = true` releases the slot to the Sequencer and
+    // (for non-final flushes) signals that the next partial belongs to a
+    // brand-new range.
+    const range_full = state.sub_id + 1 >= state.seq_range_size;
+    const end_of_range = is_final or range_full;
+
+    state.sequencer.post(ChunkResult{
+        .chunk_id = state.seq_base + state.sub_id,
+        .seq_base = state.seq_base,
+        .end_of_range = end_of_range,
+        .seq_range_size = state.seq_range_size,
+        .payload = .{ .serialized = .{
+            .data = data_slice,
+            .records = meta_slice,
+        } },
+        .user_error_msg = state.chunk_user_error_msg,
+        .arena = state.arena,
+    });
+
+    if (is_final) return;
+
+    // Reserve the next slot's in-flight allowance before we resume work, so
+    // the limiter properly bounds peak memory across partials within a Job.
+    // On shutdown we still allocate a fresh arena so the worker's defer loop
+    // remains balanced; subsequent flushes will just observe the shutdown.
+    _ = state.limiter.acquire();
+
+    if (range_full) {
+        // Chain into a brand-new range — the only way an unbounded generator
+        // can keep publishing without an in-memory cap.
+        state.seq_base = state.next_seq_range_base.fetchAdd(state.seq_range_size, .monotonic);
+        state.sub_id = 0;
+    } else {
+        state.sub_id += 1;
+    }
+
+    state.arena = std.heap.ArenaAllocator.init(state.pool_alloc);
+    state.aa = state.arena.allocator();
+    state.chunk_buf = std.ArrayList(u8){};
+    state.meta_list = std.ArrayList(RecordMeta){};
+    state.chunk_user_error_msg = null;
+}
+
 /// Parse and execute the query for a single JSONL line (serialized path).
 ///
 /// Instead of copying values via own_value(), serializes each value directly
-/// into the shared chunk buffer while the tape is still valid.
-/// Returns compact RecordMeta instead of a full RecordOutcome.
+/// into the shared chunk buffer while the tape is still valid.  Appends one
+/// or more `RecordMeta` entries to `state.meta_list` — multiple entries when
+/// partial flushes split the per-line iterator drain across ChunkResults.
+///
+/// When `state.flush_threshold` is non-zero, the per-value loop checks the
+/// buffer size after each newline boundary and calls `partial_flush` when
+/// the threshold is crossed.  This is the unblocker for infinite generators
+/// (`repeat(.+1)`, etc.) — see bugs.md #143.
 fn process_line_serialized(
     line: []const u8,
     parser: *parser_mod.Parser,
@@ -751,15 +938,26 @@ fn process_line_serialized(
     current_query: *?*const query_mod.CompiledQuery,
     query: *const query_mod.CompiledQuery,
     worker_alloc: std.mem.Allocator,
-    aa: std.mem.Allocator,
-    format: types.Format,
     color: ?*const output_mod.Color,
-    chunk_buf: *std.ArrayList(u8),
     opts: output_mod.SerializeOpts,
     raw_input: bool,
     external_bindings: []const query_mod.ExternalVarBinding,
-) RecordMeta {
-    const start: u32 = @intCast(chunk_buf.items.len);
+    state: *SerializeJobState,
+) void {
+    var start: u32 = @intCast(state.chunk_buf.items.len);
+
+    const append_meta = struct {
+        fn call(s: *SerializeJobState, meta: RecordMeta) void {
+            s.meta_list.append(s.aa, meta) catch {
+                s.meta_list.append(s.aa, .{
+                    .end_offset = @intCast(s.chunk_buf.items.len),
+                    .last_was_false_or_null = false,
+                    .is_error = true,
+                    .error_code = @intFromError(@as(ZqError, error.IoError)),
+                }) catch {};
+            };
+        }
+    }.call;
 
     // ── Sparser prefilter ───────────────────────────────────────────────────────
     if (!raw_input) {
@@ -767,12 +965,13 @@ fn process_line_serialized(
             _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);
             if (!pf.accept(line)) {
                 _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
-                return .{
+                append_meta(state, .{
                     .end_offset = start,
                     .last_was_false_or_null = false,
                     .is_error = false,
                     .error_code = 0,
-                };
+                });
+                return;
             }
         }
     }
@@ -782,23 +981,25 @@ fn process_line_serialized(
     const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
         const feed_result = parser.feed(line, true) catch |e| {
             parser.reset();
-            return .{
+            append_meta(state, .{
                 .end_offset = start,
                 .last_was_false_or_null = false,
                 .is_error = true,
                 .error_code = @intFromError(@as(ZqError, @errorCast(e))),
-            };
+            });
+            return;
         };
         break :blk switch (feed_result) {
             .done => |d| d.tape,
             .need_more => {
                 parser.reset();
-                return .{
+                append_meta(state, .{
                     .end_offset = start,
                     .last_was_false_or_null = false,
                     .is_error = true,
                     .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
-                };
+                });
+                return;
             },
         };
     };
@@ -810,12 +1011,13 @@ fn process_line_serialized(
             if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
-            return .{
+            append_meta(state, .{
                 .end_offset = start,
                 .last_was_false_or_null = false,
                 .is_error = true,
                 .error_code = @intFromError(@as(ZqError, error.IoError)),
-            };
+            });
+            return;
         };
         current_query.* = query;
     } else {
@@ -823,45 +1025,61 @@ fn process_line_serialized(
     }
 
     // ── Serialize values directly into the shared chunk buffer ────────────────
-    var sink = output_mod.BufferSink{ .list = chunk_buf, .aa = aa };
     var last_was_false_or_null = false;
     while (true) {
+        // Cooperative shutdown observation: required so an infinite generator
+        // (e.g. `repeat(.+1)` piped through `head -100`) lets the worker exit
+        // promptly when `Pool.deinit` sets the flag.  Without this, `t.join()`
+        // would hang on the tight value-emit loop.  Discard any in-flight
+        // chunk_buf — the consumer is gone.
+        if (state.shutdown.load(.acquire)) {
+            if (!raw_input) parser.reset();
+            state.chunk_buf.shrinkRetainingCapacity(start);
+            return;
+        }
+
         const maybe = opt_it.*.?.next() catch |e| {
             if (!raw_input) parser.reset();
-            chunk_buf.shrinkRetainingCapacity(start);
-            return .{
+            state.chunk_buf.shrinkRetainingCapacity(start);
+            append_meta(state, .{
                 .end_offset = start,
                 .last_was_false_or_null = false,
                 .is_error = true,
                 .error_code = @intFromError(e),
                 .error_ip = @intCast(opt_it.*.?.last_error_ip),
-            };
+            });
+            return;
         };
         const val = maybe orelse break;
 
-        // Serialize the value using the output module's generic serialize.
-        output_mod.serialize(&sink, val, format, color, opts) catch {
+        // BufferSink uses the current arena's chunk_buf — re-bind every
+        // iteration so a partial_flush mid-loop picks up the fresh buffer.
+        var sink = output_mod.BufferSink{ .list = &state.chunk_buf, .aa = state.aa };
+
+        output_mod.serialize(&sink, val, state.fmt, color, opts) catch {
             if (!raw_input) parser.reset();
-            chunk_buf.shrinkRetainingCapacity(start);
-            return .{
+            state.chunk_buf.shrinkRetainingCapacity(start);
+            append_meta(state, .{
                 .end_offset = start,
                 .last_was_false_or_null = false,
                 .is_error = true,
                 .error_code = @intFromError(@as(ZqError, error.IoError)),
-            };
+            });
+            return;
         };
 
         // Append newline for pretty/compact/raw formats (not jsonl/join which handle their own).
-        if (format != .jsonl and format != .join) {
+        if (state.fmt != .jsonl and state.fmt != .join) {
             sink.writeByte('\n') catch {
                 if (!raw_input) parser.reset();
-                chunk_buf.shrinkRetainingCapacity(start);
-                return .{
+                state.chunk_buf.shrinkRetainingCapacity(start);
+                append_meta(state, .{
                     .end_offset = start,
                     .last_was_false_or_null = false,
                     .is_error = true,
                     .error_code = @intFromError(@as(ZqError, error.IoError)),
-                };
+                });
+                return;
             };
         }
 
@@ -870,16 +1088,42 @@ fn process_line_serialized(
             .bool_val => |b| !b,
             else => false,
         };
+
+        // Partial flush check: at a record-boundary-safe point (just emitted
+        // a complete value + trailing newline), check if we should publish
+        // the accumulated buffer to unblock downstream consumers.  Fires
+        // whenever the threshold is crossed in stream mode (threshold > 0).
+        // When the current sub-id range is exhausted, `partial_flush`
+        // atomically chains a fresh range from the shared
+        // `next_seq_range_base` so an infinite generator can publish
+        // unbounded partials.
+        if (state.flush_threshold > 0 and
+            state.chunk_buf.items.len >= state.flush_threshold)
+        {
+            // Append a partial-record meta covering everything written for
+            // this line so far, then flush.  The next partial will start a
+            // new meta entry with start = 0 in the fresh chunk_buf.
+            append_meta(state, .{
+                .end_offset = @intCast(state.chunk_buf.items.len),
+                .last_was_false_or_null = false,
+                .is_error = false,
+                .error_code = 0,
+            });
+            partial_flush(state, false);
+            // After flush, chunk_buf is fresh+empty; the rest of this line's
+            // output continues into the new partial starting at offset 0.
+            start = 0;
+        }
     }
 
     if (!raw_input) parser.reset();
 
-    return .{
-        .end_offset = @intCast(chunk_buf.items.len),
+    append_meta(state, .{
+        .end_offset = @intCast(state.chunk_buf.items.len),
         .last_was_false_or_null = last_was_false_or_null,
         .is_error = false,
         .error_code = 0,
-    };
+    });
 }
 
 /// Drain the iterator and copy all values into `aa`.
@@ -947,6 +1191,18 @@ const IoCtx = struct {
     queue: *JobQueue,
     sequencer: *Sequencer,
     limiter: *InFlightLimiter,
+    /// Shared range allocator — the IO thread's per-Job `fetchAdd` returns the
+    /// `seq_base` for that Job; workers may also `fetchAdd` mid-Job to chain
+    /// new ranges when an in-progress Job exhausts its current reservation.
+    next_seq_range_base: *std.atomic.Value(u64),
+    /// Tracks Jobs in-flight; incremented on push, decremented by the worker
+    /// after the Job's final partial post.  Used together with `io_done` to
+    /// pin the Sequencer's `total_chunks` once no further ranges can be
+    /// claimed.
+    active_stream_jobs: *std.atomic.Value(u64),
+    /// Set by the IO thread once all Jobs have been pushed.  Worker observes
+    /// the (`io_done`, `active_stream_jobs == 0`) transition to pin total.
+    io_done: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
     format: ?types.Format,
     color: ?*const output_mod.Color,
@@ -957,8 +1213,6 @@ const IoCtx = struct {
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
-    var chunk_id: u64 = 0;
-
     // partial_line: holds bytes of an incomplete line spanning RingBuffer boundaries.
     var partial_line = std.ArrayList(u8){};
     defer partial_line.deinit(ctx.allocator);
@@ -974,13 +1228,13 @@ fn io_thread_fn(ctx: IoCtx) void {
             if (view.is_eof) {
                 // EOF: flush partial line into batch, then flush batch.
                 flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
-                flushBatch(&batch_buf, &chunk_id, ctx);
+                flushBatch(&batch_buf, ctx);
                 break :loop;
             }
             // No data available but not EOF (pipe stall): flush for latency.
             if (batch_buf.items.len > 0 or partial_line.items.len > 0) {
                 flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
-                flushBatch(&batch_buf, &chunk_id, ctx);
+                flushBatch(&batch_buf, ctx);
             }
             _ = ctx.src.refill() catch break :loop;
             continue;
@@ -1004,7 +1258,7 @@ fn io_thread_fn(ctx: IoCtx) void {
 
                 // Flush when batch reaches threshold.
                 if (batch_buf.items.len >= ctx.batch_size) {
-                    flushBatch(&batch_buf, &chunk_id, ctx);
+                    flushBatch(&batch_buf, ctx);
                 }
             }
         }
@@ -1017,26 +1271,42 @@ fn io_thread_fn(ctx: IoCtx) void {
 
         if (view.is_eof) {
             flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
-            flushBatch(&batch_buf, &chunk_id, ctx);
+            flushBatch(&batch_buf, ctx);
             break :loop;
         }
         _ = ctx.src.refill() catch break :loop;
     }
 
-    ctx.sequencer.set_total_chunks(chunk_id);
+    // No more Jobs will be pushed.  Workers may still claim additional ranges
+    // (infinite generator chaining) for in-flight Jobs, so we don't pin
+    // `total_chunks` here — the worker that finishes the LAST in-flight Job
+    // pins it (or `Pool.deinit` does, on early shutdown).  We do still need
+    // to handle the empty-input case where no Jobs are in-flight: pin total
+    // immediately so a collector blocked on `next_in_order` returns null.
+    ctx.io_done.store(true, .release);
     ctx.queue.signal_done();
+    try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
 }
 
 /// Flush the accumulated batch as a single Job.  Acquires an in-flight slot
 /// for backpressure, dupes the buffer, and pushes to the worker queue.
-fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
+///
+/// Each stream-mode Job claims `STREAM_SEQ_RANGE` consecutive sub-ids by
+/// `fetchAdd`-ing on the shared `next_seq_range_base`.  Workers may also
+/// `fetchAdd` on the same counter mid-Job to chain a fresh range when the
+/// current reservation fills (infinite generators), so the IO thread and
+/// workers share one allocation space.  The Sequencer skips unused trailing
+/// sub-ids when it observes `end_of_range`.
+fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
     if (batch_buf.items.len == 0) return;
     if (!ctx.limiter.acquire()) return; // shutdown
     const data = ctx.allocator.dupe(u8, batch_buf.items) catch return;
+    const base = ctx.next_seq_range_base.fetchAdd(STREAM_SEQ_RANGE, .monotonic);
+    _ = ctx.active_stream_jobs.fetchAdd(1, .monotonic);
     ctx.queue.push(.{
         .data = data,
-        .seq_base = chunk_id.*,
-        .chunk_id = chunk_id.*,
+        .seq_base = base,
+        .chunk_id = base,
         .query = ctx.query,
         .owns_data = true,
         .allocator = ctx.allocator,
@@ -1045,8 +1315,8 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), chunk_id: *u64, ctx: IoCtx) void {
         .opts = ctx.opts,
         .raw_input = ctx.raw_input,
         .external_bindings = ctx.external_bindings,
+        .seq_range_size = STREAM_SEQ_RANGE,
     });
-    chunk_id.* += 1;
     batch_buf.clearRetainingCapacity();
 }
 
@@ -1136,6 +1406,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .opts = ctx.opts,
             .raw_input = ctx.raw_input,
             .external_bindings = ctx.external_bindings,
+            .seq_range_size = 1,
         });
         chunk_id += 1;
     }
@@ -1216,12 +1487,42 @@ const SharedCtx = struct {
     /// Starts at 1 (for the Pool) + n_workers.  Each exiting thread decrements.
     /// The last to decrement frees SharedCtx.
     ref_count: std.atomic.Value(usize),
+    /// Stream-mode global range allocator.  Both the IO thread (per Job) and
+    /// workers (when an in-progress Job exhausts its current range) atomically
+    /// claim the next `STREAM_SEQ_RANGE` consecutive sub-ids from this counter,
+    /// so chunk_id ranges are unique across both producers.  An infinite
+    /// generator can therefore publish unbounded partial ChunkResults by
+    /// chaining new ranges as the previous one fills.
+    next_seq_range_base: std.atomic.Value(u64),
+    /// Hot-path cooperative shutdown signal observed by the streaming emit
+    /// loop in `process_line_serialized`.  Set by `Pool.deinit` before any
+    /// other shutdown signal so a worker stuck in a tight value-emit loop
+    /// (infinite generator + closed consumer) can break out promptly.
+    shutdown: std.atomic.Value(bool),
+    /// Number of stream-mode Jobs currently in-flight (queued or being
+    /// processed by a worker).  Incremented by the IO thread on push,
+    /// decremented by the worker after the Job's final partial post.
+    /// Used together with `io_done` to determine when no further sub-ids
+    /// will ever be claimed, so the Sequencer's `total_chunks` can be
+    /// pinned to the final value of `next_seq_range_base`.
+    active_stream_jobs: std.atomic.Value(u64),
+    /// Set by the IO thread (stream mode) once it has finished pushing all
+    /// Jobs.  Combined with `active_stream_jobs == 0` this is the canonical
+    /// "no more ranges will ever be claimed" point — the worker (or IO thread
+    /// if all Jobs are already drained) that observes this transition pins
+    /// `total_chunks = next_seq_range_base`.
+    io_done: std.atomic.Value(bool),
 };
 
 fn worker_thread_entry(shared: *SharedCtx) void {
     worker_fn(.{
         .queue = &shared.queue,
         .sequencer = &shared.sequencer,
+        .limiter = &shared.limiter,
+        .next_seq_range_base = &shared.next_seq_range_base,
+        .shutdown = &shared.shutdown,
+        .active_stream_jobs = &shared.active_stream_jobs,
+        .io_done = &shared.io_done,
         .allocator = shared.allocator,
     });
     release_shared(shared, shared.allocator);
@@ -1250,6 +1551,22 @@ const DEFAULT_CHUNK_FACTOR: usize = 4;
 /// At ~300 B/record this yields ~850 records/batch, reducing millions of jobs
 /// to a few thousand — same order of magnitude as file mode's chunk count.
 const DEFAULT_STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
+
+/// Stream-mode partial-flush threshold (per Job).  When a single record's
+/// iterator emits more than this many bytes into the chunk buffer, the worker
+/// publishes a partial ChunkResult and starts a fresh arena.  This bounds
+/// per-Job memory and unblocks downstream consumers for infinite generators
+/// (e.g. `repeat(.+1)` piped through `head`).  See bugs.md #143.
+const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Stream-mode sub-id reservation per Job.  Each stream-mode Job reserves
+/// `STREAM_SEQ_RANGE` consecutive chunk-ids `[seq_base .. seq_base + N)` so
+/// the worker can publish up to N-1 partial ChunkResults plus one final
+/// `end_of_range` ChunkResult.  Distinct Jobs are assigned non-overlapping
+/// ranges by `io_thread_fn`.  Ranges that finish before exhausting their
+/// allotment leave trailing slots empty; the Sequencer skips them when it
+/// observes `end_of_range = true` on the last published chunk.
+const STREAM_SEQ_RANGE: u32 = 8;
 
 /// Default file-mode backpressure: max simultaneously-live ChunkResults per
 /// thread.  With 2× n_threads slots, each worker can have one chunk being
@@ -1444,12 +1761,24 @@ pub const Pool = struct {
         errdefer queue.deinit();
 
         // Ring capacity must exceed the maximum spread of simultaneously live
-        // chunk IDs across both operating modes:
-        //   • File mode:   MAX_IN_FLIGHT_FACTOR × n_threads  (upper bound for limiter)
-        //   • Stream mode: QUEUE_CAP + n_threads              (queue depth + workers)
+        // chunk IDs across both operating modes.  Stream-mode Jobs reserve
+        // `STREAM_SEQ_RANGE` sub-ids each, so the spread is multiplied by the
+        // reservation size:
+        //   • File mode:   MAX_IN_FLIGHT_FACTOR × n_threads
+        //                  (upper bound for limiter, seq_range_size = 1)
+        //   • Stream mode: (QUEUE_CAP + n_threads) × STREAM_SEQ_RANGE
+        //                  (queue depth + workers, each holding one range)
         // Taking the max covers both; the allocation is at most a few KB.
+        //
+        // Worker-chained ranges (infinite-generator support) DO NOT widen this
+        // bound: a worker only `fetchAdd`s a fresh range AFTER successfully
+        // acquiring a limiter slot, so at any moment the total live-post count
+        // remains capped by `max_in_flight = in_flight_factor × n_threads`.
+        // Live chunk-ids stay within a window of (max_in_flight + a few range
+        // boundaries), which is far below the configured capacity.
         const n_eff = @max(1, n_threads);
-        const seq_capacity = @max(MAX_IN_FLIGHT_FACTOR * n_eff, QUEUE_CAP + n_eff);
+        const stream_spread = (QUEUE_CAP + n_eff) * STREAM_SEQ_RANGE;
+        const seq_capacity = @max(MAX_IN_FLIGHT_FACTOR * n_eff, stream_spread);
         var sequencer = try Sequencer.init(seq_capacity, allocator);
         errdefer sequencer.deinit();
 
@@ -1462,6 +1791,10 @@ pub const Pool = struct {
             .limiter = InFlightLimiter.init(max_in_flight),
             .allocator = allocator,
             .ref_count = std.atomic.Value(usize).init(1 + n_threads),
+            .next_seq_range_base = std.atomic.Value(u64).init(0),
+            .shutdown = std.atomic.Value(bool).init(false),
+            .active_stream_jobs = std.atomic.Value(u64).init(0),
+            .io_done = std.atomic.Value(bool).init(false),
         };
 
         const threads = try allocator.alloc(std.Thread, n_threads);
@@ -1495,11 +1828,22 @@ pub const Pool = struct {
     }
 
     pub fn deinit(p: *Pool) void {
+        // Set the cooperative shutdown flag FIRST so any worker stuck in a
+        // tight value-emit loop (infinite generator) sees it on its next
+        // per-iteration check and breaks out promptly — required for
+        // `t.join()` below to return when the consumer has closed mid-stream.
+        p._shared.shutdown.store(true, .release);
         // Unblock the feeder if it is stalled on limiter.acquire(), then stop
         // all workers.  Order matters: limiter shutdown first so the feeder can
         // wake up and call queue.signal_done() (or we call it below if it doesn't).
         p._shared.limiter.signal_shutdown();
         p._shared.queue.signal_done();
+        // Workers exiting on shutdown won't reach the Job-completion path that
+        // pins `total_chunks` for stream mode, so wake any blocked collector
+        // by pinning it here.  Using next_seq_range_base.load() as the value
+        // is conservative: collect() will return null once next_chunk_id
+        // catches up, which happens as soon as the queue drains.
+        p._shared.sequencer.set_total_chunks(p._shared.next_seq_range_base.load(.monotonic));
         if (p.io_thread) |t| t.join();
         // Join workers BEFORE unmapping — workers may still read mmap memory.
         for (p.threads) |t| t.join();
@@ -1620,6 +1964,9 @@ pub const Pool = struct {
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
             .limiter = &p._shared.limiter,
+            .next_seq_range_base = &p._shared.next_seq_range_base,
+            .active_stream_jobs = &p._shared.active_stream_jobs,
+            .io_done = &p._shared.io_done,
             .allocator = p.allocator,
             .format = format,
             .color = color,
