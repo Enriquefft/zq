@@ -4212,11 +4212,28 @@ fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
 /// Whitelist of "stack-rebinding only" ops (push their result to the
 /// value_stack without mutating `it.current`):
 ///   load_const, load_var, identity, arith, cmp, logical, alt, neg,
-///   not, arr_ctor, obj_ctor, interp, format
+///   not, arr_ctor, obj_ctor, interp, format,
+///   load_field, load_index, load_path
 /// Note: `arith` etc. recurse through their own children — a pure-op
 /// wrapping a rebinding subtree is itself rebinding.  All other ops
-/// are conservatively treated as rebinding (pipe, builtins, field
-/// access, function calls, etc.).
+/// are conservatively treated as rebinding (pipe, builtins, function
+/// calls, computed_index, etc.).
+///
+/// `load_field` (→ VM `load_key`), `load_index`, and `load_path` each
+/// emit a single bytecode instruction whose VM handler pushes the
+/// looked-up value onto `value_stack` and leaves `it.current`
+/// untouched (vm/root.zig:1336/1388/1555 — see B1 alignment commit
+/// `bbe499a`). They have no IR children (`fixedChildArity` defaults
+/// to `{0,0}`), so the recursive walk below is a no-op for them.
+///
+/// `computed_index` is intentionally NOT whitelisted: its emission
+/// (`emitComputedIndex` at L3057) ends with `pipe ; save_input ;
+/// load_variable($key) ; load_computed`, where the second `pipe`
+/// pops the captured base back into `it.current`. The residual is
+/// the base value, not the outer input — so the subtree provably
+/// does rebind. Treating it as a generator (`subtreeHasIterate`
+/// returns true) further ensures the variable-isolation path is used
+/// when it appears as a binop operand.
 fn subtreeRebindsCurrent(ir_obj: ir.IR, node_idx: u32) bool {
     const node = ir_obj.nodes.items[node_idx];
     const stack_only: bool = switch (node.op) {
@@ -4233,6 +4250,14 @@ fn subtreeRebindsCurrent(ir_obj: ir.IR, node_idx: u32) bool {
         .obj_ctor,
         .interp,
         .format,
+        // D1: post-B1/B6, these single-instruction loads push to
+        // value_stack and preserve it.current. Adding them lets
+        // `.foo = .bar`, `.foo = .bar.baz`, `.foo = .[0]`, and the
+        // analogous `.arith`/`.cmp`/`.logical` LHS shapes take the
+        // 0-op no-wrap path instead of the 4-op stack-reseed.
+        .load_field,
+        .load_index,
+        .load_path,
         => true,
         else => false,
     };
