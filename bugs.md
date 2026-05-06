@@ -8,7 +8,19 @@ Last verified: 2026-05-05, HEAD 4ce4b4d (post wave-streaming-generators — redu
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1179 pass, 0 fail, 56 skipped. Zero active failures.
+Current baseline: `zig build test` → 1179 pass, 0 fail, 56 skipped. Test suite is green; the runtime bug below is uncovered (compile-only test exists, no execute assertion).
+
+### Multi-segment path on pipe-LHS inside object-field value
+
+| Field | Value |
+|-------|-------|
+| Symptom | `{k: .a.b \| f}` mis-evaluates the field VALUE. With `f = tostring`/`.`, the result is the field-NAME string ("k"), not `f(.a.b)`. With `f = length` (and similar type-checked builtins) it raises `type error`. Parenthesising the inner pipe (`{k: (.a.b \| length)}`) does not help. |
+| Repro | `echo '{"a":{"b":"hi"}}' \| zq '{out: .a.b \| tostring}'` → zq prints `{"out":"out"}`, jq prints `{"out":"hi"}`. `echo '{"a":{"b":"hi"}}' \| zq '{out: .a.b \| length}'` → zq errors `type error`, jq prints `{"out":2}`. |
+| Scope | Triggers when the pipe-LHS is a path with **2+ segments** (`.a.b`, `.["a"]["b"]`, `.a.b.c`). 1-segment LHS (`.a \| length`) and the same `.a.b \| length` outside an object construct both work. |
+| Severity | HIGH. Silent wrong answer for `tostring`/`.` shapes; runtime error for typed builtins. Hits any caller that builds an object whose field reaches into a nested input. |
+| Suspected site | Object-construct codegen for the field-value frame: parser threads `\|` through (BUG-005 d1) but the desugar appears to bind the LHS to the field-name slot when the path has more than one step. The parser-only test at `tests/query_test.zig:644` ("BUG-005: Nix mdbook-anchors filter compiles") does not catch this — it asserts `compile()` succeeds, never executes. |
+| Fix sketch | Inspect `emitObject`/object-field-value lowering for the path-prefix optimisation; ensure the LHS path is evaluated against the input value (not the field-name literal) before the `\|` boundary. Add execute-level regression: `{content: .Chapter.content \| length}` on `{"Chapter":{"content":"hi"}}` → `{"content":2}`. |
+| Discovered | 2026-05-05 against HEAD 6d178ed, zq 0.2.3. |
 
 ## Skipped via generator (Deliberate Deviation: decnum)
 
