@@ -3604,6 +3604,21 @@ fn lowerAnyAllDesugar(
     };
 
     // first_node: builtin_call "first" [pipe_node]
+    //
+    // The naive form `first(pipe_node) // fallback` is jq-incorrect: `//`
+    // fires on falsy first values too, so when the predicate fails on the
+    // first iteration and inner_if yields `false`, the alt would convert
+    // that `false` back to `true` (the all-fallback). We need to detect
+    // "first yielded ANY value" vs "first yielded nothing", which `//`
+    // alone cannot distinguish from "first yielded a falsy value".
+    //
+    // Solution: wrap in `[first(...)]` and branch on `. == []`. Empty
+    // array means the generator exhausted without producing any output
+    // (every iteration's predicate was satisfied for `all`, or violated
+    // for `any`) — return the fallback. Non-empty means we have a value
+    // to short-circuit on — return `.[0]` directly. This mirrors the
+    // semantics of jq's reduce-based `def all/any` prelude without
+    // hitting the parked `reduce` pattern-var-clobber bug (bugs.md).
     const first_args = try alloc.alloc(*ast.Node, 1);
     first_args[0] = pipe_node;
     const first_node = try alloc.create(ast.Node);
@@ -3612,7 +3627,7 @@ fn lowerAnyAllDesugar(
         .span = ast.Span.empty(),
     };
 
-    // arr_node: [first_node]  (array_construct)
+    // arr_node: [first_node]
     const arr_node = try alloc.create(ast.Node);
     arr_node.* = .{
         .kind = .{ .array_construct = .{ .expr = first_node } },

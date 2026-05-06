@@ -2739,8 +2739,14 @@ pub const ResultIterator = struct {
                 // that limit's level). Stop propagating when a collect frame
                 // was opened inside the limit body (output is captured there,
                 // not escaping further; outer limits must not count it yet).
-                // If any limit exhausts, finalize it after all outer limits
-                // whose collect-depth guard passes have been decremented.
+                //
+                // Decrement ALL applicable limits before deciding where to
+                // exit. If multiple exhaust on the same yield (nested
+                // `first(... first(...) ...)`), exit at the OUTERMOST exhausted
+                // one — that level commits to the value and unwinds everything
+                // beneath. Stopping at the innermost (and bypassing the outer
+                // decrement) would leak the outer first into the next backtrack
+                // iteration and produce duplicate outputs.
                 {
                     const output_ip = it.ip;
                     var exhausted_at: ?usize = null;
@@ -2761,16 +2767,23 @@ pub const ResultIterator = struct {
                         }
                         lstate.remaining -= 1;
                         if (lstate.remaining == 0) {
+                            // Track outermost exhausted: keep overwriting as we
+                            // walk outward (li decreases each iteration).
                             exhausted_at = li;
-                            break;
                         }
                     }
                     if (exhausted_at) |li_ex| {
+                        // Capture the limit's exit_ip BEFORE truncate so we
+                        // can route the final value through the post-frame
+                        // code (pipe RHS, // truthiness check, outer
+                        // yield_output) instead of short-circuiting it back
+                        // to the user / collect buffer.
+                        const exhausted_exit_ip = it.fork_stack.items[li_ex].aux.limit.exit_ip;
                         // Innermost exhausted limit: unwind fork stack to it.
                         it.truncateForkStack(li_ex);
-                        // If a reduce_source wrap is still active and outside
-                        // the truncated range, route the final value into the
-                        // destructure arm. Otherwise return to the caller.
+                        // If a reduce_source wrap survived the truncate, the
+                        // value belongs to the enclosing reduce's destructure
+                        // arm — route it there.
                         if (reduce_wrap_idx) |rw_idx| {
                             if (rw_idx < li_ex) {
                                 const rs = &it.fork_stack.items[rw_idx].aux.reduce_source;
@@ -2780,16 +2793,115 @@ pub const ResultIterator = struct {
                                 return null;
                             }
                         }
-                        if (it.collect_stack.items.len > 0) {
-                            const cf = &it.collect_stack.items[it.collect_stack.items.len - 1];
-                            try cf.buffer.append(it.alloc, try valueToStackValue(val));
-                            it.value_stack.items.len = cf.outer_value_depth;
-                            it.ip = @intCast(it.instructions.len);
-                            return null;
-                        } else {
-                            it.ip = @intCast(it.instructions.len);
-                            return val;
+                        // Push val and jump to the OUTERMOST streaming-frame
+                        // exit_ip among the exhausted frame and any surviving
+                        // enclosing frames whose body wraps this yield. The
+                        // outermost has the largest exit_ip, so jumping there
+                        // bypasses every intermediate yield_output the value
+                        // would otherwise re-trigger (which would re-decrement
+                        // the same value through enclosing limits — see
+                        // `limit(N; first(g))`, `limit(N; repeat(f))`).
+                        // Preserves alt_handler frames for `first(g) // f`:
+                        // the truthy/falsy branch decides whether to pop or
+                        // fire it via the natural // desugar.
+                        var route_exit_ip: u32 = exhausted_exit_ip;
+                        const output_ip_e = it.ip;
+                        var fi_e: usize = 0;
+                        while (fi_e < it.fork_stack.items.len) : (fi_e += 1) {
+                            const fpe = &it.fork_stack.items[fi_e];
+                            switch (fpe.aux) {
+                                .limit => |s| {
+                                    if (output_ip_e > s.body_start_ip and output_ip_e < s.exit_ip and
+                                        it.collect_stack.items.len <= s.saved_collect_len)
+                                    {
+                                        route_exit_ip = s.exit_ip;
+                                        break;
+                                    }
+                                },
+                                .skip => |s| {
+                                    if (output_ip_e > s.body_start_ip and output_ip_e < s.exit_ip and
+                                        it.collect_stack.items.len <= s.saved_collect_len)
+                                    {
+                                        route_exit_ip = s.exit_ip;
+                                        break;
+                                    }
+                                },
+                                .repeat => |s| {
+                                    if (output_ip_e >= s.body_start_ip and output_ip_e < s.exit_ip and
+                                        it.collect_stack.items.len <= s.saved_collect_len)
+                                    {
+                                        // exit_ip points at `repeat_end` (the
+                                        // optional end_op); landing on it would
+                                        // pop the frame and break re-entry on
+                                        // the next backtrack. Skip past it so
+                                        // the frame stays alive for subsequent
+                                        // iterations to drive via the .repeat
+                                        // backtrack arm.
+                                        route_exit_ip = s.exit_ip + 1;
+                                        break;
+                                    }
+                                },
+                                else => {},
+                            }
                         }
+                        it.pushValue(try valueToStackValue(val));
+                        it.ip = route_exit_ip;
+                        return null;
+                    }
+                }
+
+                // Streaming-frame routing for non-exhausting yields:
+                // when the yield originates inside a limit/skip/repeat body
+                // and no reduce_source wrap claims it, push val and jump to
+                // the OUTERMOST enclosing frame's exit_ip so the post-frame
+                // code executes on it. Outermost-first ensures we don't
+                // re-trigger the same value through nested yield_outputs (each
+                // of which would re-decrement enclosing limits — see
+                // `limit(N; repeat(f))`). Without this routing, the raw inner
+                // value short-circuits to the user / collect buffer, bypassing
+                // pipe RHS, // truthiness checks, and outer yield transforms.
+                // Skipped when collect_stack opened inside the streaming body
+                // (the inner collect captures the value, not us).
+                if (reduce_wrap_idx == null) {
+                    const output_ip = it.ip;
+                    var found_exit_ip: ?u32 = null;
+                    var fi: usize = 0;
+                    while (fi < it.fork_stack.items.len) : (fi += 1) {
+                        const fp = &it.fork_stack.items[fi];
+                        switch (fp.aux) {
+                            .limit => |s| {
+                                if (output_ip > s.body_start_ip and output_ip < s.exit_ip and
+                                    it.collect_stack.items.len <= s.saved_collect_len)
+                                {
+                                    found_exit_ip = s.exit_ip;
+                                    break;
+                                }
+                            },
+                            .skip => |s| {
+                                if (output_ip > s.body_start_ip and output_ip < s.exit_ip and
+                                    it.collect_stack.items.len <= s.saved_collect_len)
+                                {
+                                    found_exit_ip = s.exit_ip;
+                                    break;
+                                }
+                            },
+                            .repeat => |s| {
+                                if (output_ip >= s.body_start_ip and output_ip < s.exit_ip and
+                                    it.collect_stack.items.len <= s.saved_collect_len)
+                                {
+                                    // Skip past `repeat_end` so the frame
+                                    // stays alive (see exhaust path comment).
+                                    found_exit_ip = s.exit_ip + 1;
+                                    break;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (found_exit_ip) |exit_ip| {
+                        it.pushValue(try valueToStackValue(val));
+                        it.ip = exit_ip;
+                        return null;
                     }
                 }
 

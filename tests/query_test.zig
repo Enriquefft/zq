@@ -4073,3 +4073,205 @@ test "path(f): path($x.a) with bound variable still returns [\"a\"] (phantom gap
     try dumpCompact(&buf, v.?);
     try std.testing.expectEqualStrings("[\"a\"]", buf.items);
 }
+
+// ── B3: limit_start alt-handler sweep ────────────────────────────────────────
+//
+// Regression tests for the B3 fix: limit_start exhaustion must not leave
+// alt_handler frames stranded on the fork stack. Previously, `first(f) // fb`
+// would output the first value from f AND then spuriously fire fb.
+
+test "B3: first(1,2) // 99 yields only 1, not 1 then 99" {
+    // Input: null.  first(1,2) exhausts after yielding 1; the enclosing //
+    // must NOT fire because first already produced a truthy value.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("first(1,2) // 99");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+}
+
+test "B3: first(empty) // 99 yields 99 (fallback fires when generator is empty)" {
+    // Input: null.  first(empty) produces no output; the enclosing // must
+    // fire with fallback 99 because the left side is exhausted.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("first(empty) // 99");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
+}
+
+test "B3/G4: any(. > 5) on [1,2,3] yields false (no element satisfies predicate)" {
+    // Tests the G4-reverted any/1 desugar: first(gen | if pred then true else empty end) // false.
+    // No element in [1,2,3] is > 5, so the generator exhausts without yielding true,
+    // and the // fallback fires with false.
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("any(. > 5)");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "B3/G4: all(. > 0) on [1,2,3] yields true (every element satisfies predicate)" {
+    // Tests the G4-reverted all/1 desugar: first(gen | if pred then empty else false end) // true.
+    // Every element in [1,2,3] is > 0, so the generator exhausts without yielding false,
+    // and the // fallback fires with true.
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("all(. > 0)");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "B3: try first(error(\"x\")) catch \"caught\" — try_handler survives limit unwind" {
+    // The B3 fix must only remove alt_handler frames, not try_handler frames.
+    // An enclosing try/catch around first(...) must still fire when the body
+    // raises an error.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try first(error(\"x\")) catch \"caught\"");
+    defer q.deinit();
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const val = (try it.next()) orelse return error.ExpectedValue;
+    try std.testing.expectEqualStrings("caught", val.string);
+    try std.testing.expectEqual(@as(?Value, null), try it.next());
+}
+
+// ── B3b: yield-pipe-RHS bypass ───────────────────────────────────────────────
+//
+// Regression tests for the B3b fix: values yielded inside a streaming-frame
+// body (limit/skip/repeat) must flow through post-frame transforms (pipe RHS,
+// // truthiness, outer yield) instead of short-circuiting to the user/collect
+// buffer. Pre-fix, `first(1) | . + 10` returned 1 instead of 11.
+
+test "B3b: first(1,2,3) | . + 10 yields 11 (not 1)" {
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("first(1,2,3) | . + 10");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 11), vals.items[0].int);
+}
+
+test "B3b: [limit(3; range(10)) | . * 2] yields [0,2,4]" {
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("[limit(3; range(10)) | . * 2]");
+    defer q.deinit();
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const v = try it.next();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[0,2,4]", buf.items);
+}
+
+test "B3b: first(false) // 99 yields 99 (// fires on falsy first value)" {
+    // jq's // semantics: alt fires on null/false. With B3b's routing, the
+    // false yielded inside first's body flows through the // truthiness
+    // check (not short-circuited to user), so the fallback 99 fires.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("first(false) // 99");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 99), vals.items[0].int);
+}
+
+test "B3b: [skip(2,3; .[])] yields [3] (multi-N each preserves input binding)" {
+    // Multi-N skip wraps the n-arg in `[n_arg] | each` and captures the
+    // original input via load_variable. B3b's exit_ip routing must not run
+    // pop_variable per iteration, else the second N's load_variable fails.
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var q = try compile("[skip(2,3; .[])]");
+    defer q.deinit();
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const v = try it.next();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[3]", buf.items);
+}
+
+test "B3b: [limit(5; repeat(.+1))] yields [1,1,1,1,1] (repeat frame survives routing)" {
+    // repeat's exit_ip points at the optional `repeat_end` end_op; B3b must
+    // route past it so the frame stays alive for re-entry on backtrack.
+    const entries = [_]Entry{.{ .tag = .int, .payload = .{ .int = 0 } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("[limit(5; repeat(.+1))]");
+    defer q.deinit();
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+
+    const v = try it.next();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(alloc);
+    try dumpCompact(&buf, v.?);
+    try std.testing.expectEqualStrings("[1,1,1,1,1]", buf.items);
+}
