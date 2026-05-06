@@ -3604,16 +3604,21 @@ fn lowerAnyAllDesugar(
     };
 
     // first_node: builtin_call "first" [pipe_node]
-    // Canonical jq desugar: first(cmp_chain) // fallback
-    // The `//` (alternative) operator fires iff first(...) produces no output
-    // (empty) or outputs false/null. Since the inner_if already gates on the
-    // predicate — emitting true/empty (any) or empty/false (all) — the only
-    // way first(...) produces nothing is when every element fails the
-    // short-circuit test and the generator exhausts; in that case the
-    // fallback (false/true) is the correct default value.
-    // Previously this was array-wrapped to avoid the B3 VM bug where
-    // limit_start exhaustion left alt_handler frames on the fork stack.
-    // That bug is now fixed, so we can use the canonical form directly.
+    //
+    // The naive form `first(pipe_node) // fallback` is jq-incorrect: `//`
+    // fires on falsy first values too, so when the predicate fails on the
+    // first iteration and inner_if yields `false`, the alt would convert
+    // that `false` back to `true` (the all-fallback). We need to detect
+    // "first yielded ANY value" vs "first yielded nothing", which `//`
+    // alone cannot distinguish from "first yielded a falsy value".
+    //
+    // Solution: wrap in `[first(...)]` and branch on `. == []`. Empty
+    // array means the generator exhausted without producing any output
+    // (every iteration's predicate was satisfied for `all`, or violated
+    // for `any`) — return the fallback. Non-empty means we have a value
+    // to short-circuit on — return `.[0]` directly. This mirrors the
+    // semantics of jq's reduce-based `def all/any` prelude without
+    // hitting the parked `reduce` pattern-var-clobber bug (bugs.md).
     const first_args = try alloc.alloc(*ast.Node, 1);
     first_args[0] = pipe_node;
     const first_node = try alloc.create(ast.Node);
@@ -3622,13 +3627,61 @@ fn lowerAnyAllDesugar(
         .span = ast.Span.empty(),
     };
 
+    // arr_node: [first_node]
+    const arr_node = try alloc.create(ast.Node);
+    arr_node.* = .{
+        .kind = .{ .array_construct = .{ .expr = first_node } },
+        .span = ast.Span.empty(),
+    };
+
+    // outer_if condition: . == []
+    const identity_node = try alloc.create(ast.Node);
+    identity_node.* = .{ .kind = .identity, .span = ast.Span.empty() };
+    const empty_arr = try alloc.create(ast.Node);
+    empty_arr.* = .{ .kind = .{ .array_construct = .{ .expr = null } }, .span = ast.Span.empty() };
+    const cmp_node = try alloc.create(ast.Node);
+    cmp_node.* = .{
+        .kind = .{ .comparison = .{ .op = .eq, .left = identity_node, .right = empty_arr } },
+        .span = ast.Span.empty(),
+    };
+
+    // .[0] for the else branch
+    const idx_node = try alloc.create(ast.Node);
+    idx_node.* = .{
+        .kind = .{ .suffix = .{
+            .base = blk: {
+                const id = try alloc.create(ast.Node);
+                id.* = .{ .kind = .identity, .span = ast.Span.empty() };
+                break :blk id;
+            },
+            .ops = blk: {
+                const ops = try alloc.alloc(ast.Node.SuffixOp, 1);
+                ops[0] = .{ .index = 0 };
+                break :blk ops;
+            },
+        } },
+        .span = ast.Span.empty(),
+    };
+
     // fallback: false (any) or true (all)
     const fallback: *ast.Node = if (is_any) false_lit else true_lit;
 
-    // root: first(cmp_chain) // fallback
+    // outer_if: if . == [] then fallback else .[0] end
+    const outer_if = try alloc.create(ast.Node);
+    outer_if.* = .{
+        .kind = .{ .if_expr = .{
+            .cond = cmp_node,
+            .then_body = fallback,
+            .elif_chains = &.{},
+            .else_body = idx_node,
+        } },
+        .span = ast.Span.empty(),
+    };
+
+    // root: arr_node | outer_if
     const root_node = try alloc.create(ast.Node);
     root_node.* = .{
-        .kind = .{ .alternative = .{ .left = first_node, .right = fallback } },
+        .kind = .{ .pipe = .{ .left = arr_node, .right = outer_if } },
         .span = ast.Span.empty(),
     };
 

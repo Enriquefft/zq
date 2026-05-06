@@ -2596,15 +2596,13 @@ fn emitLimitSkipNth(em: *Emitter, node: ir.Node, name: []const u8) EmitError!voi
         }, emitPlainBody);
     }
 
-    // Pop the captured input — undoes the push_current at the top.
-    // Intentional divergence from legacy compileLimit/Skip/Nth
-    // (compiler.zig:4684/4874/4924), which call `popScope` at end —
-    // a compile-time bookkeeping op that emits no runtime opcode and
-    // leaves the binding live in the variable table. Our pop_variable
-    // emits the runtime cleanup so the captured input slot doesn't
-    // outlive the builtin call. vm-equiv confirms output parity; no
-    // observable behavior change.
-    try em.pushInstr(.pop_variable, .{ .index = input_var }, node);
+    // No explicit pop_variable. The captured input must remain bound
+    // across each iteration of the multi-N each loop above — pop_variable
+    // here would clear the slot after the first body yield (B3b routing
+    // exits via the streaming frame's exit_ip, which lands here), so the
+    // next each iteration's `load_variable` would see a cleared slot.
+    // Matches legacy compileLimit/Skip/Nth, which use compile-time
+    // popScope (no runtime op) for the same reason.
 }
 
 /// Emit `first` / `first(f)`. The 0-arg form (bare `first`) lowers
