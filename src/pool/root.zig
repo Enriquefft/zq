@@ -527,6 +527,25 @@ const WorkerCtx = struct {
     allocator: std.mem.Allocator,
 };
 
+/// Pin `Sequencer.total_chunks` iff (a) the IO thread has finished pushing
+/// Jobs and (b) no stream-mode Jobs are still in-flight — i.e. no further
+/// sub-id ranges will ever be claimed.  First-writer-wins inside
+/// `set_total_chunks`, so racing callers (last worker vs. IO thread vs.
+/// `Pool.deinit`) all converge on the same pinned value.  SSOT for the
+/// `(io_done && active_stream_jobs == 0)` invariant — invoked from both
+/// worker paths after their final per-Job `fetchSub` and from `io_thread_fn`
+/// after `io_done.store`.
+fn try_pin_total_chunks(
+    sequencer: *Sequencer,
+    next_seq_range_base: *std.atomic.Value(u64),
+    active_stream_jobs: *std.atomic.Value(u64),
+    io_done: *std.atomic.Value(bool),
+) void {
+    if (io_done.load(.acquire) and active_stream_jobs.load(.acquire) == 0) {
+        sequencer.set_total_chunks(next_seq_range_base.load(.monotonic));
+    }
+}
+
 fn worker_fn(ctx: WorkerCtx) void {
     // One parser per worker, reused across all chunks via reset().
     var parser = parser_mod.Parser.init(ctx.allocator) catch {
@@ -662,15 +681,11 @@ fn worker_fn(ctx: WorkerCtx) void {
             partial_flush(&state, true);
 
             // Stream-mode Job accounting: this Job will not claim any more
-            // ranges.  When the IO thread has finished pushing AND no other
-            // Jobs are in-flight, pin `total_chunks` so a blocked collector
-            // unblocks.  File-mode Jobs (seq_range_size == 1) are tracked
+            // ranges.  File-mode Jobs (seq_range_size == 1) are tracked
             // separately by `set_total_chunks` in `file_feeder_fn`.
             if (job.seq_range_size > 1) {
-                const remaining_jobs = ctx.active_stream_jobs.fetchSub(1, .acq_rel) - 1;
-                if (remaining_jobs == 0 and ctx.io_done.load(.acquire)) {
-                    ctx.sequencer.set_total_chunks(ctx.next_seq_range_base.load(.monotonic));
-                }
+                _ = ctx.active_stream_jobs.fetchSub(1, .acq_rel);
+                try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
             }
         } else {
             // ── Structured path: one RecordOutcome per record ─────────────────
@@ -717,14 +732,11 @@ fn worker_fn(ctx: WorkerCtx) void {
             });
 
             // Stream-mode Job accounting (structured path mirror of the
-            // serialized branch above): pin total_chunks once IO is done and
-            // no more Jobs are in-flight.  File-mode Jobs (seq_range_size==1)
+            // serialized branch above).  File-mode Jobs (seq_range_size==1)
             // are tracked by `file_feeder_fn` and skip this path.
             if (job.seq_range_size > 1) {
-                const remaining_jobs = ctx.active_stream_jobs.fetchSub(1, .acq_rel) - 1;
-                if (remaining_jobs == 0 and ctx.io_done.load(.acquire)) {
-                    ctx.sequencer.set_total_chunks(ctx.next_seq_range_base.load(.monotonic));
-                }
+                _ = ctx.active_stream_jobs.fetchSub(1, .acq_rel);
+                try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
             }
         }
     }
@@ -1273,9 +1285,7 @@ fn io_thread_fn(ctx: IoCtx) void {
     // immediately so a collector blocked on `next_in_order` returns null.
     ctx.io_done.store(true, .release);
     ctx.queue.signal_done();
-    if (ctx.active_stream_jobs.load(.acquire) == 0) {
-        ctx.sequencer.set_total_chunks(ctx.next_seq_range_base.load(.monotonic));
-    }
+    try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
 }
 
 /// Flush the accumulated batch as a single Job.  Acquires an in-flight slot
