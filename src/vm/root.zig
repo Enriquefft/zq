@@ -318,21 +318,16 @@ const RecursePathEntry = struct {
 /// itself and breaks any downstream filter), this mode keeps `it.current` as the
 /// actual value and repopulates `frame.components` from `path_comps` before each
 /// iteration — allowing `select`, type tests, and field access to work correctly.
+///
+/// `items` and per-entry `path_comps` live in the iterator's per-record scratch
+/// arena — released wholesale at `reset()`. Per-record lifetime: no entry can
+/// escape the record boundary because the recurse_path fork frame is owned by
+/// `fork_stack`, which is unwound before the next record starts.
 const RecursePathState = struct {
-    /// All (value, path) pairs collected via DFS. Slice owned by this struct.
     items: []RecursePathEntry,
-    /// Index of the current entry (the one whose value is in `it.current` right now).
     index: usize,
-    /// Allocator used to free `items` and each entry's `path_comps` when the
-    /// forkpoint is popped.
-    alloc: std.mem.Allocator,
 
-    fn deinit(self: *RecursePathState) void {
-        for (self.items) |entry| {
-            self.alloc.free(entry.path_comps);
-        }
-        self.alloc.free(self.items);
-    }
+    fn deinit(_: *RecursePathState) void {}
 };
 
 const ForkAux = union(ForkType) {
@@ -626,6 +621,18 @@ pub const ResultIterator = struct {
     /// Importer file directory (jq's analog of `-L .`). Borrowed; same
     /// lifetime contract as `module_search_path`.
     current_file_dir: ?[]const u8,
+    /// Per-record scratch arena. Reset (retain_capacity) on every `reset()` —
+    /// lifetime is "one record's evaluation". Bump-pointer; mutex-free under
+    /// load. Holds every transient allocation that does not survive across
+    /// records: fork-stack snapshots (value_stack, object_construct), call
+    /// frame value-stack saves, base64 scratch, extracted-array elem buffers,
+    /// path-component arrays, regex MatchSlot buffers. Persistent stacks
+    /// (`value_stack`, `fork_stack`, `variable_store`, etc.) keep `alloc`.
+    ///
+    /// Worker invariant (`process_line_serialized` in pool/root.zig):
+    /// `next()` is drained for record N before `reset(tape_{N+1})` is called.
+    /// No yielded Value points into scratch beyond the record boundary.
+    scratch: std.heap.ArenaAllocator,
 
     pub fn init(
         instructions: []const Instruction,
@@ -756,6 +763,7 @@ pub const ResultIterator = struct {
             .last_dynamic_entry = null,
             .module_search_path = module_search_path,
             .current_file_dir = current_file_dir,
+            .scratch = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -766,24 +774,21 @@ pub const ResultIterator = struct {
     /// The owned-regex / owned-clone pair exists only for dynamic-pattern
     /// forks (see state-struct docs) — freeing them here is what makes the
     /// fork robust against LRU eviction of the pattern backing the frame.
-    fn freeRegexForkSlots(it: *ResultIterator, fp: *Forkpoint) void {
+    fn freeRegexForkSlots(_: *ResultIterator, fp: *Forkpoint) void {
         switch (fp.aux) {
             .scan => |*s| {
-                it.alloc.free(s.slots);
                 if (s.owned_clone) |*c| c.deinit();
                 if (s.owned_regex) |*r| r.deinit();
                 s.owned_clone = null;
                 s.owned_regex = null;
             },
             .match_g => |*s| {
-                it.alloc.free(s.slots);
                 if (s.owned_clone) |*c| c.deinit();
                 if (s.owned_regex) |*r| r.deinit();
                 s.owned_clone = null;
                 s.owned_regex = null;
             },
             .splits => |*s| {
-                it.alloc.free(s.slots);
                 if (s.owned_clone) |*c| c.deinit();
                 if (s.owned_regex) |*r| r.deinit();
                 s.owned_clone = null;
@@ -804,12 +809,9 @@ pub const ResultIterator = struct {
         it.if_path_comps_stack.deinit(it.alloc);
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.deinit(it.alloc);
-        for (it.call_stack.items) |*frame| it.alloc.free(frame.saved_stack);
         it.call_stack.deinit(it.alloc);
         it.var_save_stack.deinit(it.alloc);
         for (it.fork_stack.items) |*fp| {
-            if (fp.saved_stack) |snap| it.alloc.free(snap);
-            if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
             switch (fp.aux) {
                 .recurse_path => |*state| state.deinit(),
@@ -828,6 +830,7 @@ pub const ResultIterator = struct {
         }
         it.alloc.free(it.regex_clones);
         it.dynamic_regex_cache.deinit();
+        it.scratch.deinit();
     }
 
     /// Rebind this iterator to a new tape from the same query.
@@ -860,12 +863,9 @@ pub const ResultIterator = struct {
         it.if_path_comps_stack.clearRetainingCapacity();
         for (it.collect_stack.items) |*frame| frame.buffer.deinit(it.alloc);
         it.collect_stack.clearRetainingCapacity();
-        for (it.call_stack.items) |*frame| it.alloc.free(frame.saved_stack);
         it.call_stack.clearRetainingCapacity();
         it.var_save_stack.clearRetainingCapacity();
         for (it.fork_stack.items) |*fp| {
-            if (fp.saved_stack) |snap| it.alloc.free(snap);
-            if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
             it.freeRegexForkSlots(fp);
             switch (fp.aux) {
                 .recurse_path => |*state| state.deinit(),
@@ -885,6 +885,10 @@ pub const ResultIterator = struct {
         // compiled filter (and therefore its regex pool) is unchanged between
         // iterator runs, so recompiling would be pure waste.
         it.last_dynamic_entry = null;
+        // Per-record scratch arena: drop every transient allocation from the
+        // previous record in a single bump-pointer reset. Worker invariant:
+        // no yielded Value points into scratch beyond the record boundary.
+        _ = it.scratch.reset(.retain_capacity);
     }
 
     /// True when null propagation is active (globally via Opts).
@@ -980,13 +984,13 @@ pub const ResultIterator = struct {
             0;
         const cur_len = it.value_stack.items.len;
         if (cur_len <= outer) return null;
-        const slice = try it.alloc.alloc(StackValue, cur_len - outer);
+        const slice = try it.scratch.allocator().alloc(StackValue, cur_len - outer);
         @memcpy(slice, it.value_stack.items[outer..cur_len]);
         return slice;
     }
 
     /// Restore value_stack from a `saved_stack` snapshot, truncating first
-    /// to the outer collect-frame depth (or 0). Frees the snapshot.
+    /// to the outer collect-frame depth (or 0). Snapshot lives in scratch.
     fn restoreValueStackFromSnapshot(it: *ResultIterator, snap: []StackValue) void {
         const outer: usize = if (it.collect_stack.items.len > 0)
             it.collect_stack.items[it.collect_stack.items.len - 1].outer_value_depth
@@ -994,7 +998,6 @@ pub const ResultIterator = struct {
             0;
         it.value_stack.items.len = outer;
         it.value_stack.appendSliceAssumeCapacity(snap);
-        it.alloc.free(snap);
     }
 
     /// Snapshot the three object-construction stacks at fork time. Returns
@@ -1005,20 +1008,18 @@ pub const ResultIterator = struct {
         const i = it.object_construct_input.items.len;
         const f = it.object_construct.items.len;
         if (d == 0 and i == 0 and f == 0) return null;
-        const fields = try it.alloc.alloc(ObjectField, f);
-        errdefer it.alloc.free(fields);
+        const aa = it.scratch.allocator();
+        const fields = try aa.alloc(ObjectField, f);
         @memcpy(fields, it.object_construct.items);
-        const depth = try it.alloc.alloc(u32, d);
-        errdefer it.alloc.free(depth);
+        const depth = try aa.alloc(u32, d);
         @memcpy(depth, it.object_construct_depth.items);
-        const input = try it.alloc.alloc(Value, i);
-        errdefer it.alloc.free(input);
+        const input = try aa.alloc(Value, i);
         @memcpy(input, it.object_construct_input.items);
         return .{ .fields = fields, .depth = depth, .input = input };
     }
 
     /// Restore object-construction stacks from a fork-time snapshot. Replaces
-    /// current stack contents with the snapshot. Frees the snapshot buffers.
+    /// current stack contents with the snapshot. Snapshot lives in scratch.
     fn restoreObjectConstructState(it: *ResultIterator, snap: ObjectConstructSnapshot) void {
         it.object_construct.items.len = 0;
         it.object_construct.appendSliceAssumeCapacity(snap.fields);
@@ -1026,35 +1027,17 @@ pub const ResultIterator = struct {
         it.object_construct_depth.appendSliceAssumeCapacity(snap.depth);
         it.object_construct_input.items.len = 0;
         it.object_construct_input.appendSliceAssumeCapacity(snap.input);
-        it.alloc.free(snap.fields);
-        it.alloc.free(snap.depth);
-        it.alloc.free(snap.input);
     }
 
-    /// Free an object-construct snapshot without restoring.
-    fn freeObjectConstructSnapshot(it: *ResultIterator, snap: ObjectConstructSnapshot) void {
-        it.alloc.free(snap.fields);
-        it.alloc.free(snap.depth);
-        it.alloc.free(snap.input);
-    }
-
-    /// Truncate the fork stack to `new_len`, freeing any `saved_stack`
-    /// snapshots and scan-slot arrays on the forkpoints being discarded.
+    /// Truncate the fork stack to `new_len`. saved_stack/saved_object/scan-slot
+    /// buffers live in the per-record scratch arena — no free needed; the
+    /// recurse_path state still owns its own GPA heap and must be torn down.
     fn truncateForkStack(it: *ResultIterator, new_len: usize) void {
         var i = it.fork_stack.items.len;
         while (i > new_len) {
             i -= 1;
             const fp = &it.fork_stack.items[i];
-            if (fp.saved_stack) |snap| {
-                it.alloc.free(snap);
-                fp.saved_stack = null;
-            }
-            if (fp.saved_object) |snap| {
-                it.freeObjectConstructSnapshot(snap);
-                fp.saved_object = null;
-            }
             it.freeRegexForkSlots(fp);
-            // Clear to avoid double-free on any subsequent pass.
             switch (fp.aux) {
                 .scan, .match_g, .splits => fp.aux = .{ .normal = {} },
                 .recurse_path => |*state| {
@@ -1114,11 +1097,9 @@ pub const ResultIterator = struct {
                 // restore: append what fits, drop the rest.
                 const fit = @min(it.value_stack.capacity, frame.saved_stack.len);
                 it.value_stack.appendSliceAssumeCapacity(frame.saved_stack[0..fit]);
-                it.alloc.free(frame.saved_stack);
                 continue;
             };
             it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
-            it.alloc.free(frame.saved_stack);
         }
     }
 
@@ -1866,15 +1847,11 @@ pub const ResultIterator = struct {
                                 }
                             }
                             if (has_gen_above) break; // defer to backtrackToDepth
-                            const removed = it.fork_stack.orderedRemove(idx);
-                            if (removed.saved_stack) |snap| it.alloc.free(snap);
-                            if (removed.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
+                            _ = it.fork_stack.orderedRemove(idx);
                             break;
                         },
                         .alt_handler => {
-                            const removed = it.fork_stack.orderedRemove(idx);
-                            if (removed.saved_stack) |snap| it.alloc.free(snap);
-                            if (removed.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
+                            _ = it.fork_stack.orderedRemove(idx);
                             break;
                         },
                         else => {},
@@ -2159,7 +2136,7 @@ pub const ResultIterator = struct {
                         null;
                     try it.var_save_stack.append(it.alloc, .{ .id = id, .prev = cur });
                 }
-                const saved_stack = try it.alloc.dupe(StackValue, it.value_stack.items);
+                const saved_stack = try it.scratch.allocator().dupe(StackValue, it.value_stack.items);
                 it.value_stack.clearRetainingCapacity();
                 try it.call_stack.append(it.alloc, CallFrame{
                     .return_ip = it.ip + 1,
@@ -2202,7 +2179,6 @@ pub const ResultIterator = struct {
                     try it.value_stack.ensureTotalCapacity(it.alloc, frame.saved_stack.len + 1);
                     it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
                     if (ret_val) |v| it.value_stack.appendAssumeCapacity(v);
-                    it.alloc.free(frame.saved_stack);
                     it.ip = frame.return_ip;
                 } else {
                     // Should not happen — return without matching call.
@@ -6165,8 +6141,7 @@ pub const ResultIterator = struct {
         };
         const encoder = std.base64.standard.Encoder;
         const encoded_len = encoder.calcSize(s.len);
-        const buf = try it.alloc.alloc(u8, encoded_len);
-        defer it.alloc.free(buf);
+        const buf = try it.scratch.allocator().alloc(u8, encoded_len);
         const encoded = encoder.encode(buf, s);
         const str_ref = try it.runtime_tape.internString(it.alloc, encoded);
         return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
@@ -6180,8 +6155,7 @@ pub const ResultIterator = struct {
         };
         const decoder = std.base64.standard.Decoder;
         const decoded_len = decoder.calcSizeForSlice(s) catch return error.TypeError;
-        var buf = try it.alloc.alloc(u8, decoded_len);
-        defer it.alloc.free(buf);
+        const buf = try it.scratch.allocator().alloc(u8, decoded_len);
         decoder.decode(buf, s) catch return error.TypeError;
         const str_ref = try it.runtime_tape.internString(it.alloc, buf[0..decoded_len]);
         return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
@@ -6532,7 +6506,7 @@ pub const ResultIterator = struct {
             else => return error.TypeError,
         };
         const len = arrayLength(span.tape, span);
-        var elems = try it.alloc.alloc(Value, len);
+        const elems = try it.scratch.allocator().alloc(Value, len);
         var pos = span.start + 1;
         const end = span.end - 1;
         var i: u32 = 0;
@@ -6579,7 +6553,6 @@ pub const ResultIterator = struct {
     fn builtinRange1Gen(it: *ResultIterator) ZqError!?StackValue {
         const n_arr = it.current;
         const n_elems = try it.extractArrayElements(n_arr);
-        defer it.alloc.free(n_elems);
 
         var results = std.ArrayList(Value){};
         defer results.deinit(it.alloc);
@@ -6611,9 +6584,7 @@ pub const ResultIterator = struct {
         const from_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
 
         const from_elems = try it.extractArrayElements(from_val);
-        defer it.alloc.free(from_elems);
         const to_elems = try it.extractArrayElements(to_arr);
-        defer it.alloc.free(to_elems);
 
         var results = std.ArrayList(Value){};
         defer results.deinit(it.alloc);
@@ -6661,11 +6632,8 @@ pub const ResultIterator = struct {
         const from_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
 
         const from_elems = try it.extractArrayElements(from_val);
-        defer it.alloc.free(from_elems);
         const to_elems = try it.extractArrayElements(to_val);
-        defer it.alloc.free(to_elems);
         const by_elems = try it.extractArrayElements(by_arr);
-        defer it.alloc.free(by_elems);
 
         var results = std.ArrayList(Value){};
         defer results.deinit(it.alloc);
@@ -6725,9 +6693,7 @@ pub const ResultIterator = struct {
         const n_val = if (it.if_stack.items.len > 0) it.if_stack.pop().? else return error.TypeError;
 
         const n_elems = try it.extractArrayElements(n_val);
-        defer it.alloc.free(n_elems);
         const f_elems = try it.extractArrayElements(f_arr);
-        defer it.alloc.free(f_elems);
 
         var results = std.ArrayList(Value){};
         defer results.deinit(it.alloc);
@@ -6849,7 +6815,6 @@ pub const ResultIterator = struct {
         const new_val = try stackValueToValue(new_val_sv);
         const path_val = try stackValueToValue(path_sv);
         const path_elems = try it.extractArrayElements(path_val);
-        defer it.alloc.free(path_elems);
 
         const result = try it.setpathRecursive(it.current, path_elems, 0, new_val);
         return try valueToStackValue(result);
@@ -7195,17 +7160,15 @@ pub const ResultIterator = struct {
             return error.TypeError;
         }
         const paths_elems = try it.extractArrayElements(paths_val);
-        defer it.alloc.free(paths_elems);
 
         // Extract each path as an array of elements, normalizing the first
         // component against the base value so that negative indices and slices
         // are resolved against the original array length (matching jq's
         // delpaths which resolves all paths before applying deletions).
+        // path_list backing storage: GPA (capacity grows independently of the
+        // scratch arena which holds the path slices themselves).
         var path_list = std.ArrayList([]Value){};
-        defer {
-            for (path_list.items) |p| it.alloc.free(p);
-            path_list.deinit(it.alloc);
-        }
+        defer path_list.deinit(it.alloc);
         for (paths_elems) |p| {
             const elems = try it.extractArrayElements(p);
             try it.normalizeAndAppendPath(&path_list, elems);
@@ -7277,11 +7240,12 @@ pub const ResultIterator = struct {
                         const to_resolved: i64 = if (to_raw < 0) @max(0, arr_len + to_raw) else @min(to_raw, arr_len);
                         const slice_end: i64 = if (to_resolved < from_resolved) from_resolved else to_resolved;
 
-                        // Free the incoming elems — we're replacing with new paths.
-                        it.alloc.free(elems);
+                        // The incoming elems live in scratch — arena reset
+                        // reclaims them at end of record. Allocate replacement
+                        // paths from the same scratch arena.
                         var i: i64 = from_resolved;
                         while (i < slice_end) : (i += 1) {
-                            const new_path = try it.alloc.alloc(Value, 1);
+                            const new_path = try it.scratch.allocator().alloc(Value, 1);
                             new_path[0] = .{ .int = i };
                             try out.append(it.alloc, new_path);
                         }
@@ -7671,13 +7635,12 @@ pub const ResultIterator = struct {
 
             // Case 2: collect (value, path_components) pairs. Downstream
             // filters operate on values; path_end reads frame.components.
+            // pairs + path_buf live in the per-record scratch arena —
+            // released at reset(). RecursePathState carries the
+            // toOwnedSlice'd buffer through the fork frame's lifetime.
+            const aa = it.scratch.allocator();
             var pairs = std.ArrayList(RecursePathEntry){};
-            defer {
-                // Only free if we don't hand off to the forkpoint (error path).
-                pairs.deinit(it.alloc);
-            }
             var path_buf = std.ArrayList(Value){};
-            defer path_buf.deinit(it.alloc);
             try it.collectRecursePathValues(it.current, &path_buf, &pairs);
 
             if (pairs.items.len == 0) {
@@ -7707,13 +7670,9 @@ pub const ResultIterator = struct {
                 return null;
             }
 
-            // Push a recurse_path forkpoint for entries 1..n-1.
-            const items_owned = try pairs.toOwnedSlice(it.alloc);
-            errdefer {
-                // If fork_stack.append or snapshot fails, free the items.
-                for (items_owned) |entry| it.alloc.free(entry.path_comps);
-                it.alloc.free(items_owned);
-            }
+            // Push a recurse_path forkpoint for entries 1..n-1. items_owned
+            // backed by scratch arena — freed at reset().
+            const items_owned = try pairs.toOwnedSlice(aa);
             const saved_stack = try it.snapshotValueStackForFork();
             const saved_object = try it.snapshotObjectConstructState();
             try it.fork_stack.append(it.alloc, .{
@@ -7723,7 +7682,6 @@ pub const ResultIterator = struct {
                 .aux = .{ .recurse_path = .{
                     .items = items_owned,
                     .index = 0,
-                    .alloc = it.alloc,
                 } },
                 .saved_path = saved_path_for_fork,
                 .saved_stack = saved_stack,
@@ -7771,9 +7729,11 @@ pub const ResultIterator = struct {
         path_buf: *std.ArrayList(Value),
         out: *std.ArrayList(RecursePathEntry),
     ) ZqError!void {
-        // Emit the current (value, path) pair. Root has empty path — `[]`.
-        const path_comps = try it.alloc.dupe(Value, path_buf.items);
-        try out.append(it.alloc, .{ .value = val, .path_comps = path_comps });
+        // path_comps slices, path_buf growth, and `out` growth all live in
+        // the per-record scratch arena — released wholesale at reset().
+        const aa = it.scratch.allocator();
+        const path_comps = try aa.dupe(Value, path_buf.items);
+        try out.append(aa, .{ .value = val, .path_comps = path_comps });
 
         switch (val) {
             .array => |span| {
@@ -7782,7 +7742,7 @@ pub const ResultIterator = struct {
                 var i: i64 = 0;
                 while (pos < end) : (i += 1) {
                     const child_val = tapeEntryToValue(span.tape, pos);
-                    try path_buf.append(it.alloc, .{ .int = i });
+                    try path_buf.append(aa, .{ .int = i });
                     try it.collectRecursePathValues(child_val, path_buf, out);
                     _ = path_buf.pop();
                     pos = skipEntry(span.tape.*, pos);
@@ -7794,7 +7754,7 @@ pub const ResultIterator = struct {
                 while (pos < end) {
                     const k = span.tape.getString(span.tape.entries[pos].payload.string);
                     const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    try path_buf.append(it.alloc, .{ .string = k });
+                    try path_buf.append(aa, .{ .string = k });
                     try it.collectRecursePathValues(child_val, path_buf, out);
                     _ = path_buf.pop();
                     pos = skipEntry(span.tape.*, pos + 1);
@@ -8509,13 +8469,8 @@ pub const ResultIterator = struct {
                         it.ip = fp.backtrack_ip + 1; // resume AFTER the each instruction
                         return true;
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .range => {
@@ -8534,19 +8489,13 @@ pub const ResultIterator = struct {
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .try_handler => {
                     // Normal exhaustion — just pop, continue backtracking.
                     const saved_path = fp.saved_path;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                 },
@@ -8578,7 +8527,6 @@ pub const ResultIterator = struct {
                 .label, .limit, .skip => {
                     // Label/limit/skip scope completed — just pop.
                     const saved_path = fp.saved_path;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                 },
@@ -8593,7 +8541,6 @@ pub const ResultIterator = struct {
                         cf.buffer.deinit(it.alloc);
                     }
                     const saved_path = fp.saved_path;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
                 },
@@ -8616,7 +8563,6 @@ pub const ResultIterator = struct {
                         var frame = it.path_stack.pop().?;
                         frame.deinit(it.alloc);
                     }
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     _ = it.fork_stack.pop();
                 },
                 .scan => {
@@ -8636,13 +8582,8 @@ pub const ResultIterator = struct {
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -8663,13 +8604,8 @@ pub const ResultIterator = struct {
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -8690,13 +8626,8 @@ pub const ResultIterator = struct {
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     it.freeRegexForkSlots(fp);
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
@@ -8732,13 +8663,8 @@ pub const ResultIterator = struct {
                         return true;
                     }
                     // All entries exhausted — pop and continue backtracking.
-                    if (fp.saved_stack) |snap| {
-                        it.alloc.free(snap);
-                        fp.saved_stack = null;
-                    }
                     it.value_stack.items.len = fp.saved_value_stack_len;
                     it.current = fp.saved_current;
-                    if (fp.saved_object) |snap| it.freeObjectConstructSnapshot(snap);
                     state.deinit();
                     _ = it.fork_stack.pop();
                 },
@@ -10383,8 +10309,7 @@ pub const ResultIterator = struct {
         // Allocate at least 1 slot so that slot 0 (overall match span) is
         // always readable even for zero-capture patterns (captureCount() == 0
         // in a disabled-regex build; guarded() returning 0 on a NULL handle).
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        defer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
             const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
@@ -10436,8 +10361,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        defer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
         if (!n_flag) {
             const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
@@ -10486,8 +10410,7 @@ pub const ResultIterator = struct {
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        defer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
 
         var out = std.ArrayList(u8){};
@@ -10535,8 +10458,7 @@ pub const ResultIterator = struct {
 
         const n_slots = handles.regexPtr().captureCount();
         const has_user_captures = n_slots > 1;
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        errdefer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
         // Draw matches until we find one the caller wants to see. With the
@@ -10546,7 +10468,6 @@ pub const ResultIterator = struct {
         const got = blk: {
             while (true) {
                 const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-                    it.alloc.free(slots_buf);
                     return it.mapRegexError(e);
                 };
                 if (!ok) break :blk false;
@@ -10554,7 +10475,6 @@ pub const ResultIterator = struct {
             }
         };
         if (!got) {
-            it.alloc.free(slots_buf);
             if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
             return null;
         }
@@ -10624,14 +10544,12 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        errdefer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
         const got = blk: {
             while (true) {
                 const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-                    it.alloc.free(slots_buf);
                     return it.mapRegexError(e);
                 };
                 if (!ok) break :blk false;
@@ -10639,7 +10557,6 @@ pub const ResultIterator = struct {
             }
         };
         if (!got) {
-            it.alloc.free(slots_buf);
             if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
             return null;
         }
@@ -10701,14 +10618,12 @@ pub const ResultIterator = struct {
         defer if (!handles_transferred) handles.deinit();
 
         const n_slots = handles.regexPtr().captureCount();
-        const slots_buf = try it.alloc.alloc(regex_mod.MatchSlot, @max(n_slots, 1));
-        errdefer it.alloc.free(slots_buf);
+        const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
         var cursor: usize = 0;
         const got = blk: {
             while (true) {
                 const ok = handles.clonePtr().iterNext(input, &cursor, slots_buf) catch |e| {
-                    it.alloc.free(slots_buf);
                     return it.mapRegexError(e);
                 };
                 if (!ok) break :blk false;
@@ -10720,7 +10635,6 @@ pub const ResultIterator = struct {
 
         if (!got) {
             // No matches: yield the input whole, then terminate on next backtrack.
-            it.alloc.free(slots_buf);
             // handles defer frees owned pair automatically.
             const ref = try it.runtime_tape.internString(it.alloc, input);
             const whole_sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
