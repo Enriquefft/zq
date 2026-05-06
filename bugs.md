@@ -2,13 +2,13 @@
 
 Active bugs and latent issues. Fixed entries are pruned; check git history / commit messages for resolved incidents.
 
-Last verified: 2026-05-05, HEAD 4ce4b4d (post wave-streaming-generators — reduce fold-vs-emit, infinite-gen pool streaming, emitStreamingFrame closures).
+Last verified: 2026-05-06, HEAD ed1d0c1 (post B1-B6 wave — load_path/load_computed push semantics, big_number negate/length, streaming-frame yields, per-frame slot snapshots, recursive 1+arity self-calls, path-assign `.set` RHS-mutates-current + IR child-arity predicate guard).
 
 ---
 
 ## Active compat failures
 
-Current baseline: `zig build test` → 1184 pass, 0 fail, 56 skipped. Zero active failures.
+Current baseline: `zig build test` → 1198 pass, 0 fail, 28 skipped. Zero active failures.
 
 ## Skipped via generator (Deliberate Deviation: decnum)
 
