@@ -3604,6 +3604,16 @@ fn lowerAnyAllDesugar(
     };
 
     // first_node: builtin_call "first" [pipe_node]
+    // Canonical jq desugar: first(cmp_chain) // fallback
+    // The `//` (alternative) operator fires iff first(...) produces no output
+    // (empty) or outputs false/null. Since the inner_if already gates on the
+    // predicate — emitting true/empty (any) or empty/false (all) — the only
+    // way first(...) produces nothing is when every element fails the
+    // short-circuit test and the generator exhausts; in that case the
+    // fallback (false/true) is the correct default value.
+    // Previously this was array-wrapped to avoid the B3 VM bug where
+    // limit_start exhaustion left alt_handler frames on the fork stack.
+    // That bug is now fixed, so we can use the canonical form directly.
     const first_args = try alloc.alloc(*ast.Node, 1);
     first_args[0] = pipe_node;
     const first_node = try alloc.create(ast.Node);
@@ -3612,61 +3622,13 @@ fn lowerAnyAllDesugar(
         .span = ast.Span.empty(),
     };
 
-    // arr_node: [first_node]  (array_construct)
-    const arr_node = try alloc.create(ast.Node);
-    arr_node.* = .{
-        .kind = .{ .array_construct = .{ .expr = first_node } },
-        .span = ast.Span.empty(),
-    };
-
-    // outer_if condition: . == []
-    const identity_node = try alloc.create(ast.Node);
-    identity_node.* = .{ .kind = .identity, .span = ast.Span.empty() };
-    const empty_arr = try alloc.create(ast.Node);
-    empty_arr.* = .{ .kind = .{ .array_construct = .{ .expr = null } }, .span = ast.Span.empty() };
-    const cmp_node = try alloc.create(ast.Node);
-    cmp_node.* = .{
-        .kind = .{ .comparison = .{ .op = .eq, .left = identity_node, .right = empty_arr } },
-        .span = ast.Span.empty(),
-    };
-
-    // .[0] for the else branch
-    const idx_node = try alloc.create(ast.Node);
-    idx_node.* = .{
-        .kind = .{ .suffix = .{
-            .base = blk: {
-                const id = try alloc.create(ast.Node);
-                id.* = .{ .kind = .identity, .span = ast.Span.empty() };
-                break :blk id;
-            },
-            .ops = blk: {
-                const ops = try alloc.alloc(ast.Node.SuffixOp, 1);
-                ops[0] = .{ .index = 0 };
-                break :blk ops;
-            },
-        } },
-        .span = ast.Span.empty(),
-    };
-
     // fallback: false (any) or true (all)
     const fallback: *ast.Node = if (is_any) false_lit else true_lit;
 
-    // outer_if: if . == [] then fallback else .[0] end
-    const outer_if = try alloc.create(ast.Node);
-    outer_if.* = .{
-        .kind = .{ .if_expr = .{
-            .cond = cmp_node,
-            .then_body = fallback,
-            .elif_chains = &.{},
-            .else_body = idx_node,
-        } },
-        .span = ast.Span.empty(),
-    };
-
-    // root: arr_node | outer_if
+    // root: first(cmp_chain) // fallback
     const root_node = try alloc.create(ast.Node);
     root_node.* = .{
-        .kind = .{ .pipe = .{ .left = arr_node, .right = outer_if } },
+        .kind = .{ .alternative = .{ .left = first_node, .right = fallback } },
         .span = ast.Span.empty(),
     };
 
