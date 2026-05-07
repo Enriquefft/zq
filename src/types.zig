@@ -129,15 +129,107 @@ pub const RuntimeTape = struct {
         self.string_buf.deinit(allocator);
     }
 
-    /// Intern a string and return its reference.
+    /// Snapshot of a `[]const u8` that may alias `string_buf`. Captured
+    /// *before* any operation that could free the backing (e.g.
+    /// `ensureUnusedCapacity`), then resolved against the (possibly
+    /// reallocated) buffer just before the read. Eliminates the
+    /// self-referential-`appendSlice` UAF class for string interning,
+    /// concat, and repeat — see NIX-003.
+    const SliceSnap = union(enum) {
+        external: []const u8,
+        aliased: struct { off: usize, len: usize },
+
+        fn capture(buf: []const u8, s: []const u8) SliceSnap {
+            const sp = @intFromPtr(s.ptr);
+            const bp = @intFromPtr(buf.ptr);
+            const inside = sp >= bp and sp + s.len <= bp + buf.len;
+            return if (inside)
+                .{ .aliased = .{ .off = sp - bp, .len = s.len } }
+            else
+                .{ .external = s };
+        }
+
+        fn resolve(self: SliceSnap, buf: []const u8) []const u8 {
+            return switch (self) {
+                .external => |s| s,
+                .aliased => |a| buf[a.off..][0..a.len],
+            };
+        }
+
+        fn lenOf(self: SliceSnap) usize {
+            return switch (self) {
+                .external => |s| s.len,
+                .aliased => |a| a.len,
+            };
+        }
+    };
+
+    /// Intern a single string slice into `string_buf`. Alias-safe: `s` may
+    /// point into `string_buf`'s own backing without being invalidated by
+    /// a capacity-grow realloc inside this call.
     pub fn internString(self: *RuntimeTape, allocator: std.mem.Allocator, s: []const u8) error{OutOfMemory}!Tape.StringRef {
-        const offset = @as(u32, @intCast(self.string_buf.items.len));
-        try self.string_buf.appendSlice(allocator, s);
-        self.view.string_buf = self.string_buf.items;
-        return Tape.StringRef{
-            .offset = offset,
-            .len = @as(u32, @intCast(s.len)),
+        return self.internStringConcat(allocator, &.{s});
+    }
+
+    /// Intern the concatenation of `parts` into `string_buf` as one
+    /// contiguous string. Each part is alias-checked independently, so
+    /// any subset of `parts` may alias the existing `string_buf` backing.
+    /// One `ensureUnusedCapacity` covers the whole concat; subsequent
+    /// writes use `appendSliceAssumeCapacity` to avoid further reallocs.
+    pub fn internStringConcat(
+        self: *RuntimeTape,
+        allocator: std.mem.Allocator,
+        parts: []const []const u8,
+    ) error{OutOfMemory}!Tape.StringRef {
+        // Snapshot aliasing before any potential realloc. Stack scratch
+        // for ≤8 parts (covers all current callers; concat is binary
+        // and repeat reuses internStringRepeat).
+        var snap_buf: [8]SliceSnap = undefined;
+        var heap_snap: ?[]SliceSnap = null;
+        defer if (heap_snap) |h| allocator.free(h);
+        const snaps = if (parts.len <= snap_buf.len)
+            snap_buf[0..parts.len]
+        else blk: {
+            heap_snap = try allocator.alloc(SliceSnap, parts.len);
+            break :blk heap_snap.?;
         };
+
+        var total: usize = 0;
+        const buf_pre = self.string_buf.items;
+        for (parts, 0..) |p, i| {
+            snaps[i] = SliceSnap.capture(buf_pre, p);
+            total += p.len;
+        }
+
+        const offset: u32 = @intCast(self.string_buf.items.len);
+        try self.string_buf.ensureUnusedCapacity(allocator, total);
+        const buf_post = self.string_buf.items;
+        for (snaps) |snap| {
+            self.string_buf.appendSliceAssumeCapacity(snap.resolve(buf_post));
+        }
+        self.refreshView();
+        return .{ .offset = offset, .len = @intCast(total) };
+    }
+
+    /// Intern `count` consecutive copies of `s` into `string_buf` as one
+    /// contiguous string. Alias-safe: `s` may point into `string_buf`.
+    pub fn internStringRepeat(
+        self: *RuntimeTape,
+        allocator: std.mem.Allocator,
+        s: []const u8,
+        count: usize,
+    ) error{OutOfMemory}!Tape.StringRef {
+        const snap = SliceSnap.capture(self.string_buf.items, s);
+        const total = s.len * count;
+        const offset: u32 = @intCast(self.string_buf.items.len);
+        try self.string_buf.ensureUnusedCapacity(allocator, total);
+        const buf_post = self.string_buf.items;
+        const src = snap.resolve(buf_post);
+        for (0..count) |_| {
+            self.string_buf.appendSliceAssumeCapacity(src);
+        }
+        self.refreshView();
+        return .{ .offset = offset, .len = @intCast(total) };
     }
 
     /// Max entries in a runtime tape. Prevents quadratic blowup from deeply

@@ -4450,3 +4450,112 @@ test "B6: (.a // 5) + .b takes fallback when key is null" {
 // Forking-LHS variant `[.[] | [.foo[] // .bar]]` is verified via the CLI
 // integration check in scripts/run_jq_compat.sh — building it from raw tape
 // entries is brittle (skip indices are absolute one-past-end positions).
+// ── NIX-003: alias-safe string concat / repeat in runtime_tape ───────────────
+//
+// `doAddValues` (string-string arm) and `doStringRepeat` historically read
+// their source slices THROUGH the same `RuntimeTape.string_buf` they were
+// appending into. `ArrayList.appendSlice`'s internal `ensureUnusedCapacity`
+// could realloc the backing, freeing the buffer the source slices pointed
+// into. Subsequent `@memcpy(items[end..], src)` then read freed memory —
+// surfaces under ReleaseSafe as `0xAA` poison (Zig's `undefined` fill).
+//
+// Fix: capture aliasing offsets BEFORE `ensureUnusedCapacity`, re-resolve
+// against the (possibly moved) backing AFTER. Centralized in
+// `RuntimeTape.internStringConcat` / `internStringRepeat`.
+//
+// These tests build inputs large enough to force the capacity-doubling
+// realloc (initial string_buf cap is 4096 bytes), then byte-equality assert
+// the entire result. A regression returns the right `length` with poisoned
+// content — comparing the bytes catches it.
+
+fn buildLongString(buf: []u8, ch: u8) void {
+    @memset(buf, ch);
+}
+
+test "NIX-003: [range(20) | \"x\"*50] | add yields 1000 'x' bytes (no 0xAA poison)" {
+    // Original repro from the closure-info filter on /etc/nixos. Reduces an
+    // array of 20 strings via `add`; the accumulator crosses string_buf's
+    // initial 4096-byte capacity around iteration 14, forcing realloc.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("[range(20) | \"x\" * 50] | add");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    const out = vals.items[0].string;
+    try std.testing.expectEqual(@as(usize, 1000), out.len);
+
+    var expected: [1000]u8 = undefined;
+    buildLongString(&expected, 'x');
+    try std.testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "NIX-003: (\"x\"*4000) | . + . yields 8000 'x' bytes (both operands alias string_buf)" {
+    // Doubled-self concat: ls and rs are the SAME slice into string_buf.
+    // After ensureUnusedCapacity grows the buffer past the 4000-byte
+    // accumulator, both operand pointers dangle.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("(\"x\" * 4000) | . + .");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    const out = vals.items[0].string;
+    try std.testing.expectEqual(@as(usize, 8000), out.len);
+
+    var expected: [8000]u8 = undefined;
+    buildLongString(&expected, 'x');
+    try std.testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "NIX-003: (\"x\"*4000) * 2 yields 8000 'x' bytes (repeat source aliases string_buf)" {
+    // doStringRepeat path. The 4000-byte source lives in string_buf; the
+    // ensureUnusedCapacity(8000) call grows the buffer past 4096 cap and
+    // frees the backing the source slice pointed into.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("(\"x\" * 4000) * 2");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    const out = vals.items[0].string;
+    try std.testing.expectEqual(@as(usize, 8000), out.len);
+
+    var expected: [8000]u8 = undefined;
+    buildLongString(&expected, 'x');
+    try std.testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "NIX-003: (\"x\"*50) * 200 yields 10000 'x' bytes (chained reallocs in repeat)" {
+    // Many-copy repeat from a small seed. The single ensureUnusedCapacity
+    // for total_len=10000 forces one realloc; without alias re-resolution
+    // every appendSliceAssumeCapacity reads dangling source.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("(\"x\" * 50) * 200");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    const out = vals.items[0].string;
+    try std.testing.expectEqual(@as(usize, 10000), out.len);
+
+    var expected: [10000]u8 = undefined;
+    buildLongString(&expected, 'x');
+    try std.testing.expectEqualSlices(u8, &expected, out);
+}

@@ -3517,13 +3517,15 @@ pub const ResultIterator = struct {
                 .string => |ls| switch (right) {
                     .tape_value => |rtv| switch (rtv) {
                         .string => |rs| blk: {
-                            // Concatenate strings by appending both into runtime_tape string_buf.
-                            const total_len = ls.len + rs.len;
-                            const concat_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
-                            try it.runtime_tape.string_buf.appendSlice(it.alloc, ls);
-                            try it.runtime_tape.string_buf.appendSlice(it.alloc, rs);
-                            it.runtime_tape.refreshView();
-                            break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[concat_off..][0..total_len] } };
+                            // Concat into runtime_tape via the alias-safe helper.
+                            // Either operand may live in `string_buf` (typical
+                            // for `add` over a string array, where each
+                            // intermediate accumulator points back into the
+                            // buffer). NIX-003: naive `appendSlice` here UAF'd
+                            // the source slice when ensureUnusedCapacity grew
+                            // the backing — see types.zig:internStringConcat.
+                            const ref = try it.runtime_tape.internStringConcat(it.alloc, &.{ ls, rs });
+                            break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
                         },
                         .null_val => left,
                         else => return it.raiseBinaryArithTypeError(left, right, .add),
@@ -4211,13 +4213,11 @@ pub const ResultIterator = struct {
             it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
             return error.UserError;
         }
-        const start_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
-        try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, total_len);
-        for (0..count) |_| {
-            it.runtime_tape.string_buf.appendSliceAssumeCapacity(s);
-        }
-        it.runtime_tape.refreshView();
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[start_off..][0..total_len] } };
+        // Alias-safe repeat: `s` itself may live in string_buf (chained
+        // repeats like `("x" * 4000) * 2` route the prior repeat result
+        // back through here). NIX-003.
+        const ref = try it.runtime_tape.internStringRepeat(it.alloc, s, count);
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
     }
 
     /// jq: string / string = split. Splits the left string by the right separator.

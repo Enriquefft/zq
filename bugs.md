@@ -13,6 +13,10 @@ failures in the test corpus. The compat generator still emits inputs as compact
 single-line JSON only, but the ingestion layer is now JSON-structure-aware
 (see NIX-001 below — fixed) so that limitation is no longer a correctness gap.
 
+NIX-003 (string-add/repeat self-referential realloc) was added and fixed
+in this wave; four byte-equality regression tests now exercise the
+post-realloc string content. New baseline: 1219 pass.
+
 ---
 
 ## NIX-001: Pool input chunker splits on `\n` without tracking JSON structural context (FIXED)
@@ -75,6 +79,175 @@ $ printf '{"a":1}'         | ./zig-out/bin/zq '.a'      # 1
 $ printf '{\n  "a": 1\n}'  | ./zig-out/bin/zq '.a'      # 1
 $ printf '[\n  1,\n  2\n]' | ./zig-out/bin/zq 'length'  # 2
 ```
+
+## NIX-003: `doAddValues` / `doStringRepeat` / `internString` — self-referential `appendSlice` corrupts result on realloc (FIXED)
+
+Discovered 2026-05-06 during /etc/nixos jq → zq overlay re-enable, post-NIX-001 fix.
+ReleaseSafe-only (Debug build's safety zero-fill happens to mask it). Bisect:
+reproduces at `2dc077b` (parent of NIX-001 fix dc0597c), so it pre-exists the
+chunker work — the closure-info filter just exposed it once NIX-001 unblocked
+the pipeline.
+
+### Reproducer
+
+Single command, no I/O, bypasses pool entirely (`-n` null-input):
+
+```sh
+$ nix build .#default --no-link --print-out-paths
+$ result/bin/zq -nr '[range(20) | "x" * 50] | add' | head -c 20 | xxd
+00000000: aaaa aaaa aaaa aaaa aaaa aaaa aaaa aaaa  ................
+00000010: aaaa aaaa                                ....
+```
+
+Expected: 1000 `x` bytes. Actual: 1000 bytes, all (or first ~half) `0xAA` —
+Zig's ReleaseSafe `undefined` poison pattern, i.e. freed-heap fill from the
+GPA. `length` returns the correct 1000; the *count* is right, the *bytes*
+are dangling.
+
+### Threshold (precise)
+
+| total_len | first 4 bytes |
+|-----------|---------------|
+| ≤ 650     | `78 78 78 78` (correct) |
+| ≥ 700     | `aa aa aa aa` (poison) |
+
+The crossover is between 650 and 700 bytes — precisely where `ArrayList.string_buf`'s
+exponential capacity growth first reallocates the backing storage during the
+`add` reduction. Independent of element count vs element width: `cs=40 n=16`
+(640 B, just-fits-in-existing-capacity, varies by prior allocator state) and
+`cs=70 n=10` (700 B, forces realloc) both transition at this same buffer-growth
+boundary.
+
+### Root cause
+
+`src/vm/root.zig:3516-3527` (`doAddValues`, string × string arm):
+
+```zig
+.string => |ls| switch (right) {
+    .tape_value => |rtv| switch (rtv) {
+        .string => |rs| blk: {
+            const total_len = ls.len + rs.len;
+            const concat_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
+            try it.runtime_tape.string_buf.appendSlice(it.alloc, ls);  // ← may realloc
+            try it.runtime_tape.string_buf.appendSlice(it.alloc, rs);  // ← rs may dangle
+            it.runtime_tape.refreshView();
+            break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[concat_off..][0..total_len] } };
+        },
+```
+
+Both `ls` and `rs` are slices into `it.runtime_tape.view.string_buf` (the
+same `ArrayList` we are appending to). `ArrayList.appendSlice` calls
+`ensureUnusedCapacity` first; if capacity is exceeded the GPA frees the old
+backing (filling with `0xAA` in ReleaseSafe) and allocates a new one. `ls`
+and `rs` still hold pointers into the freed old buffer; the subsequent
+`@memcpy(items[end..], slice)` reads `0xAA` poison and writes it into the
+new buffer at `concat_off..concat_off+ls.len`. The second `appendSlice(rs)`
+has the same hazard if the first call triggered the realloc.
+
+The `add` builtin reduces `[s0, s1, …, sN]` via repeated binary `+`, so each
+intermediate accumulator grows monotonically. Eventually the accumulator
+crosses the next capacity-doubling boundary, the realloc happens, and from
+that point all bytes copied from the prior accumulator are `0xAA`.
+
+The same file already has the *correct* pattern for the analogous string-repeat
+op at `src/vm/root.zig:4214-4219`:
+
+```zig
+const start_off: u32 = @intCast(it.runtime_tape.string_buf.items.len);
+try it.runtime_tape.string_buf.ensureUnusedCapacity(it.alloc, total_len);
+for (0..count) |_| {
+    it.runtime_tape.string_buf.appendSliceAssumeCapacity(s);
+}
+it.runtime_tape.refreshView();
+```
+
+`ensureUnusedCapacity` once → realloc-or-not is decided before any source
+slice is read → subsequent `appendSliceAssumeCapacity` calls cannot
+invalidate sources.
+
+### Fix (landed)
+
+SSOT in `src/types.zig` `RuntimeTape`:
+
+- Private `SliceSnap` union — captures `(off, len)` for slices that alias
+  `string_buf` and the verbatim slice otherwise. `capture(buf, s)` runs
+  before any potential realloc; `resolve(buf)` re-slices against the
+  current backing after.
+- `pub fn internStringConcat(alloc, parts: []const []const u8) !StringRef` —
+  multi-source alias-safe concat. Single `ensureUnusedCapacity(total)` →
+  loop of `appendSliceAssumeCapacity(snap.resolve(...))`. Stack scratch
+  for ≤ 8 parts; heap fallback above that.
+- `pub fn internStringRepeat(alloc, s, count) !StringRef` — repeat with
+  one alias capture and one ensureUnusedCapacity.
+- `internString` now delegates to `internStringConcat(&.{s})`.
+
+Three call sites refactored:
+
+- `src/vm/root.zig` `doAddValues` string-string arm → `internStringConcat(.{ls, rs})`
+- `src/vm/root.zig` `doStringRepeat` → `internStringRepeat(s, count)`
+- `src/types.zig` `internString` body → `internStringConcat`
+
+Other latent sites audited:
+
+- `copyTapeSpanToRuntimeTape` (`src/vm/root.zig:3877`) — *safe*: the bulk
+  `ensureUnusedCapacity(n_string_bytes)` reserves total capacity before
+  the per-entry `internString` loop, so no in-loop realloc happens and
+  source slices stay valid.
+- `doAddValues` array arm (`src/vm/root.zig:3534+`) — uses tape *indices*
+  through `appendEntry` rather than raw byte slices into the destination
+  buffer; the `view`-refreshing `appendEntry` already handles entries
+  reallocation. No alias-on-realloc UAF here.
+
+### Test coverage (landed)
+
+`tests/query_test.zig` "NIX-003" wave — 4 tests, all assert byte-equality
+against expected content (so a regression returning correct length with
+poison content fails):
+
+- `[range(20) | "x" * 50] | add` → 1000 'x' bytes (original closure-info
+  reproducer)
+- `("x" * 4000) | . + .` → 8000 'x' (both operands aliased self)
+- `("x" * 4000) * 2` → 8000 'x' (repeat source aliased self)
+- `("x" * 50) * 200` → 10000 'x' (chained reallocs in repeat)
+
+Full suite: 1219 pass, 0 fail, 28 skipped (was 1210 before this wave).
+
+### Real-world impact
+
+Surfaced via the NixOS `closure-info.drv` builder, which runs a jq filter
+(`reduce .[] as $closure (...; .closures += [$closure])`) over an attribute
+array. The `closure-info` filter joins string fields with `+`/string-interp;
+once the accumulated path string crosses ~700 B the build output is filled
+with `0xAA` bytes, breaking the closure-info contract. The Nix derivation
+hash includes this output, so every NixOS rebuild that touches the closure
+graph would silently hash to a poisoned value.
+
+### Test coverage gap
+
+No existing test in `tests/cli_test.zig` or `tests/query_test.zig` exercises
+`add` (or `+`) on string arrays large enough to trigger string_buf realloc.
+The compat suite likely has small-string `add` cases (≤ 650 B accumulator)
+which fit in initial capacity and pass. Add:
+
+- `[range(20) | "x" * 50] | add` → 1000 `x` chars (current repro)
+- `["a" * 100, "b" * 100, "c" * 100, "d" * 100, "e" * 100, "f" * 100, "g" * 100] | add` → 700 chars, deterministic content for byte-equality assertion
+- `reduce range(20) as $i (""; . + ("x" * 50))` → same accumulator shape via explicit reduce
+
+### Bisect bookmark
+
+Reproduces at HEAD `dc0597c` and at parent `2dc077b`. Pre-dates the NIX-001
+fix wave; latent since at least the per-record scratch arena merge (`9ee4f20`)
+or earlier — the `doAddValues` string arm has not been touched recently. Not
+introduced by NIX-001; only *unmasked* by it (NIX-001 was the previous block
+on running this filter at all).
+
+### Active-failure baseline update
+
+Test suite at `1219 pass / 0 fail / 28 skipped` after NIX-003 fix wave.
+Remaining gap mentioned in the "Active compat failures" section is now
+closed: byte-equality assertions on string-realloc paths are exercised.
+
+---
 
 ## NIX-002: ReleaseSafe SIGABRT on cascade-error path (EXPECTED RESOLVED, downstream of NIX-001)
 
