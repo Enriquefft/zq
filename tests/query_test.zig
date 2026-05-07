@@ -3093,6 +3093,96 @@ fn runFilterStr(src: []const u8, input: []const u8) !OwnedValues {
     return try collectAll(&q, t);
 }
 
+// ── Deterministic UAF detector (NIX-005 family) ──────────────────────────────
+//
+// Wraps an inner allocator with two amplifications that turn intermittent
+// use-after-free into deterministic test failure:
+//
+//   1. resize=false + remap=null → every grow goes through the
+//      alloc-new + memcpy + free-old path, so the old backing is
+//      always relocated (no in-place extension).
+//   2. free poisons the freed block with 0xAA before delegating.
+//      Any dangling pointer into it reads 0xAA bytes — invalid UTF-8
+//      and visibly garbage in any captured/yielded output.
+//
+// Combined, these guarantee that an aliased input slice into
+// runtime_tape.string_buf, read after a grow, returns observable
+// garbage rather than relying on the heap to coincidentally reuse
+// the freed block in a noticeable way.
+const MoveAndPoisonAllocator = struct {
+    inner: std.mem.Allocator,
+
+    pub fn allocator(self: *MoveAndPoisonAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *MoveAndPoisonAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+    }
+
+    fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *MoveAndPoisonAllocator = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xAA);
+        self.inner.vtable.free(self.inner.ptr, memory, alignment, ret_addr);
+    }
+};
+
+/// Run `src` over a one-string tape under MoveAndPoisonAllocator. The
+/// iterator's runtime state — including `runtime_tape.string_buf`, the
+/// arena that holds any aliased input — uses the poisoning allocator,
+/// so a UAF on a cached `[]const u8` slice into string_buf manifests
+/// deterministically. Yielded values are deep-copied into a separate
+/// testing-allocator-backed OwnedValues *before* the iterator deinits,
+/// so the returned slices are stable for the assertion phase.
+fn runFilterStrPoison(src: []const u8, input: []const u8) !OwnedValues {
+    var q = try compile(src);
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, input);
+
+    var poison: MoveAndPoisonAllocator = .{ .inner = alloc };
+    const poison_alloc = poison.allocator();
+
+    const owned_tape = try alloc.create(types.RuntimeTape);
+    errdefer alloc.destroy(owned_tape);
+    owned_tape.* = try types.RuntimeTape.init(alloc);
+    errdefer owned_tape.deinit(alloc);
+
+    var out = std.ArrayList(Value){};
+    errdefer out.deinit(alloc);
+
+    {
+        var it = try q.execute(t, &.{}, poison_alloc);
+        defer it.deinit();
+        while (try it.next()) |v| {
+            const owned_v = try materializeValue(v, owned_tape, alloc);
+            try out.append(alloc, owned_v);
+        }
+    }
+
+    return .{
+        .items = try out.toOwnedSlice(alloc),
+        .tape = owned_tape,
+        .allocator = alloc,
+    };
+}
+
 test "regex runtime: test() literal matches" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("test(\"bar\")", "foo bar baz");
@@ -3293,22 +3383,36 @@ test "NIX-004: gsub() literal-string replacement still works (non-regression)" {
     try std.testing.expectEqualStrings("bXnXnX", vals.items[0].string);
 }
 
-// ── NIX-005: chained gsub UAF when input aliases runtime_tape.string_buf ────
+// ── NIX-005: alias-then-grow UAF on runtime_tape.string_buf ────────────────
 //
-// When `gsub(A) | gsub(B)` runs, the first gsub's output is interned into
-// runtime_tape.string_buf and yielded as a `[]const u8` slice into that
-// buffer. The second gsub captures the slice once (as `input`) and reuses
-// it across the per-match loop. Each per-match `internString` of capture
-// bytes can ensureUnusedCapacity-grow string_buf, reallocating the backing
-// to a different address. After the realloc, the cached `input` is a
-// dangling pointer; the next `iterNext(input,...)` reads freed memory.
+// Shape of the bug class. When a regex builtin (`sub`/`gsub`/`match`/`scan`/
+// `match` g-flag/`splits`) caches `it.current.string` once as a local
+// `input`/`hay`, then performs operations that grow `runtime_tape.string_buf`
+// (interning capture names + match bytes, running a replacement filter whose
+// concat operators call `internStringConcat`, etc.), and `input` aliases
+// that buffer (e.g. a prior `gsub` interned the value into runtime_tape and
+// yielded a slice), the grow relocates the backing and dangles `input`.
+// Subsequent reads through `input` hit freed memory — wrong output, regex
+// panic, or SIGABRT depending on heap state.
 //
-// Repro: pinned to nixpkgs nix-manual mdbook anchors.jq (a chain of two
-// gsubs feeding a recursive map). The first gsub matches zero times so the
-// early-return at builtinSubImpl interns input fresh into runtime_tape;
-// the second gsub then runs on that aliased input and crashes around
-// n≈1000 matches in the user's Nix repro. We use 2000 matches here to
-// give the test allocator's realloc-on-grow path plenty of opportunities.
+// The fix path. `RuntimeTape.stabilizeAgainstStringBuf` (src/types.zig) is
+// the SSOT helper: zero-copy when input is external, one scratch dupe when
+// it aliases. Each entry point dupes upfront so the cached slice is stable
+// across the entire builtin call (and across fork-frame yields, for the
+// scan/match-g/splits family).
+//
+// Test strategy. Each test:
+//   - Stages an input that the *first* gsub interns into runtime_tape via
+//     the zero-match early-return path (`gsub("NEVERMATCH(?<x>X)"; "X")`).
+//     That guarantees the second op's `it.current.string` aliases
+//     runtime_tape.string_buf.
+//   - Runs the second op (sub/gsub/match/scan/match-g/splits) on that
+//     aliased input, with enough match volume to force `string_buf` growth
+//     mid-call.
+//   - Wraps the iterator allocator with `MoveAndPoisonAllocator` so every
+//     grow relocates (resize=false, remap=null) and the freed backing is
+//     poisoned with 0xAA. Without the fix, any read through the dangling
+//     `input` slice returns 0xAA bytes — output diverges deterministically.
 
 test "NIX-005: chained gsub on runtime_tape-aliased input does not UAF" {
     if (!regex.enabled) return error.SkipZigTest;
@@ -3331,21 +3435,158 @@ test "NIX-005: chained gsub on runtime_tape-aliased input does not UAF" {
         try expected.appendSlice(alloc, b);
     }
 
-    // First gsub: regex never matches → zero-match early-return interns
-    // `hay` into runtime_tape.string_buf and yields a slice into it. That
-    // slice is the second gsub's `it.current.string` → the aliasing setup.
-    // Second gsub: the anchor regex with named captures + a per-match
-    // replacement filter that builds output via string concat (each `+`
-    // calls internStringConcat → grows string_buf).
+    // Second gsub: anchor regex with named captures + replacement filter
+    // whose `+` concats hammer internStringConcat on every match.
     const filter =
         "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
         " | gsub(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\";" ++
         " \"<a href=\\\"#\" + .anchor + \"\\\" id=\\\"\" + .anchor + \"\\\">\" + .text + \"</a>\")";
 
-    var vals = try runFilterStr(filter, hay.items);
+    var vals = try runFilterStrPoison(filter, hay.items);
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     try std.testing.expectEqualStrings(expected.items, vals.items[0].string);
+}
+
+test "NIX-005: sub on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // sub takes the first match only, but the replacement-filter concat
+    // path still grows string_buf mid-call. The cached `input` must
+    // survive that grow to read post-match bytes for the tail.
+    //
+    // Build a long aliased input so the post-match tail copy reads
+    // many bytes through the (potentially dangling) slice.
+    const N: usize = 2000;
+    var hay = std.ArrayList(u8){};
+    defer hay.deinit(alloc);
+    try hay.appendSlice(alloc, "[head]{#first} ");
+    for (0..N) |i| {
+        const a = try std.fmt.allocPrint(alloc, "tail{d} ", .{i});
+        defer alloc.free(a);
+        try hay.appendSlice(alloc, a);
+    }
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | sub(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\";" ++
+        " \"<\" + .anchor + \":\" + .text + \">\")";
+
+    var vals = try runFilterStrPoison(filter, hay.items);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    // Output must start with the substituted prefix and continue with
+    // the verbatim tail. Any UAF-corruption shows as 0xAA bytes.
+    const out = vals.items[0].string;
+    try std.testing.expect(std.mem.startsWith(u8, out, "<first:head> tail0 "));
+    try std.testing.expect(std.mem.endsWith(u8, out, "tail1999 "));
+}
+
+test "NIX-005: match on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // match is one-shot but `buildMatchObject` interns capture names
+    // (e.g. "anchor", "text") via internString, growing string_buf.
+    // Reads of `input[slot.start..slot.end]` for capture bytes happen
+    // *after* those grows. Use tojson to render the result so any
+    // 0xAA poison bytes in the captured strings would surface as
+    // invalid JSON or wrong content rather than passing through.
+    const hay = "[head]{#anchor1}";
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | match(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\")" ++
+        " | [.captures[0].string, .captures[1].string] | tojson";
+
+    var vals = try runFilterStrPoison(filter, hay);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings("[\"head\",\"anchor1\"]", vals.items[0].string);
+}
+
+// Notes on multi-yield NIX-005 tests:
+//
+// The fork-frame UAF is exercised per-yield. `runFilterStrPoison`
+// materializes each yielded value into an independent OwnedValues
+// tape *before* the next `it.next()` call, so post-yield grows in
+// the iterator's runtime_tape don't dangle the materialized copy.
+// We deliberately avoid the `[<gen>]` collection idiom in these
+// tests — collection accumulates StackValues that may carry slices
+// into pre-grow string_buf, which is a *separate* alias path
+// orthogonal to the builtin-internal `hay` cache that NIX-005
+// fixes.
+
+test "NIX-005: scan on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // scan stashes `hay = input` in the fork frame and reuses it across
+    // every per-match yield. Each yield interns capture bytes/names →
+    // grows string_buf → must not dangle the cached hay.
+    const N: usize = 2000;
+    var hay = std.ArrayList(u8){};
+    defer hay.deinit(alloc);
+    for (0..N) |i| {
+        const a = try std.fmt.allocPrint(alloc, "[item{d}]{{#a{d}}} ", .{ i, i });
+        defer alloc.free(a);
+        try hay.appendSlice(alloc, a);
+    }
+
+    // Direct yield (no `[…]` collector). Each yield is an array of
+    // capture strings; each is materialized into OwnedValues before
+    // the next yield, so the dangling-hay UAF either corrupts the
+    // current yield's contents or aborts iteration early.
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | scan(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\")";
+
+    var vals = try runFilterStrPoison(filter, hay.items);
+    defer vals.deinit();
+    try std.testing.expectEqual(N, vals.items.len);
+}
+
+test "NIX-005: match g-flag on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // match("…"; "g") fork-frame is the same shape as scan but yields
+    // full match objects (offset/length/string/captures) — every yield
+    // grows string_buf with capture-name interns.
+    const N: usize = 2000;
+    var hay = std.ArrayList(u8){};
+    defer hay.deinit(alloc);
+    for (0..N) |i| {
+        const a = try std.fmt.allocPrint(alloc, "[i{d}]{{#a{d}}} ", .{ i, i });
+        defer alloc.free(a);
+        try hay.appendSlice(alloc, a);
+    }
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | match(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\"; \"g\")";
+
+    var vals = try runFilterStrPoison(filter, hay.items);
+    defer vals.deinit();
+    try std.testing.expectEqual(N, vals.items.len);
+}
+
+test "NIX-005: splits on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    // splits' fork frame yields gap strings between matches. Each gap
+    // is interned via internString → grows string_buf → must not
+    // dangle the cached hay slice.
+    const N: usize = 2000;
+    var hay = std.ArrayList(u8){};
+    defer hay.deinit(alloc);
+    for (0..N) |i| {
+        const a = try std.fmt.allocPrint(alloc, "g{d}|", .{i});
+        defer alloc.free(a);
+        try hay.appendSlice(alloc, a);
+    }
+    // Trailing "|" → splits yields N gap strings + 1 empty tail = N+1.
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | splits(\"\\\\|\")";
+
+    var vals = try runFilterStrPoison(filter, hay.items);
+    defer vals.deinit();
+    try std.testing.expectEqual(N + 1, vals.items.len);
 }
 
 test "regex runtime: optional unmatched group sentinel in match" {

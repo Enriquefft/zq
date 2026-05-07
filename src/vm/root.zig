@@ -10361,10 +10361,19 @@ pub const ResultIterator = struct {
     /// backtrack/ip-jump idiom used by empty-`range` and exhausted scanners.
     fn builtinMatch(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
-        const input = switch (it.current) {
+        const input_raw = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        // NIX-005: `buildMatchObject` interns capture names + bytes,
+        // growing `runtime_tape.string_buf`. If `input_raw` aliases
+        // that buffer, the grow dangles the local slice between the
+        // `internString(name)` and `hay[slot.start..slot.end]` reads
+        // inside `buildMatchObject`/`appendCaptureEntry`. Stabilize.
+        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
+            it.scratch.allocator(),
+            input_raw,
+        );
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
@@ -10497,27 +10506,16 @@ pub const ResultIterator = struct {
         };
         // NIX-005: `input_raw` may alias `runtime_tape.string_buf` (e.g.
         // when the prior filter was itself a `gsub` whose result lives
-        // there). The per-match path grows `string_buf` repeatedly:
-        //   - `buildCaptureObject` interns each named-group name and the
-        //     match bytes (re-grows mid-call, between `internString(name)`
-        //     and the `hay[start..end]` slice for that group).
-        //   - `runReplacementBody` runs the user's replacement filter,
-        //     whose `+`/concat operators each call `internStringConcat`.
-        // Any of these reallocations dangles a slice into the old
-        // backing. Stabilize by duping into the per-record scratch arena
-        // when (and only when) the input aliases runtime_tape; otherwise
-        // the slice is already stable (parsed tape, scratch, etc.) and
-        // we keep the zero-copy path.
-        const input = blk: {
-            const buf = it.runtime_tape.string_buf.items;
-            if (buf.len == 0) break :blk input_raw;
-            const sp = @intFromPtr(input_raw.ptr);
-            const bp = @intFromPtr(buf.ptr);
-            if (sp >= bp and sp + input_raw.len <= bp + buf.len) {
-                break :blk try it.scratch.allocator().dupe(u8, input_raw);
-            }
-            break :blk input_raw;
-        };
+        // there). The per-match path grows `string_buf` repeatedly via
+        // `buildCaptureObject` (interns names + match bytes) and the
+        // replacement body's `+` / concat operators. Any such grow can
+        // relocate the buffer and dangle our cached `input` slice.
+        // Stabilize via the SSOT helper: zero-copy when input is
+        // already external; one scratch dupe when it aliases.
+        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
+            it.scratch.allocator(),
+            input_raw,
+        );
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
@@ -10804,10 +10802,20 @@ pub const ResultIterator = struct {
     /// LRU is strictly an amortization layer for pattern compile and does
     /// not participate in fork-frame lifetime.
     fn builtinScan(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input = switch (it.current) {
+        const input_raw = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        // NIX-005: the fork frame stashes `hay = input` and reuses it
+        // across yields. If input aliases `runtime_tape.string_buf`,
+        // any operation between yields that grows the buffer (concat,
+        // chained gsub, etc.) dangles the cached `hay`. Stabilize the
+        // input upfront — scratch arena lives for the record so it
+        // outlasts every advance on this fork frame.
+        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
+            it.scratch.allocator(),
+            input_raw,
+        );
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();
@@ -10891,10 +10899,15 @@ pub const ResultIterator = struct {
     /// Dynamic-pattern ownership mirrors `builtinScan`: frame owns its own
     /// (Regex, Clone) pair so the LRU cannot dangle it via eviction.
     fn builtinMatchG(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input = switch (it.current) {
+        const input_raw = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        // NIX-005: same fork-frame `hay` reuse as builtinScan.
+        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
+            it.scratch.allocator(),
+            input_raw,
+        );
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();
@@ -10965,10 +10978,15 @@ pub const ResultIterator = struct {
     /// inter-match gap, and the tail after the last match (including empty
     /// tails). Equivalent to `split` when the pattern is a literal.
     fn builtinSplits(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input = switch (it.current) {
+        const input_raw = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
         };
+        // NIX-005: same fork-frame `hay` reuse as builtinScan.
+        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
+            it.scratch.allocator(),
+            input_raw,
+        );
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();

@@ -129,6 +129,31 @@ pub const RuntimeTape = struct {
         self.string_buf.deinit(allocator);
     }
 
+    /// Return `s` if it is already stable against `string_buf` mutations
+    /// (i.e. lives outside `string_buf`), otherwise dupe it into
+    /// `dupe_alloc`. Use when `s` will be read after subsequent
+    /// `internString*` calls — those may relocate `string_buf` and
+    /// dangle any caller-held slice into it. Lifetime of the returned
+    /// slice equals `dupe_alloc`'s; the caller chooses an arena/region
+    /// long enough to cover all subsequent reads. Single SSOT for the
+    /// "stabilize a possibly-aliased string against runtime_tape mutation"
+    /// pattern (NIX-005). Mirrors `SliceSnap`'s alias detection but
+    /// resolves eagerly with a copy instead of lazily on each read.
+    pub fn stabilizeAgainstStringBuf(
+        self: *const RuntimeTape,
+        dupe_alloc: std.mem.Allocator,
+        s: []const u8,
+    ) error{OutOfMemory}![]const u8 {
+        const buf = self.string_buf.items;
+        if (buf.len == 0) return s;
+        const sp = @intFromPtr(s.ptr);
+        const bp = @intFromPtr(buf.ptr);
+        if (sp >= bp and sp + s.len <= bp + buf.len) {
+            return try dupe_alloc.dupe(u8, s);
+        }
+        return s;
+    }
+
     /// Snapshot of a `[]const u8` that may alias `string_buf`. Captured
     /// *before* any operation that could free the backing (e.g.
     /// `ensureUnusedCapacity`), then resolved against the (possibly
