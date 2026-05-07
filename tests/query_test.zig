@@ -3195,16 +3195,22 @@ test "regex runtime: capture() named groups" {
     try std.testing.expectEqualStrings("12|34", vals.items[0].string);
 }
 
-test "regex runtime: sub() with backref" {
+// NIX-004: rewritten from `\1` backref form (zq-only ext) to jq-parity
+// named-capture filter form. jq's sub/gsub replacement is a *filter*, not a
+// backref-template; `.<name>` resolves the named group via the captures
+// object rebound as `.`. Numeric `\N` backrefs are not supported by jq.
+test "regex runtime: sub() with named-capture filter" {
     if (!regex.enabled) return error.SkipZigTest;
-    var vals = try runFilterStr("sub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    var vals = try runFilterStr("sub(\"(?<x>\\\\w+)\"; \"<\" + .x + \">\")", "foo bar");
     defer vals.deinit();
     try std.testing.expectEqualStrings("<foo> bar", vals.items[0].string);
 }
 
-test "regex runtime: gsub() with backref" {
+// NIX-004: rewritten from `\1` backref form (zq-only ext) to jq-parity
+// named-capture filter form. See note above.
+test "regex runtime: gsub() with named-capture filter" {
     if (!regex.enabled) return error.SkipZigTest;
-    var vals = try runFilterStr("gsub(\"(\\\\w+)\"; \"<\\\\1>\")", "foo bar");
+    var vals = try runFilterStr("gsub(\"(?<x>\\\\w+)\"; \"<\" + .x + \">\")", "foo bar");
     defer vals.deinit();
     try std.testing.expectEqualStrings("<foo> <bar>", vals.items[0].string);
 }
@@ -3216,6 +3222,75 @@ test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
     // regex-automata matches empty at every position → Xs interleaved.
     // Just assert it terminates and produces a string.
     try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals.items[0]));
+}
+
+// ── NIX-004: gsub/sub replacement is a per-match filter with `.` = captures ─
+//
+// jq semantics: the replacement arg of sub/gsub is a *filter expression*,
+// re-evaluated for each match with `.` rebound to a JSON object containing
+// the named-capture groups (`{anchor: "...", text: "..."}`). Numeric `\N`
+// and `\g<name>` backrefs are NOT a jq feature — replacement strings are
+// taken literally; named-group access is via filter access (`.<name>`)
+// against the rebound `.`. The previous zq-only `\N` extension was
+// removed in NIX-004 for strict parity.
+//
+// Pinned upstream reproducer: nixpkgs `nix-manual` mdbook anchors.jq L6
+// uses `gsub(re; "<a id=\"" + .anchor + "\"></a>")`. With `.` left bound
+// to the original input string, `.anchor` errors at runtime (object index
+// on a string).
+
+test "NIX-004: gsub() replacement is a filter — `.` = captures (single named group)" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var vals = try runFilterStr(
+        "gsub(\"\\\\[\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\"; \"<a id=\\\"\" + .anchor + \"\\\"></a>\")",
+        "[]{#foo}",
+    );
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("<a id=\"foo\"></a>", vals.items[0].string);
+}
+
+test "NIX-004: gsub() replacement filter — multi named capture (anchor + text)" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // Mirrors anchors.jq L7: `gsub(anchor_regex; "<a href=\"#" + .anchor + "\" id=\"" + .anchor + "\">" + .text + "</a>")`
+    var vals = try runFilterStr(
+        "gsub(\"\\\\[(?<text>[^\\\\]]+)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\"; \"<a href=\\\"#\" + .anchor + \"\\\" id=\\\"\" + .anchor + \"\\\">\" + .text + \"</a>\")",
+        "see [intro]{#sec-1} now",
+    );
+    defer vals.deinit();
+    try std.testing.expectEqualStrings(
+        "see <a href=\"#sec-1\" id=\"sec-1\">intro</a> now",
+        vals.items[0].string,
+    );
+}
+
+test "NIX-004: gsub() replacement filter — applied to every match (per-match rebind)" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // Two matches; `.w` must resolve per-match, not be evaluated once.
+    var vals = try runFilterStr(
+        "gsub(\"(?<w>hello)\"; .w + \"!\")",
+        "hello world hello",
+    );
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("hello! world hello!", vals.items[0].string);
+}
+
+test "NIX-004: sub() replacement is a filter — `.` = captures" {
+    if (!regex.enabled) return error.SkipZigTest;
+    var vals = try runFilterStr(
+        "sub(\"(?<a>b)\"; \"[\" + .a + \"]\")",
+        "abc",
+    );
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("a[b]c", vals.items[0].string);
+}
+
+test "NIX-004: gsub() literal-string replacement still works (non-regression)" {
+    if (!regex.enabled) return error.SkipZigTest;
+    // Replacement is a constant string with no captures reference. Must
+    // continue to behave exactly like before — applied to every match.
+    var vals = try runFilterStr("gsub(\"a\"; \"X\")", "banana");
+    defer vals.deinit();
+    try std.testing.expectEqualStrings("bXnXnX", vals.items[0].string);
 }
 
 test "regex runtime: optional unmatched group sentinel in match" {

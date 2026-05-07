@@ -2526,35 +2526,44 @@ fn emitCallBuiltin(em: *Emitter, node: ir.Node) EmitError!void {
             const pool_idx: u32 = slots[node.extra + 2];
             const n_flag: bool = slots[node.extra + 3] != 0;
             const args = em.ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
+
+            // NIX-004: `regex2` is sub/gsub-only — `isRegex2BuiltinName`
+            // (lower.zig) routes exactly `sub`/`gsub` here. jq evaluates
+            // the replacement *as a filter*, re-binding `.` to the
+            // captures-object for each match. We therefore must NOT
+            // pre-evaluate `<repl>` before the `call_builtin` — its
+            // bytecode is laid down inline AFTER the call as a
+            // closure-body, with a `jump` over the body so top-level
+            // execution skips it. The VM (builtinSubImpl) reads the
+            // trailing `jump`'s operand to learn the body IP range and
+            // invokes it per match. SSOT for the body range: the
+            // trailing `jump exit_ip` opcode immediately after
+            // `call_builtin`.
+            std.debug.assert(bid == .sub_ or bid == .gsub_);
             if (pool_idx == types_mod.REGEX_POOL_DYNAMIC) {
-                // Dynamic pattern: span = [pat, repl]. Mirrors legacy
-                // `compileRegexBuiltin2` slow path:
-                //   save_input ; <pat> ; restore_input ;
-                //   save_input ; <repl> ; restore_input ; call_builtin
+                // Dynamic pattern: span = [pat, repl].
+                //   save_input ; <pat> ; restore_input ; call_builtin ;
+                //   jump exit_ip ; <repl> ; exit_ip:
                 std.debug.assert(args.len == 2);
                 try em.pushInstr(.save_input, .{ .none = {} }, node);
                 try emitNode(em, args[0]);
                 try em.pushInstr(.restore_input, .{ .none = {} }, node);
-                try em.pushInstr(.save_input, .{ .none = {} }, node);
-                try emitNode(em, args[1]);
-                try em.pushInstr(.restore_input, .{ .none = {} }, node);
             } else {
-                // Literal pattern: span = [repl] only. The pool index
-                // supplies the regex; the pattern push is replaced by
-                // an empty save/restore pair so the input-stack
-                // bracketing matches legacy's fast-path shape exactly.
+                // Literal pattern: span = [repl] only. Pool supplies regex.
                 std.debug.assert(args.len == 1);
-                try em.pushInstr(.save_input, .{ .none = {} }, node);
-                try em.pushInstr(.restore_input, .{ .none = {} }, node);
-                try em.pushInstr(.save_input, .{ .none = {} }, node);
-                try emitNode(em, args[0]);
-                try em.pushInstr(.restore_input, .{ .none = {} }, node);
             }
             try em.pushInstr(
                 .call_builtin,
                 .{ .index = types_mod.packRegexBuiltinOperandFlags(bid, pool_idx, n_flag) },
                 node,
             );
+            const jump_pos = em.instructions.items.len;
+            try em.pushInstr(.jump, .{ .index = 0 }, node);
+            // Body: replacement filter, invoked per match by the VM.
+            const repl_idx = if (pool_idx == types_mod.REGEX_POOL_DYNAMIC) args[1] else args[0];
+            try emitNode(em, repl_idx);
+            const exit_ip: u32 = @intCast(em.instructions.items.len);
+            em.instructions.items[jump_pos].operand = .{ .index = exit_ip };
         },
         // Post-cutover: lowering never produces a `.not_implemented`
         // class for an emitted IR node — the same exhaustiveness

@@ -33,7 +33,7 @@ const CollectFrame = struct {
 
 // ── Fork stack types ─────────────────────────────────────────────────────────
 
-const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, reduce_source, path_scope, scan, match_g, splits, recurse_path };
+const ForkType = enum(u8) { normal, each, range, try_handler, alt_handler, label, limit, skip, repeat, reduce_source, path_scope, scan, match_g, splits, recurse_path, sub_gen };
 
 const EachState = struct {
     pos: u32,
@@ -300,6 +300,27 @@ const SplitsState = struct {
     n_flag: bool = false,
 };
 
+/// State for `sub`/`gsub` generator-in-replacement (NIX-004). When the
+/// replacement filter produces K > 1 outputs per match, `builtinSubImpl`
+/// computes all K final strings up-front, returns the first as the call's
+/// pushed value, and parks the remaining as `Tape.StringRef` offsets on
+/// this frame. `advanceSubGenForkpoint` pushes the next ref's resolved
+/// string onto value_stack at each backtrack and pops the frame when the
+/// queue empties.
+///
+/// Storing `Tape.StringRef` (offset+len) rather than raw `[]const u8`
+/// keeps the frame robust against `runtime_tape.string_buf` reallocations
+/// that may happen between yields (bytecode emitted by downstream filters
+/// may intern more strings before we backtrack to advance this frame).
+///
+/// `refs` is allocated from the iterator's per-record scratch arena —
+/// released wholesale at `reset()`. No explicit per-frame deinit needed.
+const SubGenState = struct {
+    refs: []const Tape.StringRef,
+    /// Index of the NEXT string to yield (refs[index..] is the queue).
+    index: u32,
+};
+
 /// One (value, path-components) pair collected by `..` (recurse) when it runs
 /// inside a `path(f)` frame. The path components are a heap-allocated slice of
 /// `Value` (int / string elements only); the value is a `Value` borrowed from
@@ -370,6 +391,9 @@ const ForkAux = union(ForkType) {
     /// pre-built path arrays) while `frame.components` is set correctly per
     /// iteration for `path_end` to reconstruct the path.
     recurse_path: RecursePathState,
+    /// State for `sub`/`gsub` generator-in-replacement (NIX-004). Yields
+    /// the queued result strings one per backtrack until exhausted.
+    sub_gen: SubGenState,
 };
 
 /// Snapshot of the path-tracking state at the time a fork was created.
@@ -3960,7 +3984,7 @@ pub const ResultIterator = struct {
         if (it.path_stack.items.len != 0) return;
         for (it.fork_stack.items) |fp| {
             switch (fp.aux) {
-                .scan, .match_g, .splits, .recurse_path => return,
+                .scan, .match_g, .splits, .recurse_path, .sub_gen => return,
                 .each,
                 .normal,
                 .range,
@@ -8610,6 +8634,44 @@ pub const ResultIterator = struct {
                     fp.aux = .{ .normal = {} };
                     _ = it.fork_stack.pop();
                 },
+                .sub_gen => {
+                    // sub_/gsub_ K>1 generator: park each remaining branch
+                    // string in fp.aux.sub_gen.refs (Tape.StringRef offsets).
+                    // Each backtrack pushes the next branch onto value_stack
+                    // (mirroring the dispatcher's `pushValue` after the
+                    // initial call_builtin) and resumes at the trailing
+                    // `jump exit_ip` (== backtrack_ip). No regex-fork slots
+                    // owned — the regex was a one-shot in builtinSubImpl.
+                    //
+                    // Order matters: restore stack/object state FIRST (which
+                    // truncates value_stack to its pre-call snapshot), THEN
+                    // push the new branch value. Reversing the order would
+                    // see our push wiped by the restore.
+                    it.restorePathState(fp.saved_path);
+                    var st = &fp.aux.sub_gen;
+                    if (st.index < st.refs.len) {
+                        if (fp.saved_object) |snap| {
+                            it.restoreObjectConstructState(snap);
+                            fp.saved_object = try it.snapshotObjectConstructState();
+                        }
+                        if (fp.saved_stack) |snap| {
+                            it.restoreValueStackFromSnapshot(snap);
+                            fp.saved_stack = try it.snapshotValueStackForFork();
+                        } else {
+                            it.value_stack.items.len = fp.saved_value_stack_len;
+                        }
+                        const r = st.refs[st.index];
+                        st.index += 1;
+                        const slice = it.runtime_tape.view.string_buf[r.offset..][0..r.len];
+                        it.pushValue(.{ .tape_value = .{ .string = slice } });
+                        it.ip = fp.backtrack_ip;
+                        return true;
+                    }
+                    it.value_stack.items.len = fp.saved_value_stack_len;
+                    it.current = fp.saved_current;
+                    fp.aux = .{ .normal = {} };
+                    _ = it.fork_stack.pop();
+                },
                 .splits => {
                     it.restorePathState(fp.saved_path);
                     if (try it.advanceSplitsForkpoint(fp)) {
@@ -10393,15 +10455,41 @@ pub const ResultIterator = struct {
         return try it.builtinSubImpl(operand, true);
     }
 
+    /// `sub(pattern; replacement)` / `gsub(pattern; replacement)` — NIX-004.
+    ///
+    /// jq strict semantics: the replacement is a *filter expression*,
+    /// re-evaluated for each match with `.` rebound to the captures object
+    /// (named groups only; unmatched optional names → null; unnamed groups
+    /// omitted). Cartesian generator-in-repl: if the replacement filter
+    /// produces K outputs per match, this builtin emits K final strings,
+    /// where output i = concat of (gap, branch_i_repl) across all matches
+    /// followed by the trailing tail.
+    ///
+    /// Bytecode shape (set by `emit.zig` `.regex2` arm for `.sub_`/`.gsub_`):
+    ///
+    ///   [pat-eval]                ; dynamic only — pat on value_stack
+    ///   call_builtin(sub_|gsub_)  ; this function. ip auto-advances to →
+    ///   jump <exit_ip>            ; skip body at top level
+    ///   <repl bytecode>           ; body — invoked per match, `.` = captures
+    ///   exit_ip: <next instr>
+    ///
+    /// We read the trailing `jump`'s operand to discover the body IP range
+    /// and re-enter that range per match via `runReplacementBody`. The K==1
+    /// hot path returns one StackValue (legacy shape preserved). The K>1
+    /// generator path push-yields the first string and parks remaining
+    /// `Tape.StringRef`s on a fork frame (`ForkAux.sub_gen`), each released
+    /// on backtrack via `advanceSubGenForkpoint`.
     fn builtinSubImpl(it: *ResultIterator, operand: i64, global: bool) ZqError!?StackValue {
-        // Stack layout (see compiler.zig compileRegexBuiltin2): [pattern?, replacement].
-        // Dynamic path pushes pattern; literal path does NOT push pattern.
-        // Replacement is ALWAYS pushed (general parsePipe path).
-        const repl_sv = try it.popValue();
-        const repl = switch (try stackValueToValue(repl_sv)) {
-            .string => |s| s,
-            else => return error.TypeError,
-        };
+        // SSOT for body IP range: the trailing `jump exit_ip` opcode
+        // immediately after `call_builtin`. Emit guarantees this shape.
+        std.debug.assert(it.ip + 1 < it.instructions.len);
+        std.debug.assert(it.instructions[it.ip + 1].op == .jump);
+        const exit_ip: u32 = @intCast(it.instructions[it.ip + 1].operand.index);
+        const body_start: u32 = it.ip + 2;
+        const body_end: u32 = exit_ip;
+
+        // Dynamic pattern: pop pat from value_stack and compile/cache.
+        // Literal pattern: pool supplies regex.
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
             .string => |s| s,
@@ -10413,9 +10501,19 @@ pub const ResultIterator = struct {
         const slots_buf = try it.scratch.allocator().alloc(regex_mod.MatchSlot, @max(n_slots, 1));
         const n_flag = types.regexBuiltinNFlagOf(operand);
 
-        var out = std.ArrayList(u8){};
-        defer out.deinit(it.alloc);
-        try out.ensureTotalCapacity(it.alloc, input.len);
+        // Per-branch output accumulators. `branches` grows monotonically as
+        // matches with K outputs are seen — each accumulator is one final
+        // gsub/sub output. Allocator is the iterator's GPA; deinit on exit.
+        var branches = std.ArrayList(std.ArrayList(u8)){};
+        defer {
+            for (branches.items) |*b| b.deinit(it.alloc);
+            branches.deinit(it.alloc);
+        }
+
+        // Per-match scratch: capture-object outputs are accumulated into
+        // a small list. Lives in iterator GPA, deinit per iteration.
+        var match_outputs = std.ArrayList(Tape.StringRef){};
+        defer match_outputs.deinit(it.alloc);
 
         var cursor: usize = 0;
         var prev_end: usize = 0;
@@ -10425,19 +10523,254 @@ pub const ResultIterator = struct {
             const m_start = slots_buf[0].start;
             const m_end = slots_buf[0].end;
             // jq `n` flag: zero-width matches are no-ops (no replacement at
-            // that position). iterNext has already advanced the cursor past
-            // the empty match so the loop makes forward progress. Non-global
-            // sub with `n` keeps iterating until a non-empty match lands.
+            // that position). iterNext has advanced the cursor; loop makes
+            // forward progress.
             if (n_flag and m_end == m_start) continue;
-            if (m_start > prev_end) try out.appendSlice(it.alloc, input[prev_end..m_start]);
-            try expandReplacement(it.alloc, &out, regex, input, slots_buf, repl);
+
+            // Snapshot runtime_tape so per-match captures/body-intermediate
+            // entries are released after we've extracted the body's outputs.
+            // Output strings extracted as StringRefs (offset+len), NOT raw
+            // []const u8, so they survive subsequent string_buf growth.
+            const entries_pre: u32 = @intCast(it.runtime_tape.entries.items.len);
+            const string_buf_pre: u32 = @intCast(it.runtime_tape.string_buf.items.len);
+            // On any error path between snapshot and the success-path
+            // truncation below (body raises TypeError, branch alloc OOM,
+            // etc.) restore the tape so per-match captures + intermediates
+            // don't leak into subsequent records' tape.
+            errdefer {
+                it.runtime_tape.entries.items.len = entries_pre;
+                it.runtime_tape.string_buf.items.len = string_buf_pre;
+                it.runtime_tape.refreshView();
+            }
+
+            // Build {<named groups...>} captures-object on runtime_tape.
+            const captures_sv = try it.buildCaptureObject(regex, input, slots_buf);
+            const captures = try stackValueToValue(captures_sv);
+
+            // Run replacement body with `.` = captures-object. Collect ALL
+            // outputs as StringRefs (live in runtime_tape.string_buf). Null
+            // outputs coerce to "" (jq parity); non-string raises TypeError
+            // (jq parity via concat). Generator-in-repl yields K StringRefs.
+            match_outputs.clearRetainingCapacity();
+            try it.runReplacementBody(captures, body_start, body_end, &match_outputs);
+
+            // Extend per-branch accumulators with this match's gap + insert.
+            // Match k contributes to branches [0..match_outputs.len). Slots
+            // already populated in earlier matches but missing this match
+            // are not extended — mirrors jq's `def gsub` reduce shape (a
+            // newly-arriving branch slot starts from null and concatenates
+            // forward; an absent slot for this match keeps its content).
+            //
+            // Common case (1 match output): exactly 1 branch ever; this is
+            // a single concat per match, the optimal path.
+            const gap = input[prev_end..m_start];
+            for (match_outputs.items, 0..) |sref, i| {
+                if (i >= branches.items.len) {
+                    try branches.append(it.alloc, .{});
+                }
+                // Resolve StringRef NOW, before any further runtime_tape
+                // growth invalidates string_buf backing.
+                const slice = it.runtime_tape.view.string_buf[sref.offset..][0..sref.len];
+                try branches.items[i].appendSlice(it.alloc, gap);
+                try branches.items[i].appendSlice(it.alloc, slice);
+            }
+
+            // Release per-match captures + body intermediates. Final
+            // accumulators in `branches` already hold copies; safe to drop.
+            it.runtime_tape.entries.items.len = entries_pre;
+            it.runtime_tape.string_buf.items.len = string_buf_pre;
+            it.runtime_tape.refreshView();
+
             prev_end = m_end;
             if (!global) break;
         }
-        if (prev_end < input.len) try out.appendSlice(it.alloc, input[prev_end..]);
 
-        const str_ref = try it.runtime_tape.internString(it.alloc, out.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        // Trailing tail appended to every branch.
+        const tail = input[prev_end..];
+
+        // Edge case: zero matches. Mirror legacy: yield input unchanged.
+        if (branches.items.len == 0) {
+            const ref = try it.runtime_tape.internString(it.alloc, input);
+            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+        }
+
+        // Intern each branch into runtime_tape via alias-safe concat.
+        // We pre-allocate a scratch slice of StringRefs for the K>1
+        // fork-frame yield queue.
+        var refs = try it.scratch.allocator().alloc(Tape.StringRef, branches.items.len);
+        for (branches.items, 0..) |b, i| {
+            // internStringConcat is alias-safe even though our parts come
+            // from a separate ArrayList — required by NIX-003 SSOT (one
+            // contiguous alloc, snapshot-resolve aliasing).
+            refs[i] = try it.runtime_tape.internStringConcat(it.alloc, &.{ b.items, tail });
+        }
+
+        // Hot path (K == 1): return single string, no fork frame needed.
+        if (refs.len == 1) {
+            const r = refs[0];
+            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[r.offset..][0..r.len] } };
+        }
+
+        // Generator path (K > 1): push fork frame holding refs[1..]; return
+        // refs[0]. Backtracks consume one ref per call via
+        // `advanceSubGenForkpoint`. Storing StringRefs (not slices) keeps
+        // the frame robust to string_buf growth across backtrack boundaries.
+        const resume_ip = it.ip + 1; // re-enters the trailing `jump`, which jumps to exit_ip
+        it.fork_stack.appendAssumeCapacity(.{
+            .saved_value_stack_len = @intCast(it.value_stack.items.len),
+            .saved_current = it.current,
+            .backtrack_ip = resume_ip,
+            .aux = .{ .sub_gen = .{
+                .refs = refs,
+                .index = 1,
+            } },
+            .saved_path = it.snapshotPathState(),
+            .saved_stack = try it.snapshotValueStackForFork(),
+            .saved_object = try it.snapshotObjectConstructState(),
+        });
+        const r0 = refs[0];
+        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[r0.offset..][0..r0.len] } };
+    }
+
+    /// Run the replacement body bytecode (`<repl>`) once with `.` rebound to
+    /// `captures`, gathering ALL outputs as `Tape.StringRef`s in `out`.
+    /// Mirrors `walkApplyBody`'s state save/restore but collects every yield
+    /// (not just the first) so the cartesian generator-in-repl test
+    /// (`gsub("a"; "x", "y")`) works.
+    ///
+    /// Per-output policy:
+    ///   - `null`     → coerced to empty string (jq parity).
+    ///   - `string`   → interned via `internString` (alias-safe).
+    ///   - other      → `error.TypeError` (jq surfaces this via concat).
+    fn runReplacementBody(
+        it: *ResultIterator,
+        captures: Value,
+        body_start: u32,
+        body_end: u32,
+        out: *std.ArrayList(Tape.StringRef),
+    ) ZqError!void {
+        const saved_ip = it.ip;
+        const saved_current = it.current;
+        const saved_input = it.input_value;
+        const saved_value_len: u32 = @intCast(it.value_stack.items.len);
+        const saved_if_len: u32 = @intCast(it.if_stack.items.len);
+        const saved_fork_len: u32 = @intCast(it.fork_stack.items.len);
+        const saved_collect_len: u32 = @intCast(it.collect_stack.items.len);
+        const saved_path_len: u32 = @intCast(it.path_stack.items.len);
+
+        it.current = captures;
+        it.input_value = captures;
+        it.ip = body_start;
+
+        // Sub-execution loop — collect ALL outputs the body produces. The
+        // body emits one "output" per *fall-through to body_end*: the value
+        // sitting on value_stack (or `it.current` if stack is empty). After
+        // capturing, we backtrack to any fork the body opened (e.g. comma's
+        // generator fork) and re-run from there to obtain the next output.
+        // Loop terminates when no fork above saved_fork_len remains.
+        //
+        // Errors during body execution route through `handleError`; an
+        // unrecoverable error is rolled back and propagated, mirroring
+        // walkApplyBody.
+        while (true) {
+            // Inner loop: drive instructions until the body's exit point or
+            // an instruction-emit yields (path-emitting builtins).
+            while (it.ip < it.instructions.len and it.ip != body_end) {
+                const body_instr = it.instructions[it.ip];
+                if (it.execOne(body_instr)) |maybe_val| {
+                    if (maybe_val) |v| {
+                        // Path-emitting builtin yielded. Capture and continue.
+                        try collectReplacementOutput(it, v, out);
+                        if (it.fork_stack.items.len > saved_fork_len) {
+                            if (try it.backtrackToDepth(saved_fork_len)) {
+                                break; // re-enter inner loop after backtrack
+                            }
+                        }
+                        // No fork to drive — drop out cleanly.
+                        it.ip = body_end;
+                        break;
+                    }
+                } else |err| {
+                    if (!(try it.handleError(err))) {
+                        it.ip = saved_ip;
+                        it.current = saved_current;
+                        it.input_value = saved_input;
+                        it.value_stack.items.len = saved_value_len;
+                        it.if_stack.items.len = saved_if_len;
+                        it.if_path_comps_stack.items.len = saved_if_len;
+                        while (it.collect_stack.items.len > saved_collect_len) {
+                            var cf = it.collect_stack.pop().?;
+                            cf.buffer.deinit(it.alloc);
+                        }
+                        it.truncateForkStack(saved_fork_len);
+                        while (it.path_stack.items.len > saved_path_len) {
+                            var pf = it.path_stack.pop().?;
+                            pf.deinit(it.alloc);
+                        }
+                        return err;
+                    }
+                    if (it.done) {
+                        it.ip = body_end;
+                        break;
+                    }
+                }
+            }
+
+            // Body reached its exit (or fell off the instruction stream).
+            // Capture the trailing output: top-of-value_stack if the body
+            // pushed one, else `it.current` (jq's "the value IS the output"
+            // shape). Pop the stack so the next iteration starts clean.
+            if (it.ip == body_end or it.ip >= it.instructions.len) {
+                if (it.value_stack.items.len > saved_value_len) {
+                    const v = try stackValueToValue(try it.popValue());
+                    try collectReplacementOutput(it, v, out);
+                } else {
+                    try collectReplacementOutput(it, it.current, out);
+                }
+            }
+            // else: inner loop exited via path-emit branch — output already
+            // captured there; just continue the outer loop.
+
+            // Drive the next output via the body's own fork stack.
+            if (it.fork_stack.items.len > saved_fork_len) {
+                if (try it.backtrackToDepth(saved_fork_len)) continue;
+            }
+            break;
+        }
+
+        // Cleanup any residual state opened by the body.
+        while (it.collect_stack.items.len > saved_collect_len) {
+            var cf = it.collect_stack.pop().?;
+            cf.buffer.deinit(it.alloc);
+        }
+        it.truncateForkStack(saved_fork_len);
+        it.if_stack.items.len = saved_if_len;
+        it.if_path_comps_stack.items.len = saved_if_len;
+        it.value_stack.items.len = saved_value_len;
+        while (it.path_stack.items.len > saved_path_len) {
+            var pf = it.path_stack.pop().?;
+            pf.deinit(it.alloc);
+        }
+
+        it.ip = saved_ip;
+        it.current = saved_current;
+        it.input_value = saved_input;
+        it.done = false;
+    }
+
+    /// Coerce a replacement-body output value to a `Tape.StringRef` and
+    /// append to `out`. Null → empty string; non-string → TypeError.
+    fn collectReplacementOutput(
+        it: *ResultIterator,
+        v: Value,
+        out: *std.ArrayList(Tape.StringRef),
+    ) ZqError!void {
+        const ref: Tape.StringRef = switch (v) {
+            .string => |s| try it.runtime_tape.internString(it.alloc, s),
+            .null_val => try it.runtime_tape.internString(it.alloc, ""),
+            else => return error.TypeError,
+        };
+        try out.append(it.alloc, ref);
     }
 
     /// `scan(pattern)`: generator. See header comment above for integration.
@@ -11239,84 +11572,6 @@ pub const ResultIterator = struct {
         }
     }
 };
-
-// ── Replacement-string expansion for sub / gsub ────────────────────────────
-//
-// Syntax supported (jq / onig compat):
-//   `\0`–`\9`   numeric backref. `\0` is the entire match; `\1..\9` are
-//               capture groups by index. Unmatched optional groups expand to
-//               the empty string.
-//   `\g<name>`  named backref. Unknown names error with RegexInternalError.
-//   `\\`        literal backslash.
-//   anything else after `\`: literal, in line with onig's lenient behavior.
-//
-// Invalid `\g<...>` (no closing `>`, or unknown name) surfaces as
-// `error.RegexInternalError` — no silent ignore.
-
-fn expandReplacement(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    regex: *const regex_mod.Regex,
-    hay: []const u8,
-    slots: []const regex_mod.MatchSlot,
-    repl: []const u8,
-) ZqError!void {
-    var i: usize = 0;
-    while (i < repl.len) {
-        const c = repl[i];
-        if (c != '\\') {
-            try out.append(alloc, c);
-            i += 1;
-            continue;
-        }
-        // Escape. Need lookahead.
-        i += 1;
-        if (i >= repl.len) {
-            try out.append(alloc, '\\');
-            break;
-        }
-        const nx = repl[i];
-        if (nx == '\\') {
-            try out.append(alloc, '\\');
-            i += 1;
-            continue;
-        }
-        if (nx >= '0' and nx <= '9') {
-            const group_idx: usize = @intCast(nx - '0');
-            i += 1;
-            if (group_idx >= slots.len) continue; // unknown numeric ref → empty
-            const s = slots[group_idx];
-            if (s.start == regex_mod.SLOT_UNMATCHED) continue;
-            try out.appendSlice(alloc, hay[s.start..s.end]);
-            continue;
-        }
-        if (nx == 'g') {
-            // \g<name> or \g<N>
-            i += 1;
-            if (i >= repl.len or repl[i] != '<') return error.RegexInternalError;
-            i += 1;
-            const name_start = i;
-            while (i < repl.len and repl[i] != '>') : (i += 1) {}
-            if (i >= repl.len) return error.RegexInternalError;
-            const name = repl[name_start..i];
-            i += 1; // skip '>'
-            // Try numeric first
-            const group_idx: ?usize = if (name.len > 0)
-                std.fmt.parseInt(usize, name, 10) catch null
-            else
-                null;
-            const gi = group_idx orelse (regex.groupIndexByName(name) orelse return error.RegexInternalError);
-            if (gi >= slots.len) return error.RegexInternalError;
-            const s = slots[gi];
-            if (s.start == regex_mod.SLOT_UNMATCHED) continue;
-            try out.appendSlice(alloc, hay[s.start..s.end]);
-            continue;
-        }
-        // Unknown escape: preserve as literal (drop the backslash, keep nx).
-        try out.append(alloc, nx);
-        i += 1;
-    }
-}
 
 /// jq-canonical container-nesting limit for JSON parsing (`fromjson`).
 /// Matches jq 1.8.1 (`MAX_PARSING_DEPTH = 10000` in `src/jv_parse.c`):
