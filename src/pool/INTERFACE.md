@@ -8,11 +8,11 @@ work was submitted. This is the orchestration layer that stitches together `io`,
 
 Two execution paths are supported:
 
-- **Structured path** (`format = null`): Workers execute queries and copy values into
+- **Structured path** (`style = null`): Workers execute queries and copy values into
   arena-backed OwnedValues. Use `collect()` to retrieve typed `Value` results. Best
   for queries that produce complex values (objects/arrays) that need post-processing.
 
-- **Serialized path** (`format != null`): Workers execute queries and serialize values
+- **Serialized path** (`style != null`): Workers execute queries and serialize values
   directly into arena-backed byte buffers while the tape is still valid. Use
   `collect_bytes()` to retrieve pre-serialized output. Drastically reduces memory for
   per-record queries (`.id`, `select()`, `{a,b}`): arena holds only serialized bytes
@@ -99,8 +99,8 @@ pub const MemoryBudget = struct {
         stream_batch_size: usize,
     };
 
-    /// Compute chunk parameters given file size, thread count, and output format.
-    pub fn computeParams(self, file_size: u64, n_threads: usize, format: ?types.Format) ChunkParams;
+    /// Compute chunk parameters given file size, thread count, and output style.
+    pub fn computeParams(self, file_size: u64, n_threads: usize, style: ?types.OutputStyle) ChunkParams;
 };
 
 /// A fixed-size worker pool.  Create once, submit work, drain with collect()
@@ -111,7 +111,7 @@ pub const Pool = struct {
 
     /// Submit a regular file for parallel processing.
     ///
-    /// `format`: null → structured path (use `collect()`), non-null → serialized
+    /// `style`: null → structured path (use `collect()`), non-null → serialized
     /// path (use `collect_bytes()`). `color`, `opts`, `raw_input`, and
     /// `external_bindings` are forwarded to each worker so the serialized path
     /// can render final bytes directly.
@@ -119,7 +119,7 @@ pub const Pool = struct {
         p:                 *Pool,
         file:              std.fs.File,
         cq:                *const query.CompiledQuery,
-        format:            ?types.Format,
+        style:             ?types.OutputStyle,
         color:             ?*const output.Color,
         opts:              output.SerializeOpts,
         raw_input:         bool,
@@ -135,7 +135,7 @@ pub const Pool = struct {
         p:                 *Pool,
         src:               *io.Source,
         cq:                *const query.CompiledQuery,
-        format:            ?types.Format,
+        style:             ?types.OutputStyle,
         color:             ?*const output.Color,
         opts:              output.SerializeOpts,
         raw_input:         bool,
@@ -157,11 +157,11 @@ pub const Pool = struct {
 |-----------------------|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
 | `MemoryBudget.detect` | `→ MemoryBudget`                                                                 | Detect system memory + cgroup limits; budget = min(total, cgroup) / 2.                 |
 | `MemoryBudget.explicit`| `u64 → MemoryBudget`                                                            | Explicit budget for tests and future `--memory-limit` flag.                            |
-| `MemoryBudget.computeParams` | `MemoryBudget, u64, usize, ?Format → ChunkParams`                         | Compute adaptive chunk_factor, in_flight_factor, stream_batch_size.                    |
+| `MemoryBudget.computeParams` | `MemoryBudget, u64, usize, ?OutputStyle → ChunkParams`                    | Compute adaptive chunk_factor, in_flight_factor, stream_batch_size.                    |
 | `Pool.init`           | `usize, MemoryBudget, Allocator → error{OutOfMemory}!Pool`                      | Allocate all internal state and spawn N worker threads.                                 |
 | `Pool.deinit`         | `*Pool → void`                                                                   | Stop all workers, join threads, free memory.                                            |
-| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?Format, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → ZqError!void` | Read file, split into adaptive chunks, enqueue for parallel processing. |
-| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?Format, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → void`      | Attach stream; IO thread reads lines and feeds workers in pipeline mode. |
+| `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?OutputStyle, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → ZqError!void` | Read file, split into adaptive chunks, enqueue for parallel processing. |
+| `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?OutputStyle, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → void`      | Attach stream; IO thread reads lines and feeds workers in pipeline mode. |
 | `Pool.collect`        | `*Pool → ZqError!?Result`                                                        | Return next in-order result; null when exhausted; error on per-record failure.          |
 | `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                                   | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
 | `record_meta_size_for_test` | `usize` (comptime constant)                                                | `@sizeOf(RecordMeta)` — exported so the regression test in `tests/pool_test.zig` can pin the layout. Any new per-record field changes this value and fails the test intentionally. |
@@ -192,7 +192,7 @@ pub const Pool = struct {
 ## Dependencies
 
 - `src/error/root.zig`  — `ZqError` for propagation
-- `src/types.zig`       — `Value`, `Tape`, `Format`
+- `src/types.zig`       — `Value`, `Tape`, `OutputStyle`
 - `src/io/root.zig`     — `Source`, `SliceView`, `MappedFile` (mmap-backed file chunks)
 - `src/parser/root.zig` — `Parser`, `FeedResult`
 - `src/query/root.zig`  — `CompiledQuery`, `ResultIterator`, `ExternalVarBinding`

@@ -240,7 +240,7 @@ const Job = struct {
     allocator: std.mem.Allocator,
     /// When non-null, workers use the serialized path: serialize values directly
     /// into byte buffers instead of copying them via own_value().
-    format: ?types.Format,
+    style: ?types.OutputStyle,
     /// ANSI color configuration. Null means no color output.
     color: ?*const output_mod.Color,
     /// Serialization options (sort_keys, indent).
@@ -573,7 +573,7 @@ fn worker_fn(ctx: WorkerCtx) void {
         // bounding mmap RSS to O(in_flight × chunk_size) instead of O(file_size).
         defer if (!job.owns_data) madvise_dontneed_chunk(job.data);
 
-        if (job.format) |fmt| {
+        if (job.style) |style| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
             //
             // Stream-mode Jobs may publish multiple partial ChunkResults inside
@@ -595,7 +595,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                 .next_seq_range_base = ctx.next_seq_range_base,
                 .shutdown = ctx.shutdown,
                 .pool_alloc = ctx.allocator,
-                .fmt = fmt,
+                .style = style,
                 .seq_base = job.seq_base,
                 .seq_range_size = job.seq_range_size,
                 .sub_id = 0,
@@ -622,10 +622,13 @@ fn worker_fn(ctx: WorkerCtx) void {
                 break :blk parser_mod.boundary.countTopLevelValues(job.data);
             };
             state.meta_list.ensureTotalCapacity(state.aa, record_count) catch {};
-            const buf_estimate: usize = switch (fmt) {
-                .pretty => job.data.len * 6,
-                .compact, .jsonl, .raw, .join => job.data.len,
-            };
+            // Pretty-printed compounds expand ~6× input size; compact emits
+            // close to input size. raw_strings only changes string scalars
+            // (negligible) so the multiplier follows compact vs pretty.
+            const buf_estimate: usize = if (style.compact)
+                job.data.len
+            else
+                job.data.len * 6;
             state.chunk_buf.ensureTotalCapacity(state.aa, buf_estimate) catch {};
 
             const ProcessOne = struct {
@@ -951,7 +954,7 @@ const SerializeJobState = struct {
     /// per-iteration check.
     shutdown: *std.atomic.Value(bool),
     pool_alloc: std.mem.Allocator,
-    fmt: types.Format,
+    style: types.OutputStyle,
 
     // Stream-mode partial-flush configuration for the current Job.
     seq_base: u64,
@@ -1133,7 +1136,7 @@ fn process_value_serialized(
         // iteration so a partial_flush mid-loop picks up the fresh buffer.
         var sink = output_mod.BufferSink{ .list = &state.chunk_buf, .aa = state.aa };
 
-        output_mod.serialize(&sink, val, state.fmt, color, opts) catch {
+        output_mod.serialize(&sink, val, state.style, color, opts) catch {
             state.chunk_buf.shrinkRetainingCapacity(start);
             append_meta(state, .{
                 .end_offset = start,
@@ -1144,8 +1147,8 @@ fn process_value_serialized(
             return;
         };
 
-        // Append newline for pretty/compact/raw formats (not jsonl/join which handle their own).
-        if (state.fmt != .jsonl and state.fmt != .join) {
+        // Append inter-value newline unless --join-output suppresses it.
+        if (!state.style.join) {
             sink.writeByte('\n') catch {
                 state.chunk_buf.shrinkRetainingCapacity(start);
                 append_meta(state, .{
@@ -1277,7 +1280,7 @@ const IoCtx = struct {
     /// the (`io_done`, `active_stream_jobs == 0`) transition to pin total.
     io_done: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
-    format: ?types.Format,
+    style: ?types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     raw_input: bool,
@@ -1475,7 +1478,7 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
         .query = ctx.query,
         .owns_data = true,
         .allocator = ctx.allocator,
-        .format = ctx.format,
+        .style = ctx.style,
         .color = ctx.color,
         .opts = ctx.opts,
         .raw_input = ctx.raw_input,
@@ -1522,7 +1525,7 @@ const FileFeedCtx = struct {
     sequencer: *Sequencer,
     limiter: *InFlightLimiter,
     allocator: std.mem.Allocator,
-    format: ?types.Format,
+    style: ?types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     raw_input: bool,
@@ -1585,7 +1588,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .query = ctx.query,
             .owns_data = false,
             .allocator = ctx.allocator,
-            .format = ctx.format,
+            .style = ctx.style,
             .color = ctx.color,
             .opts = ctx.opts,
             .raw_input = ctx.raw_input,
@@ -1807,18 +1810,18 @@ pub const MemoryBudget = struct {
         stream_batch_size: usize,
     };
 
-    /// Compute chunk parameters given file size, thread count, and output format.
+    /// Compute chunk parameters given file size, thread count, and output style.
     ///
     /// For files that fit in budget after expansion, returns the current defaults.
     /// For larger files or constrained budgets, increases chunk_factor (smaller
     /// chunks, fewer in-flight bytes) and may reduce in_flight_factor to 1.
     /// For streams (file_size == 0), computes an appropriate batch size.
-    pub fn computeParams(self: MemoryBudget, file_size: u64, n_threads: usize, format: ?types.Format) ChunkParams {
+    pub fn computeParams(self: MemoryBudget, file_size: u64, n_threads: usize, style: ?types.OutputStyle) ChunkParams {
         const n_eff: u64 = @max(1, n_threads);
 
         // Stream mode: compute batch size from budget
         if (file_size == 0) {
-            const expansion = formatExpansion(format);
+            const expansion = formatExpansion(style);
             const batch = std.math.clamp(
                 self.budget_bytes / (n_eff * 2 * expansion),
                 MIN_STREAM_BATCH,
@@ -1832,7 +1835,7 @@ pub const MemoryBudget = struct {
         }
 
         // File mode: check if expanded file fits in budget
-        const expansion = formatExpansion(format);
+        const expansion = formatExpansion(style);
         const file_expanded = file_size *| expansion; // saturating multiply
 
         if (file_expanded <= self.budget_bytes) {
@@ -1871,13 +1874,12 @@ pub const MemoryBudget = struct {
         };
     }
 
-    /// Estimate output expansion factor for a given format.
-    fn formatExpansion(format: ?types.Format) u64 {
-        const fmt = format orelse return 3; // structured path
-        return switch (fmt) {
-            .pretty => 6,
-            .compact, .raw, .jsonl, .join => 2,
-        };
+    /// Estimate output expansion factor for a given style.
+    /// Pretty-printed compounds expand ~6×; compact stays close to input (≈2×
+    /// after escapes/whitespace). Structured path (null) sits between.
+    fn formatExpansion(style: ?types.OutputStyle) u64 {
+        const s = style orelse return 3; // structured path
+        return if (s.compact) 2 else 6;
     }
 };
 
@@ -1925,8 +1927,8 @@ pub const Pool = struct {
     _rec_idx: usize, // index into _delivering.records[]
     _val_idx: usize, // index into _delivering.records[_rec_idx].values[]
 
-    /// Output format for this pool run. null = structured path, non-null = serialized path.
-    _format: ?types.Format,
+    /// Output style for this pool run. null = structured path, non-null = serialized path.
+    _style: ?types.OutputStyle,
 
     /// Instruction pointer of the last error (for diagnostics).
     last_error_ip: u32 = 0,
@@ -2007,7 +2009,7 @@ pub const Pool = struct {
             ._delivering = null,
             ._rec_idx = 0,
             ._val_idx = 0,
-            ._format = null,
+            ._style = null,
         };
     }
 
@@ -2048,20 +2050,20 @@ pub const Pool = struct {
     /// collect()/collect_bytes() releases each slot when it frees a chunk's arena,
     /// so peak RSS is proportional to the in-flight limit, not the full file size.
     ///
-    /// When `format` is non-null, workers use the serialized path: values are
+    /// When `style` is non-null, workers use the serialized path: values are
     /// serialized directly into byte buffers. Use collect_bytes() to consume.
-    /// When `format` is null, workers use the structured path. Use collect().
+    /// When `style` is null, workers use the structured path. Use collect().
     pub fn submit_file(
         p: *Pool,
         file: std.fs.File,
         cq: *const query_mod.CompiledQuery,
-        format: ?types.Format,
+        style: ?types.OutputStyle,
         color: ?*const output_mod.Color,
         opts: output_mod.SerializeOpts,
         raw_input: bool,
         external_bindings: []const query_mod.ExternalVarBinding,
     ) ZqError!void {
-        p._format = format;
+        p._style = style;
         const stat = file.stat() catch return error.IoError;
         const file_size = @as(usize, @intCast(stat.size));
 
@@ -2073,7 +2075,7 @@ pub const Pool = struct {
 
         p._mmap = io_mod.MappedFile.init(file, file_size) catch return error.IoError;
         const n_threads = @max(1, p.threads.len);
-        const params = p._budget.computeParams(file_size, n_threads, format);
+        const params = p._budget.computeParams(file_size, n_threads, style);
         const n_chunks = n_threads * params.chunk_factor;
         p._shared.limiter.set_max(params.in_flight_factor * @max(1, n_threads));
 
@@ -2093,7 +2095,7 @@ pub const Pool = struct {
             .sequencer = &p._shared.sequencer,
             .limiter = &p._shared.limiter,
             .allocator = p.allocator,
-            .format = format,
+            .style = style,
             .color = color,
             .opts = opts,
             .raw_input = raw_input,
@@ -2122,20 +2124,20 @@ pub const Pool = struct {
     /// and posts them to worker threads.  Each line is an independent chunk
     /// (chunk_id == seq_base) so the Sequencer delivers results line-by-line.
     ///
-    /// When `format` is non-null, workers use the serialized path.
+    /// When `style` is non-null, workers use the serialized path.
     /// When null, workers use the structured path.
     pub fn submit_stream(
         p: *Pool,
         src: *io_mod.Source,
         cq: *const query_mod.CompiledQuery,
-        format: ?types.Format,
+        style: ?types.OutputStyle,
         color: ?*const output_mod.Color,
         opts: output_mod.SerializeOpts,
         raw_input: bool,
         external_bindings: []const query_mod.ExternalVarBinding,
     ) void {
-        p._format = format;
-        const params = p._budget.computeParams(0, p.threads.len, format);
+        p._style = style;
+        const params = p._budget.computeParams(0, p.threads.len, style);
         p._shared.limiter.set_max(params.in_flight_factor * @max(1, p.threads.len));
         const ctx_ptr = p.allocator.create(IoCtx) catch {
             p._shared.sequencer.set_total_chunks(0);
@@ -2152,7 +2154,7 @@ pub const Pool = struct {
             .active_stream_jobs = &p._shared.active_stream_jobs,
             .io_done = &p._shared.io_done,
             .allocator = p.allocator,
-            .format = format,
+            .style = style,
             .color = color,
             .opts = opts,
             .raw_input = raw_input,

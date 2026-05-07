@@ -4,7 +4,7 @@ const types = @import("types");
 
 const Writer = output.Writer;
 const Value = types.Value;
-const Format = types.Format;
+const OutputStyle = types.OutputStyle;
 const Tape = types.Tape;
 const Entry = types.Tape.Entry;
 const Tag = types.Tape.Tag;
@@ -29,7 +29,7 @@ fn strRef(buf: []const u8, s: []const u8) StringRef {
 // Creates a Writer targeting a pipe's write-end, writes a value, flushes,
 // then reads the pipe's read-end to obtain the rendered bytes as a slice.
 // The caller is responsible for freeing the returned slice.
-fn renderValue(val: Value, format: Format) ![]u8 {
+fn renderValue(val: Value, style: OutputStyle) ![]u8 {
     const fds = try std.posix.pipe();
 
     // Write side: use a Writer, flush, deinit, then close write fd.
@@ -40,7 +40,7 @@ fn renderValue(val: Value, format: Format) ![]u8 {
             std.posix.close(fds[1]);
             std.posix.close(fds[0]);
         }
-        try w.write_value(val, format, null, .{});
+        try w.write_value(val, style, null, .{});
         // flush is called by deinit; call it explicitly here and close write end.
         try w.flush();
         w.deinit();
@@ -83,55 +83,55 @@ test "is_tty: pipe fd is not a tty" {
 // ── Scalars: compact ─────────────────────────────────────────────────────────
 
 test "compact: null" {
-    const s = try renderValue(.null_val, .compact);
+    const s = try renderValue(.null_val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("null", s);
 }
 
 test "compact: true" {
-    const s = try renderValue(.{ .bool_val = true }, .compact);
+    const s = try renderValue(.{ .bool_val = true }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("true", s);
 }
 
 test "compact: false" {
-    const s = try renderValue(.{ .bool_val = false }, .compact);
+    const s = try renderValue(.{ .bool_val = false }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("false", s);
 }
 
 test "compact: integer zero" {
-    const s = try renderValue(.{ .int = 0 }, .compact);
+    const s = try renderValue(.{ .int = 0 }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("0", s);
 }
 
 test "compact: positive integer" {
-    const s = try renderValue(.{ .int = 42 }, .compact);
+    const s = try renderValue(.{ .int = 42 }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("42", s);
 }
 
 test "compact: negative integer" {
-    const s = try renderValue(.{ .int = -99 }, .compact);
+    const s = try renderValue(.{ .int = -99 }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("-99", s);
 }
 
 test "compact: i64 min boundary" {
-    const s = try renderValue(.{ .int = std.math.minInt(i64) }, .compact);
+    const s = try renderValue(.{ .int = std.math.minInt(i64) }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("-9223372036854775808", s);
 }
 
 test "compact: i64 max boundary" {
-    const s = try renderValue(.{ .int = std.math.maxInt(i64) }, .compact);
+    const s = try renderValue(.{ .int = std.math.maxInt(i64) }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("9223372036854775807", s);
 }
 
 test "compact: float 3.14" {
-    const s = try renderValue(.{ .float = 3.14 }, .compact);
+    const s = try renderValue(.{ .float = 3.14 }, .{ .compact = true });
     defer alloc.free(s);
     // The exact representation varies; parse back and check round-trip.
     const parsed = try std.fmt.parseFloat(f64, s);
@@ -139,7 +139,7 @@ test "compact: float 3.14" {
 }
 
 test "compact: float 0.0" {
-    const s = try renderValue(.{ .float = 0.0 }, .compact);
+    const s = try renderValue(.{ .float = 0.0 }, .{ .compact = true });
     defer alloc.free(s);
     const parsed = try std.fmt.parseFloat(f64, s);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), parsed, 1e-15);
@@ -148,79 +148,79 @@ test "compact: float 0.0" {
 test "compact: float infinity renders as clamped DBL_MAX" {
     // jq clamps ±Inf to ±DBL_MAX before formatting (jv_print.c). Previously
     // zq emitted "null" here, diverging from jq's non-decnum behaviour.
-    const s = try renderValue(.{ .float = std.math.inf(f64) }, .compact);
+    const s = try renderValue(.{ .float = std.math.inf(f64) }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("1.7976931348623157e+308", s);
 }
 
 test "compact: float -infinity renders as clamped -DBL_MAX" {
-    const s = try renderValue(.{ .float = -std.math.inf(f64) }, .compact);
+    const s = try renderValue(.{ .float = -std.math.inf(f64) }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("-1.7976931348623157e+308", s);
 }
 
 test "compact: float nan renders as null" {
-    const s = try renderValue(.{ .float = std.math.nan(f64) }, .compact);
+    const s = try renderValue(.{ .float = std.math.nan(f64) }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("null", s);
 }
 
 test "compact: empty string" {
-    const s = try renderValue(.{ .string = .{ .external = "" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\"", s);
 }
 
 test "compact: simple string" {
-    const s = try renderValue(.{ .string = .{ .external = "hello" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "hello" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"hello\"", s);
 }
 
 test "compact: string with double quote" {
-    const s = try renderValue(.{ .string = .{ .external = "say \"hi\"" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "say \"hi\"" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"say \\\"hi\\\"\"", s);
 }
 
 test "compact: string with backslash" {
-    const s = try renderValue(.{ .string = .{ .external = "a\\b" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\\b" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\\\b\"", s);
 }
 
 test "compact: string with newline" {
-    const s = try renderValue(.{ .string = .{ .external = "line1\nline2" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "line1\nline2" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"line1\\nline2\"", s);
 }
 
 test "compact: string with tab" {
-    const s = try renderValue(.{ .string = .{ .external = "a\tb" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\tb" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\tb\"", s);
 }
 
 test "compact: string with carriage return" {
-    const s = try renderValue(.{ .string = .{ .external = "a\rb" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\rb" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\rb\"", s);
 }
 
 test "compact: string with control character (0x01)" {
-    const s = try renderValue(.{ .string = .{ .external = "\x01" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x01" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\u0001\"", s);
 }
 
 test "compact: string with backspace (0x08)" {
-    const s = try renderValue(.{ .string = .{ .external = "\x08" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x08" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\b\"", s);
 }
 
 test "compact: string with form feed (0x0C)" {
-    const s = try renderValue(.{ .string = .{ .external = "\x0C" } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x0C" } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\f\"", s);
 }
@@ -234,7 +234,7 @@ test "compact: empty array" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 2 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[]", s);
 }
@@ -249,7 +249,7 @@ test "compact: array of integers" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 5 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[1,2,3]", s);
 }
@@ -266,7 +266,7 @@ test "compact: array of mixed types" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 6 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[null,true,7,\"hi\"]", s);
 }
@@ -286,7 +286,7 @@ test "compact: nested array" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 9 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[[1,2],[3]]", s);
 }
@@ -300,7 +300,7 @@ test "compact: empty object" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 2 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{}", s);
 }
@@ -316,7 +316,7 @@ test "compact: object with one key" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 4 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\"foo\":99}", s);
 }
@@ -334,7 +334,7 @@ test "compact: object with multiple keys" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 6 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\"a\":1,\"b\":true}", s);
 }
@@ -353,7 +353,7 @@ test "compact: nested object" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 7 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\"x\":{\"y\":2}}", s);
 }
@@ -361,19 +361,19 @@ test "compact: nested object" {
 // ── Pretty format ─────────────────────────────────────────────────────────────
 
 test "pretty: null scalar" {
-    const s = try renderValue(.null_val, .pretty);
+    const s = try renderValue(.null_val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("null", s);
 }
 
 test "pretty: integer scalar" {
-    const s = try renderValue(.{ .int = 5 }, .pretty);
+    const s = try renderValue(.{ .int = 5 }, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("5", s);
 }
 
 test "pretty: string scalar" {
-    const s = try renderValue(.{ .string = .{ .external = "hi" } }, .pretty);
+    const s = try renderValue(.{ .string = .{ .external = "hi" } }, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"hi\"", s);
 }
@@ -385,7 +385,7 @@ test "pretty: empty array" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 2 } };
-    const s = try renderValue(val, .pretty);
+    const s = try renderValue(val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[]", s);
 }
@@ -397,7 +397,7 @@ test "pretty: empty object" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 2 } };
-    const s = try renderValue(val, .pretty);
+    const s = try renderValue(val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{}", s);
 }
@@ -411,7 +411,7 @@ test "pretty: array of integers has newlines and 2-space indent" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 4 } };
-    const s = try renderValue(val, .pretty);
+    const s = try renderValue(val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("[\n  1,\n  2\n]", s);
 }
@@ -426,7 +426,7 @@ test "pretty: object with one key" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 4 } };
-    const s = try renderValue(val, .pretty);
+    const s = try renderValue(val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\n  \"k\": 42\n}", s);
 }
@@ -445,7 +445,7 @@ test "pretty: nested object indents correctly" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 7 } };
-    const s = try renderValue(val, .pretty);
+    const s = try renderValue(val, .{});
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\n  \"a\": {\n    \"b\": 1\n  }\n}", s);
 }
@@ -453,62 +453,65 @@ test "pretty: nested object indents correctly" {
 // ── Raw format ────────────────────────────────────────────────────────────────
 
 test "raw: string omits quotes" {
-    const s = try renderValue(.{ .string = .{ .external = "hello world" } }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "hello world" } }, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("hello world", s);
 }
 
 test "raw: empty string produces empty output" {
-    const s = try renderValue(.{ .string = .{ .external = "" } }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "" } }, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("", s);
 }
 
 test "raw: null renders as compact null (not empty)" {
-    const s = try renderValue(.null_val, .raw);
+    const s = try renderValue(.null_val, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("null", s);
 }
 
 test "raw: integer renders as compact JSON" {
-    const s = try renderValue(.{ .int = -5 }, .raw);
+    const s = try renderValue(.{ .int = -5 }, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("-5", s);
 }
 
 test "raw: bool renders as compact JSON" {
-    const s = try renderValue(.{ .bool_val = true }, .raw);
+    const s = try renderValue(.{ .bool_val = true }, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("true", s);
 }
 
 test "raw: string with newline is emitted literally (no escape)" {
-    const s = try renderValue(.{ .string = .{ .external = "a\nb" } }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "a\nb" } }, .{ .raw_strings = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("a\nb", s);
 }
 
-// ── JSONL format ──────────────────────────────────────────────────────────────
+// ── compact path (former JSONL fixtures, sans trailing newline) ──────────────
+//
+// `serialize` no longer emits the per-value newline — that lives in the
+// dispatch loop now. These tests verify the compact body only.
 
-test "jsonl: null ends with newline" {
-    const s = try renderValue(.null_val, .jsonl);
+test "compact: null body" {
+    const s = try renderValue(.null_val, .{ .compact = true });
     defer alloc.free(s);
-    try std.testing.expectEqualStrings("null\n", s);
+    try std.testing.expectEqualStrings("null", s);
 }
 
-test "jsonl: integer ends with newline" {
-    const s = try renderValue(.{ .int = 7 }, .jsonl);
+test "compact: integer body" {
+    const s = try renderValue(.{ .int = 7 }, .{ .compact = true });
     defer alloc.free(s);
-    try std.testing.expectEqualStrings("7\n", s);
+    try std.testing.expectEqualStrings("7", s);
 }
 
-test "jsonl: string ends with newline (quoted)" {
-    const s = try renderValue(.{ .string = .{ .external = "x" } }, .jsonl);
+test "compact: string body (quoted)" {
+    const s = try renderValue(.{ .string = .{ .external = "x" } }, .{ .compact = true });
     defer alloc.free(s);
-    try std.testing.expectEqualStrings("\"x\"\n", s);
+    try std.testing.expectEqualStrings("\"x\"", s);
 }
 
-test "jsonl: array ends with newline (compact)" {
+test "compact: array body" {
     const entries = [_]Entry{
         .{ .tag = .array_start, .payload = .{ .skip = 3 } },
         .{ .tag = .int, .payload = .{ .int = 1 } },
@@ -516,9 +519,92 @@ test "jsonl: array ends with newline (compact)" {
     };
     const t = makeTape(&entries, "");
     const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 3 } };
-    const s = try renderValue(val, .jsonl);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
-    try std.testing.expectEqualStrings("[1]\n", s);
+    try std.testing.expectEqualStrings("[1]", s);
+}
+
+// ── Composition cube: 4 corners on string + array fixtures ───────────────────
+
+test "compose: string with default style → quoted (pretty for scalar)" {
+    const s = try renderValue(.{ .string = .{ .external = "y" } }, .{});
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("\"y\"", s);
+}
+
+test "compose: string with compact only → quoted" {
+    const s = try renderValue(.{ .string = .{ .external = "y" } }, .{ .compact = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("\"y\"", s);
+}
+
+test "compose: string with raw_strings → unquoted" {
+    const s = try renderValue(.{ .string = .{ .external = "y" } }, .{ .raw_strings = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("y", s);
+}
+
+test "compose: string with compact+raw_strings → unquoted (Bug 1 regression)" {
+    const s = try renderValue(.{ .string = .{ .external = "y" } }, .{ .compact = true, .raw_strings = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("y", s);
+}
+
+test "compose: array with default style → pretty multiline" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = makeTape(&entries, "");
+    const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 4 } };
+    const s = try renderValue(val, .{});
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("[\n  1,\n  2\n]", s);
+}
+
+test "compose: array with compact only → compact" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = makeTape(&entries, "");
+    const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 4 } };
+    const s = try renderValue(val, .{ .compact = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("[1,2]", s);
+}
+
+test "compose: array with raw_strings only → still pretty (Bug 2 regression)" {
+    // -r alone must NOT force compact for non-strings. jq prints arrays pretty.
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = makeTape(&entries, "");
+    const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 4 } };
+    const s = try renderValue(val, .{ .raw_strings = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("[\n  1,\n  2\n]", s);
+}
+
+test "compose: array with compact+raw_strings → compact" {
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 4 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = makeTape(&entries, "");
+    const val = Value{ .array = .{ .tape = &t, .start = 0, .end = 4 } };
+    const s = try renderValue(val, .{ .compact = true, .raw_strings = true });
+    defer alloc.free(s);
+    try std.testing.expectEqualStrings("[1,2]", s);
 }
 
 // ── Multiple values written sequentially ─────────────────────────────────────
@@ -529,9 +615,9 @@ test "multiple writes: compact values accumulate in buffer" {
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
-    try w.write_value(.{ .int = 1 }, .compact, null, .{});
-    try w.write_value(.{ .int = 2 }, .compact, null, .{});
-    try w.write_value(.{ .int = 3 }, .compact, null, .{});
+    try w.write_value(.{ .int = 1 }, .{ .compact = true }, null, .{});
+    try w.write_value(.{ .int = 2 }, .{ .compact = true }, null, .{});
+    try w.write_value(.{ .int = 3 }, .{ .compact = true }, null, .{});
     try w.flush();
     w.deinit();
     std.posix.close(fds[1]);
@@ -547,14 +633,19 @@ test "multiple writes: compact values accumulate in buffer" {
     try std.testing.expectEqualStrings("123", out.items);
 }
 
-test "multiple writes: jsonl values each have their own newline" {
+test "multiple writes: compact body + explicit writeByte newline" {
+    // The dispatch-loop newline now lives at the call site (main.zig), not
+    // inside write_value. Verify the call site pattern works: write_value
+    // emits the body, the caller writes its own '\n'.
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
 
-    try w.write_value(.{ .int = 10 }, .jsonl, null, .{});
-    try w.write_value(.{ .int = 20 }, .jsonl, null, .{});
+    try w.write_value(.{ .int = 10 }, .{ .compact = true }, null, .{});
+    try w.writeByte('\n');
+    try w.write_value(.{ .int = 20 }, .{ .compact = true }, null, .{});
+    try w.writeByte('\n');
     try w.flush();
     w.deinit();
     std.posix.close(fds[1]);
@@ -590,7 +681,7 @@ test "flush: flushing empty buffer is a no-op" {
 test "compact: all JSON-required escapes appear correctly" {
     // Build a string containing every character that must be escaped.
     const input = "\"\\\n\r\t\x08\x0C";
-    const s = try renderValue(.{ .string = .{ .external = input } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = input } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\\"\\\\\\n\\r\\t\\b\\f\"", s);
 }
@@ -598,7 +689,7 @@ test "compact: all JSON-required escapes appear correctly" {
 test "compact: high-ASCII (>= 0x80) is emitted verbatim (UTF-8 passthrough)" {
     // UTF-8 bytes above 0x7F are not escaped by the JSON spec; we pass them through.
     const input = "\xC3\xA9"; // U+00E9 'é' in UTF-8
-    const s = try renderValue(.{ .string = .{ .external = input } }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = input } }, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\xC3\xA9\"", s);
 }
@@ -615,7 +706,7 @@ test "compact: object key with special characters is escaped" {
     };
     const t = makeTape(&entries, sb);
     const val = Value{ .object = .{ .tape = &t, .start = 0, .end = 4 } };
-    const s = try renderValue(val, .compact);
+    const s = try renderValue(val, .{ .compact = true });
     defer alloc.free(s);
     try std.testing.expectEqualStrings("{\"k\\\"e\":1}", s);
 }

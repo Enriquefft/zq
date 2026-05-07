@@ -61,7 +61,7 @@ const Config = struct {
     iterations: u32 = 10_000,
     warmup: u32 = 1_000,
     phases: std.EnumSet(Phase) = std.EnumSet(Phase).initFull(),
-    format: types.Format = .compact,
+    style: types.OutputStyle = .{ .compact = true },
 };
 
 // ── Statistical summary ───────────────────────────────────────────────────────
@@ -228,9 +228,9 @@ fn measurePredicate(rig: *Rig, samples: []u64) !void {
     }
 }
 
-/// serialize phase: output.serialize(sink, value, format, …).
+/// serialize phase: output.serialize(sink, value, style, …).
 /// Buffer is `clearRetainingCapacity`-reset per sample.
-fn measureSerialize(rig: *Rig, samples: []u64, format: types.Format) !void {
+fn measureSerialize(rig: *Rig, samples: []u64, style: types.OutputStyle) !void {
     // Pre-produce one value to serialize. We re-use the *same* Value every
     // sample so we're timing serialization, not value production.
     rig.parser.reset();
@@ -251,7 +251,7 @@ fn measureSerialize(rig: *Rig, samples: []u64, format: types.Format) !void {
     for (samples) |*slot| {
         rig.serialize_buf.clearRetainingCapacity();
         timer.reset();
-        try output_mod.serialize(&sink, val, format, null, opts);
+        try output_mod.serialize(&sink, val, style, null, opts);
         slot.* = timer.read();
     }
 }
@@ -259,7 +259,7 @@ fn measureSerialize(rig: *Rig, samples: []u64, format: types.Format) !void {
 /// coord phase: full per-record loop exactly as `process_line_serialized`
 /// (without the pool's chunk arena / prefilter path). Times
 /// parse→lookup→predicate→serialize→reset end-to-end per record.
-fn measureCoord(rig: *Rig, samples: []u64, format: types.Format) !void {
+fn measureCoord(rig: *Rig, samples: []u64, style: types.OutputStyle) !void {
     // Establish the persistent iterator using the first record, matching
     // production's "init-once, reset-per-record" model.
     rig.parser.reset();
@@ -289,7 +289,7 @@ fn measureCoord(rig: *Rig, samples: []u64, format: types.Format) !void {
         };
         it.reset(tape, &.{});
         while (try it.next()) |v| {
-            try output_mod.serialize(&sink, v, format, null, opts);
+            try output_mod.serialize(&sink, v, style, null, opts);
         }
         rig.parser.reset();
         slot.* = timer.read();
@@ -302,7 +302,7 @@ const RunMeta = struct {
     dataset: []const u8,
     record_count: usize,
     filter: []const u8,
-    format: types.Format,
+    style: types.OutputStyle,
     iterations: u32,
     warmup: u32,
     overhead_ns: u64,
@@ -337,9 +337,13 @@ fn emitRow(
     try writeU64(w, meta.record_count);
     try w.writeAll(",\"filter\":\"");
     try writeJsonString(w, meta.filter);
-    try w.writeAll("\",\"format\":\"");
-    try w.writeAll(@tagName(meta.format));
-    try w.writeAll("\",\"iterations\":");
+    try w.writeAll("\",\"style\":{\"compact\":");
+    try w.writeAll(if (meta.style.compact) "true" else "false");
+    try w.writeAll(",\"raw_strings\":");
+    try w.writeAll(if (meta.style.raw_strings) "true" else "false");
+    try w.writeAll(",\"join\":");
+    try w.writeAll(if (meta.style.join) "true" else "false");
+    try w.writeAll("},\"iterations\":");
     try writeU64(w, meta.iterations);
     try w.writeAll(",\"warmup\":");
     try writeU64(w, meta.warmup);
@@ -421,10 +425,23 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Config {
             i += 1;
             if (i >= argv.len) return error.MissingArg;
             cfg.warmup = try std.fmt.parseInt(u32, argv[i], 10);
-        } else if (std.mem.eql(u8, a, "--format")) {
+        } else if (std.mem.eql(u8, a, "--style")) {
             i += 1;
             if (i >= argv.len) return error.MissingArg;
-            if (std.mem.eql(u8, argv[i], "compact")) cfg.format = .compact else if (std.mem.eql(u8, argv[i], "jsonl")) cfg.format = .jsonl else if (std.mem.eql(u8, argv[i], "pretty")) cfg.format = .pretty else if (std.mem.eql(u8, argv[i], "raw")) cfg.format = .raw else return error.InvalidFormat;
+            cfg.style = .{};
+            var tok_it = std.mem.splitScalar(u8, argv[i], '+');
+            while (tok_it.next()) |tok| {
+                const t = std.mem.trim(u8, tok, " ");
+                if (t.len == 0 or std.mem.eql(u8, t, "pretty")) continue;
+                if (std.mem.eql(u8, t, "compact")) {
+                    cfg.style.compact = true;
+                } else if (std.mem.eql(u8, t, "raw")) {
+                    cfg.style.raw_strings = true;
+                } else if (std.mem.eql(u8, t, "join")) {
+                    cfg.style.join = true;
+                    cfg.style.raw_strings = true;
+                } else return error.InvalidStyle;
+            }
         } else if (std.mem.eql(u8, a, "--phases")) {
             i += 1;
             if (i >= argv.len) return error.MissingArg;
@@ -461,7 +478,7 @@ fn printHelp() void {
         \\  --iterations N          Sample count (default: 10000)
         \\  --warmup N              Warmup iterations (default: 1000)
         \\  --phases parse,lookup,… Subset to run (default: all five)
-        \\  --format compact|jsonl|pretty|raw   (default: compact)
+        \\  --style <axes>          + -separated: compact, raw, join, pretty (default: compact)
         \\  --help, -h              This message
         \\
     ;
@@ -551,7 +568,7 @@ pub fn main() !void {
         .dataset = dataset_path,
         .record_count = records_list.items.len,
         .filter = cfg.filter,
-        .format = cfg.format,
+        .style = cfg.style,
         .iterations = cfg.iterations,
         .warmup = cfg.warmup,
         .overhead_ns = overhead_ns,
@@ -612,8 +629,8 @@ fn dispatchMeasure(rig: *Rig, phase: Phase, cfg: Config, samples: []u64) !void {
         .parse => try measureParse(rig, samples),
         .lookup => try measureLookup(rig, samples),
         .predicate => try measurePredicate(rig, samples),
-        .serialize => try measureSerialize(rig, samples, cfg.format),
-        .coord => try measureCoord(rig, samples, cfg.format),
+        .serialize => try measureSerialize(rig, samples, cfg.style),
+        .coord => try measureCoord(rig, samples, cfg.style),
     }
 }
 

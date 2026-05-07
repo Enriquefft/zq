@@ -135,7 +135,7 @@ zig build microbench -Dprofile=true -- \
     [--iterations N]                    # default: 10 000
     [--warmup N]                        # default: 1 000
     [--phases parse,lookup,…]           # default: all five
-    [--format compact|jsonl|pretty|raw] # default: compact
+    [--style <axes>]                    # +-separated: compact, raw, join, pretty (default: compact)
 ```
 
 Exactly one of `--dataset` or `--inline` must be supplied. The harness
@@ -149,7 +149,7 @@ status/warnings. The schema is stable; agents consuming this output can
 rely on every field being present for every row.
 
 ```jsonl
-{"schema":"zq.microbench.v2","phase":"parse","zq_rev":"eae7af7","zig_version":"0.15.2","os":"linux","arch":"x86_64","cpu_model":"…","dataset":"benchmarks/data/huge.jsonl","record_count":15000000,"filter":".id","format":"compact","iterations":10000,"warmup":1000,"overhead_ns":12,"ns_mean":1328.4,"ns_p50":1310,"ns_p90":1420,"ns_p99":1815,"ns_min":1280,"ns_max":9422,"total_ns":13284000,"timestamp_utc":"2026-04-23T12:00:00Z"}
+{"schema":"zq.microbench.v2","phase":"parse","zq_rev":"eae7af7","zig_version":"0.15.2","os":"linux","arch":"x86_64","cpu_model":"…","dataset":"benchmarks/data/huge.jsonl","record_count":15000000,"filter":".id","style":{"compact":true,"raw_strings":false,"join":false},"iterations":10000,"warmup":1000,"overhead_ns":12,"ns_mean":1328.4,"ns_p50":1310,"ns_p90":1420,"ns_p99":1815,"ns_min":1280,"ns_max":9422,"total_ns":13284000,"timestamp_utc":"2026-04-23T12:00:00Z"}
 ```
 
 ### Field reference
@@ -166,7 +166,7 @@ rely on every field being present for every row.
 | `dataset`        | string   | Dataset path or `<inline>`.                                   |
 | `record_count`   | number   | Records loaded from the dataset (1 for `--inline`).           |
 | `filter`         | string   | Filter source.                                                |
-| `format`         | string   | Output format used for the serialize phase.                   |
+| `style`          | object   | `{compact:bool, raw_strings:bool, join:bool}` — output style for the serialize phase. Additive: future axes append new fields without breaking existing consumers. |
 | `iterations`     | number   | Sample count.                                                 |
 | `warmup`         | number   | Warmup iterations (not included in samples).                  |
 | `overhead_ns`    | number   | Subtracted per-sample counter-read overhead.                  |

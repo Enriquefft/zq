@@ -424,3 +424,102 @@ test "D1 pin: .foo = $X (load_variable RHS) preserves outer object" {
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("{\"foo\":\"99\"}\n", r.stdout);
 }
+
+// ── Output style composition (-r / -c / -j) ─────────────────────────────────
+//
+// Pre-OutputStyle, `-r -c` clobbered each other (last write wins on the same
+// `Format` enum field). After the refactor, the three axes are independent
+// and freely composable. These tests pin both the bug regressions and the
+// well-defined behavior of every reachable combination.
+
+test "style: -r on string strips quotes" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-r", "." }, "\"x\"");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("x\n", r.stdout);
+}
+
+test "style: -r -c on string still strips quotes (Bug 1 regression)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-r", "-c", "." }, "\"x\"");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("x\n", r.stdout);
+}
+
+test "style: -rc fused short flags on string strips quotes" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-rc", "." }, "\"x\"");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("x\n", r.stdout);
+}
+
+test "style: -cr fused (reverse order) on string strips quotes" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-cr", "." }, "\"x\"");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("x\n", r.stdout);
+}
+
+test "style: -r on array stays pretty (Bug 2 regression)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-r", "." }, "[1,2]");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("[\n  1,\n  2\n]\n", r.stdout);
+}
+
+test "style: -r -c on array forces compact" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-r", "-c", "." }, "[1,2]");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("[1,2]\n", r.stdout);
+}
+
+test "style: -j on multiple strings concatenates without separator" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-j", "." }, "\"x\"\n\"y\"\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("xy", r.stdout);
+}
+
+test "style: -jr is idempotent with -rj (raw implied by join)" {
+    const alloc = std.testing.allocator;
+    var r1 = try runZq(alloc, &.{ "-jr", "." }, "\"x\"");
+    defer r1.deinit(alloc);
+    var r2 = try runZq(alloc, &.{ "-rj", "." }, "\"x\"");
+    defer r2.deinit(alloc);
+    try std.testing.expectEqualStrings("x", r1.stdout);
+    try std.testing.expectEqualStrings("x", r2.stdout);
+}
+
+test "style: -j on non-string emits compact body without separator" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-j", "." }, "1\n2\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // -j sets raw_strings, but pretty for non-strings; multi-value with -j has no
+    // separator. Two top-level pretty integers concatenate as "12".
+    try std.testing.expectEqualStrings("12", r.stdout);
+}
+
+test "style: -rrr is idempotent with -r" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-rrr", "." }, "\"x\"");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("x\n", r.stdout);
+}
+
+test "style: -j -c on arrays concatenates compact bodies (8th cube cell)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-j", "-c", "." }, "[1,2]\n[3,4]\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("[1,2][3,4]", r.stdout);
+}

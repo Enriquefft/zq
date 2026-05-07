@@ -1362,19 +1362,15 @@ pub const Instruction = extern struct {
     };
 };
 
-// ─── Output Format ───────────────────────────────────────────────────────────
+// ─── Output Style ────────────────────────────────────────────────────────────
+// Three orthogonal axes. Default `.{}` = pretty JSON, quoted strings, newline
+// between top-level values. `-c` flips compact, `-r` flips raw_strings, `-j`
+// flips both join and raw_strings.
 
-pub const Format = enum {
-    /// Pretty-printed JSON (default for TTY).
-    pretty,
-    /// Compact single-line JSON.
-    compact,
-    /// Raw string output (no quotes).
-    raw,
-    /// One JSON value per line (JSONL).
-    jsonl,
-    /// Raw output with no trailing newline (--join-output / -j).
-    join,
+pub const OutputStyle = packed struct {
+    compact: bool = false,
+    raw_strings: bool = false,
+    join: bool = false,
 };
 
 // ─── Float Formatting ────────────────────────────────────────────────────────

@@ -358,7 +358,7 @@ fn runWithOptionalPrefilter(
     var p = try pool_mod.Pool.init(1, budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, cq, .{ .compact = true }, null, .{}, false, &.{});
 
     var out = std.ArrayList(u8){};
     errdefer out.deinit(alloc);

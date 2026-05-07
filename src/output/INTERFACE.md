@@ -5,9 +5,11 @@ Serialize `Value` instances produced by the Query module to an output file descr
 or a growable byte buffer. Accumulates up to 64 KB in an internal buffer before issuing
 `write()` syscalls, reducing OS round-trips from millions to a few dozen on large workloads.
 
-Supports four output formats: pretty-printed JSON (default for TTY), compact JSON,
-raw string output, and JSONL (one compact JSON value per newline). TTY detection is
-performed once at `init` time and drives the default format selection by callers.
+Output style is modeled as three orthogonal boolean axes (`OutputStyle`): `compact`
+(single-line JSON), `raw_strings` (emit string values without quotes), and `join`
+(suppress the per-value newline, used by `--join-output` / `@join`). All eight
+combinations are valid and freely composable. TTY detection is performed once at
+`init` time and drives default `compact` selection by callers.
 
 The serialization logic is generic: the same functions power both `Writer` (file-backed
 buffered output) and `BufferSink` (growable ArrayList target for worker threads).
@@ -24,7 +26,7 @@ const types = @import("types");
 
 pub const ZqError = err.ZqError;
 pub const Value   = types.Value;
-pub const Format  = types.Format;
+pub const OutputStyle = types.OutputStyle;
 
 /// ANSI color escape sequences for JSON syntax highlighting.
 pub const Color = struct {
@@ -77,10 +79,15 @@ pub const Writer = struct {
     /// Safe to call in `defer` immediately after `init`.
     pub fn deinit(w: *Writer) void;
 
-    /// Serialize `val` into the internal buffer in the requested format.
+    /// Serialize `val` into the internal buffer in the requested style.
     /// Flushes automatically when the buffer reaches 64 KB.
     /// Returns `error.IoError` if an underlying `write()` syscall fails.
-    pub fn write_value(w: *Writer, val: Value, format: Format, color: ?*const Color, opts: SerializeOpts) ZqError!void;
+    pub fn write_value(w: *Writer, val: Value, style: OutputStyle, color: ?*const Color, opts: SerializeOpts) ZqError!void;
+
+    /// Append a single byte directly to the internal buffer (auto-flushes as needed).
+    /// Used by the dispatch loop in main.zig for per-value separators that live
+    /// outside `write_value`'s remit.
+    pub fn writeByte(w: *Writer, byte: u8) ZqError!void;
 
     /// Append pre-serialized bytes directly to the internal buffer.
     /// Used by main.zig to write output from the serialized pool path.
@@ -91,7 +98,7 @@ pub const Writer = struct {
     pub fn flush(w: *Writer) ZqError!void;
 
     /// True if `file` refers to a terminal device (result cached at init).
-    /// Callers may use this to pick a default Format.
+    /// Callers may use this to default `OutputStyle.compact = true` for pipes.
     pub fn is_tty(w: *const Writer) bool;
 };
 ```
@@ -100,23 +107,39 @@ pub const Writer = struct {
 
 | Function          | Signature                                              | Description                                                                       |
 |-------------------|--------------------------------------------------------|-----------------------------------------------------------------------------------|
-| `serialize`       | `anytype, Value, Format, ?*const Color, SerializeOpts → !void` | Serialize `val` into any sink with `writeByte`/`writeSlice` methods.      |
+| `serialize`       | `anytype, Value, OutputStyle, ?*const Color, SerializeOpts → !void` | Serialize `val` into any sink with `writeByte`/`writeSlice` methods. |
 | `Writer.init`     | `std.fs.File, Allocator → error{OutOfMemory}!Writer`  | Allocate 64 KB internal buffer; cache `file.isTty()`.                             |
 | `Writer.deinit`   | `*Writer → void`                                       | Flush buffered output and free the internal buffer.                               |
-| `Writer.write_value` | `*Writer, Value, Format, ?*const Color, SerializeOpts → ZqError!void` | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB. |
+| `Writer.write_value` | `*Writer, Value, OutputStyle, ?*const Color, SerializeOpts → ZqError!void` | Serialize `val` into the buffer; auto-flush when buffer reaches 64 KB. |
+| `Writer.writeByte`   | `*Writer, u8 → ZqError!void`                       | Append a single byte (separator/newline) to the buffer; auto-flush as needed.     |
 | `Writer.writeSlice`  | `*Writer, []const u8 → ZqError!void`              | Append pre-serialized bytes to the buffer; auto-flush as needed.                  |
 | `Writer.flush`    | `*Writer → ZqError!void`                               | Write all buffered bytes to the OS; reset buffer cursor to zero.                  |
 | `Writer.is_tty`   | `*const Writer → bool`                                 | Return TTY detection result cached at `init` time.                                |
 
-### Format Semantics
+### OutputStyle Semantics
 
-| Format    | Output                                                                         |
-|-----------|--------------------------------------------------------------------------------|
-| `pretty`  | Indented JSON (default 2-space; configurable via `SerializeOpts.indent`).      |
-| `compact` | Single-line JSON with no extra whitespace.                                     |
-| `raw`     | Strings without quotes; all other types as compact JSON.                       |
-| `jsonl`   | Compact JSON followed by a single newline (`\n`).                              |
-| `join`    | Same serializer as `raw`; used by the `@join` path to avoid adding a newline.  |
+`OutputStyle` is a 1-byte packed struct of three independent boolean axes. A value
+serialized with style `s` follows three rules, applied in order:
+
+1. **Raw string fast-path**: if `s.raw_strings == true` and the value is a string,
+   the unquoted UTF-8 bytes are emitted directly (no JSON escaping).
+2. **Compact body**: otherwise if `s.compact == true`, the value is emitted as
+   single-line JSON with no extra whitespace.
+3. **Pretty body**: otherwise the value is emitted as indented JSON
+   (default 2-space; configurable via `SerializeOpts.indent`).
+
+`s.join` is **not** read by `serialize` itself — `serialize` only emits the value
+body. The dispatch loop interprets `s.join` to suppress the inter-value newline
+between successive emitted values; with `s.join == false` the loop writes one
+`\n` per value.
+
+| axis          | flag           | effect on `serialize`                                                            |
+|---------------|----------------|----------------------------------------------------------------------------------|
+| `compact`     | `-c` / `--compact-output`  | strings stay quoted, other values lose pretty whitespace            |
+| `raw_strings` | `-r` / `--raw-output`      | unquote string values; non-strings unaffected                       |
+| `join`        | `-j` / `--join-output`     | dispatch-loop axis; suppresses `\n` separator (also implies `-r`)   |
+
+All eight `(compact, raw_strings, join)` combinations are reachable and well-defined.
 
 ### Errors
 
@@ -133,7 +156,7 @@ methods propagate `error{OutOfMemory}` on every call — not only at init.
 ## Dependencies
 
 - `src/error/root.zig` — `ZqError` (`IoError` for write failures)
-- `src/types.zig`      — `Value`, `Format`, `Tape`, `Tape.Entry`, `Tape.Tag`
+- `src/types.zig`      — `Value`, `OutputStyle`, `Tape`, `Tape.Entry`, `Tape.Tag`
 
 ---
 

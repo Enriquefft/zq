@@ -4,7 +4,7 @@ const types = @import("types");
 
 pub const ZqError = err_mod.ZqError;
 pub const Value = types.Value;
-pub const Format = types.Format;
+pub const OutputStyle = types.OutputStyle;
 
 pub const Color = struct {
     null_color: []const u8,
@@ -59,18 +59,24 @@ pub const BufferSink = struct {
 // ── Public serialize entry point ──────────────────────────────────────────────
 
 /// Serialize `val` into any sink supporting `writeByte`/`writeSlice`.
-/// Format semantics match `Writer.write_value`.
-pub fn serialize(ctx: anytype, val: Value, format: Format, color: ?*const Color, opts: SerializeOpts) !void {
-    switch (format) {
-        .pretty => try serializeValuePretty(ctx, val, 0, color, opts),
-        .compact => try serializeValueCompact(ctx, val, color, opts),
-        .raw => try serializeValueRaw(ctx, val, opts),
-        .jsonl => {
-            try serializeValueCompact(ctx, val, color, opts);
-            try ctx.writeByte('\n');
-        },
-        .join => try serializeValueRaw(ctx, val, opts),
+/// Three orthogonal axes:
+///   - `style.raw_strings`: top-level string scalars emitted as raw bytes (no
+///     surrounding quotes, no escapes). Non-strings unaffected.
+///   - `style.compact`: emit JSON without indentation/whitespace. Strings still
+///     quoted unless `raw_strings` is also set.
+///   - `style.join`: caller-level concern (skip inter-value separator); not
+///     consulted here. The caller emits or omits a separator between top-level
+///     values per `style.join`.
+pub fn serialize(ctx: anytype, val: Value, style: OutputStyle, color: ?*const Color, opts: SerializeOpts) !void {
+    if (style.raw_strings and val == .string) {
+        try ctx.writeSlice(val.string.slice());
+        return;
     }
+    if (style.compact) {
+        try serializeValueCompact(ctx, val, color, opts);
+        return;
+    }
+    try serializeValuePretty(ctx, val, 0, color, opts);
 }
 
 // ── Generic serialization functions ───────────────────────────────────────────
@@ -336,13 +342,6 @@ fn serializeObjectUnsorted(ctx: anytype, tape: *const types.Tape, span: Value.Ta
     }
 }
 
-fn serializeValueRaw(ctx: anytype, val: Value, opts: SerializeOpts) anyerror!void {
-    switch (val) {
-        .string => |sv| try ctx.writeSlice(sv.slice()),
-        else => try serializeValueCompact(ctx, val, null, opts),
-    }
-}
-
 fn serializeEscaped(ctx: anytype, s: []const u8) anyerror!void {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -428,17 +427,17 @@ pub const Writer = struct {
         return w.tty;
     }
 
-    /// Serialize `val` to the internal buffer using `format`.
+    /// Serialize `val` to the internal buffer using `style`.
     /// Auto-flushes before serializing if the buffer cannot hold a single
     /// worst-case value (64 KB flush boundary). Returns `error.IoError` if
     /// any underlying `writeAll()` call fails.
-    pub fn write_value(w: *Writer, val: Value, format: Format, color: ?*const Color, opts: SerializeOpts) ZqError!void {
+    pub fn write_value(w: *Writer, val: Value, style: OutputStyle, color: ?*const Color, opts: SerializeOpts) ZqError!void {
         if (w.len > BUF_CAP / 2) {
             try w.flush();
         }
         // Generic serialize functions return anyerror (needed for recursive generics);
         // Writer's writeByte/writeSlice only produce ZqError, so @errorCast is safe.
-        serialize(w, val, format, color, opts) catch |e| return @as(ZqError, @errorCast(e));
+        serialize(w, val, style, color, opts) catch |e| return @as(ZqError, @errorCast(e));
     }
 
     /// Write all buffered bytes to the OS and reset the buffer cursor.
@@ -465,7 +464,7 @@ pub const Writer = struct {
     // ── Low-level buffer helpers (satisfy generic serialize interface) ─────────
 
     /// Append a single byte to the buffer, flushing first if full.
-    fn writeByte(w: *Writer, byte: u8) ZqError!void {
+    pub fn writeByte(w: *Writer, byte: u8) ZqError!void {
         if (w.len == BUF_CAP) try w.flush();
         w.buf[w.len] = byte;
         w.len += 1;

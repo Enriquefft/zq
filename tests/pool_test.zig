@@ -6,7 +6,7 @@
 ///
 /// Ordering invariant: collect() must always return results in submission order.
 ///
-/// Both structured (format=null) and serialized (format!=null) paths are tested.
+/// Both structured (style=null) and serialized (style!=null) paths are tested.
 const std = @import("std");
 const pool_mod = @import("pool");
 const query_mod = @import("query");
@@ -609,7 +609,7 @@ test "serialized: single integer" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -628,7 +628,7 @@ test "serialized: string value" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -646,7 +646,7 @@ test "serialized: multi-value query (.[])" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -664,7 +664,7 @@ test "serialized: error propagation" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = p.collect_bytes();
     try std.testing.expectError(error.UnexpectedToken, result);
@@ -684,7 +684,7 @@ test "serialized: user_error_msg surfaced for error(\"...\")" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = p.collect_bytes();
     try std.testing.expectError(error.UserError, result);
@@ -719,7 +719,7 @@ test "serialized: ordering with 4 workers" {
     var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -753,7 +753,7 @@ test "serialized stream: three lines via pipe" {
     var p = try Pool.init(2, test_budget, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -771,7 +771,7 @@ test "serialized: empty select produces no bytes" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -789,7 +789,7 @@ test "serialized: false/null tracking for -e flag" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -808,7 +808,7 @@ test "serialized: null tracking for -e flag" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -827,7 +827,7 @@ test "serialized: collect_bytes returns null after drain" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     alloc.free(result.data);
@@ -846,7 +846,7 @@ test "serialized: jsonl format" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .jsonl, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -865,7 +865,7 @@ test "serialized: raw format for string" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .raw, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .raw_strings = true }, null, .{}, false, &.{});
 
     const result = try drain_bytes(&p);
     defer alloc.free(result.data);
@@ -900,7 +900,7 @@ test "serialized: infinite-generator stream-mode partial flush unblocks consumer
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    p.submit_stream(&src, &cq, .compact, null, .{}, false, &.{});
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const deadline_ns: u64 = 5 * std.time.ns_per_s;
     const deadline_thread = try std.Thread.spawn(.{}, struct {
@@ -936,14 +936,14 @@ test "serialized: infinite-generator stream-mode partial flush unblocks consumer
 
 test "computeParams: small file returns defaults" {
     const budget = MemoryBudget.explicit(8 * 1024 * 1024 * 1024); // 8 GiB
-    const params = budget.computeParams(1 * 1024 * 1024, 16, .compact); // 1 MB file
+    const params = budget.computeParams(1 * 1024 * 1024, 16, .{ .compact = true }); // 1 MB file
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
     try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
 }
 
 test "computeParams: large file increases chunk_factor" {
     const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024); // 2 GiB
-    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 8, .compact); // 10 GB file
+    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 8, .{ .compact = true }); // 10 GB file
     try std.testing.expect(params.chunk_factor > 4);
     try std.testing.expect(params.chunk_factor <= 64);
     try std.testing.expect(params.in_flight_factor <= 2);
@@ -951,14 +951,14 @@ test "computeParams: large file increases chunk_factor" {
 
 test "computeParams: constrained budget reduces in_flight_factor" {
     const budget = MemoryBudget.explicit(256 * 1024 * 1024); // 256 MiB
-    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 4, .compact); // 10 GB file
+    const params = budget.computeParams(10 * 1024 * 1024 * 1024, 4, .{ .compact = true }); // 10 GB file
     try std.testing.expectEqual(@as(usize, 64), params.chunk_factor);
     try std.testing.expectEqual(@as(usize, 1), params.in_flight_factor);
 }
 
 test "computeParams: stream mode returns defaults with adapted batch_size" {
     const budget = MemoryBudget.explicit(1024 * 1024 * 1024); // 1 GiB
-    const params = budget.computeParams(0, 8, .compact); // stream mode
+    const params = budget.computeParams(0, 8, .{ .compact = true }); // stream mode
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
     try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
     try std.testing.expect(params.stream_batch_size >= 64 * 1024);
@@ -967,15 +967,15 @@ test "computeParams: stream mode returns defaults with adapted batch_size" {
 
 test "computeParams: huge budget returns defaults" {
     const budget = MemoryBudget.explicit(64 * 1024 * 1024 * 1024); // 64 GiB
-    const params = budget.computeParams(1 * 1024 * 1024 * 1024, 32, .compact); // 1 GB file
+    const params = budget.computeParams(1 * 1024 * 1024 * 1024, 32, .{ .compact = true }); // 1 GB file
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
     try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
 }
 
 test "computeParams: deterministic — same inputs same outputs" {
     const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024);
-    const p1 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .pretty);
-    const p2 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .pretty);
+    const p1 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .{});
+    const p2 = budget.computeParams(5 * 1024 * 1024 * 1024, 8, .{});
     try std.testing.expectEqual(p1.chunk_factor, p2.chunk_factor);
     try std.testing.expectEqual(p1.in_flight_factor, p2.in_flight_factor);
     try std.testing.expectEqual(p1.stream_batch_size, p2.stream_batch_size);
@@ -983,8 +983,8 @@ test "computeParams: deterministic — same inputs same outputs" {
 
 test "computeParams: pretty format uses higher expansion" {
     const budget = MemoryBudget.explicit(2 * 1024 * 1024 * 1024); // 2 GiB
-    const compact = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .compact);
-    const pretty = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .pretty);
+    const compact = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .{ .compact = true });
+    const pretty = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .{});
     // Pretty has 6x expansion vs compact's 2x, so it should need more chunks
     try std.testing.expect(pretty.chunk_factor >= compact.chunk_factor);
 }
@@ -1047,7 +1047,7 @@ test "prefilter: select(.field|test(literal)) skips non-matching records" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);
@@ -1086,7 +1086,7 @@ test "prefilter: alternation pattern uses OR-semantics" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);
@@ -1236,7 +1236,7 @@ test "prefilter: correctness — no false negatives on matching records" {
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);
@@ -1273,7 +1273,7 @@ test "prefilter: \\uXXXX escape hole — record with escape-encoded literal matc
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);
@@ -1307,7 +1307,7 @@ test "prefilter: short-escape hole — record with \\t inside string keeps liter
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);
@@ -1342,7 +1342,7 @@ test "prefilter: short-escape hole — match through \\u encoding verified end-t
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
 
-    try p.submit_file(file, &cq, .compact, null, .{}, false, &.{});
+    try p.submit_file(file, &cq, .{ .compact = true }, null, .{}, false, &.{});
 
     const out = try drain_bytes(&p);
     defer alloc.free(out.data);

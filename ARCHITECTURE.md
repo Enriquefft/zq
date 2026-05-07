@@ -58,7 +58,7 @@ Parallel — stream mode:
 
 ```
 error    (no deps)          Zig error set, lazy line/col resolution
-types    (no deps)          Tape, Value, Format, Instruction, Op, RuntimeTape, BuiltinId
+types    (no deps)          Tape, Value, OutputStyle, Instruction, Op, RuntimeTape, BuiltinId
 io       → error            mmap (files) / ring buffer (pipes)
 parser   → error, types     Streaming state machine → flat Tape
 regex    → error            Vendored Rust regex-automata shim (gated on -Dregex)
@@ -98,7 +98,7 @@ Lazy line/column resolution: byte offsets are tracked during parsing. When an er
 Shared definitions used across all modules:
 - `Tape` — flat array of `Tag + Payload` entries (the parsed JSON representation)
 - `Value` — non-owning view into a Tape: tag + payload + span
-- `Format` — output format enum: pretty, compact, raw, jsonl, join
+- `OutputStyle` — output style packed struct (1 byte): three orthogonal axes — `compact`, `raw_strings`, `join`. All eight combinations are valid; pretty is the default (all-zero).
 - `Instruction` / `Op` / `Operand` — bytecode format for the query VM
 - `StringRef` — offset+length into tape's string buffer
 - `RuntimeTape` — growable tape for constructing new JSON values at runtime. Provides `appendEntry()`, `internString()`, `copyFrom()`, `copySpan()`, and `asTape()` (immutable view). Used by the query VM for object/array construction and by main for external variable binding and `$ARGS` assembly.
@@ -149,7 +149,7 @@ Builtins: see `src/types.zig:BuiltinId` — the canonical enum (~160 variants). 
 
 ### output
 
-64 KB buffered writes to file descriptors. Formats: pretty (2-space indent), compact, raw (unquoted strings), jsonl, join (raw, no trailing newline).
+64 KB buffered writes to file descriptors. Output style is three orthogonal axes (`OutputStyle` packed struct): `compact` (single-line bodies, no whitespace), `raw_strings` (emit string values without quotes — `-r`), and `join` (suppress per-value newline — `-j`, also implies `-r`). Default (all-zero) = pretty (2-space indent). The serializer reads `compact` and `raw_strings`; the dispatch loop reads `join` to decide whether to emit `\n` between values.
 
 Serialization is generic via Zig's `anytype` — parameterized on `writeByte`/`writeSlice` methods. Same code powers `Writer` (fd-backed, used by main thread) and `BufferSink` (ArrayList-backed, used by pool workers).
 
@@ -203,8 +203,8 @@ Fixed-size worker pool. Orchestrates io → parser → query → output in paral
 **Stream mode**: dedicated IO thread reads from `Source`, accumulates complete lines into 256 KB batches (`STREAM_BATCH_SIZE`), posts as Jobs. Flush on pipe stall (peek returns 0 bytes, not EOF) preserves interactive latency.
 
 **Execution paths**:
-- Structured (`format=null`): workers copy values into arena-backed `OwnedValue`. Caller uses `collect()`.
-- Serialized (`format!=null`): workers serialize directly into arena byte buffers while tape is live, bypassing `OwnedValue`. Caller uses `collect_bytes()`.
+- Structured (`style=null`): workers copy values into arena-backed `OwnedValue`. Caller uses `collect()`.
+- Serialized (`style!=null`): workers serialize directly into arena byte buffers while tape is live, bypassing `OwnedValue`. Caller uses `collect_bytes()`.
 
 **Sequencer**: fixed-size ring buffer. `post()` is a direct array write at `chunk_id % capacity`. `next_in_order()` is a direct array read. Zero dynamic allocations in hot path.
 
@@ -285,13 +285,13 @@ Per-record alloc/free creates millions of GPA round-trips. Arena allocation is O
 
 ### Serialized execution path
 
-When the output format is known at submit time, workers serialize values directly into byte buffers while the tape is still live, bypassing `OwnedValue` entirely.
+When the output style is known at submit time, workers serialize values directly into byte buffers while the tape is still live, bypassing `OwnedValue` entirely.
 
 For scalar queries (`.id`, `select()`), `OwnedValue` copies ~150 bytes/record (tape entries + string data). Serialized output is ~3 bytes/record (`"42\n"`). On 15M records: ~700 MB vs ~50 MB of arena memory.
 
 Result: RSS for `.id` query dropped from ~2.6x to ~1.1x input size (serialized path alone). Contiguous byte buffer + compact `RecordMeta` array (8 B/record vs ~32 B per `RecordOutcome`) further reduced allocation count. A subsequent `madvise(MADV_DONTNEED)` pass on consumed mmap pages (see **pool**) took RSS to **0.31x input size** — now less than the file itself.
 
-Implementation detail: `meta_list` is pre-allocated before `chunk_buf` so the chunk buffer (always the arena's last allocation) can resize in-place when output exceeds input size (e.g. pretty format). Uses `.items` directly instead of `toOwnedSlice` — arena owns the memory.
+Implementation detail: `meta_list` is pre-allocated before `chunk_buf` so the chunk buffer (always the arena's last allocation) can resize in-place when output exceeds input size (e.g. pretty style). Uses `.items` directly instead of `toOwnedSlice` — arena owns the memory.
 
 ### InFlightLimiter backpressure
 

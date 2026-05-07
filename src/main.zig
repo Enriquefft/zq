@@ -34,13 +34,12 @@ const ExternalVar = struct {
 const Config = struct {
     filter: ?[]const u8 = null,
     files: []const []const u8 = &.{},
-    format: types.Format = .pretty,
+    style: types.OutputStyle = .{},
     exit_status: bool = false,
     null_input: bool = false,
     raw_input: bool = false,
     slurp: bool = false,
     sort_keys: bool = false,
-    join_output: bool = false,
     tab_indent: bool = false,
     indent_width: u8 = 2,
     color: enum { auto, on, off } = .auto,
@@ -584,8 +583,7 @@ pub fn main() !u8 {
     };
     defer writer.deinit();
 
-    // Pick format: if stdout is TTY and no explicit format flag, use pretty.
-    const format: types.Format = if (config.join_output) .join else config.format;
+    const style: types.OutputStyle = config.style;
 
     const serialize_opts = output_mod.SerializeOpts{
         .sort_keys = config.sort_keys,
@@ -607,7 +605,7 @@ pub fn main() !u8 {
 
     if (config.null_input) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processNullInput(&cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
+        last_was_false_or_null = processNullInput(&cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -615,7 +613,7 @@ pub fn main() !u8 {
         };
     } else if (config.slurp) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processSlurp(&config, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &diag) catch |e| {
+        last_was_false_or_null = processSlurp(&config, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -639,7 +637,7 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq, format, color, serialize_opts, config.raw_input, ext_bindings);
+        pool.submit_stream(&src, &cq, style, color, serialize_opts, config.raw_input, ext_bindings);
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {
@@ -673,7 +671,7 @@ pub fn main() !u8 {
 
             var diag = QueryDiag{};
             defer diag.deinit(allocator);
-            last_was_false_or_null = processFile(file, &cq, &writer, format, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
+            last_was_false_or_null = processFile(file, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
                 err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -701,7 +699,7 @@ fn processFile(
     file: std.fs.File,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -729,7 +727,7 @@ fn processFile(
         }
     }
 
-    try pool.submit_file(file, cq, format, color, opts, raw_input, ext_bindings);
+    try pool.submit_file(file, cq, style, color, opts, raw_input, ext_bindings);
 
     var last_was_false_or_null = false;
     while (try pool.collect_bytes()) |result| {
@@ -747,7 +745,7 @@ fn processSlurp(
     config: *const Config,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -756,9 +754,9 @@ fn processSlurp(
     diag: *QueryDiag,
 ) !bool {
     if (config.raw_input) {
-        return processSlurpRaw(config, cq, writer, format, color, opts, ext_bindings, allocator, diag);
+        return processSlurpRaw(config, cq, writer, style, color, opts, ext_bindings, allocator, diag);
     }
-    return processSlurpJson(config, cq, writer, format, color, opts, ext_bindings, allocator, had_errors, diag);
+    return processSlurpJson(config, cq, writer, style, color, opts, ext_bindings, allocator, had_errors, diag);
 }
 
 /// Collect all parsed JSON values into a single array, then run the query once.
@@ -766,7 +764,7 @@ fn processSlurpJson(
     config: *const Config,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -813,7 +811,7 @@ fn processSlurpJson(
     const tape = rt.asTape();
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, style, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 /// Read all JSON values from a file/stdin using Source + Parser, copying each
@@ -909,7 +907,7 @@ fn processSlurpRaw(
     config: *const Config,
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -952,7 +950,7 @@ fn processSlurpRaw(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, config.unbuffered, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, style, color, opts, ext_bindings, allocator, config.unbuffered, diag);
 }
 
 fn readAllBytes(
@@ -982,7 +980,7 @@ fn readAllBytes(
 fn processNullInput(
     cq: *const query_mod.CompiledQuery,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -1001,7 +999,7 @@ fn processNullInput(
 
     var opt_it: ?query_mod.ResultIterator = null;
     defer if (opt_it) |*it| it.deinit();
-    return try writeRecord(cq, tape, &opt_it, writer, format, color, opts, ext_bindings, allocator, unbuffered, diag);
+    return try writeRecord(cq, tape, &opt_it, writer, style, color, opts, ext_bindings, allocator, unbuffered, diag);
 }
 
 /// Process --validate mode: compile filter only, report success or error.
@@ -1133,7 +1131,7 @@ fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
     }
 
     // Determine output format.
-    const use_pretty = config.format == .pretty;
+    const use_pretty = !config.style.compact;
 
     // Serialize into buffer then write to stdout.
     var buf = std.ArrayList(u8){};
@@ -1254,7 +1252,7 @@ fn writeRecord(
     tape: parser_mod.Tape,
     opt_it: *?query_mod.ResultIterator,
     writer: *output_mod.Writer,
-    format: types.Format,
+    style: types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     ext_bindings: []const query_mod.ExternalVarBinding,
@@ -1281,9 +1279,9 @@ fn writeRecord(
 
     var last_was_false_or_null = false;
     while (try it.next()) |val| {
-        try writer.write_value(val, format, color, opts);
-        if (format != .jsonl and format != .join) {
-            try writer.write_value(.{ .string = .{ .external = "\n" } }, .raw, null, .{});
+        try writer.write_value(val, style, color, opts);
+        if (!style.join) {
+            try writer.writeByte('\n');
         }
         if (unbuffered) try writer.flush();
         last_was_false_or_null = switch (val) {
@@ -1481,13 +1479,16 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             var j: usize = 1;
             while (j < arg.len) : (j += 1) {
                 switch (arg[j]) {
-                    'r' => config.format = .raw,
-                    'c' => config.format = .compact,
+                    'r' => config.style.raw_strings = true,
+                    'c' => config.style.compact = true,
                     'e' => config.exit_status = true,
                     'n' => config.null_input = true,
                     's' => config.slurp = true,
                     'S' => config.sort_keys = true,
-                    'j' => config.join_output = true,
+                    'j' => {
+                        config.style.join = true;
+                        config.style.raw_strings = true;
+                    },
                     'C' => config.color = .on,
                     'M' => config.color = .off,
                     'R' => config.raw_input = true,
@@ -1521,9 +1522,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 }
             }
         } else if (std.mem.eql(u8, arg, "--raw-output")) {
-            config.format = .raw;
+            config.style.raw_strings = true;
         } else if (std.mem.eql(u8, arg, "--compact-output")) {
-            config.format = .compact;
+            config.style.compact = true;
         } else if (std.mem.eql(u8, arg, "--color-output")) {
             config.color = .on;
         } else if (std.mem.eql(u8, arg, "--monochrome-output")) {
@@ -1539,7 +1540,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--sort-keys")) {
             config.sort_keys = true;
         } else if (std.mem.eql(u8, arg, "--join-output")) {
-            config.join_output = true;
+            config.style.join = true;
+            config.style.raw_strings = true;
         } else if (std.mem.eql(u8, arg, "--tab")) {
             config.tab_indent = true;
         } else if (std.mem.eql(u8, arg, "--indent")) {

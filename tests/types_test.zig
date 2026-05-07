@@ -90,11 +90,31 @@ test "Instruction: identity with no operand" {
     try std.testing.expectEqual(Instruction.Op.identity, inst.op);
 }
 
-// ─── Format ──────────────────────────────────────────────────────────────────
+// ─── OutputStyle ─────────────────────────────────────────────────────────────
 
-test "Format: all variants accessible" {
-    const fmts = [_]types.Format{ .pretty, .compact, .raw, .jsonl };
-    try std.testing.expectEqual(@as(usize, 4), fmts.len);
+test "OutputStyle: packs into a single byte" {
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(types.OutputStyle));
+}
+
+test "OutputStyle: default is pretty (all axes off)" {
+    const s: types.OutputStyle = .{};
+    try std.testing.expect(!s.compact);
+    try std.testing.expect(!s.raw_strings);
+    try std.testing.expect(!s.join);
+}
+
+test "OutputStyle: axes are independently composable" {
+    const s = types.OutputStyle{ .compact = true, .raw_strings = true };
+    try std.testing.expect(s.compact);
+    try std.testing.expect(s.raw_strings);
+    try std.testing.expect(!s.join);
+}
+
+test "OutputStyle: full composition (compact+raw+join)" {
+    const s = types.OutputStyle{ .compact = true, .raw_strings = true, .join = true };
+    try std.testing.expect(s.compact);
+    try std.testing.expect(s.raw_strings);
+    try std.testing.expect(s.join);
 }
 
 // ─── RuntimeTape.copySpan ────────────────────────────────────────────────────
