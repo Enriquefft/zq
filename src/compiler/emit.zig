@@ -176,6 +176,22 @@ pub fn emit(
             .function_table = function_table,
             .fn_body_ip = fn_body_ip,
         };
+        // Hoist recursive function bodies above the user query.
+        // Without this, emitCallUser would emit a body lazily at the
+        // first call site. If that call site lives inside a
+        // captureAndTruncate region (e.g. emitGeneralUpdate's RHS
+        // capture for path-assigns with computed keys), the captured
+        // slice ends up containing the function body itself; the
+        // subsequent appendRebasedInstrs replays the body at a
+        // different IP while cache.body_ip still records the original
+        // (now-overwritten) location. call_function's body_ip lookup
+        // then jumps to whatever instructions now occupy the stale
+        // slot, typically re-entering call_function in a loop until
+        // max_recursion_depth surfaces as a spurious TypeError.
+        // Pre-emitting at a stable position before any user-query
+        // emission keeps cache.body_ip valid regardless of subsequent
+        // capture/replay.
+        try preEmitRecursiveBodies(&emitter);
         try emitNode(&emitter, root_idx);
     }
 
@@ -438,10 +454,20 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
                 //   `fork_try L_after ; <body> ; pop_try ; L_after:`
                 // Errors on the body are swallowed silently (legacy
                 // `?`-segment-wrap shape).
-                const start: usize = em.instructions.items.len;
+                //
+                // Emit `fork_try` BEFORE the body so internal backpatched
+                // IPs (e.g. comma `fork`/`jump` targets, alt jumps) remain
+                // correct. Inserting `fork_try` after emitting the body
+                // shifts every body instruction by one without updating
+                // the backpatched operands — yielding off-by-one targets
+                // that break comma-fork iteration inside `try` (regression
+                // visible as `try (1,2,3)` emitting `3,3,3`).
+                //
+                // catch_ip stays 0 — the suppress-rather-than-route
+                // sentinel that `handleError` interprets for the
+                // handler-absent shape.
+                try em.pushInstr(.fork_try, .{ .index = 0 }, node);
                 try emitNode(em, node.children[0]);
-                try em.instructions.insert(em.allocator, start, .{ .op = .fork_try, .operand = .{ .index = 0 } });
-                try em.source_map.insert(em.allocator, start, node.src_start);
                 try em.pushInstr(.pop_try, .{ .none = {} }, node);
             } else {
                 // Handler form (`try expr catch handler`):
@@ -686,7 +712,34 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         // avoids the IP-rebase that nested `//` would otherwise need
         // (each nested alt's recorded chain_start overlaps the outer
         // one and `insert` would shift sibling fork_alts' operands).
-        // Layout:
+        //
+        // `it.current` preservation: jq parity requires `LHS // RHS` to
+        // leave `it.current` bit-identical to the entry input when the
+        // surrounding context (e.g. binop RHS) reads `.` after alt
+        // commits. Without restoration, a truthy LHS like `.a` leaks
+        // `it.current = .a` and the next `.b` resolves against `.a` —
+        // breaking `(.a // 5) + .b`.
+        //
+        // The wrap is gated on `!lhs_may_fork`: when LHS contains a
+        // generator (iterate, comma, recurse, …) each iteration
+        // re-enters the alt body from `each.ip+1` WITHOUT re-running
+        // `save_input`, so an unconditional `restore_input` would
+        // pop `if_stack` once per iteration and underflow on iter 2.
+        // For forking LHS the outer binop emitter takes its
+        // `subtreeHasIterate` path, which captures RHS into a variable
+        // before LHS runs; alt's residual `it.current` is irrelevant
+        // because the binop op pops both values from `value_stack` and
+        // never re-reads `.`. So skipping the wrap there is correct.
+        //
+        // The falsy `backtrack` already restores `it.current` from the
+        // `fork_alt` snapshot, but it leaves the outer `save_input`
+        // entry on `if_stack` (`fork_alt` recorded `saved_if_len` AFTER
+        // `save_input` ran). The post-backtrack `restore_input` at
+        // L_right rebalances the stack — current is unchanged because
+        // both snapshots equal the outer input.
+        //
+        // Layout (lhs_may_fork=false; wrap on):
+        //   save_input             ← snapshot outer to if_stack
         //   fork_alt L_right       ← backpatch to RHS start
         //   <LHS>
         //   pipe                   ← lift value-stack top to current
@@ -694,13 +747,25 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
         //   jump_if_false L_falsy
         //   pop_try                ← truthy: drop alt-handler
         //   push_current           ← truthy: re-push committed value
+        //   restore_input          ← truthy: pop if_stack, current=outer
         //   jump L_end
         //   L_falsy:
         //   backtrack              ← alt-handler runs; jumps to L_right
         //   L_right:
+        //   restore_input          ← falsy: rebalance if_stack
         //   <RHS>
         //   L_end:
+        //
+        // Layout (lhs_may_fork=true; wrap off — preserves per-iteration
+        // alt semantics for `.foo[] // .bar`):
+        //   fork_alt L_right ; <LHS> ; pipe ; push_current
+        //   jump_if_false L_falsy ; pop_try ; push_current ; jump L_end
+        //   L_falsy: backtrack ; L_right: <RHS> ; L_end:
         .alt => {
+            const lhs_may_fork = subtreeMayFork(em.ir_obj, node.children[0]);
+
+            if (!lhs_may_fork) try em.pushInstr(.save_input, .{ .none = {} }, node);
+
             const fork_alt_pos: usize = em.instructions.items.len;
             try em.pushInstr(.fork_alt, .{ .index = 0 }, node);
 
@@ -712,9 +777,10 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const jif_pos: usize = em.instructions.items.len;
             try em.pushInstr(.jump_if_false, .{ .index = 0 }, node);
 
-            // Truthy: drop alt-handler, re-push value, jump past RHS.
+            // Truthy: drop alt-handler, re-push value, optionally restore outer, jump past RHS.
             try em.pushInstr(.pop_try, .{ .none = {} }, node);
             try em.pushInstr(.push_current, .{ .none = {} }, node);
+            if (!lhs_may_fork) try em.pushInstr(.restore_input, .{ .none = {} }, node);
 
             const jump_end_pos: usize = em.instructions.items.len;
             try em.pushInstr(.jump, .{ .index = 0 }, node);
@@ -726,6 +792,8 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             const right_ip: u32 = @intCast(em.instructions.items.len);
             em.instructions.items[fork_alt_pos].operand = .{ .index = right_ip };
 
+            // Rebalance if_stack on the falsy path before evaluating RHS.
+            if (!lhs_may_fork) try em.pushInstr(.restore_input, .{ .none = {} }, node);
             try emitNode(em, node.children[1]);
 
             em.instructions.items[jump_end_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
@@ -3447,6 +3515,43 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
 const CALL_USER_INLINE: u32 = 1;
 const CALL_USER_RECURSIVE: u32 = 0;
 
+/// Pre-emit every recursive user-function body before the user query
+/// is walked. Each entry's body lands at a stable IP at the top of
+/// the bytecode stream (wrapped in `jump <skip>` / `return_function`
+/// so the prelude is non-executable when execution begins at IP 0).
+/// Subsequent `emitCallUser` invocations see `cache.emitted=true` and
+/// emit only the `call_function` operand — they never include the body
+/// in their captureAndTruncate window.
+///
+/// Iteration order is index-ascending; emitting one body may
+/// transitively trigger nested bodies via inner `call_user` nodes
+/// (`emitCallUser`'s recursive arm at `:3609-3624`). The cache stops
+/// double-emission, so the post-hoist outer loop simply skips entries
+/// already filled in by a prior body's walk.
+fn preEmitRecursiveBodies(em: *Emitter) EmitError!void {
+    for (em.function_table, 0..) |entry, fn_id| {
+        if (!entry.is_recursive) continue;
+        if (entry.body_ir_root == lower_mod.BODY_IR_NOT_LOWERED) continue;
+        const cache = &em.fn_body_ip[fn_id];
+        if (cache.emitted) continue;
+
+        const body_root_node = em.ir_obj.nodes.items[entry.body_ir_root];
+
+        const jump_pos: usize = em.instructions.items.len;
+        try em.pushInstr(.jump, .{ .index = 0 }, body_root_node);
+
+        const body_ip: u32 = @intCast(em.instructions.items.len);
+        cache.body_ip = body_ip;
+        cache.emitted = true;
+
+        try emitNode(em, entry.body_ir_root);
+        cache.body_end_ip = @intCast(em.instructions.items.len);
+        try em.pushInstr(.return_function, .{ .none = {} }, body_root_node);
+
+        em.instructions.items[jump_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
+    }
+}
+
 fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
     const slots = em.ir_obj.extra_data.items;
     const fn_id: u32 = slots[node.extra];
@@ -4236,32 +4341,12 @@ fn subtreeHasIterate(ir_obj: ir.IR, node_idx: u32) bool {
 /// when it appears as a binop operand.
 fn subtreeRebindsCurrent(ir_obj: ir.IR, node_idx: u32) bool {
     const node = ir_obj.nodes.items[node_idx];
-    const stack_only: bool = switch (node.op) {
-        .load_const,
-        .load_var,
-        .identity,
-        .arith,
-        .cmp,
-        .logical,
-        .alt,
-        .neg,
-        .not,
-        .arr_ctor,
-        .obj_ctor,
-        .interp,
-        .format,
-        // D1: post-B1/B6, these single-instruction loads push to
-        // value_stack and preserve it.current. Adding them lets
-        // `.foo = .bar`, `.foo = .bar.baz`, `.foo = .[0]`, and the
-        // analogous `.arith`/`.cmp`/`.logical` LHS shapes take the
-        // 0-op no-wrap path instead of the 4-op stack-reseed.
-        .load_field,
-        .load_index,
-        .load_path,
-        => true,
-        else => false,
-    };
-    if (!stack_only) return true;
+    // SSOT: `Op.preservesCurrent` is the canonical declaration, co-located
+    // with the enum in `src/compiler/ir.zig`. The previous hand-mirrored
+    // switch here drifted from VM-handler reality (`.alt` truthy path
+    // leaks LHS into `it.current`); the SSOT method's exhaustive switch
+    // forces a re-classification when a new op is added.
+    if (!node.op.preservesCurrent()) return true;
     if (node.span_len > 0) {
         const span = ir_obj.extra_children.items[node.span_start .. node.span_start + node.span_len];
         for (span) |child| {

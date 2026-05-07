@@ -324,6 +324,94 @@ pub const Op = enum(u8) {
     // both through one decode helper. Maps to legacy
     // `Instruction.Op.load_path` (operand `str_ref`).
     load_path,
+
+    /// Whether this op's emitted bytecode pushes its result to
+    /// `value_stack` and leaves `it.current` bit-identical to the entry
+    /// `it.current`. Consumed by `emit.subtreeRebindsCurrent` to decide
+    /// when a binop / path-assign LHS can take the 0-op no-wrap fast
+    /// path instead of routing through `save_input`/`restore_input`
+    /// reseed.
+    ///
+    /// Single-source-of-truth — the previous hand-mirrored switch in
+    /// `emit.zig` drifted from VM-handler reality (notably, `.alt`'s
+    /// truthy `pop_try; push_current; jump` does NOT restore from the
+    /// `fork_alt` snapshot — only the falsy `backtrack` does — so
+    /// `.alt` rebinds `it.current` to the LHS result whenever LHS is
+    /// truthy). See `vm/root.zig:1304` (pipe), `:1793` (fork_alt),
+    /// `:1815` (pop_try).
+    ///
+    /// The recursive ops (`arith`, `cmp`, `logical`, `arr_ctor`,
+    /// `obj_ctor`, `interp`, `format`, `neg`, `not`) are listed as
+    /// preserving because the binop / constructor emitters re-emit
+    /// the save/restore reseed pattern around any forking child — the
+    /// caller (`subtreeRebindsCurrent`) recurses into children and
+    /// returns `true` if any child fails the predicate.
+    ///
+    /// Exhaustive switch — Zig refuses to compile when a new op skips
+    /// classification, mirroring `Instruction.Op.breaksPath` /
+    /// `clearsPathBroken` (`src/types.zig:1088,1197`).
+    pub fn preservesCurrent(self: Op) bool {
+        return switch (self) {
+            // Stack-only loads: produce a value via push to value_stack,
+            // leave it.current intact (B1 alignment commit `bbe499a`).
+            .load_const,
+            .load_var,
+            .identity,
+            .load_field,
+            .load_index,
+            .load_path,
+            // Pure-value combinators: the binop emitter routes through
+            // save/restore reseed when any child forks; the recursive
+            // walk in `subtreeRebindsCurrent` enforces the contract on
+            // children.
+            .arith,
+            .cmp,
+            .logical,
+            .neg,
+            .not,
+            // Constructors: snapshot it.current internally; per-element
+            // expressions restore from snapshot before emitting the next
+            // iteration's keys/values.
+            .arr_ctor,
+            .obj_ctor,
+            // Interpolation segments use save_input/restore_input around
+            // each expression, leaving outer it.current intact at end.
+            .interp,
+            .format,
+            // Alt (`//`) is wrapped by save_input/restore_input on both
+            // truthy and falsy paths (`emitNode .alt`); leaves it.current
+            // bit-identical to entry input.
+            .alt,
+            => true,
+
+            // Rebinds it.current (or may rebind via inner backtrack/fork
+            // residuals).
+            .slice,
+            .computed_index,
+            .computed_slice,
+            .pipe,
+            .comma,
+            .iterate,
+            .recurse,
+            .try_,
+            .if_,
+            .reduce,
+            .foreach,
+            .while_,
+            .until_,
+            .walk1,
+            .call_user,
+            .call_builtin,
+            .update_assign,
+            .destructure,
+            .as_bind,
+            .path_begin,
+            .path_end,
+            .label,
+            .break_,
+            => false,
+        };
+    }
 };
 
 /// A single IR node — the universal record type for both SemOp and EmitOp.

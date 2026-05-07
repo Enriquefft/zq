@@ -4275,3 +4275,178 @@ test "B3b: [limit(5; repeat(.+1))] yields [1,1,1,1,1] (repeat frame survives rou
     try dumpCompact(&buf, v.?);
     try std.testing.expectEqualStrings("[1,1,1,1,1]", buf.items);
 }
+
+// ── B5: comma-fork inside try (no-handler form) ──────────────────────────────
+//
+// Regression for the "comma-fork-inside-try-wrapped-binop" bug
+// (filed in bugs.md under "Architectural follow-ups", commit 2dc077b).
+//
+// Reproducer: `printf '{"a":2,"b":3}' | zq -c 'try ((.a, .b) + 1)'` emitted
+// `4\n4` instead of jq's `3\n4` — the second comma value `+1` applied twice.
+// More fundamentally, even `try (1, 2)` printed `2\n2` instead of `1\n2`.
+//
+// Root cause: `emit.zig` `.try_` (no-handler form) emitted the body first
+// then *inserted* `fork_try` at the body's start IP. The insert shifted
+// every body instruction down by one, but any IP operands the body had
+// already backpatched (e.g. a `comma`'s `fork right_start` and its
+// `jump end`) still referenced the pre-shift indices — so the comma's
+// fork target landed on the wrong instruction. The first arm and the
+// jump end were both off-by-one, which routed both comma branches to
+// emit the second arm's value.
+//
+// Fix: emit `fork_try` *before* the body (`em.pushInstr(.fork_try, ...)`
+// instead of `em.instructions.insert(start, ...)`). With the prefix in
+// place from the start, the body's own backpatched IPs already reference
+// the correct, final instruction positions.
+
+test "B5: try (1, 2) yields 1, 2 (comma fork inside try preserves both arms)" {
+    // Pure-literal reproducer — no field access, no arithmetic. Isolates
+    // the comma-fork backpatching issue from any data-dependent path.
+    const entries = [_]Entry{.{ .tag = .null_val, .payload = .{ .none = {} } }};
+    const t = tape(&entries, "");
+
+    var q = try compile("try (1, 2)");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 1), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[1].int);
+}
+
+test "B5: try (.a, .b) yields 2, 3 (comma fork over object fields inside try)" {
+    // Reproducer from the bug report's narrowing pass: `try (.a, .b)`
+    // emitted 3, 3 pre-fix (the second field's value duplicated).
+    // input: {"a": 2, "b": 3}
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("try (.a, .b)");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 2), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[1].int);
+}
+
+test "B5: try ((.a, .b) + 1) yields 3, 4 (original reproducer)" {
+    // The reproducer from the bug filing: pre-fix this emitted 4, 4.
+    // input: {"a": 2, "b": 3}
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .int, .payload = .{ .int = 3 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("try ((.a, .b) + 1)");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 3), vals.items[0].int);
+    try std.testing.expectEqual(@as(i64, 4), vals.items[1].int);
+}
+
+// ── B6: alternative `//` as binop LHS (it.current restoration) ───────────────
+//
+// Regression for `(.a // 5) + .b` returning the wrong value when alt's
+// truthy path is taken.
+//
+// Reproducer: `printf '{"a":99,"b":7}' | zq '(.a // 5) + .b'` returned `198`
+// instead of jq's `106` — `+ .b` evaluated against the alt result (99) rather
+// than the original input.
+//
+// Root cause: `.alt` emit's truthy path only stored the LHS value via
+// `push_current` and did not restore the saved input it.current. The falsy
+// path's `backtrack` happened to restore it via fork_alt's snapshot, but the
+// truthy path did not. The outer binop's emit has three paths:
+//   (1) variable-capture (gated by `subtreeHasIterate`)
+//   (2) stack-reseed via save_input/restore_input (gated by
+//       `subtreeRebindsCurrent && !subtreeMayFork`)
+//   (3) raw `<lhs>; <rhs>; op` fall-through
+// `subtreeMayFork(alt)=true` blocked path 2; arith fell into path 3, where
+// `<rhs>` saw alt's residual `.current` (the LHS value 99) instead of the
+// original `{"a":99,"b":7}`.
+//
+// Fix: wrap `.alt` body with `save_input` / `restore_input` so both arms
+// leave the original input as `.current`. The wrap is conditional on
+// `!subtreeMayFork(LHS)` because an iterate inside the LHS re-enters the
+// body without re-running save_input — restore_input on a depleted if_stack
+// would unbalance the stack. When LHS forks, the outer binop's
+// variable-capture path (gated by `subtreeHasIterate`) handles current
+// restoration via stored bindings.
+//
+// SSOT: `subtreeRebindsCurrent` now delegates to `Op.preservesCurrent` in
+// ir.zig so the predicate has a single canonical declaration.
+
+test "B6: (.a // 5) + .b restores input across alt truthy path" {
+    // Pre-fix this returned 198 (99 + 99). Expected: 106 (99 + 7).
+    // input: {"a": 99, "b": 7}
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .int, .payload = .{ .int = 99 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .int, .payload = .{ .int = 7 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("(.a // 5) + .b");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 106), vals.items[0].int);
+}
+
+test "B6: (.a // 5) + .b takes fallback when key is null" {
+    // Cover the falsy path too (backtrack restores via fork_alt snapshot).
+    // input: {"a": null, "b": 7} → 5 + 7 = 12.
+    const sb = "ab";
+    const entries = [_]Entry{
+        .{ .tag = .object_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 0, .len = 1 } } }, // "a"
+        .{ .tag = .null_val, .payload = .{ .none = {} } },
+        .{ .tag = .key, .payload = .{ .string = .{ .offset = 1, .len = 1 } } }, // "b"
+        .{ .tag = .int, .payload = .{ .int = 7 } },
+        .{ .tag = .object_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, sb);
+
+    var q = try compile("(.a // 5) + .b");
+    defer q.deinit();
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(@as(i64, 12), vals.items[0].int);
+}
+
+// Forking-LHS variant `[.[] | [.foo[] // .bar]]` is verified via the CLI
+// integration check in scripts/run_jq_compat.sh — building it from raw tape
+// entries is brittle (skip indices are absolute one-past-end positions).
