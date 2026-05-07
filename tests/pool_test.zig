@@ -435,6 +435,97 @@ test "submit_stream: empty stream returns no results" {
     try std.testing.expectEqual(@as(usize, 0), vals.len);
 }
 
+// ── NIX-001: structural chunker correctness ────────────────────────────────
+
+test "submit_file: pretty record crossing chunk boundary (4 workers)" {
+    // Several pretty-printed objects in one file. With raw-\n splitting and
+    // 4 workers, chunk boundaries naturally land inside the multi-line
+    // values — the pre-NIX-001 chunker would shred each into per-line
+    // fragments and produce parse errors. The structural chunker must
+    // align every chunk on a depth-0 newline.
+    var cq = try compile(".n");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // 16 records × ~30 bytes each → ~500 bytes total, well within one mmap
+    // chunk per worker but spread across 4 worker slots so boundary
+    // alignment must happen.
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        try data.writer(alloc).print("{{\n  \"n\": {d}\n}}\n", .{i});
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(4, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 16), vals.len);
+    for (vals, 0..) |v, idx| {
+        try std.testing.expectEqual(@as(i64, @intCast(idx)), v.int);
+    }
+}
+
+test "submit_stream: pretty value spanning IO refill" {
+    // A single pretty-printed array bigger than the IO RingBuffer
+    // (INITIAL_CAP = 64 KiB) — the boundary scanner state must persist
+    // across `view`s so that the depth-0 closing `\n` is found exactly
+    // once, after the final `]`.
+    var cq = try compile("length");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    try data.appendSlice(alloc, "[\n");
+    // 8000 elements × ~10 bytes each ≈ 80 KB — exceeds 64 KiB ring buffer.
+    var i: u32 = 0;
+    while (i < 8000) : (i += 1) {
+        try data.writer(alloc).print("  {d}{s}\n", .{ i, if (i + 1 < 8000) "," else "" });
+    }
+    try data.appendSlice(alloc, "]\n");
+
+    const pipe_fds = try std.posix.pipe();
+    // Write asynchronously: a single posix.write of >PIPE_BUF blocks until
+    // the reader drains, so spawn a writer thread.
+    const Writer = struct {
+        fn run(fd: std.posix.fd_t, bytes: []const u8) void {
+            var off: usize = 0;
+            while (off < bytes.len) {
+                const n = std.posix.write(fd, bytes[off..]) catch break;
+                if (n == 0) break;
+                off += n;
+            }
+            std.posix.close(fd);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+    defer src.deinit();
+    defer std.posix.close(pipe_fds[0]);
+
+    var p = try Pool.init(2, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    t.join();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, 8000), vals[0].int);
+}
+
 test "submit_stream: no trailing newline" {
     var cq = try compile(".");
     defer cq.deinit();

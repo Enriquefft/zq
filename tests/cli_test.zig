@@ -286,6 +286,111 @@ test "--unbuffered: short flag rejected (no -u alias yet)" {
     try std.testing.expectEqual(@as(u8, 2), r.exit_code);
 }
 
+// ── NIX-001: pretty-printed (multi-line) top-level JSON values ──────────────
+//
+// Default-mode invocation routes both stdin and file-arg paths through the
+// pool, whose chunker splits on raw '\n' without tracking JSON structural
+// context. Pretty-printed inputs (any JSON written across multiple lines)
+// are shredded into per-line fragments and fail to parse.
+//
+// Compact single-line baseline is also asserted as a regression guard so any
+// fix preserves existing JSONL behavior.
+
+test "NIX-001: pretty-printed object via stdin parses as one value" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".a" }, "{\n  \"a\": 1\n}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+    try std.testing.expectEqualStrings("", r.stderr);
+}
+
+test "NIX-001: pretty-printed array via stdin parses as one value" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", "length" }, "[\n  1,\n  2\n]\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("2\n", r.stdout);
+    try std.testing.expectEqualStrings("", r.stderr);
+}
+
+test "NIX-001: pretty-printed object via file arg parses as one value" {
+    const alloc = std.testing.allocator;
+    var path_buf: [128]u8 = undefined;
+    const path = try tmpPath(&path_buf, "pretty.json");
+    try writeTmp(path, "{\n  \"a\": 1\n}\n");
+    defer deleteTmp(path);
+
+    var r = try runZq(alloc, &.{ "-c", ".a", path }, null);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+    try std.testing.expectEqualStrings("", r.stderr);
+}
+
+test "NIX-001: nested pretty-printed object via stdin (closure-info shape)" {
+    // Mirrors structuredAttrs JSON shape that nixpkgs feeds to jq via
+    // $NIX_ATTRS_JSON_FILE — nested array of objects with an inner reference
+    // list. Filter is a simplified slice of the closure-info filter.
+    const alloc = std.testing.allocator;
+    const input =
+        \\{
+        \\  "closure": [
+        \\    {
+        \\      "path": "/nix/store/aaa",
+        \\      "narHash": "sha256-x",
+        \\      "narSize": 100,
+        \\      "references": ["/nix/store/bbb"]
+        \\    }
+        \\  ]
+        \\}
+        \\
+    ;
+    var r = try runZq(alloc, &.{ "-c", ".closure | length" }, input);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+    try std.testing.expectEqualStrings("", r.stderr);
+}
+
+test "NIX-001: compact JSONL baseline still works (regression guard)" {
+    // Sanity: any fix to the pretty-print path must preserve JSONL behavior.
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", "." }, "1\n2\n3\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n2\n3\n", r.stdout);
+}
+
+test "NIX-001: concatenated pretty values parse as multiple records" {
+    // Two pretty-printed top-level values back-to-back; chunker must
+    // recognize the depth-0 boundary between them.
+    const alloc = std.testing.allocator;
+    const input =
+        \\{
+        \\  "a": 1
+        \\}
+        \\{
+        \\  "a": 2
+        \\}
+        \\
+    ;
+    var r = try runZq(alloc, &.{ "-c", ".a" }, input);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n2\n", r.stdout);
+}
+
+test "NIX-001: --raw-input on multi-line input still splits on \\n" {
+    // Raw-input mode is line-oriented by definition; the JSON-aware
+    // chunker must NOT collapse multi-line raw input into one record.
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-R", "-c", "." }, "alpha\nbeta\ngamma\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("\"alpha\"\n\"beta\"\n\"gamma\"\n", r.stdout);
+}
+
 // ── D1 SSOT pin: predicate ↔ VM-handler coupling for path-assign RHS ────────
 //
 // `subtreeRebindsCurrent` (src/compiler/emit.zig) whitelists IR ops whose VM

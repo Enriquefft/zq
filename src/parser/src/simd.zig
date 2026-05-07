@@ -46,6 +46,45 @@ pub fn scanStringBody(data: []const u8) usize {
     return i;
 }
 
+/// Returns the count of leading bytes that are *not* JSON-structural.
+///
+/// "Structural" means: `"`, `{`, `}`, `[`, `]`, or `\n`. The first match
+/// drops the caller into a scalar state-machine handler. Used by the
+/// pool's boundary scanner (`src/parser/src/boundary.zig`) for the
+/// out-of-string fast path: outside a string literal, only these six
+/// bytes affect record-boundary state (depth open/close, string entry,
+/// or potential record terminator at depth 0).
+pub fn scanStructural(data: []const u8) usize {
+    var i: usize = 0;
+
+    // Vectorized loop — 32 bytes at a time.
+    while (i + VEC_LEN <= data.len) {
+        const chunk: Vec = data[i..][0..VEC_LEN].*;
+
+        const quotes: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, '"'))));
+        const open_obj: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, '{'))));
+        const close_obj: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, '}'))));
+        const open_arr: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, '['))));
+        const close_arr: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, ']'))));
+        const newlines: Mask = @bitCast(chunk == @as(Vec, @splat(@as(u8, '\n'))));
+
+        const interesting = quotes | open_obj | close_obj | open_arr | close_arr | newlines;
+        if (interesting != 0) {
+            return i + @ctz(interesting);
+        }
+        i += VEC_LEN;
+    }
+
+    // Scalar tail — at most VEC_LEN - 1 bytes.
+    while (i < data.len) {
+        switch (data[i]) {
+            '"', '{', '}', '[', ']', '\n' => return i,
+            else => i += 1,
+        }
+    }
+    return i;
+}
+
 /// Returns the count of leading JSON whitespace bytes (space, tab, newline, CR).
 pub fn skipWhitespace(data: []const u8) usize {
     var i: usize = 0;
@@ -159,4 +198,36 @@ test "skipWhitespace: large run then non-ws" {
 test "skipWhitespace: exactly 32 spaces" {
     const data = " " ** 32;
     try testing.expectEqual(@as(usize, 32), skipWhitespace(data));
+}
+
+test "scanStructural: all boring ASCII" {
+    const data = "abcdefghij0123456789xyzqwertyuio";
+    try testing.expectEqual(data.len, scanStructural(data));
+}
+
+test "scanStructural: each structural byte halts at start" {
+    try testing.expectEqual(@as(usize, 0), scanStructural("\"abc"));
+    try testing.expectEqual(@as(usize, 0), scanStructural("{abc"));
+    try testing.expectEqual(@as(usize, 0), scanStructural("}abc"));
+    try testing.expectEqual(@as(usize, 0), scanStructural("[abc"));
+    try testing.expectEqual(@as(usize, 0), scanStructural("]abc"));
+    try testing.expectEqual(@as(usize, 0), scanStructural("\nabc"));
+}
+
+test "scanStructural: structural mid-vector" {
+    try testing.expectEqual(@as(usize, 10), scanStructural("0123456789{rest"));
+}
+
+test "scanStructural: structural at vector boundary" {
+    const data = "0123456789012345678901234567890a{";
+    try testing.expectEqual(@as(usize, 32), scanStructural(data));
+}
+
+test "scanStructural: empty input" {
+    try testing.expectEqual(@as(usize, 0), scanStructural(""));
+}
+
+test "scanStructural: backslash and CR are boring out-of-string" {
+    // Only the 6 structural bytes halt the scanner; \\, \r, \t, space don't.
+    try testing.expectEqual(@as(usize, 5), scanStructural(" \t\r\\x{"));
 }

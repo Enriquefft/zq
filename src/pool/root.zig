@@ -613,10 +613,13 @@ fn worker_fn(ctx: WorkerCtx) void {
             // in-place when output exceeds input size (e.g. pretty format) —
             // no leaked copies from ArrayList doubling.
             const record_count = blk: {
-                var count = countNewlines(job.data);
-                // Account for a final line without trailing newline.
-                if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
-                break :blk count;
+                if (job.raw_input) {
+                    var count = countNewlines(job.data);
+                    // Account for a final line without trailing newline.
+                    if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
+                    break :blk count;
+                }
+                break :blk parser_mod.boundary.countTopLevelValues(job.data);
             };
             state.meta_list.ensureTotalCapacity(state.aa, record_count) catch {};
             const buf_estimate: usize = switch (fmt) {
@@ -625,53 +628,124 @@ fn worker_fn(ctx: WorkerCtx) void {
             };
             state.chunk_buf.ensureTotalCapacity(state.aa, buf_estimate) catch {};
 
-            var remaining: []const u8 = job.data;
-            while (remaining.len > 0) {
-                const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-                const line = if (job.raw_input)
-                    stripTrailingCr(remaining[0..nl])
-                else
-                    std.mem.trimRight(u8, remaining[0..nl], " \t\r");
-                remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
-                if (line.len == 0 and !job.raw_input) continue;
+            const ProcessOne = struct {
+                fn call(
+                    value_bytes: []const u8,
+                    tape: types.Tape,
+                    raw: bool,
+                    s: *SerializeJobState,
+                    p_opt_it: *?query_mod.ResultIterator,
+                    p_current_query: *?*const query_mod.CompiledQuery,
+                    j: Job,
+                    ctx_alloc: std.mem.Allocator,
+                ) void {
+                    const meta_count_before = s.meta_list.items.len;
 
-                const meta_count_before = state.meta_list.items.len;
+                    process_value_serialized(
+                        value_bytes,
+                        tape,
+                        p_opt_it,
+                        p_current_query,
+                        j.query,
+                        ctx_alloc,
+                        j.color,
+                        j.opts,
+                        raw,
+                        j.external_bindings,
+                        s,
+                    );
 
-                process_line_serialized(
-                    line,
-                    &parser,
-                    &opt_it,
-                    &current_query,
-                    job.query,
-                    ctx.allocator,
-                    job.color,
-                    job.opts,
-                    job.raw_input,
-                    job.external_bindings,
-                    &state,
-                );
-
-                // Capture any VM-side user error message before the iterator
-                // is reset on the next record. Only VM errors (not parse
-                // errors) populate this; `process_line_serialized` leaves the
-                // iterator valid after such an error.  We check whether any
-                // newly-appended meta in this line is_error.
-                var saw_error = false;
-                if (state.meta_list.items.len > meta_count_before) {
-                    const last = state.meta_list.items[state.meta_list.items.len - 1];
-                    saw_error = last.is_error;
-                }
-                if (saw_error) {
-                    if (opt_it) |*it| {
-                        if (it.user_error_msg) |msg| {
-                            switch (msg) {
-                                .string => |s| {
-                                    const duped = state.aa.dupe(u8, s) catch null;
-                                    if (duped) |d| state.chunk_user_error_msg = d;
-                                },
-                                else => {},
+                    // Capture any VM-side user error message before the iterator
+                    // is reset on the next record. Only VM errors (not parse
+                    // errors) populate this; `process_value_serialized` leaves
+                    // the iterator valid after such an error.
+                    var saw_error = false;
+                    if (s.meta_list.items.len > meta_count_before) {
+                        const last = s.meta_list.items[s.meta_list.items.len - 1];
+                        saw_error = last.is_error;
+                    }
+                    if (saw_error) {
+                        if (p_opt_it.*) |*it| {
+                            if (it.user_error_msg) |msg| {
+                                switch (msg) {
+                                    .string => |str| {
+                                        const duped = s.aa.dupe(u8, str) catch null;
+                                        if (duped) |d| s.chunk_user_error_msg = d;
+                                    },
+                                    else => {},
+                                }
                             }
                         }
+                    }
+                }
+            }.call;
+
+            if (job.raw_input) {
+                // ── Raw-input: line-oriented split on \n (jq --raw-input parity) ──
+                var remaining: []const u8 = job.data;
+                while (remaining.len > 0) {
+                    const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+                    const line = stripTrailingCr(remaining[0..nl]);
+                    remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
+
+                    var raw_entry_buf: [1]types.Tape.Entry = undefined;
+                    const tape = make_raw_tape(line, &raw_entry_buf);
+                    ProcessOne(line, tape, true, &state, &opt_it, &current_query, job, ctx.allocator);
+                }
+            } else {
+                // ── JSON path: structural feed-loop, depth-aware boundary advance ──
+                var cursor: usize = 0;
+                while (cursor < job.data.len) {
+                    cursor += parser_mod.simd.skipWhitespace(job.data[cursor..]);
+                    if (cursor >= job.data.len) break;
+
+                    const value_start = cursor;
+                    const result = parser.feed(job.data[cursor..], true) catch |e| {
+                        const append_err = struct {
+                            fn call(s: *SerializeJobState, code: u16) void {
+                                const meta = RecordMeta{
+                                    .end_offset = @intCast(s.chunk_buf.items.len),
+                                    .last_was_false_or_null = false,
+                                    .is_error = true,
+                                    .error_code = code,
+                                };
+                                s.meta_list.append(s.aa, meta) catch {};
+                            }
+                        }.call;
+                        append_err(&state, @intFromError(@as(ZqError, @errorCast(e))));
+                        parser.reset();
+                        // Recover: skip to the next \n (best-effort) and continue.
+                        const skip = std.mem.indexOfScalar(u8, job.data[cursor..], '\n') orelse (job.data.len - cursor);
+                        cursor += skip;
+                        if (cursor < job.data.len) cursor += 1;
+                        continue;
+                    };
+                    switch (result) {
+                        .done => |d| {
+                            // `processEof` returns consumed=0 when the parser
+                            // walked the whole slice and finalized via EOF
+                            // (number at end-of-buffer, no terminator).
+                            // Advance to end-of-slice in that case.
+                            const advance = if (d.consumed == 0) job.data.len - value_start else d.consumed;
+                            const value_bytes = job.data[value_start .. value_start + advance];
+                            ProcessOne(value_bytes, d.tape, false, &state, &opt_it, &current_query, job, ctx.allocator);
+                            parser.reset();
+                            cursor = value_start + advance;
+                        },
+                        .need_more => {
+                            // Should not occur post-NIX-001 (chunker aligns on
+                            // depth-0 boundaries). Treat defensively as a parse
+                            // error and stop processing this chunk.
+                            const meta = RecordMeta{
+                                .end_offset = @intCast(state.chunk_buf.items.len),
+                                .last_was_false_or_null = false,
+                                .is_error = true,
+                                .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
+                            };
+                            state.meta_list.append(state.aa, meta) catch {};
+                            parser.reset();
+                            break;
+                        },
                     }
                 }
             }
@@ -693,31 +767,77 @@ fn worker_fn(ctx: WorkerCtx) void {
             const aa = arena.allocator();
             var records = std.ArrayList(RecordOutcome){};
 
-            var remaining: []const u8 = job.data;
-            while (remaining.len > 0) {
-                const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
-                const line = if (job.raw_input)
-                    stripTrailingCr(remaining[0..nl])
-                else
-                    std.mem.trimRight(u8, remaining[0..nl], " \t\r");
-                remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
-                if (line.len == 0 and !job.raw_input) continue;
+            const append_outcome = struct {
+                fn call(rs: *std.ArrayList(RecordOutcome), a: std.mem.Allocator, oc: RecordOutcome) void {
+                    rs.append(a, oc) catch {
+                        rs.append(a, .{ .err = error.IoError }) catch {};
+                    };
+                }
+            }.call;
 
-                const outcome = process_line(
-                    line,
-                    &parser,
-                    &opt_it,
-                    &current_query,
-                    job.query,
-                    ctx.allocator,
-                    aa,
-                    job.raw_input,
-                    job.external_bindings,
-                );
+            if (job.raw_input) {
+                var remaining: []const u8 = job.data;
+                while (remaining.len > 0) {
+                    const nl = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+                    const line = stripTrailingCr(remaining[0..nl]);
+                    remaining = if (nl < remaining.len) remaining[nl + 1 ..] else &.{};
 
-                records.append(aa, outcome) catch {
-                    records.append(aa, .{ .err = error.IoError }) catch {};
-                };
+                    var raw_entry_buf: [1]types.Tape.Entry = undefined;
+                    const tape = make_raw_tape(line, &raw_entry_buf);
+                    const outcome = process_value(
+                        line,
+                        tape,
+                        &opt_it,
+                        &current_query,
+                        job.query,
+                        ctx.allocator,
+                        aa,
+                        true,
+                        job.external_bindings,
+                    );
+                    append_outcome(&records, aa, outcome);
+                }
+            } else {
+                var cursor: usize = 0;
+                while (cursor < job.data.len) {
+                    cursor += parser_mod.simd.skipWhitespace(job.data[cursor..]);
+                    if (cursor >= job.data.len) break;
+
+                    const value_start = cursor;
+                    const result = parser.feed(job.data[cursor..], true) catch |e| {
+                        append_outcome(&records, aa, .{ .err = @as(ZqError, @errorCast(e)) });
+                        parser.reset();
+                        const skip = std.mem.indexOfScalar(u8, job.data[cursor..], '\n') orelse (job.data.len - cursor);
+                        cursor += skip;
+                        if (cursor < job.data.len) cursor += 1;
+                        continue;
+                    };
+                    switch (result) {
+                        .done => |d| {
+                            const advance = if (d.consumed == 0) job.data.len - value_start else d.consumed;
+                            const value_bytes = job.data[value_start .. value_start + advance];
+                            const outcome = process_value(
+                                value_bytes,
+                                d.tape,
+                                &opt_it,
+                                &current_query,
+                                job.query,
+                                ctx.allocator,
+                                aa,
+                                false,
+                                job.external_bindings,
+                            );
+                            append_outcome(&records, aa, outcome);
+                            parser.reset();
+                            cursor = value_start + advance;
+                        },
+                        .need_more => {
+                            append_outcome(&records, aa, .{ .err = error.UnexpectedEof });
+                            parser.reset();
+                            break;
+                        },
+                    }
+                }
             }
 
             const records_slice = records.toOwnedSlice(aa) catch records.items;
@@ -755,15 +875,19 @@ fn make_raw_tape(line: []const u8, entry_buf: *[1]types.Tape.Entry) types.Tape {
     };
 }
 
-/// Parse and execute the query for a single JSONL line (structured path).
+/// Execute the query for a single pre-parsed JSON value (structured path).
+///
+/// The caller drives `parser.feed` and passes the resulting `tape` plus the
+/// `value_bytes` slice that produced it (used for the literal-substring
+/// prefilter). The caller is also responsible for `parser.reset()` after
+/// this returns — the tape borrows from parser-owned buffers, so it must
+/// remain valid through `collect_record_values`.
 ///
 /// `worker_alloc` — used for the persistent ResultIterator's eval stack (GPA).
 /// `aa`           — per-chunk arena; used for all OwnedValue copies.
-///
-/// Parser is reset inside this function after values are copied into `aa`.
-fn process_line(
-    line: []const u8,
-    parser: *parser_mod.Parser,
+fn process_value(
+    value_bytes: []const u8,
+    tape: types.Tape,
     opt_it: *?query_mod.ResultIterator,
     current_query: *?*const query_mod.CompiledQuery,
     query: *const query_mod.CompiledQuery,
@@ -780,34 +904,17 @@ fn process_line(
     if (!raw_input) {
         if (query.prefilter) |pf| {
             _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);
-            if (!pf.accept(line)) {
+            if (!pf.accept(value_bytes)) {
                 _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
                 return .{ .values = &[_]OwnedValue{} };
             }
         }
     }
 
-    // ── Parse ──────────────────────────────────────────────────────────────────
-    var raw_entry_buf: [1]types.Tape.Entry = undefined;
-    const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
-        const feed_result = parser.feed(line, true) catch |e| {
-            parser.reset();
-            return .{ .err = @as(ZqError, @errorCast(e)) };
-        };
-        break :blk switch (feed_result) {
-            .done => |d| d.tape,
-            .need_more => {
-                parser.reset();
-                return .{ .err = error.UnexpectedEof };
-            },
-        };
-    };
-
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
         opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
-            if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
             return .{ .err = error.IoError };
@@ -819,12 +926,7 @@ fn process_line(
     }
 
     // ── Collect values into the chunk arena ────────────────────────────────────
-    // collect_record_values() drains the iterator and copies every Value into aa.
-    // Parser.reset() is called AFTER collection so the tape remains valid during
-    // the copy.
-    const outcome = collect_record_values(&opt_it.*.?, aa);
-    if (!raw_input) parser.reset();
-    return outcome;
+    return collect_record_values(&opt_it.*.?, aa);
 }
 
 /// Per-Job mutable state for the serialized path.  Owned by `worker_fn` and
@@ -920,7 +1022,13 @@ fn partial_flush(state: *SerializeJobState, is_final: bool) void {
     state.chunk_user_error_msg = null;
 }
 
-/// Parse and execute the query for a single JSONL line (serialized path).
+/// Execute the query for a single pre-parsed JSON value (serialized path).
+///
+/// The caller drives `parser.feed` and passes the resulting `tape` plus the
+/// `value_bytes` slice that produced it (used for the literal-substring
+/// prefilter). The caller is also responsible for `parser.reset()` after
+/// this returns — the tape borrows from parser-owned buffers and must
+/// remain valid through serialization.
 ///
 /// Instead of copying values via own_value(), serializes each value directly
 /// into the shared chunk buffer while the tape is still valid.  Appends one
@@ -931,9 +1039,9 @@ fn partial_flush(state: *SerializeJobState, is_final: bool) void {
 /// buffer size after each newline boundary and calls `partial_flush` when
 /// the threshold is crossed.  This is the unblocker for infinite generators
 /// (`repeat(.+1)`, etc.) — see bugs.md #143.
-fn process_line_serialized(
-    line: []const u8,
-    parser: *parser_mod.Parser,
+fn process_value_serialized(
+    value_bytes: []const u8,
+    tape: types.Tape,
     opt_it: *?query_mod.ResultIterator,
     current_query: *?*const query_mod.CompiledQuery,
     query: *const query_mod.CompiledQuery,
@@ -963,7 +1071,7 @@ fn process_line_serialized(
     if (!raw_input) {
         if (query.prefilter) |pf| {
             _ = prefilter_stats.counters.evaluated.fetchAdd(1, .monotonic);
-            if (!pf.accept(line)) {
+            if (!pf.accept(value_bytes)) {
                 _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
                 append_meta(state, .{
                     .end_offset = start,
@@ -976,39 +1084,10 @@ fn process_line_serialized(
         }
     }
 
-    // ── Parse ──────────────────────────────────────────────────────────────────
-    var raw_entry_buf: [1]types.Tape.Entry = undefined;
-    const tape = if (raw_input) make_raw_tape(line, &raw_entry_buf) else blk: {
-        const feed_result = parser.feed(line, true) catch |e| {
-            parser.reset();
-            append_meta(state, .{
-                .end_offset = start,
-                .last_was_false_or_null = false,
-                .is_error = true,
-                .error_code = @intFromError(@as(ZqError, @errorCast(e))),
-            });
-            return;
-        };
-        break :blk switch (feed_result) {
-            .done => |d| d.tape,
-            .need_more => {
-                parser.reset();
-                append_meta(state, .{
-                    .end_offset = start,
-                    .last_was_false_or_null = false,
-                    .is_error = true,
-                    .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
-                });
-                return;
-            },
-        };
-    };
-
     // ── Bind or rebind the ResultIterator ──────────────────────────────────────
     if (opt_it.* == null or current_query.* != query) {
         if (opt_it.*) |*it| it.deinit();
         opt_it.* = query.execute(tape, external_bindings, worker_alloc) catch {
-            if (!raw_input) parser.reset();
             opt_it.* = null;
             current_query.* = null;
             append_meta(state, .{
@@ -1033,13 +1112,11 @@ fn process_line_serialized(
         // would hang on the tight value-emit loop.  Discard any in-flight
         // chunk_buf — the consumer is gone.
         if (state.shutdown.load(.acquire)) {
-            if (!raw_input) parser.reset();
             state.chunk_buf.shrinkRetainingCapacity(start);
             return;
         }
 
         const maybe = opt_it.*.?.next() catch |e| {
-            if (!raw_input) parser.reset();
             state.chunk_buf.shrinkRetainingCapacity(start);
             append_meta(state, .{
                 .end_offset = start,
@@ -1057,7 +1134,6 @@ fn process_line_serialized(
         var sink = output_mod.BufferSink{ .list = &state.chunk_buf, .aa = state.aa };
 
         output_mod.serialize(&sink, val, state.fmt, color, opts) catch {
-            if (!raw_input) parser.reset();
             state.chunk_buf.shrinkRetainingCapacity(start);
             append_meta(state, .{
                 .end_offset = start,
@@ -1071,7 +1147,6 @@ fn process_line_serialized(
         // Append newline for pretty/compact/raw formats (not jsonl/join which handle their own).
         if (state.fmt != .jsonl and state.fmt != .join) {
             sink.writeByte('\n') catch {
-                if (!raw_input) parser.reset();
                 state.chunk_buf.shrinkRetainingCapacity(start);
                 append_meta(state, .{
                     .end_offset = start,
@@ -1115,8 +1190,6 @@ fn process_line_serialized(
             start = 0;
         }
     }
-
-    if (!raw_input) parser.reset();
 
     append_meta(state, .{
         .end_offset = @intCast(state.chunk_buf.items.len),
@@ -1213,6 +1286,26 @@ const IoCtx = struct {
 };
 
 fn io_thread_fn(ctx: IoCtx) void {
+    if (ctx.raw_input) {
+        io_thread_raw_lines(ctx);
+    } else {
+        io_thread_json_boundaries(ctx);
+    }
+
+    // No more Jobs will be pushed.  Workers may still claim additional ranges
+    // (infinite generator chaining) for in-flight Jobs, so we don't pin
+    // `total_chunks` here — the worker that finishes the LAST in-flight Job
+    // pins it (or `Pool.deinit` does, on early shutdown).  We do still need
+    // to handle the empty-input case where no Jobs are in-flight: pin total
+    // immediately so a collector blocked on `next_in_order` returns null.
+    ctx.io_done.store(true, .release);
+    ctx.queue.signal_done();
+    try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
+}
+
+/// Raw-input batcher: each input line becomes one record. Identical to the
+/// pre-NIX-001 behaviour — `\n` is the only relevant byte, no JSON state.
+fn io_thread_raw_lines(ctx: IoCtx) void {
     // partial_line: holds bytes of an incomplete line spanning RingBuffer boundaries.
     var partial_line = std.ArrayList(u8){};
     defer partial_line.deinit(ctx.allocator);
@@ -1227,13 +1320,13 @@ fn io_thread_fn(ctx: IoCtx) void {
         if (view.bytes.len == 0) {
             if (view.is_eof) {
                 // EOF: flush partial line into batch, then flush batch.
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
                 flushBatch(&batch_buf, ctx);
                 break :loop;
             }
             // No data available but not EOF (pipe stall): flush for latency.
             if (batch_buf.items.len > 0 or partial_line.items.len > 0) {
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
+                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
                 flushBatch(&batch_buf, ctx);
             }
             _ = ctx.src.refill() catch break :loop;
@@ -1270,22 +1363,94 @@ fn io_thread_fn(ctx: IoCtx) void {
         ctx.src.consume(view.bytes.len);
 
         if (view.is_eof) {
-            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, ctx.raw_input) catch break :loop;
+            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
             flushBatch(&batch_buf, ctx);
             break :loop;
         }
         _ = ctx.src.refill() catch break :loop;
     }
+}
 
-    // No more Jobs will be pushed.  Workers may still claim additional ranges
-    // (infinite generator chaining) for in-flight Jobs, so we don't pin
-    // `total_chunks` here — the worker that finishes the LAST in-flight Job
-    // pins it (or `Pool.deinit` does, on early shutdown).  We do still need
-    // to handle the empty-input case where no Jobs are in-flight: pin total
-    // immediately so a collector blocked on `next_in_order` returns null.
-    ctx.io_done.store(true, .release);
-    ctx.queue.signal_done();
-    try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
+/// JSON-input batcher: persistent boundary scanner across views. Each
+/// flushed batch contains zero or more complete top-level values separated
+/// by `\n` (synthesized when the input lacks one). Records are never split
+/// across batches — the in-flight bytes accumulate in `carry` until the
+/// scanner observes a depth-0 / outside-string `\n`. The pipe-stall flush
+/// only fires when no record is in flight (carry empty + at clean state).
+fn io_thread_json_boundaries(ctx: IoCtx) void {
+    var scanner = parser_mod.boundary.ScannerState{};
+
+    // carry: bytes inside the currently in-flight record (no boundary observed yet).
+    var carry = std.ArrayList(u8){};
+    defer carry.deinit(ctx.allocator);
+
+    // batch_buf: accumulates complete records (each `\n`-terminated) until batch_size.
+    var batch_buf = std.ArrayList(u8){};
+    defer batch_buf.deinit(ctx.allocator);
+
+    // Reused per-iteration to avoid per-feed allocations.
+    var bnds = std.ArrayList(usize){};
+    defer bnds.deinit(ctx.allocator);
+
+    loop: while (true) {
+        const view = ctx.src.peek() catch break :loop;
+
+        if (view.bytes.len == 0) {
+            if (view.is_eof) {
+                // Flush any in-flight bytes as the final record (synthetic \n).
+                if (carry.items.len > 0) {
+                    batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
+                    batch_buf.append(ctx.allocator, '\n') catch break :loop;
+                    carry.clearRetainingCapacity();
+                }
+                flushBatch(&batch_buf, ctx);
+                break :loop;
+            }
+            // Pipe stall: only flush at a clean record boundary so workers
+            // never see a chunk whose final record is truncated.
+            if (carry.items.len == 0 and scanner.depth == 0 and !scanner.in_string and batch_buf.items.len > 0) {
+                flushBatch(&batch_buf, ctx);
+            }
+            _ = ctx.src.refill() catch break :loop;
+            continue;
+        }
+
+        bnds.clearRetainingCapacity();
+        parser_mod.boundary.feedBytes(&scanner, view.bytes, 0, &bnds, ctx.allocator) catch break :loop;
+
+        var consumed_offset: usize = 0;
+        for (bnds.items) |off| {
+            // Drain carry first so the record bytes appear contiguous.
+            if (carry.items.len > 0) {
+                batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
+                carry.clearRetainingCapacity();
+            }
+            batch_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..off]) catch break :loop;
+            batch_buf.append(ctx.allocator, '\n') catch break :loop;
+            consumed_offset = off + 1;
+
+            if (batch_buf.items.len >= ctx.batch_size) {
+                flushBatch(&batch_buf, ctx);
+            }
+        }
+
+        // Remainder belongs to an in-progress record — accumulate.
+        if (consumed_offset < view.bytes.len) {
+            carry.appendSlice(ctx.allocator, view.bytes[consumed_offset..]) catch break :loop;
+        }
+        ctx.src.consume(view.bytes.len);
+
+        if (view.is_eof) {
+            if (carry.items.len > 0) {
+                batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
+                batch_buf.append(ctx.allocator, '\n') catch break :loop;
+                carry.clearRetainingCapacity();
+            }
+            flushBatch(&batch_buf, ctx);
+            break :loop;
+        }
+        _ = ctx.src.refill() catch break :loop;
+    }
 }
 
 /// Flush the accumulated batch as a single Job.  Acquires an in-flight slot
@@ -1370,20 +1535,39 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
     var chunk_start: usize = 0;
     var chunk_id: u64 = 0;
 
+    // Persistent JSON-structural scanner state walks the file once
+    // sequentially. Each chunk_end is a depth-0/outside-string newline,
+    // so multi-line pretty-printed values are never split across workers.
+    // Scanner only reads — workers still MADV_DONTNEED their chunks on
+    // post(), preserving the bounded-RSS invariant.
+    var scanner = parser_mod.boundary.ScannerState{};
+    var scan_cursor: usize = 0;
+
     for (0..ctx.n_chunks) |i| {
-        const ideal_end = if (i + 1 == ctx.n_chunks)
+        // Once a previous chunk has consumed past EOF (record boundary
+        // landed at file_size for a no-trailing-newline final value), no
+        // remaining chunks are reachable.
+        if (chunk_start >= file_size) break;
+
+        const ideal_end_raw = if (i + 1 == ctx.n_chunks)
             file_size
         else
             (i + 1) * file_size / ctx.n_chunks;
+        // A previous chunk's `findNextRecordEnd` can advance past the next
+        // ideal split. Clamp so each chunk strictly follows the prior one.
+        const ideal_end = @max(ideal_end_raw, chunk_start);
 
-        // Align to newline so no record is split across chunks.
+        // Catch scanner up to ideal_end without recording boundaries.
+        if (ideal_end > scan_cursor) {
+            parser_mod.boundary.advanceState(&scanner, data[scan_cursor..ideal_end]);
+            scan_cursor = ideal_end;
+        }
+
         const chunk_end: usize = if (ideal_end >= file_size)
             file_size
-        else blk: {
-            var pos = ideal_end;
-            while (pos < file_size and data[pos] != '\n') pos += 1;
-            break :blk if (pos < file_size) pos + 1 else file_size;
-        };
+        else
+            parser_mod.boundary.findNextRecordEnd(&scanner, data, ideal_end, file_size);
+        scan_cursor = chunk_end;
 
         const chunk = data[chunk_start..chunk_end];
         chunk_start = chunk_end;
