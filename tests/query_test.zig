@@ -3293,6 +3293,61 @@ test "NIX-004: gsub() literal-string replacement still works (non-regression)" {
     try std.testing.expectEqualStrings("bXnXnX", vals.items[0].string);
 }
 
+// ── NIX-005: chained gsub UAF when input aliases runtime_tape.string_buf ────
+//
+// When `gsub(A) | gsub(B)` runs, the first gsub's output is interned into
+// runtime_tape.string_buf and yielded as a `[]const u8` slice into that
+// buffer. The second gsub captures the slice once (as `input`) and reuses
+// it across the per-match loop. Each per-match `internString` of capture
+// bytes can ensureUnusedCapacity-grow string_buf, reallocating the backing
+// to a different address. After the realloc, the cached `input` is a
+// dangling pointer; the next `iterNext(input,...)` reads freed memory.
+//
+// Repro: pinned to nixpkgs nix-manual mdbook anchors.jq (a chain of two
+// gsubs feeding a recursive map). The first gsub matches zero times so the
+// early-return at builtinSubImpl interns input fresh into runtime_tape;
+// the second gsub then runs on that aliased input and crashes around
+// n≈1000 matches in the user's Nix repro. We use 2000 matches here to
+// give the test allocator's realloc-on-grow path plenty of opportunities.
+
+test "NIX-005: chained gsub on runtime_tape-aliased input does not UAF" {
+    if (!regex.enabled) return error.SkipZigTest;
+
+    const N: usize = 2000;
+    var hay = std.ArrayList(u8){};
+    defer hay.deinit(alloc);
+    var expected = std.ArrayList(u8){};
+    defer expected.deinit(alloc);
+    for (0..N) |i| {
+        const a = try std.fmt.allocPrint(alloc, "[item{d}]{{#anchor{d}}} ", .{ i, i });
+        defer alloc.free(a);
+        try hay.appendSlice(alloc, a);
+        const b = try std.fmt.allocPrint(
+            alloc,
+            "<a href=\"#anchor{d}\" id=\"anchor{d}\">item{d}</a> ",
+            .{ i, i, i },
+        );
+        defer alloc.free(b);
+        try expected.appendSlice(alloc, b);
+    }
+
+    // First gsub: regex never matches → zero-match early-return interns
+    // `hay` into runtime_tape.string_buf and yields a slice into it. That
+    // slice is the second gsub's `it.current.string` → the aliasing setup.
+    // Second gsub: the anchor regex with named captures + a per-match
+    // replacement filter that builds output via string concat (each `+`
+    // calls internStringConcat → grows string_buf).
+    const filter =
+        "gsub(\"NEVERMATCH(?<x>X)\"; \"X\")" ++
+        " | gsub(\"\\\\[(?<text>[^\\\\]]+?)\\\\]\\\\{#(?<anchor>[^\\\\}]+?)\\\\}\";" ++
+        " \"<a href=\\\"#\" + .anchor + \"\\\" id=\\\"\" + .anchor + \"\\\">\" + .text + \"</a>\")";
+
+    var vals = try runFilterStr(filter, hay.items);
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqualStrings(expected.items, vals.items[0].string);
+}
+
 test "regex runtime: optional unmatched group sentinel in match" {
     if (!regex.enabled) return error.SkipZigTest;
     // match result.captures[0].offset == -1 when group didn't match.

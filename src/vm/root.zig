@@ -10491,9 +10491,32 @@ pub const ResultIterator = struct {
         // Dynamic pattern: pop pat from value_stack and compile/cache.
         // Literal pattern: pool supplies regex.
         const clone = try it.resolveRegexForOperand(operand);
-        const input = switch (it.current) {
+        const input_raw = switch (it.current) {
             .string => |s| s,
             else => return error.TypeError,
+        };
+        // NIX-005: `input_raw` may alias `runtime_tape.string_buf` (e.g.
+        // when the prior filter was itself a `gsub` whose result lives
+        // there). The per-match path grows `string_buf` repeatedly:
+        //   - `buildCaptureObject` interns each named-group name and the
+        //     match bytes (re-grows mid-call, between `internString(name)`
+        //     and the `hay[start..end]` slice for that group).
+        //   - `runReplacementBody` runs the user's replacement filter,
+        //     whose `+`/concat operators each call `internStringConcat`.
+        // Any of these reallocations dangles a slice into the old
+        // backing. Stabilize by duping into the per-record scratch arena
+        // when (and only when) the input aliases runtime_tape; otherwise
+        // the slice is already stable (parsed tape, scratch, etc.) and
+        // we keep the zero-copy path.
+        const input = blk: {
+            const buf = it.runtime_tape.string_buf.items;
+            if (buf.len == 0) break :blk input_raw;
+            const sp = @intFromPtr(input_raw.ptr);
+            const bp = @intFromPtr(buf.ptr);
+            if (sp >= bp and sp + input_raw.len <= bp + buf.len) {
+                break :blk try it.scratch.allocator().dupe(u8, input_raw);
+            }
+            break :blk input_raw;
         };
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
