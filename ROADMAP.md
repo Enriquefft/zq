@@ -28,16 +28,16 @@ Deliberate deviations from jq semantics are documented and justified.
 
 ---
 
-## Quick Status (Updated 2026-05-05)
+## Quick Status (Updated 2026-05-07)
 
-**Last updated:** wave-cleanup-hygiene merged: repeat per-iteration call_stack snapshot + dead-arm cleanup (Commit 1), 4 hand-written compat tests for repeat coverage (Commit 2), setpath errors routed through TypeErrorKind SSOT (Commit 3). Prior waves through Phase 2R AST-walk pipeline (e4ef917, ee3d62f) and wave5-cli-flags-12 (--unbuffered, --slurpfile, --rawfile, ExternalVarKind) remain in place.
+**Last updated:** B1–B6 correctness wave + NIX-001/003 fixes merged: load_path/load_computed push semantics, big_number negate/length, streaming-frame yields, per-frame slot snapshots, recursive 1+arity self-calls (preEmit recursive bodies), path-assign `.set` RHS-mutates-current + IR child-arity predicate guard, fork_try emit-before-body. Prior waves through Phase 2R AST-walk pipeline and wave5-cli-flags-12 remain in place.
 
 ```
 Binary size:        2.7 MB (ReleaseFast, stripped)
 Compat tests:       581/589 passing (98.6%)   <- jq compat suite (533 L-tests + 56 hand-written)
   +-- 4 failing (decnum), 4 skipped (regex-runtime gated)
 Top-20 agent patterns: 20/20 (100%)            <- usage-weighted compat
-Total:              1173/1201 passing (97.7%)  <- including own + compat + cli + lsp + fuzz harnesses
+Total:              1220/1252 passing (97.4%)  <- including own + compat + cli + lsp + fuzz harnesses
 Startup:            ~2.4 ms (1.5x faster than jq)
 Cold start:         sub-3ms
 
