@@ -285,3 +285,37 @@ test "--unbuffered: short flag rejected (no -u alias yet)" {
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), r.exit_code);
 }
+
+// ── D1 SSOT pin: predicate ↔ VM-handler coupling for path-assign RHS ────────
+//
+// `subtreeRebindsCurrent` (src/compiler/emit.zig) whitelists IR ops whose VM
+// handlers provably push their result and leave it.current untouched, letting
+// path-assign emit the no-wrap fast path. The whitelist mirrors VM-handler
+// semantics with no compile-time coupling, so a future handler change that
+// re-introduces it.current rebinding for any of these ops would silently
+// break fast-path codegen with no failing test elsewhere. These three pin
+// the load_path / load_index / load_variable arms of the invariant.
+
+test "D1 pin: .foo = .bar.baz (load_path RHS) preserves outer object" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".foo = .bar.baz" }, "{\"bar\":{\"baz\":42}}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"bar\":{\"baz\":42},\"foo\":42}\n", r.stdout);
+}
+
+test "D1 pin: .[5] = .[0] (load_index RHS) preserves outer array" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".[5] = .[0]" }, "[10,20,30,40,50,60]");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("[10,20,30,40,50,10]\n", r.stdout);
+}
+
+test "D1 pin: .foo = $X (load_variable RHS) preserves outer object" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", "--arg", "X", "99", ".foo = $X" }, "{}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"foo\":\"99\"}\n", r.stdout);
+}
