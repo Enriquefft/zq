@@ -2562,7 +2562,7 @@ test "slice: string slice extracts byte range" {
     var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
-    try std.testing.expect(v == .string.slice());
+    try std.testing.expect(v == .string);
     try std.testing.expectEqualStrings("ell", v.string.slice());
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
@@ -3310,7 +3310,7 @@ test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
     defer vals.deinit();
     // regex-automata matches empty at every position → Xs interleaved.
     // Just assert it terminates and produces a string.
-    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string.slice()), std.meta.activeTag(vals.items[0]));
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals.items[0]));
 }
 
 // ── NIX-004: gsub/sub replacement is a per-match filter with `.` = captures ─
@@ -3348,7 +3348,7 @@ test "NIX-004: gsub() replacement filter — multi named capture (anchor + text)
     defer vals.deinit();
     try std.testing.expectEqualStrings(
         "see <a href=\"#sec-1\" id=\"sec-1\">intro</a> now",
-        vals.items[0].string,
+        vals.items[0].string.slice(),
     );
 }
 
@@ -3475,7 +3475,7 @@ test "NIX-005: sub on runtime_tape-aliased input does not UAF" {
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
     // Output must start with the substituted prefix and continue with
     // the verbatim tail. Any UAF-corruption shows as 0xAA bytes.
-    const out = vals.items[0].string;
+    const out = vals.items[0].string.slice();
     try std.testing.expect(std.mem.startsWith(u8, out, "<first:head> tail0 "));
     try std.testing.expect(std.mem.endsWith(u8, out, "tail1999 "));
 }
@@ -4036,7 +4036,7 @@ fn dumpCompact(buf: *std.ArrayList(u8), val: Value) !void {
         .big_number => |bn| try buf.appendSlice(alloc, bn),
         .string => |s| {
             try buf.append(alloc, '"');
-            try buf.appendSlice(alloc, s);
+            try buf.appendSlice(alloc, s.slice());
             try buf.append(alloc, '"');
         },
         .array => |span| {
@@ -4054,7 +4054,7 @@ fn dumpCompact(buf: *std.ArrayList(u8), val: Value) !void {
                     .false_val => .{ .bool_val = false },
                     .int => .{ .int = entry.payload.int },
                     .float => .{ .float = entry.payload.float },
-                    .string => .{ .string = span.tape.getString(entry.payload.string) },
+                    .string => .{ .string = .{ .tape_ref = .{ .tape = span.tape, .ref = entry.payload.string } } },
                     .array_start => .{ .array = .{ .tape = span.tape, .start = pos, .end = entry.payload.skip } },
                     .object_start => .{ .object = .{ .tape = span.tape, .start = pos, .end = entry.payload.skip } },
                     else => unreachable,
@@ -4094,7 +4094,7 @@ test "path(f): path(. + \"x\") on string raises UserError" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result \"ax\"",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4111,7 +4111,7 @@ test "path(f): path(.foo + \"x\") on empty object raises UserError" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result \"x\"",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4141,7 +4141,7 @@ test "path(f): path(.a, 1) on {a:1} yields [\"a\"] then errors on `1`" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result 1",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4158,7 +4158,7 @@ test "path(f): del(.foo + \"x\") on empty object raises UserError" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result \"x\"",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4175,7 +4175,7 @@ test "path(f): del(1) raises UserError" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result 1",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4196,7 +4196,7 @@ test "path(f): del(.a, 1) on {a:1} errors (whole del aborts)" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result 1",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4278,7 +4278,7 @@ test "path(f): path(path(.a)) errors (nested path)" {
     try std.testing.expectError(error.UserError, it.next());
     try std.testing.expectEqualStrings(
         "Invalid path expression with result [\"a\"]",
-        it.user_error_msg.?.string,
+        it.user_error_msg.?.string.slice(),
     );
 }
 
@@ -4856,7 +4856,7 @@ test "NIX-003: [range(20) | \"x\"*50] | add yields 1000 'x' bytes (no 0xAA poiso
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    const out = vals.items[0].string;
+    const out = vals.items[0].string.slice();
     try std.testing.expectEqual(@as(usize, 1000), out.len);
 
     var expected: [1000]u8 = undefined;
@@ -4878,7 +4878,7 @@ test "NIX-003: (\"x\"*4000) | . + . yields 8000 'x' bytes (both operands alias s
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    const out = vals.items[0].string;
+    const out = vals.items[0].string.slice();
     try std.testing.expectEqual(@as(usize, 8000), out.len);
 
     var expected: [8000]u8 = undefined;
@@ -4900,7 +4900,7 @@ test "NIX-003: (\"x\"*4000) * 2 yields 8000 'x' bytes (repeat source aliases str
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    const out = vals.items[0].string;
+    const out = vals.items[0].string.slice();
     try std.testing.expectEqual(@as(usize, 8000), out.len);
 
     var expected: [8000]u8 = undefined;
@@ -4922,7 +4922,7 @@ test "NIX-003: (\"x\"*50) * 200 yields 10000 'x' bytes (chained reallocs in repe
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    const out = vals.items[0].string;
+    const out = vals.items[0].string.slice();
     try std.testing.expectEqual(@as(usize, 10000), out.len);
 
     var expected: [10000]u8 = undefined;

@@ -123,7 +123,7 @@ fn entryToValue(tape: *const types.Tape, idx: u32, entry: types.Tape.Entry) Valu
         .false_val => .{ .bool_val = false },
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
-        .string => .{ .string = tape.getString(entry.payload.string) },
+        .string => .{ .string = .{ .tape_ref = .{ .tape = tape, .ref = entry.payload.string } } },
         .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{
             .tape = tape,
