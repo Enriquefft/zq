@@ -81,7 +81,8 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            zig
+            # Match the package's pinned zig (see nativeBuildInputs below).
+            zig_0_15
             zls
             hyperfine
             jq
@@ -107,7 +108,12 @@
           # on-demand when a Zig target links `-lunwind`; no external libunwind
           # is needed. Verified via empty `nm -D unwind` + a closure containing
           # only glibc/libgcc/libunistring/libidn2/zq.
-          nativeBuildInputs = [ pkgs.zig ];
+          #
+          # Pin zig 0.15: zig 0.16 (now `pkgs.zig` on nixpkgs-unstable) removed
+          # `std.heap.GeneralPurposeAllocator` (used in src/main.zig:135,
+          # src/compiler/bench.zig:61, src/microbench/main.zig:474). Bump to
+          # `pkgs.zig` once the 0.16 std API migration lands.
+          nativeBuildInputs = [ pkgs.zig_0_15 ];
 
           buildPhase = ''
             runHook preBuild
