@@ -69,8 +69,8 @@ pub const Value = union(enum) {
     bool_val: bool,
     int: i64,
     float: f64,
-    /// Slice into the Tape's string_buf.
-    string: []const u8,
+    /// Tape-relative or external view into a string. See `StringView`.
+    string: StringView,
     /// Out-of-range numeric literal (overflow or underflow for f64).
     /// Stores the normalized canonical form, e.g. "9E+999999999".
     /// Backed by the VM's compiled string_buf; never owned by Value.
@@ -87,6 +87,49 @@ pub const Value = union(enum) {
         start: u32,
         /// One-past-end index (entry after *_end).
         end: u32,
+    };
+
+    /// View into a string. Two-mode polymorphism mirroring `TapeSpan` for
+    /// objects/arrays:
+    ///   - `external` — a slice that is stable for the Value's lifetime. Used
+    ///     for static literals and for slices into a `Tape.string_buf` that
+    ///     is read-only for the Value's lifetime (e.g. the parser-produced
+    ///     tape consumed by an iterator — the parser does not mutate it
+    ///     after `feed()` returns).
+    ///   - `tape_ref` — a reference resolved against `tape.string_buf` at
+    ///     every read. Used for strings that live in a `RuntimeTape`'s
+    ///     `string_buf` whose backing may relocate as the buffer grows.
+    ///     `string_buf` is append-only within an iterator's lifetime, so
+    ///     `(offset, len)` is permanently valid even across reallocations —
+    ///     no generation counter is needed. NIX-006: storing the slice
+    ///     directly was a UAF whenever a later op grew `string_buf`.
+    pub const StringView = union(enum) {
+        external: []const u8,
+        tape_ref: TapeRef,
+
+        pub const TapeRef = struct {
+            tape: *const Tape,
+            ref: Tape.StringRef,
+        };
+
+        /// Resolve to the current backing slice. Cheap (one pointer chase
+        /// + slice arithmetic for the tape arm; identity for external).
+        /// Bind to a local at the top of any hot loop — the tape pointer
+        /// does not move within a single VM op.
+        pub fn slice(self: StringView) []const u8 {
+            return switch (self) {
+                .external => |s| s,
+                .tape_ref => |t| t.tape.string_buf[t.ref.offset..][0..t.ref.len],
+            };
+        }
+
+        pub fn fromExternal(s: []const u8) StringView {
+            return .{ .external = s };
+        }
+
+        pub fn fromTape(tape: *const Tape, ref: Tape.StringRef) StringView {
+            return .{ .tape_ref = .{ .tape = tape, .ref = ref } };
+        }
     };
 };
 
@@ -127,31 +170,6 @@ pub const RuntimeTape = struct {
     pub fn deinit(self: *RuntimeTape, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
         self.string_buf.deinit(allocator);
-    }
-
-    /// Return `s` if it is already stable against `string_buf` mutations
-    /// (i.e. lives outside `string_buf`), otherwise dupe it into
-    /// `dupe_alloc`. Use when `s` will be read after subsequent
-    /// `internString*` calls — those may relocate `string_buf` and
-    /// dangle any caller-held slice into it. Lifetime of the returned
-    /// slice equals `dupe_alloc`'s; the caller chooses an arena/region
-    /// long enough to cover all subsequent reads. Single SSOT for the
-    /// "stabilize a possibly-aliased string against runtime_tape mutation"
-    /// pattern (NIX-005). Mirrors `SliceSnap`'s alias detection but
-    /// resolves eagerly with a copy instead of lazily on each read.
-    pub fn stabilizeAgainstStringBuf(
-        self: *const RuntimeTape,
-        dupe_alloc: std.mem.Allocator,
-        s: []const u8,
-    ) error{OutOfMemory}![]const u8 {
-        const buf = self.string_buf.items;
-        if (buf.len == 0) return s;
-        const sp = @intFromPtr(s.ptr);
-        const bp = @intFromPtr(buf.ptr);
-        if (sp >= bp and sp + s.len <= bp + buf.len) {
-            return try dupe_alloc.dupe(u8, s);
-        }
-        return s;
     }
 
     /// Snapshot of a `[]const u8` that may alias `string_buf`. Captured

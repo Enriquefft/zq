@@ -109,10 +109,10 @@ fn serializeValueCompact(ctx: anytype, val: Value, color: ?*const Color, opts: S
             try ctx.writeSlice(bn);
             if (color) |c| try ctx.writeSlice(c.reset);
         },
-        .string => |s| {
+        .string => |sv| {
             if (color) |c| try ctx.writeSlice(c.string_color);
             try ctx.writeByte('"');
-            try serializeEscaped(ctx, s);
+            try serializeEscaped(ctx, sv.slice());
             try ctx.writeByte('"');
             if (color) |c| try ctx.writeSlice(c.reset);
         },
@@ -338,7 +338,7 @@ fn serializeObjectUnsorted(ctx: anytype, tape: *const types.Tape, span: Value.Ta
 
 fn serializeValueRaw(ctx: anytype, val: Value, opts: SerializeOpts) anyerror!void {
     switch (val) {
-        .string => |s| try ctx.writeSlice(s),
+        .string => |sv| try ctx.writeSlice(sv.slice()),
         else => try serializeValueCompact(ctx, val, null, opts),
     }
 }
@@ -483,7 +483,7 @@ fn entryToValue(tape: *const types.Tape, idx: u32, entry: types.Tape.Entry) Valu
         .false_val => .{ .bool_val = false },
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
-        .string => .{ .string = tape.getString(entry.payload.string) },
+        .string => .{ .string = .{ .tape_ref = .{ .tape = tape, .ref = entry.payload.string } } },
         .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{
             .tape = tape,

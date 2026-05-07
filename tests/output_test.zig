@@ -166,61 +166,61 @@ test "compact: float nan renders as null" {
 }
 
 test "compact: empty string" {
-    const s = try renderValue(.{ .string = "" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\"", s);
 }
 
 test "compact: simple string" {
-    const s = try renderValue(.{ .string = "hello" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "hello" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"hello\"", s);
 }
 
 test "compact: string with double quote" {
-    const s = try renderValue(.{ .string = "say \"hi\"" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "say \"hi\"" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"say \\\"hi\\\"\"", s);
 }
 
 test "compact: string with backslash" {
-    const s = try renderValue(.{ .string = "a\\b" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\\b" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\\\b\"", s);
 }
 
 test "compact: string with newline" {
-    const s = try renderValue(.{ .string = "line1\nline2" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "line1\nline2" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"line1\\nline2\"", s);
 }
 
 test "compact: string with tab" {
-    const s = try renderValue(.{ .string = "a\tb" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\tb" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\tb\"", s);
 }
 
 test "compact: string with carriage return" {
-    const s = try renderValue(.{ .string = "a\rb" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "a\rb" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"a\\rb\"", s);
 }
 
 test "compact: string with control character (0x01)" {
-    const s = try renderValue(.{ .string = "\x01" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x01" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\u0001\"", s);
 }
 
 test "compact: string with backspace (0x08)" {
-    const s = try renderValue(.{ .string = "\x08" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x08" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\b\"", s);
 }
 
 test "compact: string with form feed (0x0C)" {
-    const s = try renderValue(.{ .string = "\x0C" }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = "\x0C" } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\f\"", s);
 }
@@ -373,7 +373,7 @@ test "pretty: integer scalar" {
 }
 
 test "pretty: string scalar" {
-    const s = try renderValue(.{ .string = "hi" }, .pretty);
+    const s = try renderValue(.{ .string = .{ .external = "hi" } }, .pretty);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"hi\"", s);
 }
@@ -453,13 +453,13 @@ test "pretty: nested object indents correctly" {
 // ── Raw format ────────────────────────────────────────────────────────────────
 
 test "raw: string omits quotes" {
-    const s = try renderValue(.{ .string = "hello world" }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "hello world" } }, .raw);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("hello world", s);
 }
 
 test "raw: empty string produces empty output" {
-    const s = try renderValue(.{ .string = "" }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "" } }, .raw);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("", s);
 }
@@ -483,7 +483,7 @@ test "raw: bool renders as compact JSON" {
 }
 
 test "raw: string with newline is emitted literally (no escape)" {
-    const s = try renderValue(.{ .string = "a\nb" }, .raw);
+    const s = try renderValue(.{ .string = .{ .external = "a\nb" } }, .raw);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("a\nb", s);
 }
@@ -503,7 +503,7 @@ test "jsonl: integer ends with newline" {
 }
 
 test "jsonl: string ends with newline (quoted)" {
-    const s = try renderValue(.{ .string = "x" }, .jsonl);
+    const s = try renderValue(.{ .string = .{ .external = "x" } }, .jsonl);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"x\"\n", s);
 }
@@ -590,7 +590,7 @@ test "flush: flushing empty buffer is a no-op" {
 test "compact: all JSON-required escapes appear correctly" {
     // Build a string containing every character that must be escaped.
     const input = "\"\\\n\r\t\x08\x0C";
-    const s = try renderValue(.{ .string = input }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = input } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\\\"\\\\\\n\\r\\t\\b\\f\"", s);
 }
@@ -598,7 +598,7 @@ test "compact: all JSON-required escapes appear correctly" {
 test "compact: high-ASCII (>= 0x80) is emitted verbatim (UTF-8 passthrough)" {
     // UTF-8 bytes above 0x7F are not escaped by the JSON spec; we pass them through.
     const input = "\xC3\xA9"; // U+00E9 'é' in UTF-8
-    const s = try renderValue(.{ .string = input }, .compact);
+    const s = try renderValue(.{ .string = .{ .external = input } }, .compact);
     defer alloc.free(s);
     try std.testing.expectEqualStrings("\"\xC3\xA9\"", s);
 }

@@ -57,8 +57,8 @@ test "Value: int and float" {
 
 test "Value: string holds slice" {
     const s = "hello";
-    const v = Value{ .string = s };
-    try std.testing.expectEqualStrings("hello", v.string);
+    const v = Value{ .string = .{ .external = s } };
+    try std.testing.expectEqualStrings("hello", v.string.slice());
 }
 
 // ─── Instruction ─────────────────────────────────────────────────────────────

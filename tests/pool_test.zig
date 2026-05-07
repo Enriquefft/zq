@@ -52,9 +52,9 @@ fn drain(p: *Pool) ![]types.Value {
         // Values whose tag is .string point into pool-managed memory that is
         // only valid until the next collect(); we copy strings here.
         switch (r.value) {
-            .string => |s| {
-                const copy = try alloc.dupe(u8, s);
-                try out.append(alloc, .{ .string = copy });
+            .string => |sv| {
+                const copy = try alloc.dupe(u8, sv.slice());
+                try out.append(alloc, .{ .string = .{ .external = copy } });
             },
             else => try out.append(alloc, r.value),
         }
@@ -80,7 +80,7 @@ fn drain_bytes(p: *Pool) !struct { data: []u8, last_was_false_or_null: bool } {
 
 fn free_values(values: []types.Value) void {
     for (values) |v| {
-        if (v == .string) alloc.free(v.string);
+        if (v == .string) alloc.free(v.string.slice());
     }
     alloc.free(values);
 }
@@ -248,8 +248,8 @@ test "submit_file: string value round-trip" {
     defer free_values(vals);
 
     try std.testing.expectEqual(@as(usize, 2), vals.len);
-    try std.testing.expectEqualStrings("alice", vals[0].string);
-    try std.testing.expectEqualStrings("bob", vals[1].string);
+    try std.testing.expectEqualStrings("alice", vals[0].string.slice());
+    try std.testing.expectEqualStrings("bob", vals[1].string.slice());
 }
 
 // ── File mode: ordering under parallelism (structured path) ───────────────────

@@ -33,7 +33,7 @@ pub fn entryToValue(tape: *const Tape, idx: u32) Value {
         .false_val => .{ .bool_val = false },
         .int => .{ .int = entry.payload.int },
         .float => .{ .float = entry.payload.float },
-        .string => .{ .string = tape.getString(entry.payload.string) },
+        .string => .{ .string = .{ .tape_ref = .{ .tape = tape, .ref = entry.payload.string } } },
         .big_number => .{ .big_number = tape.getString(entry.payload.string) },
         .array_start => .{ .array = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
         .object_start => .{ .object = .{ .tape = tape, .start = idx, .end = entry.payload.skip } },
@@ -65,9 +65,9 @@ pub fn serializeValue(buf: *std.ArrayList(u8), val: Value) error{OutOfMemory}!vo
             try buf.appendSlice(alloc, formatted.slice());
         },
         .big_number => |bn| try buf.appendSlice(alloc, bn),
-        .string => |s| {
+        .string => |sv| {
             try buf.append(alloc, '"');
-            try writeEscaped(buf, s);
+            try writeEscaped(buf, sv.slice());
             try buf.append(alloc, '"');
         },
         .array => |span| {
@@ -214,7 +214,7 @@ fn valuesEqual(a: Value, b: Value) bool {
             else => false,
         },
         .string => |sa| return switch (b) {
-            .string => |sb| std.mem.eql(u8, sa, sb),
+            .string => |sb| std.mem.eql(u8, sa.slice(), sb.slice()),
             else => false,
         },
         .array => |spa| {

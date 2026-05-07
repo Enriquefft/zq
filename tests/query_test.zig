@@ -88,11 +88,10 @@ fn materializeValue(v: Value, owned: *types.RuntimeTape, allocator: std.mem.Allo
             const ref = try owned.internString(allocator, bn);
             break :blk .{ .big_number = owned.view.string_buf[ref.offset..][0..ref.len] };
         },
-        .string => |s| blk: {
-            const ref = try owned.internString(allocator, s);
-            // Resolve against the *owned* view so the returned slice points
-            // into `owned.string_buf` — stable for the lifetime of OwnedValues.
-            break :blk .{ .string = owned.view.string_buf[ref.offset..][0..ref.len] };
+        .string => |sv| blk: {
+            const ref = try owned.internString(allocator, sv.slice());
+            // Resolve against the *owned* view so subsequent reads are stable.
+            break :blk .{ .string = .{ .tape_ref = .{ .tape = &owned.view, .ref = ref } } };
         },
         .array, .object => |span| blk: {
             const base: u32 = @intCast(owned.entries.items.len);
@@ -479,8 +478,8 @@ test ".[] | .name: yields name field from each element" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), vals.items.len);
-    try std.testing.expectEqualStrings("a", vals.items[0].string);
-    try std.testing.expectEqualStrings("b", vals.items[1].string);
+    try std.testing.expectEqualStrings("a", vals.items[0].string.slice());
+    try std.testing.expectEqualStrings("b", vals.items[1].string.slice());
 }
 
 // ── Nested iterate ────────────────────────────────────────────────────────────
@@ -1680,7 +1679,7 @@ test ".['key']: string literal bracket access returns field value" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("alice", vals.items[0].string);
+    try std.testing.expectEqualStrings("alice", vals.items[0].string.slice());
 }
 
 test ".['key'] equivalent to .key" {
@@ -1724,7 +1723,7 @@ test ".[.key_field]: computed string key from field value" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("Bob", vals.items[0].string);
+    try std.testing.expectEqualStrings("Bob", vals.items[0].string.slice());
 }
 
 test ".[.idx]: computed integer index from field value" {
@@ -1890,7 +1889,7 @@ test "alternative: .foo // literal when key is null" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("default", vals.items[0].string);
+    try std.testing.expectEqualStrings("default", vals.items[0].string.slice());
 }
 
 test "alternative: .foo // literal when key is present and truthy" {
@@ -2108,7 +2107,7 @@ test "try-catch: catch receives error name string" {
     defer it.deinit();
 
     const val = (try it.next()) orelse return error.ExpectedValue;
-    try std.testing.expectEqualStrings("Cannot index number with string (\"foo\")", val.string);
+    try std.testing.expectEqualStrings("Cannot index number with string (\"foo\")", val.string.slice());
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
 
@@ -2188,7 +2187,7 @@ test "try: nested - inner catch fires, outer not needed" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("inner", vals.items[0].string);
+    try std.testing.expectEqualStrings("inner", vals.items[0].string.slice());
 }
 
 test "try: division by zero - yields nothing" {
@@ -2215,7 +2214,7 @@ test "try-catch: modulo by zero uses catch" {
     defer vals.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("div0", vals.items[0].string);
+    try std.testing.expectEqualStrings("div0", vals.items[0].string.slice());
 }
 
 // ── Optional operator (?) ─────────────────────────────────────────────────────
@@ -2563,8 +2562,8 @@ test "slice: string slice extracts byte range" {
     var it = try q.execute(t, &.{}, alloc);
     defer it.deinit();
     const v = (try it.next()).?;
-    try std.testing.expect(v == .string);
-    try std.testing.expectEqualStrings("ell", v.string);
+    try std.testing.expect(v == .string.slice());
+    try std.testing.expectEqualStrings("ell", v.string.slice());
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
 
@@ -3282,7 +3281,7 @@ test "regex runtime: capture() named groups" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("capture(\"(?<a>\\\\d+)-(?<b>\\\\d+)\") | .a + \"|\" + .b", "12-34");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("12|34", vals.items[0].string);
+    try std.testing.expectEqualStrings("12|34", vals.items[0].string.slice());
 }
 
 // NIX-004: rewritten from `\1` backref form (zq-only ext) to jq-parity
@@ -3293,7 +3292,7 @@ test "regex runtime: sub() with named-capture filter" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("sub(\"(?<x>\\\\w+)\"; \"<\" + .x + \">\")", "foo bar");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("<foo> bar", vals.items[0].string);
+    try std.testing.expectEqualStrings("<foo> bar", vals.items[0].string.slice());
 }
 
 // NIX-004: rewritten from `\1` backref form (zq-only ext) to jq-parity
@@ -3302,7 +3301,7 @@ test "regex runtime: gsub() with named-capture filter" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("gsub(\"(?<x>\\\\w+)\"; \"<\" + .x + \">\")", "foo bar");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("<foo> <bar>", vals.items[0].string);
+    try std.testing.expectEqualStrings("<foo> <bar>", vals.items[0].string.slice());
 }
 
 test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
@@ -3311,7 +3310,7 @@ test "regex runtime: gsub() empty pattern short-circuits (no infinite loop)" {
     defer vals.deinit();
     // regex-automata matches empty at every position → Xs interleaved.
     // Just assert it terminates and produces a string.
-    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string), std.meta.activeTag(vals.items[0]));
+    try std.testing.expectEqual(@as(std.meta.Tag(Value), .string.slice()), std.meta.activeTag(vals.items[0]));
 }
 
 // ── NIX-004: gsub/sub replacement is a per-match filter with `.` = captures ─
@@ -3336,7 +3335,7 @@ test "NIX-004: gsub() replacement is a filter — `.` = captures (single named g
         "[]{#foo}",
     );
     defer vals.deinit();
-    try std.testing.expectEqualStrings("<a id=\"foo\"></a>", vals.items[0].string);
+    try std.testing.expectEqualStrings("<a id=\"foo\"></a>", vals.items[0].string.slice());
 }
 
 test "NIX-004: gsub() replacement filter — multi named capture (anchor + text)" {
@@ -3361,7 +3360,7 @@ test "NIX-004: gsub() replacement filter — applied to every match (per-match r
         "hello world hello",
     );
     defer vals.deinit();
-    try std.testing.expectEqualStrings("hello! world hello!", vals.items[0].string);
+    try std.testing.expectEqualStrings("hello! world hello!", vals.items[0].string.slice());
 }
 
 test "NIX-004: sub() replacement is a filter — `.` = captures" {
@@ -3371,7 +3370,7 @@ test "NIX-004: sub() replacement is a filter — `.` = captures" {
         "abc",
     );
     defer vals.deinit();
-    try std.testing.expectEqualStrings("a[b]c", vals.items[0].string);
+    try std.testing.expectEqualStrings("a[b]c", vals.items[0].string.slice());
 }
 
 test "NIX-004: gsub() literal-string replacement still works (non-regression)" {
@@ -3380,7 +3379,7 @@ test "NIX-004: gsub() literal-string replacement still works (non-regression)" {
     // continue to behave exactly like before — applied to every match.
     var vals = try runFilterStr("gsub(\"a\"; \"X\")", "banana");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("bXnXnX", vals.items[0].string);
+    try std.testing.expectEqualStrings("bXnXnX", vals.items[0].string.slice());
 }
 
 // ── NIX-005: alias-then-grow UAF on runtime_tape.string_buf ────────────────
@@ -3445,7 +3444,7 @@ test "NIX-005: chained gsub on runtime_tape-aliased input does not UAF" {
     var vals = try runFilterStrPoison(filter, hay.items);
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings(expected.items, vals.items[0].string);
+    try std.testing.expectEqualStrings(expected.items, vals.items[0].string.slice());
 }
 
 test "NIX-005: sub on runtime_tape-aliased input does not UAF" {
@@ -3499,7 +3498,7 @@ test "NIX-005: match on runtime_tape-aliased input does not UAF" {
     var vals = try runFilterStrPoison(filter, hay);
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("[\"head\",\"anchor1\"]", vals.items[0].string);
+    try std.testing.expectEqualStrings("[\"head\",\"anchor1\"]", vals.items[0].string.slice());
 }
 
 // Notes on multi-yield NIX-005 tests:
@@ -3617,7 +3616,7 @@ test "regex flags: capture() case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("capture(\"(?<a>[A-Z]+)\"; \"i\") | .a", "hello");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("hello", vals.items[0].string);
+    try std.testing.expectEqualStrings("hello", vals.items[0].string.slice());
 }
 
 test "regex flags: scan() case-insensitive" {
@@ -3632,14 +3631,14 @@ test "regex flags: sub() 3-arg with case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("sub(\"FOO\"; \"X\"; \"i\")", "foo bar");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("X bar", vals.items[0].string);
+    try std.testing.expectEqualStrings("X bar", vals.items[0].string.slice());
 }
 
 test "regex flags: gsub() 3-arg with case-insensitive" {
     if (!regex.enabled) return error.SkipZigTest;
     var vals = try runFilterStr("gsub(\"A\"; \"X\"; \"i\")", "aAbBcA");
     defer vals.deinit();
-    try std.testing.expectEqualStrings("XXbBcX", vals.items[0].string);
+    try std.testing.expectEqualStrings("XXbBcX", vals.items[0].string.slice());
 }
 
 test "regex flags: unknown flag letter is a compile error" {
@@ -3696,9 +3695,9 @@ test "regex runtime: match(re; \"g\") yields three match strings" {
     var vals = try runFilterStr("match(\"\\\\w+\"; \"g\") | .string", "foo bar baz");
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 3), vals.items.len);
-    try std.testing.expectEqualStrings("foo", vals.items[0].string);
-    try std.testing.expectEqualStrings("bar", vals.items[1].string);
-    try std.testing.expectEqualStrings("baz", vals.items[2].string);
+    try std.testing.expectEqualStrings("foo", vals.items[0].string.slice());
+    try std.testing.expectEqualStrings("bar", vals.items[1].string.slice());
+    try std.testing.expectEqualStrings("baz", vals.items[2].string.slice());
 }
 
 test "regex runtime: match(re; \"g\") offsets and lengths match each occurrence" {
@@ -3730,10 +3729,10 @@ test "regex runtime: splits(re) yields four segments around three matches" {
     var vals = try runFilterStr("splits(\"[0-9]+\")", "a1b22c333");
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 4), vals.items.len);
-    try std.testing.expectEqualStrings("a", vals.items[0].string);
-    try std.testing.expectEqualStrings("b", vals.items[1].string);
-    try std.testing.expectEqualStrings("c", vals.items[2].string);
-    try std.testing.expectEqualStrings("", vals.items[3].string);
+    try std.testing.expectEqualStrings("a", vals.items[0].string.slice());
+    try std.testing.expectEqualStrings("b", vals.items[1].string.slice());
+    try std.testing.expectEqualStrings("c", vals.items[2].string.slice());
+    try std.testing.expectEqualStrings("", vals.items[3].string.slice());
 }
 
 test "regex runtime: splits() with no match yields whole input" {
@@ -3741,7 +3740,7 @@ test "regex runtime: splits() with no match yields whole input" {
     var vals = try runFilterStr("splits(\"[0-9]+\")", "nodigits");
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("nodigits", vals.items[0].string);
+    try std.testing.expectEqualStrings("nodigits", vals.items[0].string.slice());
 }
 
 test "regex runtime: splits() with flags case-insensitive" {
@@ -3749,10 +3748,10 @@ test "regex runtime: splits() with flags case-insensitive" {
     var vals = try runFilterStr("splits(\"X\"; \"i\")", "aXbxcXd");
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 4), vals.items.len);
-    try std.testing.expectEqualStrings("a", vals.items[0].string);
-    try std.testing.expectEqualStrings("b", vals.items[1].string);
-    try std.testing.expectEqualStrings("c", vals.items[2].string);
-    try std.testing.expectEqualStrings("d", vals.items[3].string);
+    try std.testing.expectEqualStrings("a", vals.items[0].string.slice());
+    try std.testing.expectEqualStrings("b", vals.items[1].string.slice());
+    try std.testing.expectEqualStrings("c", vals.items[2].string.slice());
+    try std.testing.expectEqualStrings("d", vals.items[3].string.slice());
 }
 
 test "regex runtime: splits() dynamic pattern works through LRU" {
@@ -3760,9 +3759,9 @@ test "regex runtime: splits() dynamic pattern works through LRU" {
     var vals = try runFilterStr("(\"[0-9]+\") as $p | splits($p)", "a1b22");
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 3), vals.items.len);
-    try std.testing.expectEqualStrings("a", vals.items[0].string);
-    try std.testing.expectEqualStrings("b", vals.items[1].string);
-    try std.testing.expectEqualStrings("", vals.items[2].string);
+    try std.testing.expectEqualStrings("a", vals.items[0].string.slice());
+    try std.testing.expectEqualStrings("b", vals.items[1].string.slice());
+    try std.testing.expectEqualStrings("", vals.items[2].string.slice());
 }
 
 test "regex runtime: dynamic scan() survives LRU eviction mid-fork" {
@@ -4003,7 +4002,7 @@ test "comment: # inside string literal is NOT a comment" {
     var vals = try collectAll(&q, t);
     defer vals.deinit();
     try std.testing.expectEqual(@as(usize, 1), vals.items.len);
-    try std.testing.expectEqualStrings("#x", vals.items[0].string);
+    try std.testing.expectEqualStrings("#x", vals.items[0].string.slice());
 }
 
 // ── path(f) validation (jq compat) ───────────────────────────────────────────
@@ -4080,7 +4079,7 @@ test "path(f): path(1) raises UserError (non-path result)" {
     defer it.deinit();
     try std.testing.expectError(error.UserError, it.next());
     const msg = it.user_error_msg.?;
-    try std.testing.expectEqualStrings("Invalid path expression with result 1", msg.string);
+    try std.testing.expectEqualStrings("Invalid path expression with result 1", msg.string.slice());
 }
 
 test "path(f): path(. + \"x\") on string raises UserError" {
@@ -4209,7 +4208,7 @@ test "path(f): try path(1) catch \"caught\" suppresses error" {
     defer it.deinit();
     const v = try it.next();
     try std.testing.expect(v != null);
-    try std.testing.expectEqualStrings("caught", v.?.string);
+    try std.testing.expectEqualStrings("caught", v.?.string.slice());
 }
 
 test "path(f): path(.[]) on [1,2,3] yields [0], [1], [2] (backtrack resets broken flag)" {
@@ -4543,7 +4542,7 @@ test "B3: try first(error(\"x\")) catch \"caught\" — try_handler survives limi
     defer it.deinit();
 
     const val = (try it.next()) orelse return error.ExpectedValue;
-    try std.testing.expectEqualStrings("caught", val.string);
+    try std.testing.expectEqualStrings("caught", val.string.slice());
     try std.testing.expectEqual(@as(?Value, null), try it.next());
 }
 

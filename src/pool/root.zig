@@ -668,8 +668,8 @@ fn worker_fn(ctx: WorkerCtx) void {
                         if (p_opt_it.*) |*it| {
                             if (it.user_error_msg) |msg| {
                                 switch (msg) {
-                                    .string => |str| {
-                                        const duped = s.aa.dupe(u8, str) catch null;
+                                    .string => |sv| {
+                                        const duped = s.aa.dupe(u8, sv.slice()) catch null;
                                         if (duped) |d| s.chunk_user_error_msg = d;
                                     },
                                     else => {},
@@ -1228,7 +1228,7 @@ fn own_value(val: types.Value, aa: std.mem.Allocator) error{OutOfMemory}!OwnedVa
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
         .big_number => |bn| .{ .big_number = try aa.dupe(u8, bn) },
-        .string => |s| .{ .string = try aa.dupe(u8, s) },
+        .string => |sv| .{ .string = try aa.dupe(u8, sv.slice()) },
         .object => |span| blk: {
             const entries = try aa.dupe(types.Tape.Entry, span.tape.entries);
             const string_buf = try aa.dupe(u8, span.tape.string_buf);
@@ -2320,7 +2320,7 @@ fn owned_to_value(ov: *const OwnedValue) types.Value {
         .int => |i| .{ .int = i },
         .float => |f| .{ .float = f },
         .big_number => |bn| .{ .big_number = bn },
-        .string => |s| .{ .string = s },
+        .string => |s| .{ .string = .{ .external = s } },
         .tape_value => blk: {
             const tv = &ov.tape_value;
             break :blk if (tv.is_object)

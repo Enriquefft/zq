@@ -524,8 +524,11 @@ pub const StackValue = union(enum) {
 /// One accumulated field during object literal construction.
 /// Declared at module level (rather than nested in ResultIterator) so
 /// Forkpoint can snapshot slices of the in-progress construct stack.
+/// `key` resolves at every read — when it points into a runtime tape's
+/// `string_buf`, that buffer may grow between push and finalize, but
+/// growth is append-only so `(offset, len)` stays valid (NIX-006).
 const ObjectField = struct {
-    key: []const u8,
+    key: Value.StringView,
     value: StackValue,
 };
 
@@ -926,6 +929,22 @@ pub const ResultIterator = struct {
         it.value_stack.appendAssumeCapacity(val);
     }
 
+    /// Construct a `Value.StringView` referencing a string interned in this
+    /// iterator's `runtime_tape`. Resolved lazily at every read against
+    /// `runtime_tape.view.string_buf`, which is append-only — refs are
+    /// permanently valid even when the buffer's backing relocates after a
+    /// grow. Use this for any string produced by `internString*` whose
+    /// `StackValue` (or `Value`) will outlive the producing op. NIX-006.
+    fn rtString(it: *ResultIterator, ref: Tape.StringRef) Value.StringView {
+        return .{ .tape_ref = .{ .tape = &it.runtime_tape.view, .ref = ref } };
+    }
+
+    /// Construct a tape-resident `StackValue.tape_value.string` for a string
+    /// interned in `runtime_tape`. See `rtString`.
+    fn rtStringSV(it: *ResultIterator, ref: Tape.StringRef) StackValue {
+        return .{ .tape_value = .{ .string = it.rtString(ref) } };
+    }
+
     fn popValue(it: *ResultIterator) ZqError!StackValue {
         if (it.value_stack.items.len == 0) return error.TypeError;
         return it.value_stack.pop() orelse return error.TypeError;
@@ -1224,13 +1243,13 @@ pub const ResultIterator = struct {
             if (state.catch_ip > 0) {
                 // Route to catch handler with error as current.
                 if (err == error.UserError) {
-                    it.current = it.user_error_msg orelse Value{ .string = "null" };
+                    it.current = it.user_error_msg orelse Value{ .string = .{ .external = "null" } };
                     it.user_error_msg = null;
                 } else if (err == error.TypeError and it.type_error_detail != null) {
                     it.current = it.type_error_detail.?;
                     it.type_error_detail = null;
                 } else {
-                    it.current = Value{ .string = errorToString(err) };
+                    it.current = Value{ .string = .{ .external = errorToString(err) } };
                 }
                 it.ip = state.catch_ip;
             } else {
@@ -1384,7 +1403,7 @@ pub const ResultIterator = struct {
                 if (it.path_stack.items.len > 0) {
                     const frame = &it.path_stack.items[it.path_stack.items.len - 1];
                     if (!frame.skipComponents()) {
-                        try frame.components.append(it.alloc, .{ .string = key });
+                        try frame.components.append(it.alloc, .{ .string = .{ .external = key } });
                     }
                 }
                 // Push result to value stack. Do NOT update it.current here — the
@@ -1465,10 +1484,10 @@ pub const ResultIterator = struct {
                                 }
                             }
                             break :blk switch (base) {
-                                .object => |span| lookupKey(span.tape, span, s) orelse @as(Value, .null_val),
+                                .object => |span| lookupKey(span.tape, span, s.slice()) orelse @as(Value, .null_val),
                                 .null_val => @as(Value, .null_val),
                                 else => {
-                                    it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_string = s });
+                                    it.type_error_detail = it.buildTypeErrorMsg(base, .{ .index_string = s.slice() });
                                     return error.TypeError;
                                 },
                             };
@@ -1584,7 +1603,7 @@ pub const ResultIterator = struct {
                     if (!frame.skipComponents()) {
                         var segs = std.mem.splitScalar(u8, path, '.');
                         while (segs.next()) |seg| {
-                            try frame.components.append(it.alloc, .{ .string = seg });
+                            try frame.components.append(it.alloc, .{ .string = .{ .external = seg } });
                         }
                     }
                 }
@@ -1718,7 +1737,7 @@ pub const ResultIterator = struct {
             .push_string => {
                 const str_ref = instr.operand.str_ref;
                 const str = it.string_buf[str_ref.offset..][0..str_ref.len];
-                it.pushValue(.{ .tape_value = .{ .string = str } });
+                it.pushValue(.{ .tape_value = .{ .string = .{ .external = str } } });
                 it.ip += 1;
                 return null;
             },
@@ -2332,7 +2351,7 @@ pub const ResultIterator = struct {
                     else => return error.TypeError,
                 };
                 if (n_i < 0) {
-                    it.user_error_msg = .{ .string = "limit doesn't support negative count" };
+                    it.user_error_msg = .{ .string = .{ .external = "limit doesn't support negative count" } };
                     return error.UserError;
                 }
                 if (n_i == 0) {
@@ -2463,10 +2482,10 @@ pub const ResultIterator = struct {
                     else => return error.TypeError,
                 };
                 if (n_i < 0) {
-                    it.user_error_msg = .{ .string = if (is_nth)
+                    it.user_error_msg = .{ .string = .{ .external = if (is_nth)
                         "nth doesn't support negative indices"
                     else
-                        "skip doesn't support negative count" };
+                        "skip doesn't support negative count" } };
                     return error.UserError;
                 }
                 // n==0 means pass through all outputs (no skip frame needed).
@@ -2791,8 +2810,9 @@ pub const ResultIterator = struct {
                             const frame = &it.path_stack.items[it.path_stack.items.len - 1];
                             if (!frame.skipComponents()) {
                                 const key_entry = span.tape.entries[first_key];
-                                const key = span.tape.getString(key_entry.payload.string);
-                                try frame.components.append(it.alloc, .{ .string = key });
+                                try frame.components.append(it.alloc, .{
+                                    .string = .{ .tape_ref = .{ .tape = span.tape, .ref = key_entry.payload.string } },
+                                });
                             }
                         }
                         it.current = tapeEntryToValue(span.tape, first_key + 1);
@@ -3210,7 +3230,8 @@ pub const ResultIterator = struct {
                     .end = arr_end_idx + 1,
                 } } };
             },
-            .string => |s| {
+            .string => |sv| {
+                const s = sv.slice();
                 // jq slice on strings is codepoint-indexed, not
                 // byte-indexed. Walk the UTF-8 sequence to map the
                 // requested codepoint bounds to byte offsets. ASCII
@@ -3250,7 +3271,7 @@ pub const ResultIterator = struct {
                     byte_to = i;
                 }
                 const str_ref = try it.runtime_tape.internString(it.alloc, s[byte_from..byte_to]);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             // jq: slicing null yields null (not an error).
             .null_val => return .null_val,
@@ -3358,17 +3379,17 @@ pub const ResultIterator = struct {
                 const resolved_idx = if (idx < 0) blk: {
                     const neg_idx = @as(i64, @intCast(len)) + idx;
                     if (neg_idx < 0) {
-                        it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                        it.type_error_detail = .{ .string = .{ .external = "Out of bounds negative array index" } };
                         return error.TypeError;
                     }
                     if (neg_idx > max_array_index) {
-                        it.type_error_detail = .{ .string = "Array index too large" };
+                        it.type_error_detail = .{ .string = .{ .external = "Array index too large" } };
                         return error.TypeError;
                     }
                     break :blk @as(u32, @intCast(neg_idx));
                 } else blk: {
                     if (idx > max_array_index) {
-                        it.type_error_detail = .{ .string = "Array index too large" };
+                        it.type_error_detail = .{ .string = .{ .external = "Array index too large" } };
                         return error.TypeError;
                     }
                     break :blk @as(u32, @intCast(idx));
@@ -3379,11 +3400,11 @@ pub const ResultIterator = struct {
                 // Updating an index on null creates a fresh array. Negative
                 // indices are an error because there is no length to wrap around.
                 if (idx < 0) {
-                    it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                    it.type_error_detail = .{ .string = .{ .external = "Out of bounds negative array index" } };
                     return error.TypeError;
                 }
                 if (idx > max_array_index) {
-                    it.type_error_detail = .{ .string = "Array index too large" };
+                    it.type_error_detail = .{ .string = .{ .external = "Array index too large" } };
                     return error.TypeError;
                 }
                 return try it.buildNewArrayAtIndex(@intCast(idx), new_val);
@@ -3548,8 +3569,8 @@ pub const ResultIterator = struct {
                             // buffer). NIX-003: naive `appendSlice` here UAF'd
                             // the source slice when ensureUnusedCapacity grew
                             // the backing — see types.zig:internStringConcat.
-                            const ref = try it.runtime_tape.internStringConcat(it.alloc, &.{ ls, rs });
-                            break :blk .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+                            const ref = try it.runtime_tape.internStringConcat(it.alloc, &.{ ls.slice(), rs.slice() });
+                            break :blk it.rtStringSV(ref);
                         },
                         .null_val => left,
                         else => return it.raiseBinaryArithTypeError(left, right, .add),
@@ -3775,8 +3796,10 @@ pub const ResultIterator = struct {
 
         // Append key-value pairs from start_idx to end
         for (it.object_construct.items[start_idx..]) |field| {
-            // Intern key string
-            const key_ref = try it.runtime_tape.internString(it.alloc, field.key);
+            // Intern key string. Re-resolve via StringView at this read so
+            // any prior `runtime_tape.string_buf` grow (from peer fields)
+            // sees the up-to-date backing rather than a captured slice.
+            const key_ref = try it.runtime_tape.internString(it.alloc, field.key.slice());
             // Append key entry
             _ = try it.runtime_tape.appendEntry(it.alloc, .{
                 .tag = .key,
@@ -3839,9 +3862,14 @@ pub const ResultIterator = struct {
                 });
             },
             .tape_value => |tv| switch (tv) {
-                .string => |s| {
-                    // Intern the string
-                    const str_ref = try it.runtime_tape.internString(it.alloc, s);
+                .string => |sv| {
+                    // Resolve the StringView at the moment of intern. If the
+                    // view points into runtime_tape.string_buf, the resolved
+                    // slice reflects the *current* backing — the upcoming
+                    // ensureUnusedCapacity inside internString may relocate
+                    // the buffer, but `internStringConcat`'s SliceSnap
+                    // catches the in-call self-aliasing case (NIX-003).
+                    const str_ref = try it.runtime_tape.internString(it.alloc, sv.slice());
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
                         .tag = .string,
                         .payload = .{ .string = str_ref },
@@ -4225,39 +4253,46 @@ pub const ResultIterator = struct {
 
     /// String repetition for `*` operator.
     /// `"abc" * 3` produces `"abcabcabc"`. `"abc" * 0` produces `null`.
-    fn doStringRepeat(it: *ResultIterator, s: []const u8, n: i64) !StackValue {
+    fn doStringRepeat(it: *ResultIterator, sv: Value.StringView, n: i64) !StackValue {
         if (n < 0) return .null_val;
-        if (n == 0) return .{ .tape_value = .{ .string = "" } };
+        if (n == 0) return .{ .tape_value = .{ .string = .{ .external = "" } } };
         const count: usize = @intCast(n);
-        if (count == 1) return .{ .tape_value = .{ .string = s } };
+        if (count == 1) return .{ .tape_value = .{ .string = sv } };
+        const s = sv.slice();
         // Guard against excessive allocations
         const total_len = s.len * count;
         if (total_len > 128 * 1024 * 1024) {
             const str_ref = try it.runtime_tape.internString(it.alloc, "Repeat string result too long");
-            it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+            it.user_error_msg = .{ .string = it.rtString(str_ref) };
             return error.UserError;
         }
         // Alias-safe repeat: `s` itself may live in string_buf (chained
         // repeats like `("x" * 4000) * 2` route the prior repeat result
         // back through here). NIX-003.
         const ref = try it.runtime_tape.internStringRepeat(it.alloc, s, count);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+        return it.rtStringSV(ref);
     }
 
     /// jq: string / string = split. Splits the left string by the right separator.
-    fn doStringSplit(it: *ResultIterator, input: []const u8, sep: []const u8) ZqError!StackValue {
+    fn doStringSplit(it: *ResultIterator, input_sv: Value.StringView, sep_sv: Value.StringView) ZqError!StackValue {
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
             .tag = .array_start,
             .payload = .{ .skip = 0 },
         });
 
-        if (sep.len == 0) {
+        // Re-resolve the StringViews at every iteration so growth of
+        // `runtime_tape.string_buf` (from the per-segment internString
+        // below) does not leave us reading from a relocated, freed
+        // backing. NIX-006: the prior code passed raw `[]const u8`
+        // slices that dangled after the first internString.
+        if (sep_sv.slice().len == 0) {
             // Split into individual characters (UTF-8 aware)
             var i: usize = 0;
-            while (i < input.len) {
-                const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch 1;
-                const char_end = @min(i + seq_len, input.len);
-                const str_ref = try it.runtime_tape.internString(it.alloc, input[i..char_end]);
+            while (i < input_sv.slice().len) {
+                const input_now = input_sv.slice();
+                const seq_len = std.unicode.utf8ByteSequenceLength(input_now[i]) catch 1;
+                const char_end = @min(i + seq_len, input_now.len);
+                const str_ref = try it.runtime_tape.internString(it.alloc, input_now[i..char_end]);
                 _ = try it.runtime_tape.appendEntry(it.alloc, .{
                     .tag = .string,
                     .payload = .{ .string = str_ref },
@@ -4265,15 +4300,18 @@ pub const ResultIterator = struct {
                 i = char_end;
             }
         } else {
-            var rest = input;
+            var rest_off: usize = 0;
             while (true) {
-                if (std.mem.indexOf(u8, rest, sep)) |idx| {
+                const input_now = input_sv.slice();
+                const sep_now = sep_sv.slice();
+                const rest = input_now[rest_off..];
+                if (std.mem.indexOf(u8, rest, sep_now)) |idx| {
                     const str_ref = try it.runtime_tape.internString(it.alloc, rest[0..idx]);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
                         .tag = .string,
                         .payload = .{ .string = str_ref },
                     });
-                    rest = rest[idx + sep.len ..];
+                    rest_off += idx + sep_now.len;
                 } else {
                     const str_ref = try it.runtime_tape.internString(it.alloc, rest);
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -4719,8 +4757,9 @@ pub const ResultIterator = struct {
             .int => |i| .{ .int = if (i < 0) -i else i },
             .float => |f| .{ .float = @abs(f) },
             .big_number => |bn| .{ .int = @intCast(bn.len) },
-            .string => |s| blk: {
+            .string => |sv| blk: {
                 // Count Unicode codepoints, not bytes.
+                const s = sv.slice();
                 var count: i64 = 0;
                 var i: usize = 0;
                 while (i < s.len) {
@@ -4841,7 +4880,7 @@ pub const ResultIterator = struct {
             .object => |span| {
                 const key_str = switch (key_sv) {
                     .tape_value => |tv| switch (tv) {
-                        .string => |s| s,
+                        .string => |s| s.slice(),
                         else => return error.TypeError,
                     },
                     else => return error.TypeError,
@@ -4879,7 +4918,7 @@ pub const ResultIterator = struct {
                 .object => |span| {
                     const key_str = switch (key_sv) {
                         .tape_value => |ktv| switch (ktv) {
-                            .string => |s| s,
+                            .string => |s| s.slice(),
                             else => return error.TypeError,
                         },
                         else => return error.TypeError,
@@ -4917,28 +4956,28 @@ pub const ResultIterator = struct {
             .array => "array",
             .object => "object",
         };
-        return .{ .tape_value = .{ .string = type_str } };
+        return .{ .tape_value = .{ .string = .{ .external = type_str } } };
     }
 
     fn builtinTostring(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .string => |s| return .{ .tape_value = .{ .string = s } },
-            .null_val => return .{ .tape_value = .{ .string = "null" } },
-            .bool_val => |b| return .{ .tape_value = .{ .string = if (b) "true" else "false" } },
+            .null_val => return .{ .tape_value = .{ .string = .{ .external = "null" } } },
+            .bool_val => |b| return .{ .tape_value = .{ .string = .{ .external = if (b) "true" else "false" } } },
             .int => |n| {
                 var tmp: [32]u8 = undefined;
                 const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.TypeError;
                 const str_ref = try it.runtime_tape.internString(it.alloc, s);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             .float => |f| {
                 const formatted = types.formatJqFloat(f);
                 const str_ref = try it.runtime_tape.internString(it.alloc, formatted.slice());
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             .big_number => |bn| {
                 const str_ref = try it.runtime_tape.internString(it.alloc, bn);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             .array, .object => {
                 // Compact JSON serialization into runtime_tape string_buf
@@ -4946,7 +4985,7 @@ pub const ResultIterator = struct {
                 defer json_buf.deinit(it.alloc);
                 try serializeValueCompact(&json_buf, it.alloc, it.current);
                 const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
         }
     }
@@ -4956,7 +4995,8 @@ pub const ResultIterator = struct {
             .int => |n| return .{ .int = n },
             .float => |f| return .{ .float = f },
             .big_number => |bn| return .{ .big_number = bn },
-            .string => |s| {
+            .string => |sv| {
+                const s = sv.slice();
                 // Try integer parse first; fall back to float.
                 // jq raises an error for null-byte strings or invalid number strings.
                 const null_byte = std.mem.indexOfScalar(u8, s, 0) != null;
@@ -4975,7 +5015,7 @@ pub const ResultIterator = struct {
                 try appendJsonString(&msg_buf, it.alloc, s);
                 try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a number");
                 const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-                it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                it.user_error_msg = .{ .string = it.rtString(str_ref) };
                 return error.UserError;
             },
             else => return error.TypeError,
@@ -4986,7 +5026,8 @@ pub const ResultIterator = struct {
     fn builtinToboolean(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
             .bool_val => |b| return .{ .bool_val = b },
-            .string => |s| {
+            .string => |sv| {
+                const s = sv.slice();
                 if (std.mem.eql(u8, s, "true")) return .{ .bool_val = true };
                 if (std.mem.eql(u8, s, "false")) return .{ .bool_val = false };
                 // Invalid string — produce typed error
@@ -5005,14 +5046,14 @@ pub const ResultIterator = struct {
         try serializeValueCompact(&msg_buf, it.alloc, it.current);
         try msg_buf.appendSlice(it.alloc, ") cannot be parsed as a boolean");
         const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        it.user_error_msg = .{ .string = it.rtString(str_ref) };
         return error.UserError;
     }
 
     /// `utf8bytelength`: return byte length of a string.
     fn builtinUtf8bytelength(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .string => |s| return .{ .int = @intCast(s.len) },
+            .string => |sv| return .{ .int = @intCast(sv.slice().len) },
             else => {
                 var msg_buf = std.ArrayList(u8){};
                 defer msg_buf.deinit(it.alloc);
@@ -5021,7 +5062,7 @@ pub const ResultIterator = struct {
                 try serializeValueCompact(&msg_buf, it.alloc, it.current);
                 try msg_buf.appendSlice(it.alloc, ") only strings have UTF-8 byte length");
                 const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-                it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                it.user_error_msg = .{ .string = it.rtString(str_ref) };
                 return error.UserError;
             },
         }
@@ -5031,10 +5072,11 @@ pub const ResultIterator = struct {
 
     /// `trim`, `ltrim`, `rtrim`: trim Unicode whitespace.
     fn builtinTrim(it: *ResultIterator, side: TrimSide) ZqError!?StackValue {
-        const s = switch (it.current) {
-            .string => |s| s,
+        const sv = switch (it.current) {
+            .string => |sv| sv,
             else => return try it.raiseUserError("trim input must be a string"),
         };
+        const s = sv.slice();
 
         var start: usize = 0;
         var end: usize = s.len;
@@ -5070,7 +5112,7 @@ pub const ResultIterator = struct {
 
         const trimmed = s[start..end];
         const str_ref = try it.runtime_tape.internString(it.alloc, trimmed);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// `add` builtin: fold array elements with +. Empty array → null.
@@ -5142,7 +5184,8 @@ pub const ResultIterator = struct {
                 // Build runtime tape array
                 return try it.buildRuntimeArray(elems.items);
             },
-            .string => |s| {
+            .string => |sv| {
+                const s = sv.slice();
                 // Reverse a string (by Unicode codepoints)
                 var reversed = std.ArrayList(u8){};
                 defer reversed.deinit(it.alloc);
@@ -5164,7 +5207,7 @@ pub const ResultIterator = struct {
                     try reversed.appendSlice(it.alloc, s[r.start..r.end]);
                 }
                 const str_ref = try it.runtime_tape.internString(it.alloc, reversed.items);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             else => return error.TypeError,
         }
@@ -5313,7 +5356,7 @@ pub const ResultIterator = struct {
                                 return error.TypeError;
                             // Extract key string
                             const key_str = switch (key_val) {
-                                .string => |s| s,
+                                .string => |sv| sv.slice(),
                                 // jq coerces non-string keys to string via tostring
                                 .int => |n| blk: {
                                     var tmp: [32]u8 = undefined;
@@ -5339,8 +5382,8 @@ pub const ResultIterator = struct {
                             try it.stackValueToRuntimeTapeEntry(val_sv);
                         },
                         // jq also accepts strings as shorthand: "foo" -> {"key":"foo","value":null}
-                        .string => |s| {
-                            const new_key_ref = try it.runtime_tape.internString(it.alloc, s);
+                        .string => |sv| {
+                            const new_key_ref = try it.runtime_tape.internString(it.alloc, sv.slice());
                             _ = try it.runtime_tape.appendEntry(it.alloc, .{
                                 .tag = .key,
                                 .payload = .{ .string = new_key_ref },
@@ -5483,10 +5526,11 @@ pub const ResultIterator = struct {
         defer positions.deinit(it.alloc);
 
         switch (it.current) {
-            .string => |haystack| {
+            .string => |hsv| {
+                const haystack = hsv.slice();
                 // String search: find all codepoint indices of needle string
                 const needle_str = switch (needle) {
-                    .string => |s| s,
+                    .string => |sv| sv.slice(),
                     else => return error.TypeError,
                 };
                 if (needle_str.len == 0) {
@@ -5565,9 +5609,10 @@ pub const ResultIterator = struct {
         const needle = try stackValueToValue(needle_sv);
 
         switch (it.current) {
-            .string => |haystack| {
+            .string => |hsv| {
+                const haystack = hsv.slice();
                 const needle_str = switch (needle) {
-                    .string => |s| s,
+                    .string => |sv| sv.slice(),
                     else => return error.TypeError,
                 };
                 if (needle_str.len == 0 or haystack.len == 0) return .null_val;
@@ -5627,9 +5672,10 @@ pub const ResultIterator = struct {
         const needle = try stackValueToValue(needle_sv);
 
         switch (it.current) {
-            .string => |haystack| {
+            .string => |hsv| {
+                const haystack = hsv.slice();
                 const needle_str = switch (needle) {
-                    .string => |s| s,
+                    .string => |sv| sv.slice(),
                     else => return error.TypeError,
                 };
                 if (needle_str.len == 0 or haystack.len == 0) return .null_val;
@@ -5974,7 +6020,7 @@ pub const ResultIterator = struct {
                 // Delete by key (string)
                 const key_str = switch (key_sv) {
                     .tape_value => |tv| switch (tv) {
-                        .string => |s| s,
+                        .string => |sv| sv.slice(),
                         else => return error.TypeError,
                     },
                     else => return error.TypeError,
@@ -6064,13 +6110,13 @@ pub const ResultIterator = struct {
         defer json_buf.deinit(it.alloc);
         try serializeValueCompact(&json_buf, it.alloc, it.current);
         const str_ref = try it.runtime_tape.internString(it.alloc, json_buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @html: HTML-escape: & → &amp;, < → &lt;, > → &gt;, ' → &apos;, " → &quot;
     fn builtinFormatHtml(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         var buf = std.ArrayList(u8){};
@@ -6086,13 +6132,13 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @uri: Percent-encode all bytes except A-Za-z0-9-._~, uppercase hex (%XX)
     fn builtinFormatUri(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         var buf = std.ArrayList(u8){};
@@ -6107,13 +6153,13 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @urid: Decode %XX sequences in a string
     fn builtinFormatUrid(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         var buf = std.ArrayList(u8){};
@@ -6133,13 +6179,13 @@ pub const ResultIterator = struct {
             i += 1;
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @sh: Wrap in single quotes, escape ' as '\''
     fn builtinFormatSh(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         var buf = std.ArrayList(u8){};
@@ -6154,13 +6200,13 @@ pub const ResultIterator = struct {
         }
         try buf.append(it.alloc, '\'');
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @base64: Base64 encode the string
     fn builtinFormatBase64(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         const encoder = std.base64.standard.Encoder;
@@ -6168,13 +6214,13 @@ pub const ResultIterator = struct {
         const buf = try it.scratch.allocator().alloc(u8, encoded_len);
         const encoded = encoder.encode(buf, s);
         const str_ref = try it.runtime_tape.internString(it.alloc, encoded);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @base64d: Base64 decode the string
     fn builtinFormatBase64d(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         const decoder = std.base64.standard.Decoder;
@@ -6182,7 +6228,7 @@ pub const ResultIterator = struct {
         const buf = try it.scratch.allocator().alloc(u8, decoded_len);
         decoder.decode(buf, s) catch return error.TypeError;
         const str_ref = try it.runtime_tape.internString(it.alloc, buf[0..decoded_len]);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @csv: Array → CSV row. Strings double-quoted (internal " doubled to ""),
@@ -6202,9 +6248,9 @@ pub const ResultIterator = struct {
             first = false;
             const elem = tapeEntryToValue(span.tape, pos);
             switch (elem) {
-                .string => |s| {
+                .string => |sv| {
                     try buf.append(it.alloc, '"');
-                    for (s) |c| {
+                    for (sv.slice()) |c| {
                         if (c == '"') {
                             try buf.appendSlice(it.alloc, "\"\"");
                         } else {
@@ -6229,7 +6275,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// @tsv: Array → TSV row. Tab-separated, strings escape \t→\\t, \n→\\n, \r→\\r, \\→\\\\
@@ -6248,8 +6294,8 @@ pub const ResultIterator = struct {
             first = false;
             const elem = tapeEntryToValue(span.tape, pos);
             switch (elem) {
-                .string => |s| {
-                    for (s) |c| {
+                .string => |sv| {
+                    for (sv.slice()) |c| {
                         switch (c) {
                             '\t' => try buf.appendSlice(it.alloc, "\\t"),
                             '\n' => try buf.appendSlice(it.alloc, "\\n"),
@@ -6275,7 +6321,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// Helper: build a runtime tape array from a slice of Values.
@@ -6771,10 +6817,12 @@ pub const ResultIterator = struct {
                 const entry = span.tape.entries[scan_pos];
                 switch (entry.tag) {
                     .string => {
-                        // getString returns a slice into tape.string_buf which
-                        // remains valid for the lifetime of this query execution.
-                        const key_str = span.tape.getString(entry.payload.string);
-                        try frame.components.append(it.alloc, .{ .string = key_str });
+                        // The parsed-tape string_buf is stable for the query lifetime,
+                        // so refer to it via tape_ref to keep StringView the SSOT.
+                        try frame.components.append(it.alloc, .{ .string = .{ .tape_ref = .{
+                            .tape = span.tape,
+                            .ref = entry.payload.string,
+                        } } });
                     },
                     .int => {
                         try frame.components.append(it.alloc, .{ .int = entry.payload.int });
@@ -6850,7 +6898,8 @@ pub const ResultIterator = struct {
 
         const component = path[depth];
         switch (component) {
-            .string => |key| {
+            .string => |key_sv| {
+                const key = key_sv.slice();
                 // Build a new object with the key replaced/added.
                 var tmp_tape = try types.RuntimeTape.init(it.alloc);
                 defer tmp_tape.deinit(it.alloc);
@@ -6937,14 +6986,14 @@ pub const ResultIterator = struct {
                     const len: i64 = switch (base) {
                         .array => |span| @intCast(arrayLength(span.tape, span)),
                         .null_val => {
-                            it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                            it.type_error_detail = .{ .string = .{ .external = "Out of bounds negative array index" } };
                             return error.TypeError;
                         },
                         else => 0,
                     };
                     const resolved = len + idx;
                     if (resolved < 0) {
-                        it.type_error_detail = .{ .string = "Out of bounds negative array index" };
+                        it.type_error_detail = .{ .string = .{ .external = "Out of bounds negative array index" } };
                         return error.TypeError;
                     }
                     break :blk @intCast(resolved);
@@ -7031,7 +7080,7 @@ pub const ResultIterator = struct {
                             it.alloc,
                             "Cannot update string slices",
                         );
-                        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                        it.user_error_msg = .{ .string = it.rtString(str_ref) };
                         return error.UserError;
                     },
                     .null_val => {
@@ -7140,7 +7189,7 @@ pub const ResultIterator = struct {
                 // UserError for the special case) matches jq's catchable
                 // surface.
                 if (base == .array) {
-                    it.user_error_msg = .{ .string = "Cannot update field at array index of array" };
+                    it.user_error_msg = .{ .string = .{ .external = "Cannot update field at array index of array" } };
                     return error.UserError;
                 }
                 it.type_error_detail = it.buildTypeErrorMsg(.null_val, .{ .setpath_index = .{ .base = base, .pc_type = "array" } });
@@ -7159,7 +7208,7 @@ pub const ResultIterator = struct {
                         it.alloc,
                         "Cannot set array element at NaN index",
                     );
-                    it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                    it.user_error_msg = .{ .string = it.rtString(str_ref) };
                     return error.UserError;
                 },
                 else => {
@@ -7180,7 +7229,7 @@ pub const ResultIterator = struct {
         // Set detail before delegating to extractArrayElements so the TypeError
         // surfaces with the right message rather than a bare type failure.
         if (paths_val != .array) {
-            it.type_error_detail = .{ .string = "Paths must be specified as an array" };
+            it.type_error_detail = .{ .string = .{ .external = "Paths must be specified as an array" } };
             return error.TypeError;
         }
         const paths_elems = try it.extractArrayElements(paths_val);
@@ -7306,7 +7355,8 @@ pub const ResultIterator = struct {
 
         switch (component) {
             .null_val => return base,
-            .string => |key| {
+            .string => |key_sv| {
+                const key = key_sv.slice();
                 switch (base) {
                     .object => |span| {
                         var tmp_tape = try types.RuntimeTape.init(it.alloc);
@@ -7553,9 +7603,11 @@ pub const ResultIterator = struct {
                 var pos = span.start + 1;
                 const end = span.end - 1;
                 while (pos < end) {
-                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
                     const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    try path_buf.append(it.alloc, .{ .string = k });
+                    try path_buf.append(it.alloc, .{ .string = .{ .tape_ref = .{
+                        .tape = span.tape,
+                        .ref = span.tape.entries[pos].payload.string,
+                    } } });
                     try it.collectPaths(child_val, path_buf, all_paths, leaf_only);
                     _ = path_buf.pop();
                     pos = skipEntry(span.tape.*, pos + 1);
@@ -7776,9 +7828,11 @@ pub const ResultIterator = struct {
                 var pos = span.start + 1;
                 const end = span.end - 1;
                 while (pos < end) {
-                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
                     const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    try path_buf.append(aa, .{ .string = k });
+                    try path_buf.append(aa, .{ .string = .{ .tape_ref = .{
+                        .tape = span.tape,
+                        .ref = span.tape.entries[pos].payload.string,
+                    } } });
                     try it.collectRecursePathValues(child_val, path_buf, out);
                     _ = path_buf.pop();
                     pos = skipEntry(span.tape.*, pos + 1);
@@ -7819,9 +7873,11 @@ pub const ResultIterator = struct {
                 var pos = span.start + 1;
                 const end = span.end - 1;
                 while (pos < end) {
-                    const k = span.tape.getString(span.tape.entries[pos].payload.string);
                     const child_val = tapeEntryToValue(span.tape, pos + 1);
-                    try path_buf.append(it.alloc, .{ .string = k });
+                    try path_buf.append(it.alloc, .{ .string = .{ .tape_ref = .{
+                        .tape = span.tape,
+                        .ref = span.tape.entries[pos].payload.string,
+                    } } });
                     try it.collectRecursePaths(child_val, path_buf, all_paths);
                     _ = path_buf.pop();
                     pos = skipEntry(span.tape.*, pos + 1);
@@ -7878,7 +7934,7 @@ pub const ResultIterator = struct {
 
     fn walkChildren(it: *ResultIterator, val: Value, body_start: u32, body_end: u32, depth: u32) ZqError!Value {
         if (depth > max_walk_depth) {
-            it.user_error_msg = .{ .string = "walk recursion depth limit exceeded" };
+            it.user_error_msg = .{ .string = .{ .external = "walk recursion depth limit exceeded" } };
             return error.UserError;
         }
         switch (val) {
@@ -8094,8 +8150,8 @@ pub const ResultIterator = struct {
         });
         for (components) |comp| {
             switch (comp) {
-                .string => |s| {
-                    const str_ref = try it.runtime_tape.internString(it.alloc, s);
+                .string => |sv| {
+                    const str_ref = try it.runtime_tape.internString(it.alloc, sv.slice());
                     _ = try it.runtime_tape.appendEntry(it.alloc, .{
                         .tag = .string,
                         .payload = .{ .string = str_ref },
@@ -8397,8 +8453,9 @@ pub const ResultIterator = struct {
             if (!frame.body_emits_paths_directly and !frame.skipComponents()) {
                 if (st.is_object) {
                     const key_entry = st.tape.entries[next_pos];
-                    const key = st.tape.getString(key_entry.payload.string);
-                    frame.components.append(it.alloc, .{ .string = key }) catch return false;
+                    frame.components.append(it.alloc, .{
+                        .string = .{ .tape_ref = .{ .tape = st.tape, .ref = key_entry.payload.string } },
+                    }) catch return false;
                 } else {
                     frame.components.append(it.alloc, .{ .int = @intCast(st.index) }) catch return false;
                 }
@@ -8662,8 +8719,9 @@ pub const ResultIterator = struct {
                         }
                         const r = st.refs[st.index];
                         st.index += 1;
-                        const slice = it.runtime_tape.view.string_buf[r.offset..][0..r.len];
-                        it.pushValue(.{ .tape_value = .{ .string = slice } });
+                        it.pushValue(.{ .tape_value = .{ .string = .{
+                            .tape_ref = .{ .tape = &it.runtime_tape.view, .ref = r },
+                        } } });
                         it.ip = fp.backtrack_ip;
                         return true;
                     }
@@ -9069,7 +9127,7 @@ pub const ResultIterator = struct {
 
     fn builtinAsciiCase(it: *ResultIterator, comptime upper: bool) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         var buf = std.ArrayList(u8){};
@@ -9083,12 +9141,13 @@ pub const ResultIterator = struct {
             }
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     fn builtinAscii(it: *ResultIterator) ZqError!?StackValue {
         switch (it.current) {
-            .string => |s| {
+            .string => |sv| {
+                const s = sv.slice();
                 if (s.len == 0) return error.TypeError;
                 return .{ .int = @intCast(s[0]) };
             },
@@ -9096,7 +9155,7 @@ pub const ResultIterator = struct {
                 if (i < 0 or i > 127) return error.TypeError;
                 var buf: [1]u8 = .{@intCast(@as(u8, @intCast(i)))};
                 const str_ref = try it.runtime_tape.internString(it.alloc, &buf);
-                return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+                return it.rtStringSV(str_ref);
             },
             else => return error.TypeError,
         }
@@ -9104,7 +9163,7 @@ pub const ResultIterator = struct {
 
     fn builtinExplode(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -9189,7 +9248,7 @@ pub const ResultIterator = struct {
                         try appendCompactJsonTrunc(&msg_buf, it.alloc, val);
                         try msg_buf.appendSlice(it.alloc, ") can't be imploded,unicode codepoint needs to be numeric");
                         const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-                        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                        it.user_error_msg = .{ .string = it.rtString(str_ref) };
                         return error.UserError;
                     }
                     // Valid finite float: truncate toward zero (jq behaviour).
@@ -9205,7 +9264,7 @@ pub const ResultIterator = struct {
                     try appendCompactJsonTrunc(&msg_buf, it.alloc, val);
                     try msg_buf.appendSlice(it.alloc, ") can't be imploded,unicode codepoint needs to be numeric");
                     const str_ref = try it.runtime_tape.internString(it.alloc, msg_buf.items);
-                    it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+                    it.user_error_msg = .{ .string = it.rtString(str_ref) };
                     return error.UserError;
                 },
             };
@@ -9228,7 +9287,7 @@ pub const ResultIterator = struct {
             pos = skipEntry(span.tape.*, pos);
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     // ── JSON builtins ──────────────────────────────────────────────────────
@@ -9239,7 +9298,7 @@ pub const ResultIterator = struct {
 
     fn builtinFromjson(it: *ResultIterator) ZqError!?StackValue {
         const s = switch (it.current) {
-            .string => |str| str,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         // Parse JSON string into a value using a simple recursive descent parser
@@ -9326,7 +9385,7 @@ pub const ResultIterator = struct {
     /// as `"name/arity"` strings — transitive imports are not included.
     fn builtinModulemeta(it: *ResultIterator) ZqError!?StackValue {
         const relpath = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
 
@@ -9681,58 +9740,98 @@ pub const ResultIterator = struct {
     // ── String builtins (arg-taking) ─────────────────────────────────────────
 
     /// `split(sep)`: split string by separator.
+    /// Intern each substring on the runtime tape eagerly and re-resolve
+    /// `input`/`sep` slices via StringView after every intern, since the
+    /// runtime_tape.string_buf may reallocate (NIX-006 alias-safety).
     fn builtinSplit(it: *ResultIterator) ZqError!?StackValue {
         const sep_sv = try it.popValue();
         const sep_val = try stackValueToValue(sep_sv);
-        const sep = switch (sep_val) {
-            .string => |s| s,
+        const sep_view: Value.StringView = switch (sep_val) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        const input = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
 
-        var parts = std.ArrayList(Value){};
-        defer parts.deinit(it.alloc);
+        // Open the result array on the runtime tape directly so we can
+        // intern part strings into it as we go without holding stale Values.
+        const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_start,
+            .payload = .{ .skip = 0 },
+        });
 
-        if (sep.len == 0) {
-            // Split into individual characters (Unicode codepoints)
+        const sep_len_initial = sep_view.slice().len;
+        if (sep_len_initial == 0) {
+            // Split into individual codepoints.
             var i: usize = 0;
-            while (i < input.len) {
+            while (true) {
+                const input = input_view.slice();
+                if (i >= input.len) break;
                 const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch 1;
                 const char_end = @min(i + seq_len, input.len);
-                try parts.append(it.alloc, .{ .string = input[i..char_end] });
+                const part_ref = try it.runtime_tape.internString(it.alloc, input[i..char_end]);
+                _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                    .tag = .string,
+                    .payload = .{ .string = part_ref },
+                });
                 i = char_end;
             }
         } else {
             var start: usize = 0;
-            while (start <= input.len) {
+            while (true) {
+                const input = input_view.slice();
+                const sep = sep_view.slice();
+                if (start > input.len) break;
                 if (start + sep.len <= input.len and std.mem.eql(u8, input[start..][0..sep.len], sep)) {
-                    try parts.append(it.alloc, .{ .string = input[start..start] });
+                    const part_ref = try it.runtime_tape.internString(it.alloc, "");
+                    _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                        .tag = .string,
+                        .payload = .{ .string = part_ref },
+                    });
                     start += sep.len;
                 } else {
-                    // Find next occurrence of separator
                     var end = start;
                     var found = false;
                     while (end < input.len) {
-                        if (end + sep.len <= input.len and std.mem.eql(u8, input[end..][0..sep.len], sep)) {
-                            try parts.append(it.alloc, .{ .string = input[start..end] });
-                            start = end + sep.len;
+                        const input2 = input_view.slice();
+                        const sep2 = sep_view.slice();
+                        if (end + sep2.len <= input2.len and std.mem.eql(u8, input2[end..][0..sep2.len], sep2)) {
+                            const part_ref = try it.runtime_tape.internString(it.alloc, input2[start..end]);
+                            _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                                .tag = .string,
+                                .payload = .{ .string = part_ref },
+                            });
+                            start = end + sep2.len;
                             found = true;
                             break;
                         }
                         end += 1;
                     }
                     if (!found) {
-                        try parts.append(it.alloc, .{ .string = input[start..input.len] });
+                        const input3 = input_view.slice();
+                        const part_ref = try it.runtime_tape.internString(it.alloc, input3[start..input3.len]);
+                        _ = try it.runtime_tape.appendEntry(it.alloc, .{
+                            .tag = .string,
+                            .payload = .{ .string = part_ref },
+                        });
                         break;
                     }
                 }
             }
         }
 
-        return try it.buildRuntimeArray(parts.items);
+        const arr_end = try it.runtime_tape.appendEntry(it.alloc, .{
+            .tag = .array_end,
+            .payload = .{ .none = {} },
+        });
+        it.runtime_tape.entries.items[arr_start].payload.skip = arr_end + 1;
+        return .{ .tape_value = .{ .array = .{
+            .tape = &it.runtime_tape.view,
+            .start = arr_start,
+            .end = arr_end + 1,
+        } } };
     }
 
     /// `join(sep)`: join array elements with separator.
@@ -9740,8 +9839,8 @@ pub const ResultIterator = struct {
     fn builtinJoin(it: *ResultIterator) ZqError!?StackValue {
         const sep_sv = try it.popValue();
         const sep_val = try stackValueToValue(sep_sv);
-        const sep = switch (sep_val) {
-            .string => |s| s,
+        const sep_view: Value.StringView = switch (sep_val) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
 
@@ -9758,13 +9857,13 @@ pub const ResultIterator = struct {
         var first = true;
         while (pos < end) {
             if (!first) {
-                try buf.appendSlice(it.alloc, sep);
+                try buf.appendSlice(it.alloc, sep_view.slice());
             }
             first = false;
 
             const elem = tapeEntryToValue(span.tape, pos);
             switch (elem) {
-                .string => |s| try buf.appendSlice(it.alloc, s),
+                .string => |sv| try buf.appendSlice(it.alloc, sv.slice()),
                 .null_val => {}, // null treated as empty string
                 .int => |n| {
                     var tmp: [32]u8 = undefined;
@@ -9798,7 +9897,7 @@ pub const ResultIterator = struct {
         }
 
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     /// Build a jq-compatible TypeError detail message for field access on wrong type.
@@ -10001,13 +10100,13 @@ pub const ResultIterator = struct {
         // Store in the runtime tape so the string lives as long as the iterator.
         // Note: callers must access this value before the iterator is deinitialized.
         const str_ref = it.runtime_tape.internString(it.alloc, buf.items) catch return null;
-        return .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        return .{ .string = it.rtString(str_ref) };
     }
 
     /// Helper: raise a UserError with a message string.
     fn raiseUserError(it: *ResultIterator, msg: []const u8) ZqError!?StackValue {
         const str_ref = try it.runtime_tape.internString(it.alloc, msg);
-        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        it.user_error_msg = .{ .string = it.rtString(str_ref) };
         return error.UserError;
     }
 
@@ -10057,7 +10156,7 @@ pub const ResultIterator = struct {
             },
         }
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        it.user_error_msg = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        it.user_error_msg = .{ .string = it.rtString(str_ref) };
     }
 
     /// `startswith(str)`: test if string starts with prefix.
@@ -10065,11 +10164,11 @@ pub const ResultIterator = struct {
         const arg_sv = try it.popValue();
         const arg = try stackValueToValue(arg_sv);
         const prefix = switch (arg) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("startswith() requires string inputs"),
         };
         const input = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("startswith() requires string inputs"),
         };
         return .{ .bool_val = std.mem.startsWith(u8, input, prefix) };
@@ -10080,73 +10179,85 @@ pub const ResultIterator = struct {
         const arg_sv = try it.popValue();
         const arg = try stackValueToValue(arg_sv);
         const suffix = switch (arg) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("endswith() requires string inputs"),
         };
         const input = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("endswith() requires string inputs"),
         };
         return .{ .bool_val = std.mem.endsWith(u8, input, suffix) };
     }
 
     /// `ltrimstr(str)`: remove prefix if present.
+    /// Re-intern the trimmed slice on the runtime tape so the returned
+    /// StackValue does not alias the (possibly volatile) input view.
     fn builtinLtrimstr(it: *ResultIterator) ZqError!?StackValue {
         const arg_sv = try it.popValue();
         const arg = try stackValueToValue(arg_sv);
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
+            else => return try it.raiseUserError("startswith() requires string inputs"),
+        };
         const prefix = switch (arg) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("startswith() requires string inputs"),
         };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return try it.raiseUserError("startswith() requires string inputs"),
-        };
+        const input = input_view.slice();
         if (std.mem.startsWith(u8, input, prefix)) {
-            return .{ .tape_value = .{ .string = input[prefix.len..] } };
+            const ref = try it.runtime_tape.internString(it.alloc, input[prefix.len..]);
+            return it.rtStringSV(ref);
         }
-        return .{ .tape_value = .{ .string = input } };
+        return .{ .tape_value = .{ .string = input_view } };
     }
 
     /// `rtrimstr(str)`: remove suffix if present.
     fn builtinRtrimstr(it: *ResultIterator) ZqError!?StackValue {
         const arg_sv = try it.popValue();
         const arg = try stackValueToValue(arg_sv);
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
+            else => return try it.raiseUserError("endswith() requires string inputs"),
+        };
         const suffix = switch (arg) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("endswith() requires string inputs"),
         };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return try it.raiseUserError("endswith() requires string inputs"),
-        };
+        const input = input_view.slice();
         if (suffix.len > 0 and std.mem.endsWith(u8, input, suffix)) {
-            return .{ .tape_value = .{ .string = input[0 .. input.len - suffix.len] } };
+            const ref = try it.runtime_tape.internString(it.alloc, input[0 .. input.len - suffix.len]);
+            return it.rtStringSV(ref);
         }
-        return .{ .tape_value = .{ .string = input } };
+        return .{ .tape_value = .{ .string = input_view } };
     }
 
     /// `trimstr(str)`: remove prefix and suffix if present.
     fn builtinTrimstr(it: *ResultIterator) ZqError!?StackValue {
         const arg_sv = try it.popValue();
         const arg = try stackValueToValue(arg_sv);
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
+            else => return try it.raiseUserError("trimstr() requires string inputs"),
+        };
         const affix = switch (arg) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("trimstr() requires string inputs"),
         };
-        const input = switch (it.current) {
-            .string => |s| s,
-            else => return try it.raiseUserError("trimstr() requires string inputs"),
-        };
+        const input = input_view.slice();
         // Apply ltrimstr then rtrimstr
         const after_prefix = if (std.mem.startsWith(u8, input, affix))
             input[affix.len..]
         else
             input;
         if (affix.len > 0 and std.mem.endsWith(u8, after_prefix, affix)) {
-            return .{ .tape_value = .{ .string = after_prefix[0 .. after_prefix.len - affix.len] } };
+            const ref = try it.runtime_tape.internString(it.alloc, after_prefix[0 .. after_prefix.len - affix.len]);
+            return it.rtStringSV(ref);
         }
-        return .{ .tape_value = .{ .string = after_prefix } };
+        if (after_prefix.ptr == input.ptr and after_prefix.len == input.len) {
+            return .{ .tape_value = .{ .string = input_view } };
+        }
+        const ref = try it.runtime_tape.internString(it.alloc, after_prefix);
+        return it.rtStringSV(ref);
     }
 
     // ── Regex fork-frame handle ownership ──────────────────────────────────
@@ -10214,7 +10325,7 @@ pub const ResultIterator = struct {
         const pat_sv = try it.popValue();
         const pat_val = try stackValueToValue(pat_sv);
         const pat = switch (pat_val) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
 
@@ -10283,7 +10394,7 @@ pub const ResultIterator = struct {
         const pat_sv = try it.popValue();
         const pat_val = try stackValueToValue(pat_sv);
         const pat = switch (pat_val) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         const entry = try it.resolveDynamicRegex(pat);
@@ -10333,7 +10444,7 @@ pub const ResultIterator = struct {
     fn builtinTest(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
         const input = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return error.TypeError,
         };
         const n_flag = types.regexBuiltinNFlagOf(operand);
@@ -10361,19 +10472,18 @@ pub const ResultIterator = struct {
     /// backtrack/ip-jump idiom used by empty-`range` and exhausted scanners.
     fn builtinMatch(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
-        const input_raw = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        // NIX-005: `buildMatchObject` interns capture names + bytes,
-        // growing `runtime_tape.string_buf`. If `input_raw` aliases
-        // that buffer, the grow dangles the local slice between the
-        // `internString(name)` and `hay[slot.start..slot.end]` reads
-        // inside `buildMatchObject`/`appendCaptureEntry`. Stabilize.
-        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
-            it.scratch.allocator(),
-            input_raw,
-        );
+        // For raw byte-level regex calls (isMatch / iterNext / findCaptures)
+        // the haystack must be a stable []const u8 for the duration of the
+        // call. Re-resolve through StringView and pass the slice. The slice
+        // is only used INSIDE one regex call before the next intern, so it
+        // remains valid. NIX-006 alias safety: callers passing the slice
+        // into helpers that intern on runtime_tape thread `input_view`
+        // through and re-resolve via `.slice()` after each intern.
+        const input = input_view.slice();
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
@@ -10385,7 +10495,7 @@ pub const ResultIterator = struct {
         if (!n_flag) {
             const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
             if (!matched) return error.TypeError;
-            return try it.buildMatchObject(regex, input, slots_buf);
+            return try it.buildMatchObject(regex, input_view, slots_buf);
         }
         // n-flag path: iterate until a non-empty overall match lands. If the
         // iterator exhausts without one (only zero-width hits, or none at
@@ -10393,13 +10503,14 @@ pub const ResultIterator = struct {
         // terminating the value stream rather than raising TypeError.
         var cursor: usize = 0;
         while (true) {
-            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            const input_iter = input_view.slice();
+            const got = clone.iterNext(input_iter, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
             if (!got) {
                 if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             if (slots_buf[0].end > slots_buf[0].start) {
-                return try it.buildMatchObject(regex, input, slots_buf);
+                return try it.buildMatchObject(regex, input_view, slots_buf);
             }
         }
     }
@@ -10425,10 +10536,11 @@ pub const ResultIterator = struct {
     /// exist.
     fn builtinCapture(it: *ResultIterator, operand: i64) ZqError!?StackValue {
         const clone = try it.resolveRegexForOperand(operand);
-        const input = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
+        const input = input_view.slice();
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
@@ -10437,17 +10549,18 @@ pub const ResultIterator = struct {
         if (!n_flag) {
             const matched = clone.findCaptures(input, 0, slots_buf) catch |e| return it.mapRegexError(e);
             if (!matched) return error.TypeError;
-            return try it.buildCaptureObject(regex, input, slots_buf);
+            return try it.buildCaptureObject(regex, input_view, slots_buf);
         }
         var cursor: usize = 0;
         while (true) {
-            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            const input_iter = input_view.slice();
+            const got = clone.iterNext(input_iter, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
             if (!got) {
                 if (!(try it.doBacktrack())) it.ip = @intCast(it.instructions.len);
                 return null;
             }
             if (slots_buf[0].end > slots_buf[0].start) {
-                return try it.buildCaptureObject(regex, input, slots_buf);
+                return try it.buildCaptureObject(regex, input_view, slots_buf);
             }
         }
     }
@@ -10500,22 +10613,16 @@ pub const ResultIterator = struct {
         // Dynamic pattern: pop pat from value_stack and compile/cache.
         // Literal pattern: pool supplies regex.
         const clone = try it.resolveRegexForOperand(operand);
-        const input_raw = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        // NIX-005: `input_raw` may alias `runtime_tape.string_buf` (e.g.
-        // when the prior filter was itself a `gsub` whose result lives
-        // there). The per-match path grows `string_buf` repeatedly via
-        // `buildCaptureObject` (interns names + match bytes) and the
-        // replacement body's `+` / concat operators. Any such grow can
-        // relocate the buffer and dangle our cached `input` slice.
-        // Stabilize via the SSOT helper: zero-copy when input is
-        // already external; one scratch dupe when it aliases.
-        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
-            it.scratch.allocator(),
-            input_raw,
-        );
+        // NIX-006: input_view is a tape-relative reference; we re-resolve
+        // via `.slice()` after every operation that may grow
+        // runtime_tape.string_buf (interns inside buildCaptureObject and
+        // body intermediates). Each call to `clone.iterNext(input, ...)`
+        // sees a fresh resolution so the regex engine never sees a stale
+        // pointer.
         const pool_index = types.regexPoolIndexOf(operand);
         const regex = try it.resolveRegexMetaForOperand(pool_index);
         const n_slots = regex.captureCount();
@@ -10539,7 +10646,10 @@ pub const ResultIterator = struct {
         var cursor: usize = 0;
         var prev_end: usize = 0;
         while (true) {
-            const got = clone.iterNext(input, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
+            // Re-resolve input freshly: the previous iteration may have grown
+            // runtime_tape.string_buf (NIX-006 alias safety).
+            const input_iter = input_view.slice();
+            const got = clone.iterNext(input_iter, &cursor, slots_buf) catch |e| return it.mapRegexError(e);
             if (!got) break;
             const m_start = slots_buf[0].start;
             const m_end = slots_buf[0].end;
@@ -10564,8 +10674,14 @@ pub const ResultIterator = struct {
                 it.runtime_tape.refreshView();
             }
 
+            // Snapshot the gap NOW (before captures-object interns relocate
+            // string_buf) into a per-iteration scratch buffer, so subsequent
+            // intern/grow operations cannot dangle it.
+            const gap_src = input_view.slice()[prev_end..m_start];
+            const gap_copy = try it.scratch.allocator().dupe(u8, gap_src);
+
             // Build {<named groups...>} captures-object on runtime_tape.
-            const captures_sv = try it.buildCaptureObject(regex, input, slots_buf);
+            const captures_sv = try it.buildCaptureObject(regex, input_view, slots_buf);
             const captures = try stackValueToValue(captures_sv);
 
             // Run replacement body with `.` = captures-object. Collect ALL
@@ -10584,7 +10700,6 @@ pub const ResultIterator = struct {
             //
             // Common case (1 match output): exactly 1 branch ever; this is
             // a single concat per match, the optimal path.
-            const gap = input[prev_end..m_start];
             for (match_outputs.items, 0..) |sref, i| {
                 if (i >= branches.items.len) {
                     try branches.append(it.alloc, .{});
@@ -10592,7 +10707,7 @@ pub const ResultIterator = struct {
                 // Resolve StringRef NOW, before any further runtime_tape
                 // growth invalidates string_buf backing.
                 const slice = it.runtime_tape.view.string_buf[sref.offset..][0..sref.len];
-                try branches.items[i].appendSlice(it.alloc, gap);
+                try branches.items[i].appendSlice(it.alloc, gap_copy);
                 try branches.items[i].appendSlice(it.alloc, slice);
             }
 
@@ -10606,13 +10721,16 @@ pub const ResultIterator = struct {
             if (!global) break;
         }
 
-        // Trailing tail appended to every branch.
-        const tail = input[prev_end..];
+        // Trailing tail appended to every branch. Snapshot to scratch so
+        // subsequent runtime_tape.string_buf grows (the per-branch concat
+        // intern below) cannot dangle it.
+        const tail_src = input_view.slice()[prev_end..];
+        const tail = try it.scratch.allocator().dupe(u8, tail_src);
 
         // Edge case: zero matches. Mirror legacy: yield input unchanged.
         if (branches.items.len == 0) {
-            const ref = try it.runtime_tape.internString(it.alloc, input);
-            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            const ref = try it.runtime_tape.internString(it.alloc, input_view.slice());
+            return it.rtStringSV(ref);
         }
 
         // Intern each branch into runtime_tape via alias-safe concat.
@@ -10629,7 +10747,7 @@ pub const ResultIterator = struct {
         // Hot path (K == 1): return single string, no fork frame needed.
         if (refs.len == 1) {
             const r = refs[0];
-            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[r.offset..][0..r.len] } };
+            return it.rtStringSV(r);
         }
 
         // Generator path (K > 1): push fork frame holding refs[1..]; return
@@ -10650,7 +10768,7 @@ pub const ResultIterator = struct {
             .saved_object = try it.snapshotObjectConstructState(),
         });
         const r0 = refs[0];
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[r0.offset..][0..r0.len] } };
+        return it.rtStringSV(r0);
     }
 
     /// Run the replacement body bytecode (`<repl>`) once with `.` rebound to
@@ -10787,7 +10905,7 @@ pub const ResultIterator = struct {
         out: *std.ArrayList(Tape.StringRef),
     ) ZqError!void {
         const ref: Tape.StringRef = switch (v) {
-            .string => |s| try it.runtime_tape.internString(it.alloc, s),
+            .string => |sv| try it.runtime_tape.internString(it.alloc, sv.slice()),
             .null_val => try it.runtime_tape.internString(it.alloc, ""),
             else => return error.TypeError,
         };
@@ -10802,20 +10920,15 @@ pub const ResultIterator = struct {
     /// LRU is strictly an amortization layer for pattern compile and does
     /// not participate in fork-frame lifetime.
     fn builtinScan(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input_raw = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        // NIX-005: the fork frame stashes `hay = input` and reuses it
-        // across yields. If input aliases `runtime_tape.string_buf`,
-        // any operation between yields that grows the buffer (concat,
-        // chained gsub, etc.) dangles the cached `hay`. Stabilize the
-        // input upfront — scratch arena lives for the record so it
-        // outlasts every advance on this fork frame.
-        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
-            it.scratch.allocator(),
-            input_raw,
-        );
+        // NIX-006: the fork frame stashes `hay` and reuses it across yields.
+        // Snapshot the input bytes onto scratch (which lives for the whole
+        // record) so subsequent runtime_tape.string_buf grows cannot dangle
+        // the fork-frame's cached pointer.
+        const input = try it.scratch.allocator().dupe(u8, input_view.slice());
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();
@@ -10899,15 +11012,14 @@ pub const ResultIterator = struct {
     /// Dynamic-pattern ownership mirrors `builtinScan`: frame owns its own
     /// (Regex, Clone) pair so the LRU cannot dangle it via eviction.
     fn builtinMatchG(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input_raw = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        // NIX-005: same fork-frame `hay` reuse as builtinScan.
-        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
-            it.scratch.allocator(),
-            input_raw,
-        );
+        // Fork-frame `hay` must remain valid across backtracks, possibly
+        // through arbitrary runtime_tape interns. Snapshot to scratch (which
+        // outlives the iterator). NIX-006: replaces stabilizeAgainstStringBuf.
+        const input = try it.scratch.allocator().dupe(u8, input_view.slice());
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();
@@ -10954,7 +11066,7 @@ pub const ResultIterator = struct {
         if (st.owned_clone) |*oc| st.clone = oc;
         if (st.owned_regex) |*or_| st.regex = or_;
 
-        const yield_sv = try it.buildMatchObject(st.regex, input, st.slots);
+        const yield_sv = try it.buildMatchObject(st.regex, Value.StringView.fromExternal(input), st.slots);
         it.current = try stackValueToValue(yield_sv);
         it.ip = resume_ip;
         return null;
@@ -10966,7 +11078,7 @@ pub const ResultIterator = struct {
             const got = st.clone.iterNext(st.hay, &st.cursor, st.slots) catch |e| return it.mapRegexError(e);
             if (!got) return false;
             if (st.n_flag and st.slots[0].end == st.slots[0].start) continue;
-            const yield_sv = try it.buildMatchObject(st.regex, st.hay, st.slots);
+            const yield_sv = try it.buildMatchObject(st.regex, Value.StringView.fromExternal(st.hay), st.slots);
             it.current = try stackValueToValue(yield_sv);
             return true;
         }
@@ -10978,15 +11090,13 @@ pub const ResultIterator = struct {
     /// inter-match gap, and the tail after the last match (including empty
     /// tails). Equivalent to `split` when the pattern is a literal.
     fn builtinSplits(it: *ResultIterator, operand: i64) ZqError!?StackValue {
-        const input_raw = switch (it.current) {
-            .string => |s| s,
+        const input_view: Value.StringView = switch (it.current) {
+            .string => |sv| sv,
             else => return error.TypeError,
         };
-        // NIX-005: same fork-frame `hay` reuse as builtinScan.
-        const input = try it.runtime_tape.stabilizeAgainstStringBuf(
-            it.scratch.allocator(),
-            input_raw,
-        );
+        // NIX-006: snapshot input to scratch — fork frames hold `hay` across
+        // backtracks and arbitrary runtime_tape interns.
+        const input = try it.scratch.allocator().dupe(u8, input_view.slice());
         var handles = try it.buildRegexForkHandles(operand);
         var handles_transferred = false;
         defer if (!handles_transferred) handles.deinit();
@@ -11011,7 +11121,7 @@ pub const ResultIterator = struct {
             // No matches: yield the input whole, then terminate on next backtrack.
             // handles defer frees owned pair automatically.
             const ref = try it.runtime_tape.internString(it.alloc, input);
-            const whole_sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            const whole_sv: StackValue = it.rtStringSV(ref);
             // Push a `normal` forkpoint so the single emitted value ends the
             // generator cleanly on backtrack — this matches scan's empty-case
             // shape without bypassing the fork stack.
@@ -11037,7 +11147,7 @@ pub const ResultIterator = struct {
         const prev_end: usize = slots_buf[0].end;
         const seg_bytes = input[seg_start..seg_end];
         const ref = try it.runtime_tape.internString(it.alloc, seg_bytes);
-        const seg_sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+        const seg_sv: StackValue = it.rtStringSV(ref);
 
         it.fork_stack.appendAssumeCapacity(.{
             .saved_value_stack_len = @intCast(it.value_stack.items.len),
@@ -11085,7 +11195,7 @@ pub const ResultIterator = struct {
             // Yield final tail segment [prev_end, input.len), then terminate.
             const bytes = st.hay[st.prev_end..st.hay.len];
             const ref = try it.runtime_tape.internString(it.alloc, bytes);
-            const sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            const sv: StackValue = it.rtStringSV(ref);
             it.current = try stackValueToValue(sv);
             st.tail_yielded = true;
             return true;
@@ -11093,7 +11203,7 @@ pub const ResultIterator = struct {
         // Inter-match segment [prev_end, slots[0].start).
         const seg_bytes = st.hay[st.prev_end..st.slots[0].start];
         const ref = try it.runtime_tape.internString(it.alloc, seg_bytes);
-        const sv: StackValue = .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+        const sv: StackValue = it.rtStringSV(ref);
         st.prev_end = st.slots[0].end;
         it.current = try stackValueToValue(sv);
         return true;
@@ -11112,7 +11222,7 @@ pub const ResultIterator = struct {
             const s = slots[0];
             const bytes = hay[s.start..s.end];
             const ref = try it.runtime_tape.internString(it.alloc, bytes);
-            return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[ref.offset..][0..ref.len] } };
+            return it.rtStringSV(ref);
         }
         // Array of capture strings (indices 1..captureCount).
         const arr_start = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -11147,10 +11257,10 @@ pub const ResultIterator = struct {
     fn buildMatchObject(
         it: *ResultIterator,
         regex: *const regex_mod.Regex,
-        hay: []const u8,
+        hay_view: Value.StringView,
         slots: []const regex_mod.MatchSlot,
     ) ZqError!StackValue {
-        var oc = regex_mod.offset.OffsetCursor.init(hay);
+        var oc = regex_mod.offset.OffsetCursor.init(hay_view.slice());
         const m_start_char = oc.charAt(slots[0].start);
         const m_end_char = oc.charAt(slots[0].end);
 
@@ -11167,7 +11277,9 @@ pub const ResultIterator = struct {
             "length",
             .{ .tag = .int, .payload = .{ .int = @intCast(m_end_char - m_start_char) } },
         );
-        const match_bytes = hay[slots[0].start..slots[0].end];
+        // Re-resolve hay AFTER any intern that grew runtime_tape.string_buf
+        // — `appendRuntimeKV` interns the key. NIX-006 alias safety.
+        const match_bytes = hay_view.slice()[slots[0].start..slots[0].end];
         const match_ref = try it.runtime_tape.internString(it.alloc, match_bytes);
         try it.appendRuntimeKV(
             "string",
@@ -11181,7 +11293,7 @@ pub const ResultIterator = struct {
 
         var i: usize = 1;
         while (i < slots.len) : (i += 1) {
-            try it.appendCaptureEntry(regex, hay, slots[i], i, &oc);
+            try it.appendCaptureEntry(regex, hay_view, slots[i], i, &oc);
         }
 
         const caps_end = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .array_end, .payload = .{ .none = {} } });
@@ -11202,7 +11314,7 @@ pub const ResultIterator = struct {
     fn buildCaptureObject(
         it: *ResultIterator,
         regex: *const regex_mod.Regex,
-        hay: []const u8,
+        hay_view: Value.StringView,
         slots: []const regex_mod.MatchSlot,
     ) ZqError!StackValue {
         const obj_start = try it.runtime_tape.appendEntry(it.alloc, .{
@@ -11218,6 +11330,9 @@ pub const ResultIterator = struct {
             if (slots[i].start == regex_mod.SLOT_UNMATCHED) {
                 _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .null_val, .payload = .{ .none = {} } });
             } else {
+                // Re-resolve hay each iteration — interns above may have
+                // grown runtime_tape.string_buf (NIX-006 alias safety).
+                const hay = hay_view.slice();
                 const bytes = hay[slots[i].start..slots[i].end];
                 const s_ref = try it.runtime_tape.internString(it.alloc, bytes);
                 _ = try it.runtime_tape.appendEntry(it.alloc, .{ .tag = .string, .payload = .{ .string = s_ref } });
@@ -11240,7 +11355,7 @@ pub const ResultIterator = struct {
     fn appendCaptureEntry(
         it: *ResultIterator,
         regex: *const regex_mod.Regex,
-        hay: []const u8,
+        hay_view: Value.StringView,
         slot: regex_mod.MatchSlot,
         idx: usize,
         oc: *regex_mod.offset.OffsetCursor,
@@ -11259,6 +11374,8 @@ pub const ResultIterator = struct {
             const e_char = oc.charAt(slot.end);
             try it.appendRuntimeKV("offset", .{ .tag = .int, .payload = .{ .int = @intCast(s_char) } });
             try it.appendRuntimeKV("length", .{ .tag = .int, .payload = .{ .int = @intCast(e_char - s_char) } });
+            // Re-resolve hay AFTER appendRuntimeKV interns above (NIX-006).
+            const hay = hay_view.slice();
             const bytes = hay[slot.start..slot.end];
             const ref = try it.runtime_tape.internString(it.alloc, bytes);
             try it.appendRuntimeKV("string", .{ .tag = .string, .payload = .{ .string = ref } });
@@ -11373,9 +11490,9 @@ pub const ResultIterator = struct {
                 var msg_buf = std.ArrayList(u8){};
                 defer msg_buf.deinit(it.alloc);
                 switch (it.current) {
-                    .string => |s| {
+                    .string => |sv| {
                         try msg_buf.appendSlice(it.alloc, "string (");
-                        try appendJsonString(&msg_buf, it.alloc, s);
+                        try appendJsonString(&msg_buf, it.alloc, sv.slice());
                         try msg_buf.appendSlice(it.alloc, ") cannot be searched from");
                     },
                     .null_val => try msg_buf.appendSlice(it.alloc, "null cannot be searched from"),
@@ -11500,7 +11617,7 @@ pub const ResultIterator = struct {
         const fmt_sv = try it.popValue();
         const fmt_val = try stackValueToValue(fmt_sv);
         const fmt = switch (fmt_val) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError(name ++ "/1 requires a string format"),
         };
         // Convert current value to BrokenDownTime
@@ -11512,7 +11629,7 @@ pub const ResultIterator = struct {
         defer buf.deinit(it.alloc);
         formatDatetime(&buf, it.alloc, fmt, bd) catch return error.OutOfMemory;
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     fn builtinStrptime(it: *ResultIterator) ZqError!?StackValue {
@@ -11520,11 +11637,11 @@ pub const ResultIterator = struct {
         const fmt_sv = try it.popValue();
         const fmt_val = try stackValueToValue(fmt_sv);
         const fmt = switch (fmt_val) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
         };
         const input = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
         };
         const bd = parseDatetime(input, fmt) catch {
@@ -11551,12 +11668,12 @@ pub const ResultIterator = struct {
         defer buf.deinit(it.alloc);
         formatDatetime(&buf, it.alloc, "%Y-%m-%dT%H:%M:%SZ", bd) catch return error.OutOfMemory;
         const str_ref = try it.runtime_tape.internString(it.alloc, buf.items);
-        return .{ .tape_value = .{ .string = it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] } };
+        return it.rtStringSV(str_ref);
     }
 
     fn builtinFromdate(it: *ResultIterator) ZqError!?StackValue {
         const input = switch (it.current) {
-            .string => |s| s,
+            .string => |sv| sv.slice(),
             else => return try it.raiseUserError("strptime/1 requires string inputs and arguments"),
         };
         const bd = parseDatetime(input, "%Y-%m-%dT%H:%M:%SZ") catch {
@@ -11663,7 +11780,7 @@ const JsonParser = struct {
     /// "Exceeds depth limit for parsing" string.
     fn raiseDepthLimit(self: *JsonParser) ZqError {
         const str_ref = self.it.runtime_tape.internString(self.it.alloc, PARSE_DEPTH_LIMIT_MSG) catch return error.OutOfMemory;
-        self.it.user_error_msg = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        self.it.user_error_msg = .{ .string = self.it.rtString(str_ref) };
         return error.UserError;
     }
 
@@ -11914,7 +12031,7 @@ const JsonParser = struct {
             .{ col, literal },
         ) catch return error.TypeError;
         const str_ref = self.it.runtime_tape.internString(self.it.alloc, buf.items) catch return error.TypeError;
-        self.it.type_error_detail = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        self.it.type_error_detail = .{ .string = self.it.rtString(str_ref) };
         return error.TypeError;
     }
 
@@ -11970,7 +12087,7 @@ const JsonParser = struct {
             .{ bad_char, col, self.src },
         ) catch return error.TypeError;
         const str_ref = self.it.runtime_tape.internString(self.it.alloc, buf.items) catch return error.TypeError;
-        self.it.type_error_detail = .{ .string = self.it.runtime_tape.view.string_buf[str_ref.offset..][0..str_ref.len] };
+        self.it.type_error_detail = .{ .string = self.it.rtString(str_ref) };
         return error.TypeError;
     }
 
@@ -12137,7 +12254,7 @@ fn tapeValuesEqual(a: Value, b: Value) bool {
             else => false,
         },
         .string => |as| switch (b) {
-            .string => |bs| std.mem.eql(u8, as, bs),
+            .string => |bs| std.mem.eql(u8, as.slice(), bs.slice()),
             else => false,
         },
         .array => |aspan| switch (b) {
@@ -12208,7 +12325,7 @@ fn jqCompareValues(a: Value, b: Value) std.math.Order {
             else => unreachable,
         },
         .string => |as_str| switch (b) {
-            .string => |bs_str| std.mem.order(u8, as_str, bs_str),
+            .string => |bs_str| std.mem.order(u8, as_str.slice(), bs_str.slice()),
             else => unreachable,
         },
         .array => |aspan| switch (b) {
@@ -12393,8 +12510,10 @@ fn jqContains(a: Value, b: Value) bool {
             .int => |ai| @as(f64, @floatFromInt(ai)) == bf,
             else => false,
         },
-        .string => |bs| return switch (a) {
-            .string => |as_str| {
+        .string => |bs_sv| return switch (a) {
+            .string => |as_sv| {
+                const bs = bs_sv.slice();
+                const as_str = as_sv.slice();
                 // b is substring of a
                 if (bs.len == 0) return true;
                 if (bs.len > as_str.len) return false;
@@ -12654,7 +12773,7 @@ fn writeScalar(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, val: Value) er
             try buf.appendSlice(alloc, formatted.slice());
         },
         .big_number => |bn| try buf.appendSlice(alloc, bn),
-        .string => |s| try appendJsonString(buf, alloc, s),
+        .string => |sv| try appendJsonString(buf, alloc, sv.slice()),
         .array, .object => unreachable,
     }
 }
@@ -12843,7 +12962,7 @@ fn tapeEntryToValue(tape: *const Tape, pos: u32) Value {
         .false_val => .{ .bool_val = false },
         .int => .{ .int = e.payload.int },
         .float => .{ .float = e.payload.float },
-        .string => .{ .string = tape.getString(e.payload.string) },
+        .string => .{ .string = .{ .tape_ref = .{ .tape = tape, .ref = e.payload.string } } },
         .big_number => .{ .big_number = tape.getString(e.payload.string) },
         .object_start => .{ .object = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
         .array_start => .{ .array = .{ .tape = tape, .start = pos, .end = e.payload.skip } },
@@ -12942,8 +13061,8 @@ fn writeValueToTape(tape: *types.RuntimeTape, alloc: std.mem.Allocator, val: Val
                 .payload = .{ .float = f },
             });
         },
-        .string => |s| {
-            const str_ref = try tape.internString(alloc, s);
+        .string => |sv| {
+            const str_ref = try tape.internString(alloc, sv.slice());
             _ = try tape.appendEntry(alloc, .{
                 .tag = .string,
                 .payload = .{ .string = str_ref },

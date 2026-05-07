@@ -344,7 +344,7 @@ pub fn main() !u8 {
                     // --arg: string value
                     ext_bindings_buf[i] = .{
                         .var_id = cq.external_var_ids[i],
-                        .value = .{ .tape_value = .{ .string = ev.value } },
+                        .value = .{ .tape_value = .{ .string = .{ .external = ev.value } } },
                     };
                 },
             }
@@ -554,7 +554,7 @@ pub fn main() !u8 {
     for (compound_refs.items) |ref| {
         const rt_entry = argjson_tape_view.entries[ref.rt_start];
         ext_bindings_buf[ref.idx].value = switch (rt_entry.tag) {
-            .string => .{ .tape_value = .{ .string = argjson_tape_view.getString(rt_entry.payload.string) } },
+            .string => .{ .tape_value = .{ .string = .{ .tape_ref = .{ .tape = &argjson_tape_view, .ref = rt_entry.payload.string } } } },
             .big_number => .{ .big_number = argjson_tape_view.getString(rt_entry.payload.string) },
             .array_start => .{ .tape_value = .{ .array = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
             .object_start => .{ .tape_value = .{ .object = .{ .tape = &argjson_tape_view, .start = ref.rt_start, .end = rt_entry.payload.skip } } },
@@ -1273,7 +1273,7 @@ fn writeRecord(
         // Capture user error message from the iterator before it's cleaned up.
         if (it.user_error_msg) |msg| {
             switch (msg) {
-                .string => |s| diag.user_error_msg = s,
+                .string => |sv| diag.user_error_msg = sv.slice(),
                 else => {},
             }
         }
@@ -1283,7 +1283,7 @@ fn writeRecord(
     while (try it.next()) |val| {
         try writer.write_value(val, format, color, opts);
         if (format != .jsonl and format != .join) {
-            try writer.write_value(.{ .string = "\n" }, .raw, null, .{});
+            try writer.write_value(.{ .string = .{ .external = "\n" } }, .raw, null, .{});
         }
         if (unbuffered) try writer.flush();
         last_was_false_or_null = switch (val) {

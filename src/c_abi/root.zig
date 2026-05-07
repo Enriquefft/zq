@@ -70,9 +70,9 @@ fn writeValueCompact(
             try buf.appendSlice(allocator, formatted.slice());
         },
         .big_number => |bn| try buf.appendSlice(allocator, bn),
-        .string => |s| {
+        .string => |sv| {
             try buf.append(allocator, '"');
-            try writeEscaped(buf, allocator, s);
+            try writeEscaped(buf, allocator, sv.slice());
             try buf.append(allocator, '"');
         },
         .array => |span| {
@@ -425,7 +425,7 @@ pub export fn zq_execute(
         var user_msg: ?[]const u8 = null;
         if (iterator.user_error_msg) |msg| {
             switch (msg) {
-                .string => |s| user_msg = s,
+                .string => |sv| user_msg = sv.slice(),
                 else => {},
             }
         }
