@@ -1521,7 +1521,6 @@ fn flushPartialToBatch(
 const FileFeedCtx = struct {
     data: []const u8,
     n_chunks: usize,
-    n_stripes: usize,
     query: *const query_mod.CompiledQuery,
     queue: *JobQueue,
     sequencer: *Sequencer,
@@ -1534,213 +1533,30 @@ const FileFeedCtx = struct {
     external_bindings: []const query_mod.ExternalVarBinding,
 };
 
-/// Files smaller than this use the single-threaded boundary scanner. Below
-/// the threshold, parallel fan-out (thread spawn + join + merge) costs more
-/// than the serial scan it would replace.
-const PARALLEL_BOUNDARY_THRESHOLD: usize = 256 * 1024;
-
-/// Smallest per-stripe span that justifies the parallel summary's overhead.
-/// `computeBoundariesParallelRange` clamps `eff_stripes` so each stripe holds
-/// at least this many bytes; sub-ranges thinner than `2 × MIN_STRIPE` bypass
-/// the parallel path entirely and run a single in-thread `feedBytes`.
-const MIN_STRIPE: usize = 16 * 1024;
-
-/// Per-stripe scratch and outputs for the parallel boundary scan. One of
-/// these per stripe; passed to pass-1 and pass-2 worker threads by pointer.
-const StripeWork = struct {
-    data: []const u8,
-    base_offset: usize,
-    summary: parser_mod.boundary.Stripe = undefined,
-    /// Set by the serial stitch step from the running carry.
-    start: parser_mod.boundary.ScannerState = .{},
-    /// Pass-2 output: absolute offsets of depth-0/outside-string newlines.
-    boundaries: std.ArrayList(usize) = .{},
-    allocator: std.mem.Allocator,
-    err: ?error{OutOfMemory} = null,
-};
-
-fn stripeSummaryEntry(work: *StripeWork) void {
-    work.summary = parser_mod.boundary.summarizeStripe(work.data);
-}
-
-fn stripeBoundariesEntry(work: *StripeWork) void {
-    var s = work.start;
-    parser_mod.boundary.feedBytes(&s, work.data, work.base_offset, &work.boundaries, work.allocator) catch |e| {
-        work.err = e;
-    };
-}
-
-/// Two-pass parallel prefix-sum boundary scan over `data[range_start..range_end]`.
-/// Boundaries appended to `out_boundaries` are absolute mmap offsets.
-/// The supplied `(initial_cat, initial_depth)` is the carry at `range_start`.
-///
-/// Pass 1 (parallel): each stripe records, for each of the 3 categorical
-/// input states, the terminal categorical state and signed depth delta.
-/// Stitch (serial, O(n_stripes) scalar work): folds left-to-right from the
-/// supplied initial carry to derive each stripe's actual starting state.
-/// Pass 2 (parallel): each stripe runs `feedBytes` from its correct carry.
-/// Boundary set is byte-identical to the serial feeder for well-formed JSON.
-///
-/// No terminal carry is returned: `feedParallel` enforces the cross-wave
-/// invariant `(.oos, 0)` by slicing dispatch at depth-0 boundaries, so the
-/// terminal scanner state would be redundant with that structural guarantee.
-fn computeBoundariesParallelRange(
-    allocator: std.mem.Allocator,
-    data: []const u8,
-    range_start: usize,
-    range_end: usize,
-    n_stripes: usize,
-    initial_cat: parser_mod.boundary.Cat,
-    initial_depth: i64,
-    out_boundaries: *std.ArrayList(usize),
-) !void {
-    std.debug.assert(range_start <= range_end and range_end <= data.len);
-    const span_len = range_end - range_start;
-    if (span_len == 0) return;
-
-    // Sub-range smaller than two minimum stripes: in-thread serial scan
-    // from the supplied carry. Avoids spawn overhead on tail waves.
-    const eff_stripes = @max(@as(usize, 1), @min(n_stripes, span_len / MIN_STRIPE));
-    if (eff_stripes < 2) {
-        var s = parser_mod.boundary.ScannerState{
-            .depth = if (initial_depth < 0) 0 else @intCast(initial_depth),
-            .in_string = (initial_cat != .oos),
-            .escape_pending = (initial_cat == .is_esc),
-        };
-        try parser_mod.boundary.feedBytes(&s, data[range_start..range_end], range_start, out_boundaries, allocator);
-        return;
-    }
-
-    const works = try allocator.alloc(StripeWork, eff_stripes);
-    defer allocator.free(works);
-
-    for (works, 0..) |*w, i| {
-        const s = range_start + i * span_len / eff_stripes;
-        const e = if (i + 1 == eff_stripes) range_end else range_start + (i + 1) * span_len / eff_stripes;
-        w.* = .{
-            .data = data[s..e],
-            .base_offset = s,
-            .allocator = allocator,
-        };
-    }
-
-    // Pass 1: parallel summary. n-1 spawned threads + this thread runs the
-    // last stripe. If a spawn fails, fall back to in-thread summarization
-    // for the remaining stripes — correctness preserved, parallelism lost.
-    runStripesParallel(allocator, works, stripeSummaryEntry);
-
-    // Stitch: fold per-stripe summaries left-to-right against the running
-    // carry. depth is tracked signed because stripe-local saturation in
-    // `summarizeStripe` would not be additive.
-    var cur_cat = initial_cat;
-    var cur_depth = initial_depth;
-    for (works) |*w| {
-        const idx: usize = @intFromEnum(cur_cat);
-        const start_depth: u32 = if (cur_depth < 0) 0 else @intCast(cur_depth);
-        w.start = .{
-            .depth = start_depth,
-            .in_string = (cur_cat != .oos),
-            .escape_pending = (cur_cat == .is_esc),
-        };
-        cur_depth += w.summary.depth_delta[idx];
-        cur_cat = w.summary.terminal[idx];
-    }
-
-    // Pass 2: parallel boundary recording with correct carry per stripe.
-    runStripesParallel(allocator, works, stripeBoundariesEntry);
-
-    errdefer for (works) |*w| w.boundaries.deinit(allocator);
-
-    for (works) |*w| if (w.err) |e| return e;
-
-    var total: usize = 0;
-    for (works) |*w| total += w.boundaries.items.len;
-    try out_boundaries.ensureUnusedCapacity(allocator, total);
-    for (works) |*w| out_boundaries.appendSliceAssumeCapacity(w.boundaries.items);
-    for (works) |*w| w.boundaries.deinit(allocator);
-}
-
-fn runStripesParallel(
-    allocator: std.mem.Allocator,
-    works: []StripeWork,
-    comptime entry: fn (*StripeWork) void,
-) void {
-    const n = works.len;
-    if (n == 0) return;
-
-    const threads = allocator.alloc(std.Thread, n - 1) catch {
-        for (works) |*w| entry(w);
-        return;
-    };
-    defer allocator.free(threads);
-
-    var spawned: usize = 0;
-    for (threads, 0..) |*t, i| {
-        t.* = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, entry, .{&works[i]}) catch {
-            break;
-        };
-        spawned += 1;
-    }
-    // Run any unspawned stripes plus the always-on-this-thread last one.
-    for (works[spawned..]) |*w| entry(w);
-    for (threads[0..spawned]) |t| t.join();
-}
-
 fn file_feeder_fn(ctx: FileFeedCtx) void {
-    var chunk_id: u64 = 0;
-    var i_chunk: usize = 0;
-    if (ctx.data.len >= PARALLEL_BOUNDARY_THRESHOLD and ctx.n_stripes >= 2) {
-        feedParallel(ctx, &chunk_id, &i_chunk);
-    } else {
-        // Start of file: scanner is at depth-0 / outside-string by definition.
-        feedSerialRange(ctx, &chunk_id, 0, .{}, &i_chunk);
-    }
-    // Always inform the Sequencer of the final total and stop workers,
-    // even when we exit early due to shutdown.
-    ctx.sequencer.set_total_chunks(chunk_id);
-    ctx.queue.signal_done();
-}
-
-/// Single-threaded structural scan + dispatch starting at `start_offset`.
-/// `i_chunk` is the running chunk index into `ctx.n_chunks`; the caller
-/// passes a pointer so the wave-fallback path can resume from the chunk
-/// index reached by the parallel path before failure.
-///
-/// Precondition: `start_state` accurately describes the JSON-structural
-/// scanner state at `start_offset`. Passing a default `.{}` is correct
-/// only when `start_offset` lands at depth-0 / outside-string. Today's
-/// callers always satisfy this (file start, or wave-fallback at a
-/// previous depth-0 boundary), but the parameter makes the contract
-/// explicit so future callers can't break it silently.
-fn feedSerialRange(
-    ctx: FileFeedCtx,
-    chunk_id: *u64,
-    start_offset: usize,
-    start_state: parser_mod.boundary.ScannerState,
-    i_chunk: *usize,
-) void {
     const data = ctx.data;
     const file_size = data.len;
-    var chunk_start: usize = start_offset;
+    var chunk_start: usize = 0;
+    var chunk_id: u64 = 0;
 
-    // Persistent JSON-structural scanner state walks the file sequentially.
-    // Each chunk_end is a depth-0/outside-string newline, so multi-line
-    // pretty-printed values are never split across workers. Scanner only
-    // reads — workers still MADV_DONTNEED their chunks on post(),
-    // preserving the bounded-RSS invariant.
-    var scanner = start_state;
-    var scan_cursor: usize = start_offset;
+    // Persistent JSON-structural scanner state walks the file once
+    // sequentially. Each chunk_end is a depth-0/outside-string newline,
+    // so multi-line pretty-printed values are never split across workers.
+    // Scanner only reads — workers still MADV_DONTNEED their chunks on
+    // post(), preserving the bounded-RSS invariant.
+    var scanner = parser_mod.boundary.ScannerState{};
+    var scan_cursor: usize = 0;
 
-    while (i_chunk.* < ctx.n_chunks) : (i_chunk.* += 1) {
+    for (0..ctx.n_chunks) |i| {
         // Once a previous chunk has consumed past EOF (record boundary
         // landed at file_size for a no-trailing-newline final value), no
         // remaining chunks are reachable.
         if (chunk_start >= file_size) break;
 
-        const ideal_end_raw = if (i_chunk.* + 1 == ctx.n_chunks)
+        const ideal_end_raw = if (i + 1 == ctx.n_chunks)
             file_size
         else
-            (i_chunk.* + 1) * file_size / ctx.n_chunks;
+            (i + 1) * file_size / ctx.n_chunks;
         // A previous chunk's `findNextRecordEnd` can advance past the next
         // ideal split. Clamp so each chunk strictly follows the prior one.
         const ideal_end = @max(ideal_end_raw, chunk_start);
@@ -1757,164 +1573,36 @@ fn feedSerialRange(
             parser_mod.boundary.findNextRecordEnd(&scanner, data, ideal_end, file_size);
         scan_cursor = chunk_end;
 
-        if (!emitChunk(ctx, data[chunk_start..chunk_end], chunk_id)) return;
+        const chunk = data[chunk_start..chunk_end];
         chunk_start = chunk_end;
+
+        if (chunk.len == 0) continue;
+        if (!ctx.raw_input and !hasNonEmptyLine(chunk)) continue;
+
+        // Block until a slot is available.  Returns false on shutdown (deinit).
+        if (!ctx.limiter.acquire()) break;
+
+        ctx.queue.push(.{
+            .data = chunk,
+            .seq_base = chunk_id,
+            .chunk_id = chunk_id,
+            .query = ctx.query,
+            .owns_data = false,
+            .allocator = ctx.allocator,
+            .style = ctx.style,
+            .color = ctx.color,
+            .opts = ctx.opts,
+            .raw_input = ctx.raw_input,
+            .external_bindings = ctx.external_bindings,
+            .seq_range_size = 1,
+        });
+        chunk_id += 1;
     }
-}
 
-/// Wave size: how many bytes of mmap the parallel scan may run ahead of
-/// the dispatcher. Hardware-agnostic by construction: each wave hands every
-/// stripe-thread one chunk's worth of work, so per-wave fan-out cost
-/// amortizes across the same byte volume regardless of core count.
-///
-///   wave_bytes = n_stripes × ideal_chunk
-///              ≡ in_flight_bytes / in_flight_factor   (identity)
-///
-/// Wave count is `ceil(file_size / wave_bytes)`, which depends only on the
-/// `MemoryBudget` chain — not on absolute `n_threads`. A 4-core and a
-/// 22-core machine on the same input run the same number of waves; each
-/// just fans the wave's work across a different number of stripes.
-///
-/// RSS bound: `peak ≈ wave_bytes + in_flight_overlap`. Since
-/// `wave_bytes ≤ in_flight_bytes` (because `n_stripes ≤ limiter.max` by
-/// construction in `submit_file`), peak stays within the
-/// `MemoryBudget`-derived ceiling that already governs in-flight chunks.
-fn computeWaveBytes(ctx: FileFeedCtx) usize {
-    const file_size = ctx.data.len;
-    const ideal_chunk = @max(@as(usize, 1), file_size / @max(@as(usize, 1), ctx.n_chunks));
-    const stripes = @max(@as(usize, 1), ctx.n_stripes);
-    const wave_bytes = stripes * ideal_chunk;
-    // Invariant: wave_bytes never exceeds in_flight_bytes, because
-    // `submit_file` allocates `limiter.max ≥ n_stripes` slots.
-    // `limiter.max` is set before the feeder thread is spawned
-    // (happens-before via `std.Thread.spawn`); reading it here without
-    // locking is safe — no concurrent writer exists by construction.
-    const in_flight_bytes = @max(@as(usize, 1), ctx.limiter.max) * ideal_chunk;
-    std.debug.assert(wave_bytes <= in_flight_bytes);
-    return @max(wave_bytes, PARALLEL_BOUNDARY_THRESHOLD);
-}
-
-/// Wave-based parallel dispatcher. Processes the mmap in waves of
-/// `wave_bytes`, scanning + dispatching each before moving on. Cross-wave
-/// backpressure is supplied by `InFlightLimiter.acquire` inside `emitChunk`,
-/// which gates wave N+1's first emissions until wave N's chunks have been
-/// MADV_DONTNEED'd by their workers — keeping peak RSS bounded.
-fn feedParallel(ctx: FileFeedCtx, chunk_id: *u64, i_chunk: *usize) void {
-    const data = ctx.data;
-    const file_size = data.len;
-    const wave_bytes = computeWaveBytes(ctx);
-    const max_extension = wave_bytes; // single extension before falling back
-
-    var boundaries = std.ArrayList(usize){};
-    defer boundaries.deinit(ctx.allocator);
-
-    var dispatch_cursor: usize = 0;
-    var extension: usize = 0;
-
-    while (dispatch_cursor < file_size) {
-        const wave_start = dispatch_cursor;
-        const wave_end = @min(wave_start + wave_bytes + extension, file_size);
-        const is_last_wave = (wave_end == file_size);
-
-        boundaries.clearRetainingCapacity();
-        // Cross-wave carry is the trivial (oos, 0): every successful wave
-        // hands off at a depth-0 / outside-string boundary. The zero-boundary
-        // extension just rescans a wider window from the same dispatch_cursor,
-        // so the carry stays trivial there too.
-        computeBoundariesParallelRange(
-            ctx.allocator,
-            data,
-            wave_start,
-            wave_end,
-            ctx.n_stripes,
-            .oos,
-            0,
-            &boundaries,
-        ) catch {
-            // wave_start is at a previous wave's last depth-0 boundary +1
-            // (or 0 for the first wave) — scanner state is .{} by invariant.
-            feedSerialRange(ctx, chunk_id, wave_start, .{}, i_chunk);
-            return;
-        };
-
-        if (boundaries.items.len == 0 and !is_last_wave) {
-            extension += wave_bytes;
-            if (extension > max_extension) {
-                // wave_start unchanged from a successful prior wave (or 0):
-                // depth-0 boundary, scanner state is .{}.
-                feedSerialRange(ctx, chunk_id, wave_start, .{}, i_chunk);
-                return;
-            }
-            continue;
-        }
-
-        // Dispatch chunks within this wave. Stop at the last in-wave
-        // boundary; bytes beyond it are deferred to the next wave (the
-        // tail [last_boundary+1, wave_end] gets re-scanned, which is
-        // bounded by the longest record length per wave).
-        const dispatch_end: usize = if (is_last_wave)
-            file_size
-        else
-            boundaries.items[boundaries.items.len - 1] + 1;
-
-        // `n_chunks` is the file-wide *ideal* chunk count, used only to derive
-        // ideal split points. Each wave dispatches every byte it owns
-        // regardless of how many chunk slots remain — once `i_chunk` reaches
-        // `n_chunks`, subsequent chunks fall through to `dispatch_end`.
-        var b_idx: usize = 0;
-        while (dispatch_cursor < dispatch_end) : (i_chunk.* += 1) {
-            const ideal_end_raw = if (i_chunk.* + 1 >= ctx.n_chunks)
-                file_size
-            else
-                (i_chunk.* + 1) * file_size / ctx.n_chunks;
-            const ideal_end = @max(ideal_end_raw, dispatch_cursor);
-            const cap = @min(ideal_end, dispatch_end);
-
-            // Walk b_idx forward to the first boundary at-or-after `cap`.
-            while (b_idx < boundaries.items.len and boundaries.items[b_idx] + 1 < cap) b_idx += 1;
-
-            const chunk_end: usize =
-                if (is_last_wave and cap >= file_size)
-                    file_size
-                else if (b_idx < boundaries.items.len)
-                    boundaries.items[b_idx] + 1
-                else
-                    dispatch_end;
-
-            if (b_idx < boundaries.items.len and boundaries.items[b_idx] + 1 == chunk_end) b_idx += 1;
-
-            if (!emitChunk(ctx, data[dispatch_cursor..chunk_end], chunk_id)) return;
-            dispatch_cursor = chunk_end;
-        }
-
-        extension = 0;
-        if (is_last_wave) break;
-    }
-}
-
-fn emitChunk(ctx: FileFeedCtx, chunk: []const u8, chunk_id: *u64) bool {
-    if (chunk.len == 0) return true;
-    if (!ctx.raw_input and !hasNonEmptyLine(chunk)) return true;
-
-    // Block until a slot is available. Returns false on shutdown (deinit).
-    if (!ctx.limiter.acquire()) return false;
-
-    ctx.queue.push(.{
-        .data = chunk,
-        .seq_base = chunk_id.*,
-        .chunk_id = chunk_id.*,
-        .query = ctx.query,
-        .owns_data = false,
-        .allocator = ctx.allocator,
-        .style = ctx.style,
-        .color = ctx.color,
-        .opts = ctx.opts,
-        .raw_input = ctx.raw_input,
-        .external_bindings = ctx.external_bindings,
-        .seq_range_size = 1,
-    });
-    chunk_id.* += 1;
-    return true;
+    // Always inform the Sequencer of the final total and stop workers,
+    // even when we exit early due to shutdown.
+    ctx.sequencer.set_total_chunks(chunk_id);
+    ctx.queue.signal_done();
 }
 
 /// Count newline bytes using SIMD (AVX2 on x86-64, NEON on aarch64).
@@ -2403,7 +2091,6 @@ pub const Pool = struct {
         ctx_ptr.* = .{
             .data = p._mmap.?.data,
             .n_chunks = n_chunks,
-            .n_stripes = n_threads,
             .query = cq,
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
