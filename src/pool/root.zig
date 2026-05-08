@@ -1762,39 +1762,36 @@ fn feedSerialRange(
     }
 }
 
-/// Divisor of `in_flight_bytes` that yields the wave-scan window size.
-/// Empirically Pareto-tuned: a Pareto sweep across {1/2, 3/8, 1/4, 3/16}
-/// of `n_stripes × ideal_chunk` (≈ {22, 16.5, 11, 8.25}× ideal_chunk on
-/// the 22-thread reference machine) showed `1/4 × n_stripes × ideal`
-/// gave the best RSS-vs-wall tradeoff (373 MB / 3.20 s on a 1.3 GB / 15M
-/// JSONL workload). Since `n_stripes × ideal_chunk ≈ ideal_chunk × n_threads`
-/// and `in_flight_bytes = limiter.max × ideal_chunk = in_flight_factor ×
-/// n_threads × ideal_chunk`, dividing `in_flight_bytes` by 8 reproduces
-/// the same window for the default `in_flight_factor = 2` and scales it
-/// proportionally as the budget tightens (`in_flight_factor → 1`).
-const WAVE_BYTES_DIVISOR: usize = 8;
-
 /// Wave size: how many bytes of mmap the parallel scan may run ahead of
-/// the dispatcher. Bounds peak resident-set size to roughly
-/// `in_flight_bytes + wave_bytes`. Derived from the same `MemoryBudget`
-/// chain as `in_flight_bytes` so the bound holds across budget regimes.
+/// the dispatcher. Hardware-agnostic by construction: each wave hands every
+/// stripe-thread one chunk's worth of work, so per-wave fan-out cost
+/// amortizes across the same byte volume regardless of core count.
+///
+///   wave_bytes = n_stripes × ideal_chunk
+///              ≡ in_flight_bytes / in_flight_factor   (identity)
+///
+/// Wave count is `ceil(file_size / wave_bytes)`, which depends only on the
+/// `MemoryBudget` chain — not on absolute `n_threads`. A 4-core and a
+/// 22-core machine on the same input run the same number of waves; each
+/// just fans the wave's work across a different number of stripes.
+///
+/// RSS bound: `peak ≈ wave_bytes + in_flight_overlap`. Since
+/// `wave_bytes ≤ in_flight_bytes` (because `n_stripes ≤ limiter.max` by
+/// construction in `submit_file`), peak stays within the
+/// `MemoryBudget`-derived ceiling that already governs in-flight chunks.
 fn computeWaveBytes(ctx: FileFeedCtx) usize {
     const file_size = ctx.data.len;
     const ideal_chunk = @max(@as(usize, 1), file_size / @max(@as(usize, 1), ctx.n_chunks));
-    // `limiter.max` is set by `submit_file` before the feeder thread is
-    // spawned (happens-before via `std.Thread.spawn`); reading it here
-    // without locking is safe — no concurrent writer exists by construction.
-    const slots = @max(@as(usize, 1), ctx.limiter.max);
-    const in_flight_bytes = slots * ideal_chunk;
-    const raw = in_flight_bytes / WAVE_BYTES_DIVISOR;
-    // Derived bound: raw ≤ in_flight_bytes by construction (DIVISOR ≥ 1).
-    // The threshold floor below may push `wave_bytes` above `in_flight_bytes`
-    // on tiny budgets — that's intentional: `feedParallel` is only entered
-    // when `data.len ≥ PARALLEL_BOUNDARY_THRESHOLD` (gate at the call site),
-    // so peak RSS stays bounded by `2 × PARALLEL_BOUNDARY_THRESHOLD` on the
-    // smallest workloads regardless of `in_flight_bytes`.
-    std.debug.assert(raw <= in_flight_bytes);
-    return @max(raw, PARALLEL_BOUNDARY_THRESHOLD);
+    const stripes = @max(@as(usize, 1), ctx.n_stripes);
+    const wave_bytes = stripes * ideal_chunk;
+    // Invariant: wave_bytes never exceeds in_flight_bytes, because
+    // `submit_file` allocates `limiter.max ≥ n_stripes` slots.
+    // `limiter.max` is set before the feeder thread is spawned
+    // (happens-before via `std.Thread.spawn`); reading it here without
+    // locking is safe — no concurrent writer exists by construction.
+    const in_flight_bytes = @max(@as(usize, 1), ctx.limiter.max) * ideal_chunk;
+    std.debug.assert(wave_bytes <= in_flight_bytes);
+    return @max(wave_bytes, PARALLEL_BOUNDARY_THRESHOLD);
 }
 
 /// Wave-based parallel dispatcher. Processes the mmap in waves of
