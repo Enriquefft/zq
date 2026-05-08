@@ -65,6 +65,22 @@ pub const ParamInfo = struct {
     /// Allocated at registration time for value params. Filter params
     /// don't carry a var_id (they re-lower the caller's AST).
     var_id: u32,
+    /// Positional index among value-args (0-based, leftmost first).
+    /// Filter args carry the sentinel `0` and never read this field.
+    /// Used by the `.variable_ref` arm to emit `Op.load_arg(arg_index)`
+    /// when this param belongs to the currently-lowering recursive UDF
+    /// (NIX-011). Non-recursive UDFs ignore `arg_index` and use the
+    /// existing slot path via `var_id`.
+    arg_index: u8 = 0,
+};
+
+/// Owner record for `Lowerer.recursive_arg_owners`. Pairs a value-arg
+/// var_id with the recursive UDF that declared it, so the
+/// `.variable_ref` arm can detect closure refs (owner_fn_id !=
+/// `current_recursive_fn`) and surface a diagnostic. NIX-011.
+pub const RecursiveArgOwner = struct {
+    fn_id: u32,
+    arg_index: u8,
 };
 
 /// Active filter-arg binding during user-function body re-walk
@@ -218,6 +234,33 @@ pub const Lowerer = struct {
     /// extended to a stack so mutual recursion (a def `f` whose body
     /// calls `g`, whose body calls `f`) works without a textual scan.
     expanding_stack: std.ArrayListUnmanaged(u32) = .{},
+    /// fn_id of the recursive UDF whose body is currently being
+    /// lowered. Set by `inlineUserCall` immediately before the body
+    /// re-walk for recursive entries (`did_push_expanding == true`),
+    /// restored on exit. `null` whenever an INLINE (non-recursive) UDF
+    /// body or top-level expression is being lowered. Used by the
+    /// `.variable_ref` arm to decide between frame-local `load_arg`
+    /// emission and slot-path `load_var` emission. NIX-011.
+    current_recursive_fn: ?u32 = null,
+    /// Name → arg_index for the currently-lowering recursive UDF's
+    /// value-args. Populated alongside `current_recursive_fn`.
+    /// Lookups are O(1) by name; `.variable_ref` consults this BEFORE
+    /// `var_table` so own-frame value-args route through `load_arg`
+    /// regardless of whether the param's canonical var_id is also
+    /// installed in `var_table` (it is — for closure-fallback /
+    /// diagnostic purposes). NIX-011.
+    current_value_args: std.StringHashMapUnmanaged(u8) = .{},
+    /// var_id → owner fn_id for value-args of recursive UDFs. Populated
+    /// at `lowerFuncDef` param registration. The `.variable_ref` arm
+    /// uses this on the slot-path branch to detect closures: a `$name`
+    /// that resolves to a value-arg owned by an enclosing recursive
+    /// UDF (i.e. owner != `current_recursive_fn`) is a closure
+    /// capture, which the current emitter doesn't support — surfaced
+    /// as a `LowerDiagnostic`. Survey of the zq stdlib + corpus
+    /// confirms zero such call shapes today; the diagnostic exists to
+    /// fail loud rather than miscompile if a future filter triggers
+    /// this case. NIX-011.
+    recursive_arg_owners: std.AutoHashMapUnmanaged(u32, RecursiveArgOwner) = .{},
     /// Lexical-scoping hidden range. Functions with `fn_id` in
     /// `[func_hidden_start, func_hidden_end)` are skipped during
     /// lookup. Mirrors legacy
@@ -1339,6 +1382,31 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                     .src_len = sp.len,
                 });
             }
+            // NIX-011: own-frame value-arg of the currently-lowering
+            // recursive UDF — emit `load_arg(arg_index)` so the body
+            // reads the per-call-frame slot instead of a shared
+            // `variable_store` slot. The shared-slot path was broken
+            // by save-after-clobber when a recursive call site's
+            // `capture_variable` overwrote the outer's slot before
+            // `call_function` snapshotted it (help.sh repro: outer
+            // `$prefix` corrupted to `["build"]` on second iter of
+            // top-level `to_entries[]`). Order matters — this branch
+            // is checked BEFORE `lookupVar` so an own-frame ref wins
+            // over any same-named outer slot binding still living in
+            // `var_table`.
+            if (ctx.current_recursive_fn != null) {
+                if (ctx.current_value_args.get(vr.name)) |arg_index| {
+                    const alloc_a = ctx.arena.allocator();
+                    const extra_idx_a: u32 = @intCast(ctx.out.extra_data.items.len);
+                    try ctx.out.extra_data.append(alloc_a, @intCast(arg_index));
+                    return ctx.pushNode(.{
+                        .op = .load_arg,
+                        .extra = extra_idx_a,
+                        .src_start = sp.start,
+                        .src_len = sp.len,
+                    });
+                }
+            }
             const var_id = ctx.lookupVar(vr.name) orelse {
                 ctx.compile_err = .{
                     .kind = .query_syntax_error,
@@ -1347,6 +1415,29 @@ pub fn lowerNode(ctx: *Lowerer, node: *const Node) LowerError!u32 {
                 };
                 return error.LowerDiagnostic;
             };
+            // NIX-011: closure detection. A `$name` slot ref from
+            // inside a recursive UDF body that resolves to a value-arg
+            // owned by a DIFFERENT recursive UDF is a closure capture.
+            // The shared-slot path can't service it correctly under
+            // the current emit shape (the inner recursive entry's
+            // `call_function` doesn't save/restore the outer's value-
+            // arg slot, and the outer's `call_function` no longer
+            // emits `capture_variable` for value-args after this fix).
+            // Survey of zq stdlib + corpus: zero current occurrences.
+            // Surface a diagnostic so a future filter that triggers
+            // this case fails loud instead of silently miscompiling.
+            if (ctx.current_recursive_fn) |cur_fn| {
+                if (ctx.recursive_arg_owners.get(var_id)) |owner| {
+                    if (owner.fn_id != cur_fn) {
+                        ctx.compile_err = .{
+                            .kind = .query_syntax_error,
+                            .offset = sp.start,
+                            .len = sp.len,
+                        };
+                        return error.LowerDiagnostic;
+                    }
+                }
+            }
             const alloc = ctx.arena.allocator();
             const extra_idx: u32 = @intCast(ctx.out.extra_data.items.len);
             const offset: u32 = @intCast(ctx.out.string_buf.items.len);
@@ -4690,6 +4781,7 @@ fn lowerFuncDef(
     // AST sub-tree at call time.
     var params: std.ArrayListUnmanaged(ParamInfo) = .{};
     defer params.deinit(alloc);
+    var next_arg_index: u8 = 0;
     for (fd.params) |p| {
         if (p.is_filter) {
             try params.append(alloc, .{
@@ -4704,7 +4796,9 @@ fn lowerFuncDef(
                 .name = p.name,
                 .is_filter = false,
                 .var_id = var_id,
+                .arg_index = next_arg_index,
             });
+            next_arg_index += 1;
         }
     }
 
@@ -4720,6 +4814,7 @@ fn lowerFuncDef(
     const func_table_snapshot: u32 = @intCast(ctx.function_table.items.len);
 
     const params_owned = try alloc.dupe(ParamInfo, params.items);
+    const fn_id_for_owners: u32 = @intCast(ctx.function_table.items.len);
     try ctx.function_table.append(alloc, .{
         .name = fd.name,
         .params = params_owned,
@@ -4728,6 +4823,19 @@ fn lowerFuncDef(
         .body_ir_root = BODY_IR_NOT_LOWERED,
         .func_table_snapshot = func_table_snapshot,
     });
+    // Register value-arg ownership so the `.variable_ref` arm can
+    // diagnose closure refs from a deeper recursive body. Done for
+    // every UDF (recursive or not) — the arm only consults this when
+    // a recursive body is being lowered (NIX-011).
+    if (params_owned.len > 0) {
+        for (params_owned) |p| {
+            if (p.is_filter) continue;
+            try ctx.recursive_arg_owners.put(alloc, p.var_id, .{
+                .fn_id = fn_id_for_owners,
+                .arg_index = p.arg_index,
+            });
+        }
+    }
 
     // Lower the continuation. The function entry stays in scope for
     // the entirety of `rest` (legacy lex pos progresses past `;` and
@@ -4851,6 +4959,23 @@ fn inlineUserCall(
     const did_push_expanding = ctx.function_table.items[fn_id].is_recursive;
     if (did_push_expanding) try ctx.expanding_stack.append(alloc, fn_id);
 
+    // NIX-011: install per-frame value-arg context for the recursive
+    // body re-walk. The `.variable_ref` arm consults `current_value_args`
+    // BEFORE `var_table` so own-frame value-arg refs route through
+    // `Op.load_arg(arg_index)` instead of the shared-slot `load_var`
+    // path. The save/restore around the body walk preserves outer
+    // recursive UDFs' contexts when nested defs are inlined.
+    const saved_recursive_fn = ctx.current_recursive_fn;
+    var saved_value_args = ctx.current_value_args;
+    if (did_push_expanding) {
+        ctx.current_recursive_fn = fn_id;
+        ctx.current_value_args = .{};
+        for (params) |param| {
+            if (param.is_filter) continue;
+            try ctx.current_value_args.put(alloc, param.name, param.arg_index);
+        }
+    }
+
     const func_table_save: u32 = @intCast(ctx.function_table.items.len);
 
     // Phase 2a — module-private import scope. If this function came
@@ -4890,17 +5015,43 @@ fn inlineUserCall(
         }
     }
     if (did_push_expanding) _ = ctx.expanding_stack.pop();
+    if (did_push_expanding) {
+        ctx.current_value_args.deinit(alloc);
+        ctx.current_value_args = saved_value_args;
+        ctx.current_recursive_fn = saved_recursive_fn;
+    } else {
+        // No save/install happened — `saved_value_args` is just an
+        // alias to the existing field. Mark unused so the unused-var
+        // check stays clean while keeping the symmetric save shape.
+        _ = &saved_value_args;
+    }
     ctx.var_table.deinit(alloc);
     ctx.var_table = saved_var_table;
     ctx.func_hidden_start = saved_hidden_start;
     ctx.func_hidden_end = saved_hidden_end;
     ctx.filter_arg_bindings.items.len = saved_bindings_len;
 
-    // Phase 3 — synthesize a single call_user IR node with the body
-    // appended to the value-args span. Emit reads the IS_INLINE flag
-    // and renders the legacy `<arg>; capture_variable; ...; <body>;
-    // pop_variable; ...` ladder without intervening pipes — current
-    // is preserved for the body to consume the OUTER input.
+    // Phase 3 — synthesize the call_user IR.
+    //
+    // For RECURSIVE UDFs the body has just been lowered with
+    // `current_recursive_fn = fn_id` (NIX-011), which means every
+    // own-frame `$p` reference inside the body emits `Op.load_arg`.
+    // `load_arg` resolves against `it.current_args`, which is set up
+    // ONLY by `call_function` — the INLINE expansion shape (capture
+    // ladder + body emitted in caller's bytecode) leaves
+    // `current_args` empty, so an inline-expanded body would crash on
+    // the first arg load. Force the call site through the RECURSIVE
+    // arm so `call_function` populates `current_args` before the
+    // shared body bytecode runs.
+    //
+    // For non-recursive UDFs we keep the legacy INLINE shape: body is
+    // re-lowered fresh per call site with `current_recursive_fn = null`,
+    // value-arg refs route through `load_var`, and the capture ladder
+    // binds the slot at the caller. Cheaper than a frame push and
+    // free of the recursion hazard the frame design solves.
+    if (did_push_expanding) {
+        return synthCallUser(ctx, fn_id, value_arg_idxs.items, src_start, src_len);
+    }
     return synthCallUserInline(ctx, fn_id, value_arg_idxs.items, body_idx, src_start, src_len);
 }
 
@@ -5127,11 +5278,24 @@ fn bodyReferencesSelf(node: *const Node, name: []const u8, arity: u32) bool {
             if (arity == 0 and std.mem.eql(u8, fa.name, name)) return true;
             return false;
         },
-        // Inner defs introduce a new scope — their bodies' refs to
-        // the SAME name address themselves (or the parent if the inner
-        // def shadows it the outer def — but legacy doesn't detect
-        // that here either). We descend only into `rest`, not body.
-        .func_def => |fd| return bodyReferencesSelf(fd.rest, name, arity),
+        // Inner defs introduce a new scope. Inner def's BODY is its
+        // own scope (we never recurse into it from here). Inner def's
+        // REST is in the outer scope, but if the inner def's name +
+        // arity SHADOWS our target, references to `name`/`arity` in
+        // `rest` resolve to the inner def, not us — so we must skip.
+        // NIX-011: legacy ignored shadowing here, which produced false
+        // positives for `def g: ...; def g: 3; ... g ...` shapes
+        // (L798). Pre-NIX-011 the false positive was harmless because
+        // the recursive UDF first-call site still went through the
+        // INLINE arm; post-NIX-011 it routes through `synthCallUser`
+        // (frame-local args), so the body emits `call_function` for
+        // an outer g that's actually shadowed → infinite re-entry on
+        // fork-fire-after-return. Detect shadowing here.
+        .func_def => |fd| {
+            const shadows = std.mem.eql(u8, fd.name, name) and fd.params.len == arity;
+            if (shadows) return false;
+            return bodyReferencesSelf(fd.rest, name, arity);
+        },
         .pipe => |bp| return bodyReferencesSelf(bp.left, name, arity) or bodyReferencesSelf(bp.right, name, arity),
         .comma => |bc| return bodyReferencesSelf(bc.left, name, arity) or bodyReferencesSelf(bc.right, name, arity),
         .arithmetic => |bn| return bodyReferencesSelf(bn.left, name, arity) or bodyReferencesSelf(bn.right, name, arity),

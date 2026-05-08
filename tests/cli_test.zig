@@ -497,6 +497,96 @@ test "NIX-010: non-generator body still pops (no leak across calls)" {
     try std.testing.expectEqualStrings("11\n21\n", r.stdout);
 }
 
+// ── NIX-011: value-args must be frame-local under recursion ─────────────────
+//
+// NIX-010 was a symptom-level fix (suppressed pop_variable when body had a
+// generator). The deeper bug: value-args were stored in shared
+// `variable_store[var_id]` slots, so a recursive call's `capture_variable`
+// overwrote the outer's slot BEFORE `call_function` snapshotted it for
+// save/restore. Outer's binding got corrupted to inner's value across
+// backtracks of the outer's body. nixos-rebuild's `help.sh` filter
+// (`recurse($prefix)` walking nested commands) exposed it: outer
+// `$prefix` corrupted to `["build"]` on the second iter of top-level
+// `to_entries[]`, emitting `"build flake"` instead of `"flake"`.
+//
+// Fix: value-args live in `CallFrame.args` (frame-local). Body refs emit
+// `Op.load_arg(arg_index)` reading `it.current_args[arg_index]`. The
+// recursive call site evaluates each arg expression onto `value_stack`;
+// VM `.call_function` pops them into the new frame's `args`. No slot
+// writes, no save/restore protocol for value-args, no ordering bug class.
+//
+// Fork-after-yield: a body with internal generators (range, comma,
+// to_entries[]) leaves forks on `fork_stack` after the first yield. The
+// VM defers the frame pop and uses cascading-yield: subsequent
+// `return_function` walks call_stack top-down for the first
+// non-returned frame. On a body fork's fire, frames at idx
+// 0..saved_call_len-1 reactivate (returned=false; body_vars swapped
+// back into variable_store).
+
+test "NIX-011: help.sh repro — recursive UDF preserves outer value-arg" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{
+        "-r",
+        \\def recurse($prefix):
+        \\    to_entries[] |
+        \\    ($prefix + [.key]) as $newPrefix |
+        \\    (if .value | has("commands") then
+        \\      ($newPrefix, (.value.commands | recurse($newPrefix)))
+        \\    else $newPrefix end);
+        \\.args.commands | recurse([]) | join(" ")
+    },
+        \\{"args":{"commands":{"build":{"about":"Build","commands":{"all":{"about":"Build all"}}},"flake":{"about":"Flake","commands":{"init":{"about":"Init"}}}}}}
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("build\nbuild all\nflake\nflake init\n", r.stdout);
+}
+
+test "NIX-011: own-frame value-arg survives recursion" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(
+        alloc,
+        &.{"def f($a): if $a<=0 then \"stop\" else f($a-1) end; f(3)"},
+        "null",
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("\"stop\"\n", r.stdout);
+}
+
+test "NIX-011: self-recursive comma body cascades yield correctly" {
+    // `[r(3)]` exercises: comma generator inside body + recursion.
+    // Each call yields $n THEN recurses; cascade walks call_stack
+    // bottom-up to top-level on each yield. Without cascading-yield,
+    // self-recursion's shared body bytecode causes return_function
+    // to re-yield the inner frame indefinitely.
+    const alloc = std.testing.allocator;
+    var r = try runZq(
+        alloc,
+        &.{ "-c", "def r($n): if $n<=0 then \"end\" else $n, r($n-1) end; [r(3)]" },
+        "null",
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("[3,2,1,\"end\"]\n", r.stdout);
+}
+
+test "NIX-011: generator in recursive body does not corrupt value-arg" {
+    // `range(2) as $i` in body forks twice per call; outer call's
+    // $p must remain intact across each iteration of the range.
+    const alloc = std.testing.allocator;
+    var r = try runZq(
+        alloc,
+        &.{ "-c", "def f($p): range(2) as $i | if $p==2 then $p else f($p+1) end; [f(0)]" },
+        "null",
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // f(0) -> f(1) twice (i=0, i=1) -> f(2) twice (×2 = 4 emissions of 2),
+    // f(1) yields 4 values × 2 iterations = 8 emissions total at f(0).
+    try std.testing.expectEqualStrings("[2,2,2,2,2,2,2,2]\n", r.stdout);
+}
+
 // ── NIX-009: dotted-key access via fused chain returns null ─────────────────
 //
 // `.x["a.b"]` and `.x | .["a.b"]` and `.x."a.b"` all became `load_path`

@@ -70,6 +70,16 @@ pub const Result = struct {
 /// (every allocation lands in the arena that owns `input`), so the
 /// caller's arena lifetime covers both.
 ///
+/// `extra_roots` carries off-main-root subtree roots that must also be
+/// walked — cat-9 user-function bodies hang off `function_table` via
+/// `body_ir_root` and aren't reachable from the main IR root. Without
+/// walking them, their nodes never enter the rewritten IR and their
+/// `index_map` slots stay at the sentinel, which `compile()`'s remap
+/// loop then writes back into `body_ir_root` — clobbering it to
+/// `BODY_IR_NOT_LOWERED` and breaking emit. The caller (root.zig
+/// `compile`) collects every non-sentinel `body_ir_root` and passes it
+/// here so the forest of (main + per-fn-body) roots is walked as one.
+///
 /// Extra-data and string_buf are bulk-copied up front. Op payloads
 /// reference these arrays by absolute index (`Node.extra`, plus
 /// `(offset, len)` pairs into `string_buf`); copying the full slices
@@ -81,7 +91,7 @@ pub const Result = struct {
 /// remapping. Auxiliary tables that point into the IR by node index
 /// (Lowerer's `function_table.body_ir_root`) consult `Result.index_map`
 /// to update their references.
-pub fn fuse(input: ir.IR) error{OutOfMemory}!Result {
+pub fn fuse(input: ir.IR, extra_roots: []const u32) error{OutOfMemory}!Result {
     // Empty IR: emit returns immediately, fuse follows. Lowering always
     // produces ≥1 node for a non-empty AST so this path is only hit on
     // malformed inputs.
@@ -106,6 +116,20 @@ pub fn fuse(input: ir.IR) error{OutOfMemory}!Result {
     @memset(map, std.math.maxInt(u32));
 
     var ctx = WalkCtx{ .src = &input, .out = &out, .index_map = map };
+
+    // Walk function-body roots BEFORE the main root. Each body is a
+    // disjoint subtree (lowering builds the IR as a forest: one main
+    // root + one root per recursive UDF body). Walking them first
+    // preserves emit's `root_idx = nodes.len - 1` convention: the main
+    // root must end up as the final node appended to the output IR.
+    // A body might already be covered if it happens to alias a main-
+    // root subtree — guard with the sentinel check so we don't double-
+    // walk.
+    for (extra_roots) |old_root| {
+        if (old_root == std.math.maxInt(u32)) continue;
+        if (map[old_root] != std.math.maxInt(u32)) continue;
+        _ = try copyAndFold(&ctx, old_root);
+    }
     const root_idx: u32 = @intCast(input.nodes.items.len - 1);
     _ = try copyAndFold(&ctx, root_idx);
 

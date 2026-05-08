@@ -138,7 +138,19 @@ pub fn compile(
     // (cat-9 `function_table.body_ir_root`) must be re-pointed via
     // `index_map`. Untouched table entries (`BODY_IR_NOT_LOWERED`
     // sentinel) pass through unchanged.
-    const fuse_result = try fuse_mod.fuse(lowered);
+    //
+    // Recursive UDF bodies live as off-main-root subtrees (the call
+    // site emits `call_user`, not the body inline), so fuse only
+    // reaches them if we hand them in as extra walk roots. Otherwise
+    // their `index_map` slots stay at sentinel and the remap loop
+    // below clobbers `body_ir_root` to `BODY_IR_NOT_LOWERED`.
+    var extra_roots: std.ArrayList(u32) = .{};
+    defer extra_roots.deinit(allocator);
+    for (lowerer.function_table.items) |entry| {
+        if (entry.body_ir_root == lower_mod.BODY_IR_NOT_LOWERED) continue;
+        try extra_roots.append(allocator, entry.body_ir_root);
+    }
+    const fuse_result = try fuse_mod.fuse(lowered, extra_roots.items);
     const fused = fuse_result.ir;
     for (lowerer.function_table.items) |*entry| {
         if (entry.body_ir_root == lower_mod.BODY_IR_NOT_LOWERED) continue;

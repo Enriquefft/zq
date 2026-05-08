@@ -150,6 +150,14 @@ pub const Op = enum(u8) {
     // ── SemOp namespace (lowered from AST) ────────────────────────────────
     load_const,
     load_var,
+    /// Frame-local value-arg load. Emitted by `lower.zig`'s
+    /// `.variable_ref` arm when `$name` resolves to a value-arg of the
+    /// currently-lowering recursive UDF. `extra_data[node.extra]`
+    /// carries the arg_index (0-based, leftmost first). Maps to
+    /// bytecode `Instruction.Op.load_arg`. Body refs to value-args of
+    /// non-recursive (INLINE) UDFs and closure refs to outer-UDF
+    /// value-args continue to use `load_var` (slot path). NIX-011.
+    load_arg,
     /// Identity `.` — pass-through of the current input. Emitted by
     /// `lower.zig` for the AST `.identity` kind (plan §3 R3 step 6
     /// category 1). Maps to bytecode `Instruction.Op.identity`.
@@ -356,6 +364,7 @@ pub const Op = enum(u8) {
             // leave it.current intact (B1 alignment commit `bbe499a`).
             .load_const,
             .load_var,
+            .load_arg,
             .identity,
             .load_field,
             .load_index,
@@ -1807,6 +1816,11 @@ fn renderNodePayload(ir_obj: *const IR, node: Node, writer: anytype) !void {
             const var_id: u32 = slots[node.extra];
             try writer.print("load_var(id={d})", .{var_id});
         },
+        .load_arg => {
+            const slots = ir_obj.extra_data.items;
+            const arg_index: u32 = slots[node.extra];
+            try writer.print("load_arg(idx={d})", .{arg_index});
+        },
         .identity => try writer.writeAll("identity"),
         .load_field => {
             const slots = ir_obj.extra_data.items;
@@ -1996,7 +2010,7 @@ fn dumpIRChildren(
     // a leaf in the IR even though emit treats it as a unary op (it
     // operates on the implicit current input — see `lower.zig:1539`).
     switch (node.op) {
-        .load_const, .load_var, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end, .break_ => return,
+        .load_const, .load_var, .load_arg, .identity, .load_field, .load_index, .slice, .iterate, .recurse, .not, .load_path, .path_end, .break_ => return,
         .computed_slice => {
             // Dynamic arity: 0/1/2 child exprs depending on which
             // bound flags are set, plus an optional base when has_base

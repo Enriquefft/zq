@@ -228,16 +228,24 @@ pub fn emit(
         allocator.free(function_defs);
     };
     for (fn_body_ip, 0..) |cache, i| {
-        const param_count: u8 = blk: {
-            const fn_entry = function_table[i];
-            break :blk @intCast(fn_entry.params.len);
-        };
+        const fn_entry = function_table[i];
+        const param_count: u8 = @intCast(fn_entry.params.len);
+        // NIX-011: VM `.call_function` reads `value_param_count` to
+        // know how many entries to pop off `value_stack` into
+        // `frame.args`. Filter args don't reach the call site as
+        // value_stack residue (re-substituted into the body AST), so
+        // they're excluded here.
+        var value_param_count: u8 = 0;
+        for (fn_entry.params) |p| {
+            if (!p.is_filter) value_param_count += 1;
+        }
         if (cache.emitted) {
             const ws = try collectWriteSet(allocator, instr_slice[cache.body_ip..cache.body_end_ip]);
             function_defs[i] = .{
                 .body_ip = cache.body_ip,
                 .body_end = cache.body_end_ip,
                 .param_count = param_count,
+                .value_param_count = value_param_count,
                 .write_set = ws,
             };
         } else {
@@ -245,6 +253,7 @@ pub fn emit(
                 .body_ip = 0,
                 .body_end = 0,
                 .param_count = param_count,
+                .value_param_count = value_param_count,
                 .write_set = &.{},
             };
         }
@@ -1049,6 +1058,15 @@ fn emitNode(em: *Emitter, node_idx: u32) EmitError!void {
             // extra_data layout: [name_offset, name_len, var_id]
             const var_id: i64 = @intCast(slots[node.extra + 2]);
             try em.pushInstr(.load_variable, .{ .index = var_id }, node);
+        },
+
+        // Frame-local value-arg load. extra_data layout: [arg_index].
+        // Emitted by the lowerer for recursive UDF body refs to own
+        // value-args (NIX-011). Maps 1:1 to bytecode `.load_arg`.
+        .load_arg => {
+            const slots = em.ir_obj.extra_data.items;
+            const arg_index: i64 = @intCast(slots[node.extra]);
+            try em.pushInstr(.load_arg, .{ .index = arg_index }, node);
         },
 
         // Destructure pattern. The kind discriminant in extra_data slot 0
@@ -3649,20 +3667,33 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
     // RECURSIVE shape — entry.is_recursive must be true; the body is
     // emitted ONCE (cached in `fn_body_ip[fn_id]`) and subsequent
     // call sites resolve to `call_function(body_ip)`.
+    //
+    // NIX-011 — value-args are frame-local. The call site evaluates
+    // each arg expression and leaves its result on `value_stack`; the
+    // VM `.call_function` handler pops `value_param_count` entries
+    // into `frame.args` BEFORE snapshotting the caller's residue.
+    // The body reads them via `Op.load_arg(arg_index)`. There are no
+    // `capture_variable` / `pop_variable` ops for value-args at the
+    // call site, eliminating the save-after-clobber ordering bug
+    // that broke nested-recursive value-args under shared-slot
+    // storage (help.sh repro: outer `$prefix` corrupted across
+    // top-level `to_entries[]` iterations).
     std.debug.assert(flag == CALL_USER_RECURSIVE);
     std.debug.assert(entry.is_recursive);
     std.debug.assert(span.len == num_value_args);
 
-    // Same input-scope bracket as INLINE: each value-arg evaluates
-    // against the original `.` at the call site, and the body entry
-    // sees the original `.` too.
+    // Input-scope bracket: each value-arg evaluates against the
+    // original `.` at the call site, and the body entry sees the
+    // original `.` too. This concerns `it.current`, not the per-arg
+    // slot — unrelated to the NIX-011 frame-local change.
     if (num_value_args > 0) {
         const input_var = em.allocVar();
         try emitInputScopeBracket(em, node, input_var);
-        for (span, value_var_ids.items) |arg_idx, var_id| {
+        for (span) |arg_idx| {
             try emitInputScopeReseed(em, node, input_var);
             try emitNode(em, arg_idx);
-            try em.pushInstr(.capture_variable, .{ .index = @intCast(var_id) }, node);
+            // Result lives on `value_stack` until `call_function`
+            // pops it into `frame.args[i]`. No `capture_variable`.
         }
         // Restore original input before calling the recursive body.
         try emitInputScopeReseed(em, node, input_var);
@@ -3685,35 +3716,16 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
         em.instructions.items[jump_pos].operand = .{ .index = @intCast(em.instructions.items.len) };
     }
 
-    // call_function carries fn_id (NOT body_ip) — VM looks up body_ip
-    // and the per-fn write_set from `function_table` populated post-emit
-    // (compile()) once every recursive body has been emitted. Per-call
+    // call_function carries fn_id (NOT body_ip) — VM looks up body_ip,
+    // `value_param_count`, and the per-fn write_set from
+    // `function_table` populated post-emit (compile()) once every
+    // recursive body has been emitted. The handler pops
+    // `value_param_count` entries off `value_stack` into
+    // `frame.args` before snapshotting the caller's residue. Per-call
     // save_variable cannot live at the call site because a body's OWN
     // self-recursion emits its call_function before the body finishes
     // being walked; the write set is finalized only after.
     try em.pushInstr(.call_function, .{ .index = @intCast(fn_id) }, node);
-
-    // Suppress pop_variable when the body (or any value-arg) contains a
-    // generator: backtracking re-enters the body after the pop, leaving
-    // load_variable($p) reading a cleared slot (NIX-010).
-    var has_generator_arg = false;
-    for (span[0..num_value_args]) |arg_idx| {
-        if (subtreeHasIterate(em.ir_obj, arg_idx)) {
-            has_generator_arg = true;
-            break;
-        }
-    }
-    var body_has_generator = false;
-    if (entry.body_ir_root != lower_mod.BODY_IR_NOT_LOWERED) {
-        body_has_generator = subtreeHasIterate(em.ir_obj, entry.body_ir_root);
-    }
-    if (!(has_generator_arg or body_has_generator)) {
-        var i: usize = num_value_args;
-        while (i > 0) {
-            i -= 1;
-            try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
-        }
-    }
 }
 
 // ── Cat-15 emission helpers ────────────────────────────────────────

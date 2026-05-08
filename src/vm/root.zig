@@ -443,6 +443,26 @@ const Forkpoint = struct {
     /// See `ObjectConstructSnapshot`. Null when no object literal is being
     /// constructed at fork time (the common case).
     saved_object: ?ObjectConstructSnapshot = null,
+    /// `it.current_args` at fork-creation time. Restored on every fork
+    /// FIRE site in `backtrackToDepth` so a fork created inside a
+    /// recursive UDF body can re-enter that body after the frame has
+    /// already returned (e.g. `range(2) as $i | f($p-1)` — the range
+    /// fork outlives the call to f's body in the same frame, and the
+    /// caller's outer fork resumes into a now-popped frame). Default
+    /// `&.{}` is correct for forks created outside any UDF body.
+    /// NIX-011: replaces the dead `frame.args` lookup that broke when
+    /// `call_stack` was popped on return.
+    saved_current_args: []StackValue = &.{},
+    /// `it.call_stack.items.len` at fork-creation time. Used at fire
+    /// time to detect "this fork was created inside a now-yielded
+    /// frame's body" (deferred-pop scheme): a yielded frame stays on
+    /// `call_stack` until its body forks are exhausted, so a fork with
+    /// `saved_call_len == call_stack.items.len` whose top frame has
+    /// `returned == true` is a body fork — `backtrackToDepth` swaps
+    /// the frame's `body_vars` back into `variable_store` before
+    /// resuming, so body re-execution sees its own pattern-var
+    /// bindings (not the caller's) (NIX-011).
+    saved_call_len: u32 = 0,
 };
 
 /// State for one active function call (used for recursive user-defined functions).
@@ -474,6 +494,37 @@ const CallFrame = struct {
     /// `current` per the emitter convention, so any leftover on body's
     /// own value_stack at return is discarded.
     saved_stack: []StackValue,
+    /// Caller's `current_args` register at call_function time. Restored
+    /// by return_function so the caller body's subsequent `load_arg`s
+    /// resolve against the caller's own value-args (NIX-011). Owned by
+    /// the previous frame's scratch allocation (or `&.{}` for the
+    /// outermost call) — no explicit free.
+    saved_args: []StackValue,
+    /// Set true the first time `return_function` fires for this frame.
+    /// Frame stays on `call_stack` after return so body forks created
+    /// inside the body (e.g. `range(2) as $i | f($p-1)`) can re-enter
+    /// the body when they fire — `backtrackToDepth` only finalizes
+    /// the pop once `fork_stack.items.len <= frame.saved_fork_len`.
+    /// While `returned == true`, the caller is the active execution
+    /// context; `variable_store` holds caller-state pattern vars and
+    /// body's bindings live in `body_vars`. (NIX-011)
+    returned: bool = false,
+    /// Snapshot of body's pattern-var values at last yield, for every
+    /// id in the called fn's `write_set`. Populated lazily on first
+    /// `return_function` call (frame.returned=false→true) and refreshed
+    /// on each subsequent yield. `backtrackToDepth` writes these back
+    /// into `variable_store` before resuming a body fork so the body
+    /// sees its own `as $x` / reduce-key bindings, not the caller's.
+    /// Owned by the same scratch arena as `saved_stack` / `args` —
+    /// freed implicitly on per-record reset; no explicit free.
+    body_vars: []SavedVar = &.{},
+    /// Index into `function_table` for the fn this frame is executing.
+    /// `return_function` uses the fn's `[body_ip, body_end)` to identify
+    /// which frame's body contains the current IP — when nested
+    /// yielded frames are present (cascading returns), the topmost
+    /// frame on `call_stack` is not necessarily the one whose body the
+    /// return_function instruction lives in. (NIX-011)
+    fn_id: u32,
 };
 
 /// A snapshot of one variable slot's value, taken at call_function time
@@ -603,6 +654,17 @@ pub const ResultIterator = struct {
     /// truncation of call_stack) restores each saved slot in LIFO order.
     /// See `CallFrame.saved_var_len` and `truncateCallStackTo`.
     var_save_stack: std.ArrayList(SavedVar),
+    /// Live value-args of the innermost recursive UDF body currently
+    /// executing. `Op.load_arg(i)` reads `current_args[i]`. Updated by
+    /// `call_function` (set to the new frame's args after saving the
+    /// caller's value into `frame.saved_args`) and `return_function`
+    /// (restored from the popped frame's `saved_args`). Forkpoints
+    /// snapshot this at creation (`Forkpoint.saved_current_args`) and
+    /// restore on fire so a fork that re-enters a returned-and-popped
+    /// body still resolves load_arg correctly. Empty `&.{}` outside
+    /// any body. Owned by `scratch` (per-record arena) at the call
+    /// that allocated it. NIX-011 SSOT for value-arg storage.
+    current_args: []StackValue,
     /// Fork stack for unified backtracking (comma, iteration, range, try, alt, label, limit).
     fork_stack: std.ArrayList(Forkpoint),
     /// Path tracking stack for path(f). Pushed by path_begin, popped by path_end.
@@ -774,6 +836,7 @@ pub const ResultIterator = struct {
             .collect_stack = collect_stack,
             .call_stack = call_stack,
             .var_save_stack = var_save_stack,
+            .current_args = &.{},
             .fork_stack = fork_stack,
             .path_stack = path_stack,
             .next_break_token = 0,
@@ -892,6 +955,7 @@ pub const ResultIterator = struct {
         it.collect_stack.clearRetainingCapacity();
         it.call_stack.clearRetainingCapacity();
         it.var_save_stack.clearRetainingCapacity();
+        it.current_args = &.{};
         for (it.fork_stack.items) |*fp| {
             it.freeRegexForkSlots(fp);
             switch (fp.aux) {
@@ -1126,6 +1190,14 @@ pub const ResultIterator = struct {
     fn truncateCallStackTo(it: *ResultIterator, target_len: usize) void {
         while (it.call_stack.items.len > target_len) {
             const frame = it.call_stack.pop().?;
+            if (frame.returned) {
+                // NIX-011 deferred-pop: yielded frame — caller-state
+                // value_stack / variable_store / current_args were
+                // already established at yield. Just discard the
+                // var_save_stack entries this frame owned.
+                it.var_save_stack.items.len = frame.saved_var_len;
+                continue;
+            }
             while (it.var_save_stack.items.len > frame.saved_var_len) {
                 const sv = it.var_save_stack.pop().?;
                 if (sv.id < it.variable_store.items.len) {
@@ -1140,9 +1212,16 @@ pub const ResultIterator = struct {
                 // restore: append what fits, drop the rest.
                 const fit = @min(it.value_stack.capacity, frame.saved_stack.len);
                 it.value_stack.appendSliceAssumeCapacity(frame.saved_stack[0..fit]);
+                it.current_args = frame.saved_args;
                 continue;
             };
             it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
+            // Mirror return_function's restore: peel off this frame's
+            // arg context as the call_stack drops below it. The fork
+            // that drove this truncate (alt/break/etc.) will then
+            // override `current_args` from its own snapshot in
+            // `backtrackToDepth`. NIX-011.
+            it.current_args = frame.saved_args;
         }
     }
 
@@ -1239,6 +1318,14 @@ pub const ResultIterator = struct {
                 cf.buffer.deinit(it.alloc);
             }
             it.truncateCallStackTo(state.saved_call_len);
+            // Catch handler runs in the lexical context where the
+            // try/alt was opened — same args that were live when fp
+            // was pushed. truncateCallStackTo already restored
+            // current_args to that depth's frame; mirror the explicit
+            // restore that fire-paths in backtrackToDepth perform so
+            // the contract "current_args reflects fp.saved_current_args
+            // after a fire" holds uniformly. NIX-011.
+            it.current_args = fp.saved_current_args;
 
             if (state.catch_ip > 0) {
                 // Route to catch handler with error as current.
@@ -1826,6 +1913,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .try_handler = handler_state },
                     .saved_path = it.snapshotPathState(),
@@ -1845,6 +1934,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .alt_handler = handler_state },
                     .saved_path = it.snapshotPathState(),
@@ -2138,6 +2229,14 @@ pub const ResultIterator = struct {
                 return null;
             },
 
+            .load_arg => {
+                const arg_index = @as(u32, @intCast(instr.operand.index));
+                std.debug.assert(arg_index < it.current_args.len);
+                it.pushValue(it.current_args[arg_index]);
+                it.ip += 1;
+                return null;
+            },
+
             .compact_runtime_tape => {
                 it.compactRuntimeTape();
                 it.ip += 1;
@@ -2151,26 +2250,46 @@ pub const ResultIterator = struct {
             },
 
             .call_function => {
-                // Recursive function call. Two snapshots establish the
+                // Recursive function call. Three snapshots establish the
                 // body's isolation boundary:
-                //   1. var_save_stack: every slot the body may overwrite
-                //      (FunctionDef.write_set) records its caller value,
-                //      restored on return. Without this, recursive bodies
-                //      sharing compiled slot ids clobber outer bindings.
-                //   2. value_stack: caller's pending operands (e.g. the
+                //   1. frame.args: value-args popped off `value_stack`
+                //      LIFO, leftmost arg landing at args[0]. The body
+                //      reads them only via `Op.load_arg(i)` —
+                //      frame-local, no shared slot, no save/restore
+                //      ordering bug across recursive calls (NIX-011).
+                //   2. var_save_stack: every slot the body may overwrite
+                //      (FunctionDef.write_set: pattern vars + closure
+                //      slots only — value-args excluded post-NIX-011)
+                //      records its caller value, restored on return.
+                //   3. value_stack: caller's pending operands (e.g. the
                 //      LHS of an outer binary op) are duped onto the
-                //      frame and the live stack cleared. Without this,
-                //      a body's `capture_variable` (whose semantics are
-                //      "pop if non-empty, else use current") pops the
-                //      caller's residue and binds the wrong value.
-                // saved_var_len / saved_stack ownership is freed on
-                // return_function or truncateCallStackTo.
+                //      frame and the live stack cleared. The args pop
+                //      MUST happen before this snapshot, otherwise
+                //      return_function would re-push consumed args onto
+                //      the caller's stack.
+                // saved_var_len / saved_stack / args ownership is freed
+                // by the per-record `scratch` arena reset; explicit
+                // free paths in return_function / truncateCallStackTo
+                // are unnecessary.
                 const max_recursion_depth = 10000;
                 if (it.call_stack.items.len >= max_recursion_depth) {
                     return error.TypeError;
                 }
                 const fn_id = @as(u32, @intCast(instr.operand.index));
                 const fn_def = it.function_table[fn_id];
+                std.debug.assert(it.value_stack.items.len >= fn_def.value_param_count);
+                const argc: usize = fn_def.value_param_count;
+                var frame_args: []StackValue = &.{};
+                if (argc > 0) {
+                    frame_args = try it.scratch.allocator().alloc(StackValue, argc);
+                    // value_stack holds args in push order (leftmost
+                    // pushed first → bottom-of-args). Copy the top
+                    // `argc` entries verbatim so frame_args[0] is the
+                    // leftmost (= deepest of the arg block).
+                    const top = it.value_stack.items.len;
+                    @memcpy(frame_args, it.value_stack.items[top - argc .. top]);
+                    it.value_stack.shrinkRetainingCapacity(top - argc);
+                }
                 const saved_var_len: u32 = @intCast(it.var_save_stack.items.len);
                 for (fn_def.write_set) |id| {
                     const cur: ?StackValue = if (id < it.variable_store.items.len)
@@ -2181,6 +2300,7 @@ pub const ResultIterator = struct {
                 }
                 const saved_stack = try it.scratch.allocator().dupe(StackValue, it.value_stack.items);
                 it.value_stack.clearRetainingCapacity();
+                const prev_current_args = it.current_args;
                 try it.call_stack.append(it.alloc, CallFrame{
                     .return_ip = it.ip + 1,
                     .saved_value_len = 0,
@@ -2189,44 +2309,150 @@ pub const ResultIterator = struct {
                     .saved_fork_len = @intCast(it.fork_stack.items.len),
                     .saved_var_len = saved_var_len,
                     .saved_stack = saved_stack,
+                    .saved_args = prev_current_args,
+                    .returned = false,
+                    .body_vars = &.{},
+                    .fn_id = fn_id,
                 });
+                it.current_args = frame_args;
                 it.ip = fn_def.body_ip;
                 return null;
             },
 
             .return_function => {
-                // Return from a recursive function call. Restore variable
-                // snapshots pushed by call_function and re-instate the
-                // caller's value_stack. Calling convention: body leaves
-                // its return value on its own value_stack (the binop /
-                // pipe / capture sequence at the call site pops it). We
-                // forward that top-of-stack across the isolation boundary
-                // by re-pushing it onto the restored caller stack. If the
-                // body left no value on its stack it returned via
-                // `current` instead — both `0` and `1` produce-count
-                // bodies appear in compiled jq output (the latter is the
-                // common case, e.g. `1 + ($n-1 | rec)`).
-                if (it.call_stack.items.len > 0) {
-                    const frame = it.call_stack.pop().?;
-                    while (it.var_save_stack.items.len > frame.saved_var_len) {
-                        const sv = it.var_save_stack.pop().?;
-                        if (sv.id < it.variable_store.items.len) {
-                            it.variable_store.items[sv.id] = sv.prev;
+                // Yield from a recursive function call. Body produced one
+                // value via `current`; caller resumes from `return_ip`
+                // with that value pushed onto its restored value_stack.
+                //
+                // NIX-011 deferred pop: do NOT pop the frame yet. Body
+                // forks (e.g. `range(2) as $i | f($p-1)`) created during
+                // body execution stay live on `fork_stack`; when one
+                // fires after this yield we must re-enter the body with
+                // its own bindings intact. The frame stays on
+                // `call_stack` (with `returned = true`) until
+                // `backtrackToDepth` observes
+                // `fork_stack.items.len <= frame.saved_fork_len` and
+                // performs the final pop. While yielded, `body_vars`
+                // stashes the body's pattern-var values; the caller's
+                // pre-call values (already in `var_save_stack` entries
+                // above `frame.saved_var_len`) are written back into
+                // `variable_store` so the caller's continuation sees
+                // its own bindings. On a body fork fire, `backtrack`
+                // swaps `body_vars` back in and resumes.
+                // Drop any exhausted yielded frames at the top of
+                // call_stack first — a nested call whose return left
+                // its frame behind (because the OUTER frame still had
+                // body forks alive at that moment) must be cleared
+                // before we identify the frame this return belongs to.
+                // The outer frame's body forks may have been consumed
+                // by intervening backtracks; this is the next chance
+                // to finalize the inner pop. Without this, we'd
+                // re-yield the inner frame's value indefinitely while
+                // the IP cycles through its return_ip.
+                it.dropExhaustedYieldedFrames();
+                if (it.call_stack.items.len == 0) {
+                    // Stray return without matching call — defensive.
+                    it.ip += 1;
+                    return null;
+                }
+                const ret_val: ?StackValue = if (it.value_stack.items.len > 0)
+                    it.value_stack.items[it.value_stack.items.len - 1]
+                else
+                    null;
+
+                // Fast path: top frame not yet yielded AND no body forks
+                // alive — legacy pop. Common case (no generators left
+                // in body at return time).
+                {
+                    const top = &it.call_stack.items[it.call_stack.items.len - 1];
+                    if (!top.returned and
+                        it.fork_stack.items.len <= top.saved_fork_len)
+                    {
+                        const popped = it.call_stack.pop().?;
+                        while (it.var_save_stack.items.len > popped.saved_var_len) {
+                            const sv = it.var_save_stack.pop().?;
+                            if (sv.id < it.variable_store.items.len) {
+                                it.variable_store.items[sv.id] = sv.prev;
+                            }
                         }
+                        it.value_stack.clearRetainingCapacity();
+                        try it.value_stack.ensureTotalCapacity(it.alloc, popped.saved_stack.len + 1);
+                        it.value_stack.appendSliceAssumeCapacity(popped.saved_stack);
+                        if (ret_val) |v| it.value_stack.appendAssumeCapacity(v);
+                        it.ip = popped.return_ip;
+                        it.current_args = popped.saved_args;
+                        return null;
                     }
-                    const ret_val: ?StackValue = if (it.value_stack.items.len > 0)
-                        it.value_stack.items[it.value_stack.items.len - 1]
+                }
+
+                // Deferred / cascading path. The IP we just executed
+                // (return_function) lives in some frame's body. With
+                // self-recursion, multiple frames share the same
+                // compiled body bytecode, so IP alone cannot identify
+                // the target frame. Instead: walk call_stack top-down
+                // and pick the first NON-returned frame as the yield
+                // target. Already-returned frames represent yields
+                // that have been cascaded through — control flow has
+                // returned past them, and their next yield will fire
+                // when the caller's body re-enters them via this same
+                // return_function instruction.
+                var target_idx: usize = it.call_stack.items.len;
+                var found_target = false;
+                while (target_idx > 0) {
+                    target_idx -= 1;
+                    if (!it.call_stack.items[target_idx].returned) {
+                        found_target = true;
+                        break;
+                    }
+                }
+                if (!found_target) {
+                    // All frames already returned — every cascade level
+                    // has yielded and we hit return_function again with
+                    // no live body. Should not happen in well-formed
+                    // emission (the outermost yield exits the call_stack
+                    // before a fresh return_function fires). Defensive
+                    // skip: advance ip past return_function to avoid hang.
+                    std.debug.assert(false);
+                    it.ip += 1;
+                    return null;
+                }
+                const frame = &it.call_stack.items[target_idx];
+
+                // Scope this frame's body captures: var_save_stack
+                // entries between `frame.saved_var_len` and the next
+                // inner frame's `saved_var_len` (or stack top if none)
+                // belong to THIS frame's body. Without scoping, we'd
+                // mistake inner-frame captures for ours and corrupt
+                // their slot bindings on yield.
+                const upper_bound: usize = if (target_idx + 1 < it.call_stack.items.len)
+                    it.call_stack.items[target_idx + 1].saved_var_len
+                else
+                    it.var_save_stack.items.len;
+                const saved_count = upper_bound - frame.saved_var_len;
+                if (!frame.returned) {
+                    frame.body_vars = try it.scratch.allocator().alloc(SavedVar, saved_count);
+                }
+                std.debug.assert(frame.body_vars.len == saved_count);
+                var i: usize = 0;
+                while (i < saved_count) : (i += 1) {
+                    const entry = it.var_save_stack.items[frame.saved_var_len + i];
+                    const cur: ?StackValue = if (entry.id < it.variable_store.items.len)
+                        it.variable_store.items[entry.id]
                     else
                         null;
-                    it.value_stack.clearRetainingCapacity();
-                    try it.value_stack.ensureTotalCapacity(it.alloc, frame.saved_stack.len + 1);
-                    it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
-                    if (ret_val) |v| it.value_stack.appendAssumeCapacity(v);
-                    it.ip = frame.return_ip;
-                } else {
-                    // Should not happen — return without matching call.
-                    it.ip += 1;
+                    frame.body_vars[i] = .{ .id = entry.id, .prev = cur };
+                    if (entry.id < it.variable_store.items.len) {
+                        it.variable_store.items[entry.id] = entry.prev;
+                    }
                 }
+                frame.returned = true;
+
+                it.value_stack.clearRetainingCapacity();
+                try it.value_stack.ensureTotalCapacity(it.alloc, frame.saved_stack.len + 1);
+                it.value_stack.appendSliceAssumeCapacity(frame.saved_stack);
+                if (ret_val) |v| it.value_stack.appendAssumeCapacity(v);
+                it.ip = frame.return_ip;
+                it.current_args = frame.saved_args;
                 return null;
             },
 
@@ -2271,6 +2497,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = saved_value_len,
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index), // exit_ip
                     .aux = .{ .label = .{
                         .break_token = token,
@@ -2332,6 +2560,10 @@ pub const ResultIterator = struct {
                                 }
                             }
                             it.truncateCallStackTo(state.saved_call_len);
+                            // Mirror catch-handler / fork-fire restore so
+                            // the post-break IP runs with the args the
+                            // label scope was opened in. NIX-011.
+                            it.current_args = fp.saved_current_args;
                             // Break produces empty — set ip past end for backtracking.
                             it.ip = @intCast(it.instructions.len);
                             return null;
@@ -2362,6 +2594,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index), // exit_ip
                     .aux = .{ .limit = .{
                         .remaining = @intCast(n_i),
@@ -2405,6 +2639,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = exit_ip,
                     .aux = .{ .repeat = .{
                         .body_start_ip = body_start_ip,
@@ -2446,6 +2682,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = exit_ip,
                     .aux = .{ .reduce_source = .{
                         .body_start_ip = body_start_ip,
@@ -2497,6 +2735,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index), // exit_ip
                     .aux = .{ .skip = .{
                         .remaining = @intCast(n_i),
@@ -2539,6 +2779,8 @@ pub const ResultIterator = struct {
                 try it.fork_stack.append(it.alloc, .{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = 0, // unused for path_scope
                     .aux = .{ .path_scope = {} },
                     .saved_path = .{
@@ -2710,6 +2952,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = @intCast(instr.operand.index),
                     .aux = .{ .normal = {} },
                     .saved_path = it.snapshotPathState(),
@@ -2759,6 +3003,8 @@ pub const ResultIterator = struct {
                         it.fork_stack.appendAssumeCapacity(.{
                             .saved_value_stack_len = @intCast(it.value_stack.items.len),
                             .saved_current = it.current,
+                            .saved_current_args = it.current_args,
+                            .saved_call_len = @intCast(it.call_stack.items.len),
                             .backtrack_ip = it.ip,
                             .aux = .{ .each = .{
                                 .pos = first,
@@ -2793,6 +3039,8 @@ pub const ResultIterator = struct {
                         it.fork_stack.appendAssumeCapacity(.{
                             .saved_value_stack_len = @intCast(it.value_stack.items.len),
                             .saved_current = it.current,
+                            .saved_current_args = it.current_args,
+                            .saved_call_len = @intCast(it.call_stack.items.len),
                             .backtrack_ip = it.ip,
                             .aux = .{ .each = .{
                                 .pos = first_key,
@@ -6360,6 +6608,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = resume_ip,
                     .aux = .{ .range = .{
                         .current_int = 0,
@@ -6385,6 +6635,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = resume_ip,
                     .aux = .{ .range = .{
                         .current_int = 0,
@@ -6432,6 +6684,8 @@ pub const ResultIterator = struct {
             it.fork_stack.appendAssumeCapacity(.{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 .backtrack_ip = resume_ip,
                 .aux = .{ .range = .{
                     .current_int = 0,
@@ -6463,6 +6717,8 @@ pub const ResultIterator = struct {
             it.fork_stack.appendAssumeCapacity(.{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 .backtrack_ip = resume_ip,
                 .aux = .{ .range = .{
                     .current_int = from_i,
@@ -6514,6 +6770,8 @@ pub const ResultIterator = struct {
             it.fork_stack.appendAssumeCapacity(.{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 .backtrack_ip = resume_ip,
                 .aux = .{ .range = .{
                     .current_int = 0,
@@ -6549,6 +6807,8 @@ pub const ResultIterator = struct {
             it.fork_stack.appendAssumeCapacity(.{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 .backtrack_ip = resume_ip,
                 .aux = .{ .range = .{
                     .current_int = from_i,
@@ -7754,6 +8014,8 @@ pub const ResultIterator = struct {
             try it.fork_stack.append(it.alloc, .{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 .backtrack_ip = it.ip, // advance handler uses ip + 1
                 .aux = .{ .recurse_path = .{
                     .items = items_owned,
@@ -8382,6 +8644,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = it.ip,
                     .aux = .{ .each = .{
                         .pos = first,
@@ -8406,6 +8670,8 @@ pub const ResultIterator = struct {
                 it.fork_stack.appendAssumeCapacity(.{
                     .saved_value_stack_len = @intCast(it.value_stack.items.len),
                     .saved_current = it.current,
+                    .saved_current_args = it.current_args,
+                    .saved_call_len = @intCast(it.call_stack.items.len),
                     .backtrack_ip = it.ip,
                     .aux = .{ .each = .{
                         .pos = first_key,
@@ -8490,6 +8756,52 @@ pub const ResultIterator = struct {
         return true;
     }
 
+    /// Drop any yielded frames at the top of `call_stack` whose body
+    /// forks are exhausted (`fork_stack.items.len <= saved_fork_len`).
+    /// Caller-state value_stack / variable_store / current_args were
+    /// already established by the yield; the final pop just removes
+    /// the bookkeeping.
+    fn dropExhaustedYieldedFrames(it: *ResultIterator) void {
+        while (it.call_stack.items.len > 0) {
+            const top = &it.call_stack.items[it.call_stack.items.len - 1];
+            if (!top.returned) break;
+            if (it.fork_stack.items.len > top.saved_fork_len) break;
+            // Drop var_save_stack entries this frame owned. variable_store
+            // is already at caller-state from the yield.
+            it.var_save_stack.items.len = top.saved_var_len;
+            _ = it.call_stack.pop();
+        }
+    }
+
+    /// Re-activate frames whose bodies are about to re-execute because
+    /// a fork created at `fork_saved_call_len` is firing. The fork's
+    /// resume IP lives in the body of `call_stack[fork_saved_call_len-1]`,
+    /// which (in jq's cascading-yield semantics) implicitly re-enters
+    /// EVERY ancestor frame's body too — when this frame next yields,
+    /// the cascade walks back up `call_stack` through each ancestor's
+    /// post-call instruction. So for every frame at idx 0..depth-1 that
+    /// was previously yielded, swap its `body_vars` back into
+    /// `variable_store` (re-establish the body bindings) and clear
+    /// `returned` so the next `return_function` cascade can target it.
+    /// No-op for caller-side forks (depth ≤ pre-call call_stack length,
+    /// which means no yielded frames lie within the fork's IP scope —
+    /// the loop body's `if (f.returned)` guard handles this naturally).
+    /// (NIX-011)
+    fn reactivateFramesUpToDepth(it: *ResultIterator, depth: u32) void {
+        const limit = @min(@as(usize, depth), it.call_stack.items.len);
+        var idx: usize = 0;
+        while (idx < limit) : (idx += 1) {
+            const f = &it.call_stack.items[idx];
+            if (!f.returned) continue;
+            for (f.body_vars) |bv| {
+                if (bv.id < it.variable_store.items.len) {
+                    it.variable_store.items[bv.id] = bv.prev;
+                }
+            }
+            f.returned = false;
+        }
+    }
+
     /// Walk the fork stack from the top, trying to advance each forkpoint.
     /// Normal forkpoints restore saved state and jump to backtrack_ip.
     /// Each/range forkpoints try to advance; if exhausted, pop and continue.
@@ -8497,7 +8809,32 @@ pub const ResultIterator = struct {
     /// Returns true if a path was found, false if all forkpoints exhausted.
     fn backtrackToDepth(it: *ResultIterator, min_depth: u32) ZqError!bool {
         while (it.fork_stack.items.len > min_depth) {
+            // NIX-011: any yielded frame whose body forks are exhausted
+            // must finalize its pop before we inspect the next fork —
+            // a caller-side fork with `saved_call_len < call_stack.len`
+            // would otherwise be mis-detected as a body fork.
+            it.dropExhaustedYieldedFrames();
+            if (it.fork_stack.items.len <= min_depth) break;
             const fp = &it.fork_stack.items[it.fork_stack.items.len - 1];
+            // NIX-011: rebind current_args to the lexical context where
+            // this fork was created. Whether this fork fires (return
+            // true) or pops to its outer context (continues the while
+            // loop), the IP we resume at lived inside the fork-time
+            // call frame's body. The next iteration re-sets from the
+            // outer fork; if the loop exits with no fire, the latest
+            // popped fork's snapshot is the surviving lexical context,
+            // which matches the call_stack state truncateCallStackTo
+            // already restored.
+            it.current_args = fp.saved_current_args;
+            // NIX-011 deferred-pop: capture saved_call_len BEFORE the
+            // switch — every fire-site below pops `fp` from
+            // `fork_stack`, invalidating the pointer. The captured
+            // value is consumed by `reactivateFramesUpToDepth` to
+            // detect body-fork-fires and swap `frame.body_vars` back
+            // into `variable_store` so body re-execution sees its own
+            // pattern-var bindings (not the caller's, which the prior
+            // yield wrote to `variable_store`).
+            const fp_saved_call_len = fp.saved_call_len;
             switch (fp.aux) {
                 .normal => {
                     // If we captured a stack snapshot (fork nested in a
@@ -8518,6 +8855,7 @@ pub const ResultIterator = struct {
                     if (fp.saved_object) |snap| it.restoreObjectConstructState(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
+                    it.reactivateFramesUpToDepth(fp_saved_call_len);
                     return true;
                 },
                 .each => {
@@ -8548,6 +8886,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip + 1; // resume AFTER the each instruction
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8568,6 +8907,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip;
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8603,6 +8943,7 @@ pub const ResultIterator = struct {
                     if (fp.saved_object) |snap| it.restoreObjectConstructState(snap);
                     _ = it.fork_stack.pop();
                     it.restorePathState(saved_path);
+                    it.reactivateFramesUpToDepth(fp_saved_call_len);
                     return true;
                 },
                 .label, .limit, .skip => {
@@ -8635,6 +8976,7 @@ pub const ResultIterator = struct {
                     it.current = fp.saved_current;
                     it.restorePathState(fp.saved_path);
                     it.ip = state.body_start_ip;
+                    it.reactivateFramesUpToDepth(fp_saved_call_len);
                     return true;
                 },
                 .path_scope => {
@@ -8661,6 +9003,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip;
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8683,6 +9026,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip;
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8723,6 +9067,7 @@ pub const ResultIterator = struct {
                             .tape_ref = .{ .tape = &it.runtime_tape.view, .ref = r },
                         } } });
                         it.ip = fp.backtrack_ip;
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8744,6 +9089,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip;
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     it.value_stack.items.len = fp.saved_value_stack_len;
@@ -8780,6 +9126,7 @@ pub const ResultIterator = struct {
                             it.value_stack.items.len = fp.saved_value_stack_len;
                         }
                         it.ip = fp.backtrack_ip + 1; // resume after the call_builtin
+                        it.reactivateFramesUpToDepth(fp_saved_call_len);
                         return true;
                     }
                     // All entries exhausted — pop and continue backtracking.
@@ -10758,6 +11105,8 @@ pub const ResultIterator = struct {
         it.fork_stack.appendAssumeCapacity(.{
             .saved_value_stack_len = @intCast(it.value_stack.items.len),
             .saved_current = it.current,
+            .saved_current_args = it.current_args,
+            .saved_call_len = @intCast(it.call_stack.items.len),
             .backtrack_ip = resume_ip,
             .aux = .{ .sub_gen = .{
                 .refs = refs,
@@ -10960,6 +11309,8 @@ pub const ResultIterator = struct {
         it.fork_stack.appendAssumeCapacity(.{
             .saved_value_stack_len = @intCast(it.value_stack.items.len),
             .saved_current = it.current,
+            .saved_current_args = it.current_args,
+            .saved_call_len = @intCast(it.call_stack.items.len),
             .backtrack_ip = resume_ip,
             .aux = .{ .scan = .{
                 .clone = handles.clonePtr(),
@@ -11045,6 +11396,8 @@ pub const ResultIterator = struct {
         it.fork_stack.appendAssumeCapacity(.{
             .saved_value_stack_len = @intCast(it.value_stack.items.len),
             .saved_current = it.current,
+            .saved_current_args = it.current_args,
+            .saved_call_len = @intCast(it.call_stack.items.len),
             .backtrack_ip = resume_ip,
             .aux = .{ .match_g = .{
                 .clone = handles.clonePtr(),
@@ -11128,6 +11481,8 @@ pub const ResultIterator = struct {
             it.fork_stack.appendAssumeCapacity(.{
                 .saved_value_stack_len = @intCast(it.value_stack.items.len),
                 .saved_current = it.current,
+                .saved_current_args = it.current_args,
+                .saved_call_len = @intCast(it.call_stack.items.len),
                 // Point past the instructions so backtracking pops the frame
                 // and the loop sees no more work.
                 .backtrack_ip = @intCast(it.instructions.len),
@@ -11152,6 +11507,8 @@ pub const ResultIterator = struct {
         it.fork_stack.appendAssumeCapacity(.{
             .saved_value_stack_len = @intCast(it.value_stack.items.len),
             .saved_current = it.current,
+            .saved_current_args = it.current_args,
+            .saved_call_len = @intCast(it.call_stack.items.len),
             .backtrack_ip = resume_ip,
             .aux = .{ .splits = .{
                 .clone = handles.clonePtr(),

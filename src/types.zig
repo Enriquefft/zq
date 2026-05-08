@@ -872,13 +872,26 @@ pub const FunctionDef = struct {
     body_ip: u32,
     body_end: u32,
     param_count: u8,
+    /// Number of value-args (`$name` params) for this function. Filter
+    /// args are AST-substituted at lowering and have no runtime
+    /// representation. The VM's `call_function` handler pops this many
+    /// values off `value_stack` (LIFO) into the new frame's `args`
+    /// slice BEFORE snapshotting the caller's residual stack — so the
+    /// caller's pre-arg `value_stack` survives the call boundary
+    /// without contaminating `frame.saved_stack` with consumed args.
+    /// Body refs to own value-args emit `Op.load_arg(arg_index)` which
+    /// reads `frame.args[arg_index]` directly — no slot writes, no
+    /// save/restore protocol, no shared mutable state. NIX-011.
+    value_param_count: u8 = 0,
     /// Sorted, de-duplicated set of variable slot IDs written by the
     /// recursive body (`capture_variable` / `pop_variable` operands).
     /// `call_function` snapshots each slot onto `var_save_stack` before
     /// jumping; `return_function` (and fork-backtrack truncation of
-    /// `call_stack`) restores them. Without this, recursive calls
-    /// clobber the outer call's pattern-var bindings (e.g. reduce
-    /// `as $key` self-recursion). Empty for non-recursive entries.
+    /// `call_stack`) restores them. Covers pattern-vars (`as $x`,
+    /// reduce `$key`) plus closure-write slot ids registered by the
+    /// lowerer for nested-recursive UDFs that close over outer-scope
+    /// value-args. Empty for non-recursive entries. Value-args
+    /// themselves do NOT appear here — they live in `frame.args`.
     write_set: []const u32 = &.{},
 };
 
@@ -947,6 +960,14 @@ pub const Instruction = extern struct {
         load_variable,
         /// Pop variable from scope. operand.index = variable id.
         pop_variable,
+        /// Load value-arg from current call frame. operand.index =
+        /// arg_index (0-based, leftmost first). Reads
+        /// `it.call_stack.last().args[arg_index]` and pushes onto
+        /// value_stack. Emitted by the lowerer for recursive UDF
+        /// bodies referencing their own value-args; non-recursive
+        /// bodies and nested-recursive closure-over-outer references
+        /// continue to use `load_variable` (slot path). NIX-011.
+        load_arg,
 
         /// Compact the runtime tape in place: discards entries below the
         /// minimum live tape index and rebases all surviving spans/skip
@@ -1241,6 +1262,10 @@ pub const Instruction = extern struct {
                 // not break the path). Accepted gap: user-written
                 // `$x | path($x.a)` won't raise, matching a subset of jq.
                 .load_variable,
+                // load_arg shares load_variable's semantics (push value-arg
+                // onto value_stack, leaves current intact); same path-frame
+                // treatment.
+                .load_arg,
                 // Tape compaction is a memory-management op that preserves
                 // every live value bit-for-bit; it cannot break a path frame.
                 .compact_runtime_tape,

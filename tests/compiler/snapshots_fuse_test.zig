@@ -128,7 +128,18 @@ test "snapshot fixtures: fuse" {
         try compiler.dumpIR(&lowerer.out, w);
         try w.writeAll("# after\n");
 
-        const fuse_out = try compiler.fuse(lowerer.out);
+        // Mirror `compile()` in `root.zig`: gather body roots and pass
+        // them as extra walk roots so fuse traverses the off-main-root
+        // function-body subtrees too. Without this, body indices stay
+        // at sentinel in `index_map` and the remap below would clobber
+        // `body_ir_root` to `BODY_IR_NOT_LOWERED`.
+        var extra_roots: std.ArrayList(u32) = .{};
+        defer extra_roots.deinit(std.testing.allocator);
+        for (lowerer.function_table.items) |entry| {
+            if (entry.body_ir_root == compiler.BODY_IR_NOT_LOWERED) continue;
+            try extra_roots.append(std.testing.allocator, entry.body_ir_root);
+        }
+        const fuse_out = try compiler.fuse(lowerer.out, extra_roots.items);
         try compiler.dumpIR(&fuse_out.ir, w);
 
         // Recursive-UDF body verification: when lowering populated any
