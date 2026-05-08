@@ -183,11 +183,7 @@ pub fn main() !u8 {
 
             break :blk std.mem.trimRight(u8, contents, "\r\n");
         }
-        break :blk config.filter orelse {
-            printErr("zq: no filter provided\n");
-            printUsage();
-            return EXIT_USAGE;
-        };
+        break :blk config.filter orelse ".";
     };
 
     // Build external variable declarations for compile.

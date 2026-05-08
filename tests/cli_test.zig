@@ -425,6 +425,28 @@ test "D1 pin: .foo = $X (load_variable RHS) preserves outer object" {
     try std.testing.expectEqualStrings("{\"foo\":\"99\"}\n", r.stdout);
 }
 
+// ── NIX-008: missing filter defaults to identity ────────────────────────────
+//
+// jq treats `jq` (no positional, no -f) as identity. zq used to error with
+// "no filter provided" (rc=2), breaking 4 nix-functional-tests. The CLI now
+// resolves a missing filter to ".".
+
+test "NIX-008: no filter defaults to identity" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{"-c"}, "{\"a\":1}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+test "NIX-008: --sort-keys with no filter still defaults to identity" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", "--sort-keys" }, "{\"b\":2,\"a\":1}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2}\n", r.stdout);
+}
+
 // ── Output style composition (-r / -c / -j) ─────────────────────────────────
 //
 // Pre-OutputStyle, `-r -c` clobbered each other (last write wins on the same
