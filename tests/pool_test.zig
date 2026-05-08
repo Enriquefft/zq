@@ -63,18 +63,19 @@ fn drain(p: *Pool) ![]types.Value {
 }
 
 /// Drain all results from the pool as bytes (serialized path).
-/// Returns concatenated output and the last last_was_false_or_null flag.
-fn drain_bytes(p: *Pool) !struct { data: []u8, last_was_false_or_null: bool } {
+/// Returns concatenated output and the folded last_output across all
+/// sequenced results (last non-empty wins; matches main.zig fold).
+fn drain_bytes(p: *Pool) !struct { data: []u8, last_output: types.LastOutput } {
     var out = std.ArrayList(u8){};
     errdefer out.deinit(alloc);
-    var last_flag = false;
+    var last: types.LastOutput = .none;
     while (try p.collect_bytes()) |r| {
         try out.appendSlice(alloc, r.data);
-        last_flag = r.last_was_false_or_null;
+        last = types.lastOutputFold(last, r.last_output);
     }
     return .{
         .data = try out.toOwnedSlice(alloc),
-        .last_was_false_or_null = last_flag,
+        .last_output = last,
     };
 }
 
@@ -615,7 +616,7 @@ test "serialized: single integer" {
     defer alloc.free(result.data);
 
     try std.testing.expectEqualStrings("42\n", result.data);
-    try std.testing.expectEqual(false, result.last_was_false_or_null);
+    try std.testing.expectEqual(types.LastOutput.truthy, result.last_output);
 }
 
 test "serialized: string value" {
@@ -795,7 +796,7 @@ test "serialized: false/null tracking for -e flag" {
     defer alloc.free(result.data);
 
     try std.testing.expectEqualStrings("false\n", result.data);
-    try std.testing.expectEqual(true, result.last_was_false_or_null);
+    try std.testing.expectEqual(types.LastOutput.false_or_null, result.last_output);
 }
 
 test "serialized: null tracking for -e flag" {
@@ -814,7 +815,7 @@ test "serialized: null tracking for -e flag" {
     defer alloc.free(result.data);
 
     try std.testing.expectEqualStrings("null\n", result.data);
-    try std.testing.expectEqual(true, result.last_was_false_or_null);
+    try std.testing.expectEqual(types.LastOutput.false_or_null, result.last_output);
 }
 
 test "serialized: collect_bytes returns null after drain" {

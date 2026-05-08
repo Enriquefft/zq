@@ -1373,6 +1373,29 @@ pub const OutputStyle = packed struct {
     join: bool = false,
 };
 
+/// Tri-state encoding of a query's last emitted value, consumed by `-e`.
+/// SSOT for jq's exit-code decision: `none` → 4 (no output), `false_or_null`
+/// → 1, `truthy` → 0. Folds across pool segments via `last_output_fold`:
+/// `.none` is identity, any other value overwrites. The fold preserves
+/// "last non-empty wins" across the sequenced output stream.
+pub const LastOutput = enum(u8) { none, false_or_null, truthy };
+
+/// Map a Value to its LastOutput tag — used wherever the VM emits a value
+/// the `-e` decision cares about. Single canonical encoding.
+pub fn lastOutputOf(val: Value) LastOutput {
+    return switch (val) {
+        .null_val => .false_or_null,
+        .bool_val => |b| if (b) .truthy else .false_or_null,
+        else => .truthy,
+    };
+}
+
+/// Fold two segment-level LastOutput values: `.none` preserves prev,
+/// anything else overwrites. Sequenced fold order = chunk-id order.
+pub fn lastOutputFold(prev: LastOutput, next: LastOutput) LastOutput {
+    return if (next == .none) prev else next;
+}
+
 // ─── Float Formatting ────────────────────────────────────────────────────────
 // Single source of truth for jq-compatible float formatting.
 // Implements jq's jvp_dtoa_fmt algorithm: uses Ryu shortest representation,

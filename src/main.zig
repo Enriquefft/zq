@@ -13,6 +13,12 @@ const EXIT_OK = 0;
 const EXIT_FALSE = 1; // -e: last output was false/null
 const EXIT_USAGE = 2;
 const EXIT_COMPILE = 3; // filter syntax/compilation error
+// Tier-1: introduce EXIT_NO_OUTPUT for jq's "-e and no valid result was ever
+// produced" case. Numerically collides with EXIT_RUNTIME below; the two are
+// emitted on disjoint paths (runtime errors return early via exitCodeForKind
+// before the no-output check). Tier-2 (next commit) renumbers EXIT_RUNTIME
+// to 5 and EXIT_SYSTEM to 2 to match jq 1.8.1 spec exactly.
+const EXIT_NO_OUTPUT = 4; // -e: filter produced zero outputs (jq spec)
 const EXIT_RUNTIME = 4; // TypeError, IndexOutOfBounds, UserError during query execution
 const EXIT_SYSTEM = 5; // OOM, I/O error, write failure
 
@@ -593,7 +599,7 @@ pub fn main() !u8 {
         .auto => if (writer.is_tty() and !hasNoColor()) &output_mod.default_colors else null,
     };
 
-    var last_was_false_or_null = false;
+    var last_output: types.LastOutput = .none;
     var had_parse_errors = false;
     var pool_error_exit: ?u8 = null;
 
@@ -601,7 +607,7 @@ pub fn main() !u8 {
 
     if (config.null_input) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processNullInput(&cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
+        last_output = processNullInput(&cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.unbuffered, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -609,7 +615,7 @@ pub fn main() !u8 {
         };
     } else if (config.slurp) {
         var diag = QueryDiag{};
-        last_was_false_or_null = processSlurp(&config, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &diag) catch |e| {
+        last_output = processSlurp(&config, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, &had_parse_errors, &diag) catch |e| {
             const kind = err_mod.kindFromZqError(@errorCast(e));
             const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
             err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -653,7 +659,7 @@ pub fn main() !u8 {
                 printErr("zq: write error\n");
                 return EXIT_SYSTEM;
             };
-            last_was_false_or_null = result.last_was_false_or_null;
+            last_output = types.lastOutputFold(last_output, result.last_output);
         }
     } else {
         for (config.files) |path| {
@@ -667,12 +673,13 @@ pub fn main() !u8 {
 
             var diag = QueryDiag{};
             defer diag.deinit(allocator);
-            last_was_false_or_null = processFile(file, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
+            const file_last = processFile(file, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
                 err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
                 return exitCodeForKind(kind);
             };
+            last_output = types.lastOutputFold(last_output, file_last);
         }
     }
 
@@ -683,8 +690,12 @@ pub fn main() !u8 {
 
     if (pool_error_exit) |code| return code;
     if (had_parse_errors) return EXIT_SYSTEM;
-    if (config.exit_status and last_was_false_or_null) {
-        return EXIT_FALSE;
+    if (config.exit_status) {
+        return switch (last_output) {
+            .none => EXIT_NO_OUTPUT,
+            .false_or_null => EXIT_FALSE,
+            .truthy => EXIT_OK,
+        };
     }
     return EXIT_OK;
 }
@@ -703,7 +714,7 @@ fn processFile(
     raw_input: bool,
     unbuffered: bool,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     const n_threads = std.Thread.getCpuCount() catch 4;
     const budget = pool_mod.MemoryBudget.detect();
     var pool = try pool_mod.Pool.init(n_threads, budget, allocator);
@@ -725,14 +736,14 @@ fn processFile(
 
     try pool.submit_file(file, cq, style, color, opts, raw_input, ext_bindings);
 
-    var last_was_false_or_null = false;
+    var last_output: types.LastOutput = .none;
     while (try pool.collect_bytes()) |result| {
         try writer.writeSlice(result.data);
         if (unbuffered) try writer.flush();
-        last_was_false_or_null = result.last_was_false_or_null;
+        last_output = types.lastOutputFold(last_output, result.last_output);
     }
 
-    return last_was_false_or_null;
+    return last_output;
 }
 
 // ── Slurp Processing ─────────────────────────────────────────────────────────
@@ -748,7 +759,7 @@ fn processSlurp(
     allocator: std.mem.Allocator,
     had_errors: *bool,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     if (config.raw_input) {
         return processSlurpRaw(config, cq, writer, style, color, opts, ext_bindings, allocator, diag);
     }
@@ -767,7 +778,7 @@ fn processSlurpJson(
     allocator: std.mem.Allocator,
     had_errors: *bool,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     var rt = try types.RuntimeTape.init(allocator);
     defer rt.deinit(allocator);
 
@@ -909,7 +920,7 @@ fn processSlurpRaw(
     ext_bindings: []const query_mod.ExternalVarBinding,
     allocator: std.mem.Allocator,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     var text_buf = std.ArrayList(u8){};
     defer text_buf.deinit(allocator);
 
@@ -983,14 +994,14 @@ fn processNullInput(
     allocator: std.mem.Allocator,
     unbuffered: bool,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     var parser = try parser_mod.Parser.init(allocator);
     defer parser.deinit();
 
     const result = try parser.feed("null", true);
     const tape = switch (result) {
         .done => |d| d.tape,
-        .need_more => return false,
+        .need_more => return .none,
     };
 
     var opt_it: ?query_mod.ResultIterator = null;
@@ -1255,7 +1266,7 @@ fn writeRecord(
     allocator: std.mem.Allocator,
     unbuffered: bool,
     diag: *QueryDiag,
-) !bool {
+) !types.LastOutput {
     if (opt_it.*) |*it| {
         it.reset(tape, ext_bindings);
     } else {
@@ -1273,21 +1284,17 @@ fn writeRecord(
         }
     }
 
-    var last_was_false_or_null = false;
+    var last_output: types.LastOutput = .none;
     while (try it.next()) |val| {
         try writer.write_value(val, style, color, opts);
         if (!style.join) {
             try writer.writeByte('\n');
         }
         if (unbuffered) try writer.flush();
-        last_was_false_or_null = switch (val) {
-            .null_val => true,
-            .bool_val => |b| !b,
-            else => false,
-        };
+        last_output = types.lastOutputOf(val);
     }
 
-    return last_was_false_or_null;
+    return last_output;
 }
 
 fn hasNoColor() bool {

@@ -105,7 +105,7 @@ pub const Result = struct {
 /// Valid until the next collect_bytes() or deinit() call.
 pub const BytesResult = struct {
     data: []const u8,
-    last_was_false_or_null: bool,
+    last_output: types.LastOutput,
 };
 
 // ── Internal value representation ─────────────────────────────────────────────
@@ -145,8 +145,10 @@ const OwnedValue = union(enum) {
 const RecordMeta = struct {
     /// Exclusive byte offset in the chunk's data buffer.
     end_offset: u32,
-    /// For -e flag: true if the last value produced was false or null.
-    last_was_false_or_null: bool,
+    /// Tri-state for -e: encodes whether this segment emitted a value and
+    /// whether the last value was null/false. `.none` for error/skip/partial
+    /// markers; folded by `types.lastOutputFold` at the collector.
+    last_output: types.LastOutput,
     /// If true, error_code is valid and this record produced an error.
     is_error: bool,
     /// @intFromError(ZqError), valid when is_error is true.
@@ -708,7 +710,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                             fn call(s: *SerializeJobState, code: u16) void {
                                 const meta = RecordMeta{
                                     .end_offset = @intCast(s.chunk_buf.items.len),
-                                    .last_was_false_or_null = false,
+                                    .last_output = .none,
                                     .is_error = true,
                                     .error_code = code,
                                 };
@@ -741,7 +743,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                             // error and stop processing this chunk.
                             const meta = RecordMeta{
                                 .end_offset = @intCast(state.chunk_buf.items.len),
-                                .last_was_false_or_null = false,
+                                .last_output = .none,
                                 .is_error = true,
                                 .error_code = @intFromError(@as(ZqError, error.UnexpectedEof)),
                             };
@@ -1062,7 +1064,7 @@ fn process_value_serialized(
             s.meta_list.append(s.aa, meta) catch {
                 s.meta_list.append(s.aa, .{
                     .end_offset = @intCast(s.chunk_buf.items.len),
-                    .last_was_false_or_null = false,
+                    .last_output = .none,
                     .is_error = true,
                     .error_code = @intFromError(@as(ZqError, error.IoError)),
                 }) catch {};
@@ -1078,7 +1080,7 @@ fn process_value_serialized(
                 _ = prefilter_stats.counters.skipped.fetchAdd(1, .monotonic);
                 append_meta(state, .{
                     .end_offset = start,
-                    .last_was_false_or_null = false,
+                    .last_output = .none,
                     .is_error = false,
                     .error_code = 0,
                 });
@@ -1095,7 +1097,7 @@ fn process_value_serialized(
             current_query.* = null;
             append_meta(state, .{
                 .end_offset = start,
-                .last_was_false_or_null = false,
+                .last_output = .none,
                 .is_error = true,
                 .error_code = @intFromError(@as(ZqError, error.IoError)),
             });
@@ -1107,7 +1109,7 @@ fn process_value_serialized(
     }
 
     // ── Serialize values directly into the shared chunk buffer ────────────────
-    var last_was_false_or_null = false;
+    var last_output: types.LastOutput = .none;
     while (true) {
         // Cooperative shutdown observation: required so an infinite generator
         // (e.g. `repeat(.+1)` piped through `head -100`) lets the worker exit
@@ -1123,7 +1125,7 @@ fn process_value_serialized(
             state.chunk_buf.shrinkRetainingCapacity(start);
             append_meta(state, .{
                 .end_offset = start,
-                .last_was_false_or_null = false,
+                .last_output = .none,
                 .is_error = true,
                 .error_code = @intFromError(e),
                 .error_ip = @intCast(opt_it.*.?.last_error_ip),
@@ -1140,7 +1142,7 @@ fn process_value_serialized(
             state.chunk_buf.shrinkRetainingCapacity(start);
             append_meta(state, .{
                 .end_offset = start,
-                .last_was_false_or_null = false,
+                .last_output = .none,
                 .is_error = true,
                 .error_code = @intFromError(@as(ZqError, error.IoError)),
             });
@@ -1153,7 +1155,7 @@ fn process_value_serialized(
                 state.chunk_buf.shrinkRetainingCapacity(start);
                 append_meta(state, .{
                     .end_offset = start,
-                    .last_was_false_or_null = false,
+                    .last_output = .none,
                     .is_error = true,
                     .error_code = @intFromError(@as(ZqError, error.IoError)),
                 });
@@ -1161,11 +1163,7 @@ fn process_value_serialized(
             };
         }
 
-        last_was_false_or_null = switch (val) {
-            .null_val => true,
-            .bool_val => |b| !b,
-            else => false,
-        };
+        last_output = types.lastOutputOf(val);
 
         // Partial flush check: at a record-boundary-safe point (just emitted
         // a complete value + trailing newline), check if we should publish
@@ -1181,9 +1179,12 @@ fn process_value_serialized(
             // Append a partial-record meta covering everything written for
             // this line so far, then flush.  The next partial will start a
             // new meta entry with start = 0 in the fresh chunk_buf.
+            // last_output carries the accumulated state so far; the
+            // downstream fold preserves "last non-empty wins" across
+            // partial-flush and final-meta entries.
             append_meta(state, .{
                 .end_offset = @intCast(state.chunk_buf.items.len),
-                .last_was_false_or_null = false,
+                .last_output = last_output,
                 .is_error = false,
                 .error_code = 0,
             });
@@ -1196,7 +1197,7 @@ fn process_value_serialized(
 
     append_meta(state, .{
         .end_offset = @intCast(state.chunk_buf.items.len),
-        .last_was_false_or_null = last_was_false_or_null,
+        .last_output = last_output,
         .is_error = false,
         .error_code = 0,
     });
@@ -2293,7 +2294,7 @@ pub const Pool = struct {
 
                     return BytesResult{
                         .data = data,
-                        .last_was_false_or_null = meta.last_was_false_or_null,
+                        .last_output = meta.last_output,
                     };
                 },
                 .structured => {

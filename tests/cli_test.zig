@@ -653,3 +653,55 @@ test "style: -j -c on arrays concatenates compact bodies (8th cube cell)" {
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("[1,2][3,4]", r.stdout);
 }
+
+// ── -e exit-status: jq 1.8.1 spec parity (NIX-008) ─────────────────────────
+
+test "-e: filter produces no output yields EXIT_NO_OUTPUT (4)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".[] | .signatures.[] | select(startswith(\"cache2.\"))" }, "{\"a\":{\"signatures\":[\"cache1.x\"]}}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 4), r.exit_code);
+    try std.testing.expectEqualStrings("", r.stdout);
+}
+
+test "-e: last output null yields EXIT_FALSE (1)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".a" }, "{\"a\":null}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 1), r.exit_code);
+}
+
+test "-e: last output false yields EXIT_FALSE (1)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".a" }, "{\"a\":false}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 1), r.exit_code);
+}
+
+test "-e: last output truthy yields EXIT_OK (0)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".a" }, "{\"a\":[1]}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+}
+
+test "-e: mixed output, last is truthy, yields EXIT_OK (0)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".[]" }, "[null, false, 1]\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+}
+
+test "-e: mixed output, last is null, yields EXIT_FALSE (1)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-e", ".[]" }, "[1, null]\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 1), r.exit_code);
+}
+
+test "-e absent: empty output is still EXIT_OK (0)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{".b"}, "{\"a\":1}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+}
