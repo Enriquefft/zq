@@ -447,6 +447,56 @@ test "NIX-008: --sort-keys with no filter still defaults to identity" {
     try std.testing.expectEqualStrings("{\"a\":1,\"b\":2}\n", r.stdout);
 }
 
+// ── NIX-010: value-arg slot must survive backtracking generators ────────────
+//
+// `def f($p): <body referencing $p>; f(<value>)` emitted `pop_variable`
+// after the body, clearing the value-arg slot. With a generator anywhere
+// in args OR body, the VM backtracks past the pop and subsequent
+// `load_variable($p)` reads a cleared slot → "type error at $p".
+//
+// Fix: extend the suppress-pop predicate (INLINE + RECURSIVE arms in
+// `src/compiler/emit.zig`) to OR in the body subtree, not just the args.
+// Filter-arg `def f(p)` always worked — filter args are AST-substituted
+// at lower, never slot-stored.
+
+test "NIX-010: value-arg survives generator body across backtracks (.[])" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{"def f($p): .[] | $p; f(\"hi\")"}, "[1,2]");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("\"hi\"\n\"hi\"\n", r.stdout);
+}
+
+test "NIX-010: value-arg survives to_entries[] body across backtracks" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{"def f($p): to_entries[] | $p; f(\"hi\")"}, "{\"a\":1,\"b\":2}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("\"hi\"\n\"hi\"\n", r.stdout);
+}
+
+test "NIX-010: filter-arg path (control — must keep working)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{"def f(p): .[] | p; f(\"hi\")"}, "[1,2]");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("\"hi\"\n\"hi\"\n", r.stdout);
+}
+
+test "NIX-010: non-generator body still pops (no leak across calls)" {
+    const alloc = std.testing.allocator;
+    // Two sequential calls with different value-args. If the slot leaked
+    // from the first call, the second would see the wrong value.
+    var r = try runZq(
+        alloc,
+        &.{"def f($p): $p + 1; f(10), f(20)"},
+        "null",
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("11\n21\n", r.stdout);
+}
+
 // ── Output style composition (-r / -c / -j) ─────────────────────────────────
 //
 // Pre-OutputStyle, `-r -c` clobbered each other (last write wins on the same

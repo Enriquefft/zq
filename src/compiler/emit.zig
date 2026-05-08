@@ -3585,16 +3585,14 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
         std.debug.assert(span.len == num_value_args + 1);
         const body_idx = span[span.len - 1];
 
-        // Detect whether any value-arg contains a generator.  When true we
-        // need the input-scope bracket (each arg must see the original `.`)
-        // AND we must NOT emit pop_variable at the end.  pop_variable clears
-        // the slot immediately after the first body execution; if the arg is
-        // a generator the VM backtracks to an IP before the pop and
-        // subsequent load_variable calls find a null slot (root.zig:853).
-        // Omitting pop is safe because the INLINE body is re-lowered fresh
-        // per call site — the canonical var_ids live only within this call's
-        // generator lifecycle.  Non-generator calls retain pop_variable so
-        // sequential calls to the same function don't see stale values.
+        // Detect whether any value-arg OR the body contains a generator.
+        // Generator args force the input-scope bracket so each arg sees the
+        // original `.`. Generator bodies (e.g. `def f($p): .[] | $p`) must
+        // also suppress pop_variable: backtracking re-enters the body after
+        // pop_variable already cleared the value-arg slot, so subsequent
+        // load_variable($p) returns null (NIX-010). Omitting pop is safe
+        // because the INLINE body is re-lowered fresh per call site — the
+        // var_ids live only within this call's generator lifecycle.
         var has_generator_arg = false;
         for (span[0..num_value_args]) |arg_idx| {
             if (subtreeHasIterate(em.ir_obj, arg_idx)) {
@@ -3602,6 +3600,8 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
                 break;
             }
         }
+        const body_has_generator = subtreeHasIterate(em.ir_obj, body_idx);
+        const suppress_pop = has_generator_arg or body_has_generator;
 
         // Phase 1 — save input ONCE, then emit each value arg with input
         // reseeded before every evaluation. Without the bracket, arg_1
@@ -3633,10 +3633,10 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
         try emitNode(em, body_idx);
 
         // Phase 3 — pop value-arg variables in reverse order, but ONLY when
-        // no arg is a generator.  With generator args the body may be
-        // re-entered via backtrack; the pop would already have cleared the
-        // slot on the first pass, causing load_variable to return null.
-        if (!has_generator_arg) {
+        // neither args nor body contains a generator. If either does, the
+        // body may be re-entered via backtrack and the pop would have
+        // already cleared the slot, causing load_variable to return null.
+        if (!suppress_pop) {
             var i: usize = num_value_args;
             while (i > 0) {
                 i -= 1;
@@ -3693,10 +3693,26 @@ fn emitCallUser(em: *Emitter, node: ir.Node) EmitError!void {
     // being walked; the write set is finalized only after.
     try em.pushInstr(.call_function, .{ .index = @intCast(fn_id) }, node);
 
-    var i: usize = num_value_args;
-    while (i > 0) {
-        i -= 1;
-        try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+    // Suppress pop_variable when the body (or any value-arg) contains a
+    // generator: backtracking re-enters the body after the pop, leaving
+    // load_variable($p) reading a cleared slot (NIX-010).
+    var has_generator_arg = false;
+    for (span[0..num_value_args]) |arg_idx| {
+        if (subtreeHasIterate(em.ir_obj, arg_idx)) {
+            has_generator_arg = true;
+            break;
+        }
+    }
+    var body_has_generator = false;
+    if (entry.body_ir_root != lower_mod.BODY_IR_NOT_LOWERED) {
+        body_has_generator = subtreeHasIterate(em.ir_obj, entry.body_ir_root);
+    }
+    if (!(has_generator_arg or body_has_generator)) {
+        var i: usize = num_value_args;
+        while (i > 0) {
+            i -= 1;
+            try em.pushInstr(.pop_variable, .{ .index = @intCast(value_var_ids.items[i]) }, node);
+        }
     }
 }
 
