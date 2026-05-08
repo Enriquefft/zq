@@ -74,11 +74,14 @@ pub const Result = struct {
 
 /// Pre-serialized bytes for one record, returned by collect_bytes().
 /// Valid until the next call to collect_bytes() or deinit().
-/// `last_was_false_or_null` flags records whose final emitted value was `false`
-/// or `null`; the CLI uses it to compute the process exit code (jq parity).
+/// `last_output` carries the tri-state SSOT used to compute the `-e` exit code
+/// per jq 1.8.1: `.none` (no value emitted by this record), `.false_or_null`
+/// (final emitted value was `false`/`null`), or `.truthy`. The CLI folds
+/// per-record values across the sequenced stream via `types.lastOutputFold`
+/// ("last non-empty wins") and maps the terminal tag to exit 4 / 1 / 0.
 pub const BytesResult = struct {
-    data:                   []const u8,
-    last_was_false_or_null: bool,
+    data:        []const u8,
+    last_output: types.LastOutput,
 };
 
 /// Adaptive memory budget for chunk sizing.
