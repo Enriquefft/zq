@@ -173,13 +173,30 @@ fn foldPipeTree(ctx: *WalkCtx, pipe_idx: u32) error{OutOfMemory}!u32 {
     // Step 2 — group + fold consecutive load_field runs. Each output
     // segment is either a pre-existing leaf (copied via copyAndFold)
     // or a freshly-emitted load_path collapsing a run of ≥2 leaves.
+    //
+    // NIX-009: a `load_field` whose key contains `.` is excluded from
+    // fold runs. The fused `load_path` payload encodes the key chain as
+    // a single dot-joined string consumed by `splitScalar(u8, _, '.')`
+    // in the VM (`src/vm/root.zig` `.load_path` handler) and in
+    // `doLoadPath` for the actual lookup. Any `.` inside a key would be
+    // mis-split, returning `null` for the access. Treating dotted keys
+    // as chain-breakers preserves correctness — they regress to the
+    // unfused per-leaf `load_field` path (semantically `lookup_key` per
+    // segment), which is what callers like `.x["a.b"]` already use
+    // when the key ships through bracket access.
     var segments: SegmentList = .{};
     var i: usize = 0;
     const leaves_slice = leaves.slice();
     while (i < leaves_slice.len) : (i += 0) {
-        // Scan the maximal load_field run starting at `i`.
+        // Scan the maximal load_field run starting at `i`. A leaf whose
+        // key contains `.` cannot be folded (see NIX-009 note above), so
+        // it terminates the run. If `leaves[i]` itself is dotted, the
+        // run is empty and the single-leaf copy path handles it.
         var j: usize = i;
-        while (j < leaves_slice.len and leaves_slice[j].op == .load_field) : (j += 1) {}
+        while (j < leaves_slice.len and
+            leaves_slice[j].op == .load_field and
+            !loadFieldKeyHasDot(ctx.src, leaves_slice[j].src_idx)) : (j += 1)
+        {}
         const run_len = j - i;
 
         if (run_len >= 2) {
@@ -242,6 +259,17 @@ fn collectLeaves(
     if (!collectLeaves(src_ir, node.children[1], leaves, pipes)) return false;
     pipes.push(node_idx) catch return false;
     return true;
+}
+
+/// True iff `src_idx` is a `load_field` whose key bytes contain a `.`.
+/// Caller must have already verified `node.op == .load_field`.
+fn loadFieldKeyHasDot(src_ir: *const ir.IR, src_idx: u32) bool {
+    const node = src_ir.nodes.items[src_idx];
+    std.debug.assert(node.op == .load_field);
+    const off: u32 = src_ir.extra_data.items[node.extra];
+    const len: u32 = src_ir.extra_data.items[node.extra + 1];
+    const key = src_ir.string_buf.items[off .. off + len];
+    return std.mem.indexOfScalar(u8, key, '.') != null;
 }
 
 /// Materialize a `load_path` node from a run of `load_field` leaves.

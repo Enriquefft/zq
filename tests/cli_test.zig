@@ -497,6 +497,64 @@ test "NIX-010: non-generator body still pops (no leak across calls)" {
     try std.testing.expectEqualStrings("11\n21\n", r.stdout);
 }
 
+// ── NIX-009: dotted-key access via fused chain returns null ─────────────────
+//
+// `.x["a.b"]` and `.x | .["a.b"]` and `.x."a.b"` all became `load_path`
+// after fuse, whose payload encoded the chain as a dot-joined string
+// `"x.a.b"` and was split back on `.` at execute time — silently
+// re-routing the second access through key `"a"` then `"b"`. Direct
+// single-leaf bracket access never hit fuse, so it stayed correct.
+//
+// Fix: the fuse pass treats any `load_field` whose key contains `.`
+// as a chain-breaker. Dotted-key chains regress to per-leaf
+// `load_field`; the common case (no dots) is unchanged.
+
+test "NIX-009: .x[\"a.b\"] returns the dotted-key value" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".x[\"a.b\"]" }, "{\"x\":{\"a.b\":1}}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+}
+
+test "NIX-009: .x | .[\"a.b\"] (piped) returns the dotted-key value" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".x | .[\"a.b\"]" }, "{\"x\":{\"a.b\":1}}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+}
+
+test "NIX-009: .x.\"a.b\" (string-key suffix) returns the dotted-key value" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".x.\"a.b\"" }, "{\"x\":{\"a.b\":1}}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("1\n", r.stdout);
+}
+
+test "NIX-009: dotted key adjacent to plain keys still resolves both halves" {
+    const alloc = std.testing.allocator;
+    // `.outer."a.b".inner` — split point is the dotted segment; the
+    // plain segments around it must still chain correctly.
+    var r = try runZq(
+        alloc,
+        &.{ "-c", ".outer.\"a.b\".inner" },
+        "{\"outer\":{\"a.b\":{\"inner\":42}}}",
+    );
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("42\n", r.stdout);
+}
+
+test "NIX-009: common case .a.b.c (no dots in keys) still resolves" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-c", ".a.b.c" }, "{\"a\":{\"b\":{\"c\":42}}}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("42\n", r.stdout);
+}
+
 // ── Output style composition (-r / -c / -j) ─────────────────────────────────
 //
 // Pre-OutputStyle, `-r -c` clobbered each other (last write wins on the same
