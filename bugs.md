@@ -2,7 +2,17 @@
 
 Active bugs and latent issues. Fixed entries are pruned; check git history for resolved incidents.
 
-Last verified: 2026-05-07. Suite: 1220/1252 pass, 28 skipped, 4 NIX-004 failures (gsub/sub replacement-as-filter — out of current scope).
+Last verified: 2026-05-07. Suite: 1263/1291 pass, 28 skipped, 0 failures.
+NIX-008/009/010 closed; `nix-functional-tests` re-run pending to confirm
+the 7-of-8 triaged failures clear (only `signing.sh` remained unreproduced).
+
+---
+
+## Unconfirmed jq-compat: `signing.sh`
+
+Not reproduced. Every jq pattern extracted from the script produced
+byte-identical zq vs jq output in isolation. Likely non-jq cause (env,
+fixture, sandbox). Pull the actual nix test log next.
 
 ---
 
