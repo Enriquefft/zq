@@ -253,6 +253,92 @@ pub fn countTopLevelValues(data: []const u8) usize {
     return count;
 }
 
+// ── Parallel prefix-sum support ──────────────────────────────────────────────
+
+/// Categorical input/output state for a stripe summary. Index encoding:
+///   0 = outside string
+///   1 = inside string, no escape pending
+///   2 = inside string, escape pending
+///
+/// `depth` itself is not categorical (unbounded), so it is composed
+/// additively across stripes via `Stripe.depth_delta`.
+pub const Cat = enum(u2) {
+    oos = 0,
+    is_no_esc = 1,
+    is_esc = 2,
+
+    fn fromState(s: ScannerState) Cat {
+        if (!s.in_string) return .oos;
+        return if (s.escape_pending) .is_esc else .is_no_esc;
+    }
+};
+
+/// Per-stripe pass-1 summary. For each of the 3 categorical input states,
+/// records the terminal categorical state and the *signed* depth delta
+/// accumulated over the stripe. The delta is signed (i64) rather than the
+/// saturating `u32` of `ScannerState`: parallel composition requires
+/// additivity, which `-|=` would break when an early-stripe excursion
+/// would dip below zero from a `depth=0` starting point but stays
+/// non-negative when started from the real (positive) carry.
+pub const Stripe = struct {
+    terminal: [3]Cat,
+    depth_delta: [3]i64,
+};
+
+/// Run the scanner over `data` from each of the 3 categorical starting
+/// states (`oos`, `is_no_esc`, `is_esc`) with depth tracked as a signed
+/// counter (no saturation). Returns the per-input terminal categorical
+/// state and depth delta. Pure function of `data`. Used by the parallel
+/// boundary-scan feeder to drive the serial stitch step.
+pub fn summarizeStripe(data: []const u8) Stripe {
+    var out: Stripe = undefined;
+    inline for ([_]Cat{ .oos, .is_no_esc, .is_esc }, 0..) |start, idx| {
+        const r = summarizeFrom(start, data);
+        out.terminal[idx] = r.cat;
+        out.depth_delta[idx] = r.depth_delta;
+    }
+    return out;
+}
+
+const SummaryResult = struct { cat: Cat, depth_delta: i64 };
+
+fn summarizeFrom(start: Cat, data: []const u8) SummaryResult {
+    var in_string = (start != .oos);
+    var escape_pending = (start == .is_esc);
+    var depth: i64 = 0;
+    var i: usize = 0;
+    while (i < data.len) {
+        if (in_string and !escape_pending) {
+            i += simd.scanStringBody(data[i..]);
+            if (i >= data.len) break;
+        }
+        if (!in_string) {
+            i += simd.scanStructural(data[i..]);
+            if (i >= data.len) break;
+        }
+
+        const b = data[i];
+        if (in_string) {
+            if (escape_pending) {
+                escape_pending = false;
+            } else if (b == '\\') {
+                escape_pending = true;
+            } else if (b == '"') {
+                in_string = false;
+            }
+        } else switch (b) {
+            '"' => in_string = true,
+            '{', '[' => depth += 1,
+            '}', ']' => depth -= 1,
+            else => {},
+        }
+        i += 1;
+    }
+
+    const cat: Cat = if (!in_string) .oos else if (escape_pending) .is_esc else .is_no_esc;
+    return .{ .cat = cat, .depth_delta = depth };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -368,4 +454,95 @@ test "findNextRecordEnd: aligns past mid-value newline inside string" {
     try testing.expectEqual(@as(usize, 10), end);
     try testing.expect(!state.in_string);
     try testing.expectEqual(@as(u32, 0), state.depth);
+}
+
+// ── Stripe summary tests (parallel boundary scan) ───────────────────────────
+
+test "summarizeStripe: empty stripe is identity for all starts" {
+    const s = summarizeStripe("");
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(Cat.is_no_esc, s.terminal[@intFromEnum(Cat.is_no_esc)]);
+    try testing.expectEqual(Cat.is_esc, s.terminal[@intFromEnum(Cat.is_esc)]);
+    for (s.depth_delta) |d| try testing.expectEqual(@as(i64, 0), d);
+}
+
+test "summarizeStripe: pure JSONL terminal stays oos with zero depth delta" {
+    const s = summarizeStripe("1\n2\n3\n");
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(@as(i64, 0), s.depth_delta[@intFromEnum(Cat.oos)]);
+}
+
+test "summarizeStripe: open brace from oos start lifts depth by one" {
+    const s = summarizeStripe("{\"a\": 1");
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(@as(i64, 1), s.depth_delta[@intFromEnum(Cat.oos)]);
+}
+
+test "summarizeStripe: starting in_string ignores braces inside" {
+    // Starting in_string at offset 0, "{" is literal, "}" is literal. No
+    // depth change until the closing quote at offset 1.
+    const s = summarizeStripe("{}\":1");
+    // From oos start: `{` opens (+1), `}` closes (0), then `"` opens string,
+    // `:` and `1` inside string. Terminal is in_string with delta 0.
+    try testing.expectEqual(Cat.is_no_esc, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(@as(i64, 0), s.depth_delta[@intFromEnum(Cat.oos)]);
+    // From is_no_esc start: `{` literal, `}` literal, `"` closes string,
+    // `:` and `1` outside string. Terminal is oos with depth 0.
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.is_no_esc)]);
+    try testing.expectEqual(@as(i64, 0), s.depth_delta[@intFromEnum(Cat.is_no_esc)]);
+}
+
+test "summarizeStripe: signed depth delta survives apparent over-close" {
+    // A close-then-reopen sequence dips depth below the from-zero baseline.
+    // Saturating arithmetic would lose information; signed tracking keeps
+    // the additivity needed for the parallel stitch.
+    const s = summarizeStripe("}{");
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(@as(i64, 0), s.depth_delta[@intFromEnum(Cat.oos)]);
+
+    const s2 = summarizeStripe("}}{");
+    try testing.expectEqual(@as(i64, -1), s2.depth_delta[@intFromEnum(Cat.oos)]);
+}
+
+test "summarizeStripe: escape pending start consumes next byte then resumes string" {
+    // Starting is_esc, the very first byte clears escape and stays in
+    // string. After that a `"` closes the string normally.
+    const s = summarizeStripe("n\"");
+    try testing.expectEqual(Cat.oos, s.terminal[@intFromEnum(Cat.is_esc)]);
+    try testing.expectEqual(@as(i64, 0), s.depth_delta[@intFromEnum(Cat.is_esc)]);
+}
+
+test "summarizeStripe: matches advanceState terminal for oos start" {
+    // Cross-check: the categorical+signed-depth summary from oos start
+    // must agree with `advanceState` on terminal in_string/escape_pending
+    // (and on terminal depth, modulo saturation, when the input never
+    // dips below zero from oos).
+    const data = "[1,2,{\"a\":\"hi\\n\",\"b\":[3,\"x\\\"y\"]}]\n";
+    const s = summarizeStripe(data);
+
+    var ref = ScannerState{};
+    advanceState(&ref, data);
+    const ref_cat = Cat.fromState(ref);
+    try testing.expectEqual(ref_cat, s.terminal[@intFromEnum(Cat.oos)]);
+    try testing.expectEqual(@as(i64, @intCast(ref.depth)), s.depth_delta[@intFromEnum(Cat.oos)]);
+}
+
+test "summarizeStripe: composes across split equal to whole" {
+    const whole = "{\"a\":\"x\\n\",\"b\":1}\n{\"c\":2}\n";
+    const split: usize = 7; // mid-string, mid-escape arrangement
+    const left = whole[0..split];
+    const right = whole[split..];
+
+    const s_l = summarizeStripe(left);
+    const s_r = summarizeStripe(right);
+
+    // Compose as the parallel stitch would.
+    const cat_l = s_l.terminal[@intFromEnum(Cat.oos)];
+    const depth_l = s_l.depth_delta[@intFromEnum(Cat.oos)];
+    const cat_after = s_r.terminal[@intFromEnum(cat_l)];
+    const depth_after = depth_l + s_r.depth_delta[@intFromEnum(cat_l)];
+
+    const s_whole = summarizeStripe(whole);
+    try testing.expectEqual(s_whole.terminal[@intFromEnum(Cat.oos)], cat_after);
+    try testing.expectEqual(s_whole.depth_delta[@intFromEnum(Cat.oos)], depth_after);
 }

@@ -22,6 +22,11 @@ const alloc = std.testing.allocator;
 /// 1 GiB budget — reproduces current defaults for all test files (tiny).
 const test_budget = MemoryBudget.explicit(1024 * 1024 * 1024);
 
+/// 16 MiB budget — forces `MemoryBudget.computeParams` into the tight regime
+/// (chunk_factor > 4, in_flight_factor → 1) so wave-dispatch fires many
+/// short waves. Used by the wave-correctness stress tests.
+const small_budget = MemoryBudget.explicit(16 * 1024 * 1024);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write `data` to a tmp file and return a readable File.
@@ -471,6 +476,206 @@ test "submit_file: pretty record crossing chunk boundary (4 workers)" {
     try std.testing.expectEqual(@as(usize, 16), vals.len);
     for (vals, 0..) |v, idx| {
         try std.testing.expectEqual(@as(i64, @intCast(idx)), v.int);
+    }
+}
+
+test "submit_file: parallel boundary scan over >256 KiB pretty JSON" {
+    // Exercise the parallel prefix-sum feeder path. The file must exceed
+    // PARALLEL_BOUNDARY_THRESHOLD (256 KiB) so boundary scan fans out
+    // across stripes; pretty-printed records ensure stripe splits land
+    // inside multi-line values, where the stitch step's correctness
+    // (carrying `in_string` / `escape_pending` across stripe boundaries)
+    // matters.
+    var cq = try compile(".n");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // ~80 bytes/record × 10 000 records ≈ 800 KB → comfortably over the
+    // threshold and large enough for the natural stripe split (file_size
+    // / n_threads) to land mid-record at random offsets.
+    var i: u32 = 0;
+    while (i < 10_000) : (i += 1) {
+        try data.writer(alloc).print(
+            "{{\n  \"n\": {d},\n  \"s\": \"line {d} with \\\"quotes\\\" and \\\\backslash\\\\\"\n}}\n",
+            .{ i, i },
+        );
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(8, test_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 10_000), vals.len);
+    for (vals, 0..) |v, idx| {
+        try std.testing.expectEqual(@as(i64, @intCast(idx)), v.int);
+    }
+}
+
+test "submit_file: wave-boundary mid-string with escape pending" {
+    // Cross-wave invariant: the parallel summary's escape-pending category
+    // must propagate correctly when a wave boundary lands inside a string
+    // immediately after a `\` byte. Every record is one long string of
+    // `\\` pairs — half of all bytes are `\` — so a stripe split is highly
+    // likely to land in `is_esc` state.
+    var cq = try compile(".s | length");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // ~3 MB total, 200 records × ~15 KB each. With small_budget the wave
+    // dispatcher fires multiple waves; record bodies are heavy on escapes
+    // to exercise is_esc carry across stripe and wave splits.
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        try data.writer(alloc).writeAll("{\"s\":\"");
+        var j: u32 = 0;
+        while (j < 1500) : (j += 1) try data.writer(alloc).writeAll("\\\\");
+        try data.writer(alloc).writeAll("\"}\n");
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(8, small_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 200), vals.len);
+    // Each record's string is 1500 `\\` pairs → 1500 backslash chars
+    // after JSON unescape (every `\\` → `\`).
+    for (vals) |v| try std.testing.expectEqual(@as(i64, 1500), v.int);
+}
+
+test "submit_file: wave-boundary inside multi-line pretty record" {
+    // Cross-wave (oos, 0) carry: each wave must dispatch up to a depth-0
+    // boundary, never splitting a multi-line pretty-printed object across
+    // workers. With ~5 KB pretty records straddling wave splits, any
+    // mis-aligned dispatch shreds records into parse errors.
+    var cq = try compile(".n");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // 5 000 records × ~5 KB each ≈ 25 MB. Each record has many `\n`
+    // characters at depth > 0 (pretty-printing) which the structural
+    // scanner must skip; only the trailing depth-0 `\n` counts.
+    var i: u32 = 0;
+    while (i < 5_000) : (i += 1) {
+        try data.writer(alloc).print("{{\n  \"n\": {d},\n  \"payload\": [\n", .{i});
+        var j: u32 = 0;
+        while (j < 60) : (j += 1) {
+            try data.writer(alloc).print("    \"item-{d}-{d}\",\n", .{ i, j });
+        }
+        try data.writer(alloc).writeAll("    \"end\"\n  ]\n}\n");
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(8, small_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 5_000), vals.len);
+    for (vals, 0..) |v, idx| {
+        try std.testing.expectEqual(@as(i64, @intCast(idx)), v.int);
+    }
+}
+
+test "submit_file: many waves — file >> wave_bytes" {
+    // Stress test: many waves in sequence under a tight memory budget.
+    // Verifies cumulative correctness — no off-by-one drift in dispatch
+    // cursors across many cross-wave handoffs, no record loss, ordering
+    // preserved.
+    var cq = try compile(".id");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // 500 000 compact records × ~25 bytes ≈ 12 MB. Under small_budget
+    // (16 MiB) `computeParams` pushes chunk_factor up so wave_bytes
+    // shrinks → many waves.
+    var i: u32 = 0;
+    while (i < 500_000) : (i += 1) {
+        try data.writer(alloc).print("{{\"id\":{d}}}\n", .{i});
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(8, small_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 500_000), vals.len);
+    for (vals, 0..) |v, idx| {
+        try std.testing.expectEqual(@as(i64, @intCast(idx)), v.int);
+    }
+}
+
+test "submit_file: zero-boundary wave fallback" {
+    // Pathological case: a single record larger than wave_bytes and even
+    // larger than 2× wave_bytes, so the wave dispatcher's one-shot
+    // extension fails to find any depth-0 boundary. The fallback path is
+    // a serial scan from wave_start. Test verifies (a) no deadlock, (b)
+    // correct output for the giant record, (c) correct output for the
+    // 100 follow-up records that the serial fallback must dispatch.
+    var cq = try compile(".s | length");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    // One giant string record: ~3 MB of plain ASCII with no internal
+    // newlines. Far larger than any wave_bytes the small_budget config
+    // produces for this file size.
+    try data.writer(alloc).writeAll("{\"s\":\"");
+    var k: u32 = 0;
+    while (k < 3_000_000) : (k += 1) try data.writer(alloc).writeByte('a');
+    try data.writer(alloc).writeAll("\"}\n");
+    // 100 small follow-up records.
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        try data.writer(alloc).print("{{\"s\":\"x{d}\"}}\n", .{i});
+    }
+
+    const file = try tmp_file_fd(data.items);
+    defer file.close();
+
+    var p = try Pool.init(8, small_budget, alloc);
+    defer p.deinit();
+
+    try p.submit_file(file, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 101), vals.len);
+    // First record: 3 000 000 'a' chars.
+    try std.testing.expectEqual(@as(i64, 3_000_000), vals[0].int);
+    // Follow-up records: "x" + decimal idx → length = 1 + digit count.
+    for (vals[1..], 0..) |v, idx| {
+        const expected: i64 = 1 + @as(i64, @intCast(std.fmt.count("{d}", .{idx})));
+        try std.testing.expectEqual(expected, v.int);
     }
 }
 
