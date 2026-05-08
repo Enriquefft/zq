@@ -149,7 +149,7 @@ I/O (`input`/`inputs`/`debug`/`stderr`/`halt`/`halt_error`), env (`env`, `builti
 | [x] | **`--json-errors`** | Errors as JSON to stderr: `{"error": "type_error", "line": 1, "col": 5, "offset": 4, "len": 0, "filter": "...", "message": "...", "description": "..."}`. Agents can parse, understand, and self-correct. |
 | [x] | **`--describe`** | Print input data shape to stdout: `{"type": "object", "fields": {...}, "count": N}`. Agents inspect data before writing a query. |
 | [x] | **`--validate FILTER`** | Check filter syntax, exit 0 if valid, exit 3 with JSON error if not. No input required. |
-| [x] | **Documented exit codes** | 0=success, 1=false/null (-e), 2=usage, 3=compile error, 4=runtime error, 5=system error. |
+| [x] | **Documented exit codes** | jq 1.8.1 spec parity: 0=success, 1=false/null (-e), 2=usage/system, 3=compile error, 4=no output (-e), 5=runtime error. |
 | [x] | **`llms.txt`** | Machine-readable documentation file at repo root. Structured reference of all flags, builtins, and query syntax. |
 | [x] | **C ABI error details** | `zq_execute` returns granular error codes (-1 to -5). `zq_get_error` returns JSON error string. `zq_compile_ext` reports compile errors. |
 | [x] | **LSP (Language Server)** | `zq --lsp`. Autocomplete, hover docs, diagnostics, references, rename, semantic tokens, formatting. Source: `src/lsp/`. |

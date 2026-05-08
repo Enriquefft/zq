@@ -9,18 +9,17 @@ const describe_mod = @import("describe");
 const types = @import("types");
 const err_mod = @import("error");
 
-const EXIT_OK = 0;
-const EXIT_FALSE = 1; // -e: last output was false/null
-const EXIT_USAGE = 2;
+// Exit codes match jq 1.8.1 manpage table verbatim. SSOT for the
+// `alias jq=zq` parity story; downstream scripts written against jq's
+// codes get identical behavior. Diagnostics on stderr (via
+// `err_mod.formatDiagnostic`) carry the OOM/IO/usage distinction that
+// the exit-code byte folds away.
+const EXIT_OK = 0; // success; with -e, last output was not null/false
+const EXIT_FALSE = 1; // -e: last output was null or false
+const EXIT_USAGE = 2; // usage error or system error (OOM, I/O, write failure)
 const EXIT_COMPILE = 3; // filter syntax/compilation error
-// Tier-1: introduce EXIT_NO_OUTPUT for jq's "-e and no valid result was ever
-// produced" case. Numerically collides with EXIT_RUNTIME below; the two are
-// emitted on disjoint paths (runtime errors return early via exitCodeForKind
-// before the no-output check). Tier-2 (next commit) renumbers EXIT_RUNTIME
-// to 5 and EXIT_SYSTEM to 2 to match jq 1.8.1 spec exactly.
-const EXIT_NO_OUTPUT = 4; // -e: filter produced zero outputs (jq spec)
-const EXIT_RUNTIME = 4; // TypeError, IndexOutOfBounds, UserError during query execution
-const EXIT_SYSTEM = 5; // OOM, I/O error, write failure
+const EXIT_NO_OUTPUT = 4; // -e: filter produced zero outputs
+const EXIT_RUNTIME = 5; // uncaught runtime error (type, index OOB, user-raised)
 
 /// Source classification for an external variable binding.
 /// Drives binding construction in main.zig: `string`/`json` carry the literal
@@ -111,28 +110,24 @@ const QueryDiag = struct {
     }
 };
 
-/// Map an ErrorKind to the appropriate exit code.
+/// Map an ErrorKind to the appropriate exit code per jq 1.8.1 manpage.
 ///
-/// Bucket rationale (single source of truth for the zq exit-code contract):
-///   - `EXIT_COMPILE`  — the user's filter or build environment cannot run
-///     the query as written. `regex_compile_error` (bad pattern) is obvious.
-///     `regex_not_compiled` also lands here even when it fires at runtime
-///     (dynamic pattern in a `-Dregex=false` build): the failure root-cause
-///     is build-configuration, not runtime data. The user cannot recover by
-///     changing input — they recover by rebuilding with regex enabled. That
-///     makes it a compile-surface class of failure, not a data-runtime one.
-///   - `EXIT_RUNTIME` — the filter compiled and the build supports the
-///     operation, but the runtime data tripped a jq-level semantic error
-///     (type mismatch, index OOB, user-raised `error`, regex-engine
-///     internal failure). These can be caught with `try`/`?`.
-///   - `EXIT_SYSTEM`  — the process itself failed at a lower layer
-///     (tokenization, number parsing, I/O, OOM, depth-limit). Not
-///     recoverable from the filter; operational issue.
+///   - `EXIT_COMPILE` (3) — filter could not be compiled, or the build
+///     does not support a feature the filter requires. `regex_compile_error`
+///     (bad pattern) and `regex_not_compiled` (dynamic pattern in a
+///     `-Dregex=false` build) both land here: the user recovers by
+///     changing the filter or rebuilding, not by changing input.
+///   - `EXIT_RUNTIME` (5) — uncaught runtime error: type mismatch, index
+///     OOB, user-raised `error`, regex-engine internal failure. Catchable
+///     with `try`/`?` in the filter.
+///   - `EXIT_USAGE`   (2) — process-level failure: tokenization, number
+///     parsing, I/O, OOM, depth-limit. jq folds usage and system errors
+///     into this code; stderr diagnostic carries the distinction.
 fn exitCodeForKind(kind: err_mod.ErrorKind) u8 {
     return switch (kind) {
         .query_syntax_error, .regex_compile_error, .regex_not_compiled => EXIT_COMPILE,
         .type_error, .index_out_of_bounds, .user_error, .regex_internal_error => EXIT_RUNTIME,
-        .unexpected_token, .unexpected_eof, .invalid_utf8, .invalid_number, .unterminated_string, .depth_limit_exceeded, .io_error, .out_of_memory => EXIT_SYSTEM,
+        .unexpected_token, .unexpected_eof, .invalid_utf8, .invalid_number, .unterminated_string, .depth_limit_exceeded, .io_error, .out_of_memory => EXIT_USAGE,
     };
 }
 
@@ -141,12 +136,7 @@ pub fn main() !u8 {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var config = parseArgs(allocator) catch |e| {
-        switch (e) {
-            error.UsageError => return EXIT_USAGE,
-            else => return EXIT_SYSTEM,
-        }
-    };
+    var config = parseArgs(allocator) catch return EXIT_USAGE;
     defer config.deinit();
 
     if (config.lsp_mode) {
@@ -155,7 +145,7 @@ pub fn main() !u8 {
             printErr("zq: --lsp is not available in this build (compiled with -Dlsp=false).\n");
             return EXIT_USAGE;
         }
-        lsp_mod.run(allocator) catch return EXIT_SYSTEM;
+        lsp_mod.run(allocator) catch return EXIT_USAGE;
         return EXIT_OK;
     }
 
@@ -174,7 +164,7 @@ pub fn main() !u8 {
                 printErr("zq: could not open filter file: ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             defer file.close();
 
@@ -182,7 +172,7 @@ pub fn main() !u8 {
                 printErr("zq: could not read filter file: ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             if (config._owned_filter) |old| allocator.free(old);
             config._owned_filter = contents;
@@ -195,7 +185,7 @@ pub fn main() !u8 {
     // Build external variable declarations for compile.
     var ext_decls_buf = allocator.alloc(query_mod.ExternalVarDecl, config.external_vars.len + 1) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer allocator.free(ext_decls_buf);
     for (config.external_vars, 0..) |ev, i| {
@@ -209,7 +199,7 @@ pub fn main() !u8 {
         .external_vars = ext_decls_buf,
     }, allocator) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     var cq = switch (compile_result) {
         .ok => |compiled| compiled,
@@ -223,7 +213,7 @@ pub fn main() !u8 {
     // Build external variable bindings after compile (var_ids are now known).
     var ext_bindings_buf = allocator.alloc(query_mod.ExternalVarBinding, config.external_vars.len + 1) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer allocator.free(ext_bindings_buf);
 
@@ -231,7 +221,7 @@ pub fn main() !u8 {
     // Must outlive all execution since StackValues reference its tape entries.
     var argjson_rt = types.RuntimeTape.init(allocator) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer argjson_rt.deinit(allocator);
 
@@ -246,7 +236,7 @@ pub fn main() !u8 {
         // Temporary parser for --argjson and --slurpfile values.
         var argjson_parser = parser_mod.Parser.init(allocator) catch {
             printErr("zq: out of memory\n");
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
         defer argjson_parser.deinit();
 
@@ -299,13 +289,13 @@ pub fn main() !u8 {
                             const rt_start: u32 = @intCast(argjson_rt.entries.items.len);
                             argjson_rt.copyFrom(tape, allocator) catch {
                                 printErr("zq: out of memory\n");
-                                return EXIT_SYSTEM;
+                                return EXIT_USAGE;
                             };
                             // Placeholder value; will be resolved below.
                             ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
                             compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
                                 printErr("zq: out of memory\n");
-                                return EXIT_SYSTEM;
+                                return EXIT_USAGE;
                             };
                         },
                     }
@@ -316,14 +306,14 @@ pub fn main() !u8 {
                     const rt_start = loadSlurpfile(ev.value, &argjson_rt, &argjson_parser, ev.name, allocator) catch |e| switch (e) {
                         error.OutOfMemory => {
                             printErr("zq: out of memory\n");
-                            return EXIT_SYSTEM;
+                            return EXIT_USAGE;
                         },
                         error.UsageError => return EXIT_USAGE,
                     };
                     ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
                     compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
                         printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
+                        return EXIT_USAGE;
                     };
                 },
                 .rawfile => {
@@ -331,14 +321,14 @@ pub fn main() !u8 {
                     const rt_start = loadRawfile(ev.value, &argjson_rt, ev.name, allocator) catch |e| switch (e) {
                         error.OutOfMemory => {
                             printErr("zq: out of memory\n");
-                            return EXIT_SYSTEM;
+                            return EXIT_USAGE;
                         },
                         error.UsageError => return EXIT_USAGE,
                     };
                     ext_bindings_buf[i] = .{ .var_id = cq.external_var_ids[i], .value = .null_val };
                     compound_refs.append(allocator, .{ .idx = i, .rt_start = rt_start }) catch {
                         printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
+                        return EXIT_USAGE;
                     };
                 },
                 .string => {
@@ -357,24 +347,24 @@ pub fn main() !u8 {
             // outer object_start
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_start, .payload = .{ .skip = 0 } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
 
             // key "positional"
             const pos_key_ref = argjson_rt.internString(allocator, "positional") catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = pos_key_ref } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
 
             // array_start for positional
             const pos_arr_start: u32 = @intCast(argjson_rt.entries.items.len);
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .array_start, .payload = .{ .skip = 0 } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
 
             // Populate positional args
@@ -407,18 +397,18 @@ pub fn main() !u8 {
                     // Copy parsed value into argjson_rt
                     argjson_rt.copyFrom(tape, allocator) catch {
                         printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
+                        return EXIT_USAGE;
                     };
                     argjson_parser.reset();
                 } else {
                     // --args: store as string
                     const str_ref = argjson_rt.internString(allocator, pa) catch {
                         printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
+                        return EXIT_USAGE;
                     };
                     _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = str_ref } }) catch {
                         printErr("zq: out of memory\n");
-                        return EXIT_SYSTEM;
+                        return EXIT_USAGE;
                     };
                 }
             }
@@ -427,25 +417,25 @@ pub fn main() !u8 {
             const pos_arr_end: u32 = @intCast(argjson_rt.entries.items.len);
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .array_end, .payload = .{ .none = {} } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             argjson_rt.entries.items[pos_arr_start].payload.skip = pos_arr_end + 1;
 
             // key "named"
             const named_key_ref = argjson_rt.internString(allocator, "named") catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = named_key_ref } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
 
             // object_start for named
             const named_obj_start: u32 = @intCast(argjson_rt.entries.items.len);
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_start, .payload = .{ .skip = 0 } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
 
             // Populate named args from --arg / --argjson / --slurpfile / --rawfile.
@@ -457,11 +447,11 @@ pub fn main() !u8 {
                 // key
                 const k_ref = argjson_rt.internString(allocator, ev.name) catch {
                     printErr("zq: out of memory\n");
-                    return EXIT_SYSTEM;
+                    return EXIT_USAGE;
                 };
                 _ = argjson_rt.appendEntry(allocator, .{ .tag = .key, .payload = .{ .string = k_ref } }) catch {
                     printErr("zq: out of memory\n");
-                    return EXIT_SYSTEM;
+                    return EXIT_USAGE;
                 };
                 switch (ev.kind) {
                     .json => {
@@ -487,7 +477,7 @@ pub fn main() !u8 {
                         };
                         argjson_rt.copyFrom(tape, allocator) catch {
                             printErr("zq: out of memory\n");
-                            return EXIT_SYSTEM;
+                            return EXIT_USAGE;
                         };
                         argjson_parser.reset();
                     },
@@ -498,7 +488,7 @@ pub fn main() !u8 {
                         _ = loadSlurpfile(ev.value, &argjson_rt, &argjson_parser, ev.name, allocator) catch |e| switch (e) {
                             error.OutOfMemory => {
                                 printErr("zq: out of memory\n");
-                                return EXIT_SYSTEM;
+                                return EXIT_USAGE;
                             },
                             error.UsageError => {
                                 _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
@@ -510,7 +500,7 @@ pub fn main() !u8 {
                         _ = loadRawfile(ev.value, &argjson_rt, ev.name, allocator) catch |e| switch (e) {
                             error.OutOfMemory => {
                                 printErr("zq: out of memory\n");
-                                return EXIT_SYSTEM;
+                                return EXIT_USAGE;
                             },
                             error.UsageError => {
                                 _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
@@ -522,11 +512,11 @@ pub fn main() !u8 {
                         // String value
                         const v_ref = argjson_rt.internString(allocator, ev.value) catch {
                             printErr("zq: out of memory\n");
-                            return EXIT_SYSTEM;
+                            return EXIT_USAGE;
                         };
                         _ = argjson_rt.appendEntry(allocator, .{ .tag = .string, .payload = .{ .string = v_ref } }) catch {
                             printErr("zq: out of memory\n");
-                            return EXIT_SYSTEM;
+                            return EXIT_USAGE;
                         };
                     },
                 }
@@ -536,7 +526,7 @@ pub fn main() !u8 {
             const named_obj_end: u32 = @intCast(argjson_rt.entries.items.len);
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_end, .payload = .{ .none = {} } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             argjson_rt.entries.items[named_obj_start].payload.skip = named_obj_end + 1;
 
@@ -544,7 +534,7 @@ pub fn main() !u8 {
             const args_obj_end: u32 = @intCast(argjson_rt.entries.items.len);
             _ = argjson_rt.appendEntry(allocator, .{ .tag = .object_end, .payload = .{ .none = {} } }) catch {
                 printErr("zq: out of memory\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             argjson_rt.entries.items[args_obj_start].payload.skip = args_obj_end + 1;
         }
@@ -581,7 +571,7 @@ pub fn main() !u8 {
     // Set up output writer on stdout.
     var writer = output_mod.Writer.init(std.fs.File.stdout(), allocator) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer writer.deinit();
 
@@ -626,7 +616,7 @@ pub fn main() !u8 {
         var src = io_mod.Source.init(std.fs.File.stdin(), allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
         defer src.deinit();
 
@@ -635,7 +625,7 @@ pub fn main() !u8 {
         var pool = pool_mod.Pool.init(n_threads, budget, allocator) catch |e| {
             printErr("zq: ");
             printZqErr(e);
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
         defer pool.deinit();
 
@@ -653,11 +643,11 @@ pub fn main() !u8 {
             const result = maybe orelse break;
             writer.writeSlice(result.data) catch {
                 printErr("zq: write error\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             if (config.unbuffered) writer.flush() catch {
                 printErr("zq: write error\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             last_output = types.lastOutputFold(last_output, result.last_output);
         }
@@ -667,7 +657,7 @@ pub fn main() !u8 {
                 printErr("zq: could not open ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             defer file.close();
 
@@ -685,11 +675,11 @@ pub fn main() !u8 {
 
     writer.flush() catch {
         printErr("zq: write error\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
 
     if (pool_error_exit) |code| return code;
-    if (had_parse_errors) return EXIT_SYSTEM;
+    if (had_parse_errors) return EXIT_USAGE;
     if (config.exit_status) {
         return switch (last_output) {
             .none => EXIT_NO_OUTPUT,
@@ -1027,7 +1017,7 @@ fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
                 printErr("zq: could not open filter file: ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             defer file.close();
 
@@ -1035,7 +1025,7 @@ fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
                 printErr("zq: could not read filter file: ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             // Note: leaks on this path, but process exits immediately after.
             break :blk std.mem.trimRight(u8, contents, "\r\n");
@@ -1049,7 +1039,7 @@ fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
     // Build external variable declarations for compile.
     var ext_decls_buf = allocator.alloc(query_mod.ExternalVarDecl, config.external_vars.len + 1) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer allocator.free(ext_decls_buf);
     for (config.external_vars, 0..) |ev, i| {
@@ -1061,7 +1051,7 @@ fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
         .external_vars = ext_decls_buf,
     }, allocator) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
 
     switch (compile_result) {
@@ -1071,7 +1061,7 @@ fn processValidate(config: *const Config, allocator: std.mem.Allocator) u8 {
             if (config.json_errors) {
                 std.fs.File.stdout().writeAll("{\"valid\":true}\n") catch {
                     printErr("zq: write error\n");
-                    return EXIT_SYSTEM;
+                    return EXIT_USAGE;
                 };
             }
             return EXIT_OK;
@@ -1109,7 +1099,7 @@ fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
 
     var parser = parser_mod.Parser.init(allocator) catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     defer parser.deinit();
 
@@ -1117,7 +1107,7 @@ fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
         // Read from stdin.
         describeStream(std.fs.File.stdin(), &inferrer, &parser, allocator) catch {
             printErr("zq: I/O error reading stdin\n");
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
     } else {
         for (config.files) |path| {
@@ -1125,14 +1115,14 @@ fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
                 printErr("zq: could not open ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
             defer file.close();
             describeStream(file, &inferrer, &parser, allocator) catch {
                 printErr("zq: I/O error reading ");
                 printErr(path);
                 printErr("\n");
-                return EXIT_SYSTEM;
+                return EXIT_USAGE;
             };
         }
     }
@@ -1150,21 +1140,21 @@ fn processDescribe(config: *const Config, allocator: std.mem.Allocator) u8 {
         const indent: describe_mod.Indent = if (config.tab_indent) .tab else .{ .spaces = config.indent_width };
         inferrer.serializePretty(buf_writer, config.sort_keys, indent) catch {
             printErr("zq: out of memory\n");
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
     } else {
         inferrer.serialize(buf_writer, config.sort_keys) catch {
             printErr("zq: out of memory\n");
-            return EXIT_SYSTEM;
+            return EXIT_USAGE;
         };
     }
     buf_writer.writeByte('\n') catch {
         printErr("zq: out of memory\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
     std.fs.File.stdout().writeAll(buf.items) catch {
         printErr("zq: write error\n");
-        return EXIT_SYSTEM;
+        return EXIT_USAGE;
     };
 
     return EXIT_OK;
