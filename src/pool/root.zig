@@ -582,8 +582,10 @@ fn worker_fn(ctx: WorkerCtx) void {
 
         // Structural scanner still upstream; tryAlignChunk acts as cross-check
         // here. Commit 3 makes it load-bearing and deletes the duplicate.
+        // .spans_lookback can fire from synthetic Jobs in unit tests today;
+        // commit 3 will make it fire from the file feeder once memchr-split
+        // chunks are emitted.
         const align_result = parser_mod.tryAlignChunk(job.data, 0, job.lookback orelse &.{});
-        std.debug.assert(align_result == .aligned_at and align_result.aligned_at == 0);
 
         if (job.style) |style| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
@@ -715,7 +717,38 @@ fn worker_fn(ctx: WorkerCtx) void {
                 }
             } else {
                 // ── JSON path: structural feed-loop, depth-aware boundary advance ──
-                var cursor: usize = 0;
+                var cursor: usize = switch (align_result) {
+                    .aligned_at => |idx| idx,
+                    // Stitch path: emit the spanning record up-front, then resume
+                    // the normal loop at the byte where it ended in `job.data`.
+                    .spans_lookback => |k| blk: {
+                        const lb_full = job.lookback orelse &.{};
+                        const lb_tail = lb_full[k..];
+                        parser.reset();
+                        const span = parser_mod.feedSpanning(&parser, lb_tail, job.data, true) catch {
+                            parser.reset();
+                            break :blk job.data.len;
+                        };
+                        switch (span) {
+                            .done => |d| {
+                                const stitched = state.aa.alloc(u8, lb_tail.len + d.consumed_data) catch {
+                                    parser.reset();
+                                    break :blk job.data.len;
+                                };
+                                @memcpy(stitched[0..lb_tail.len], lb_tail);
+                                @memcpy(stitched[lb_tail.len..], job.data[0..d.consumed_data]);
+                                ProcessOne(stitched, d.tape, false, &state, &opt_it, &current_query, job, ctx.allocator);
+                                parser.reset();
+                                break :blk d.consumed_data;
+                            },
+                            .need_more, .rejected => {
+                                parser.reset();
+                                break :blk job.data.len;
+                            },
+                        }
+                    },
+                    .in_progress, .empty => job.data.len,
+                };
                 while (cursor < job.data.len) {
                     cursor += parser_mod.simd.skipWhitespace(job.data[cursor..]);
                     if (cursor >= job.data.len) break;
@@ -819,7 +852,49 @@ fn worker_fn(ctx: WorkerCtx) void {
                     append_outcome(&records, aa, outcome);
                 }
             } else {
-                var cursor: usize = 0;
+                var cursor: usize = switch (align_result) {
+                    .aligned_at => |idx| idx,
+                    // Stitch path: emit the spanning record up-front, then resume
+                    // the normal loop at the byte where it ended in `job.data`.
+                    .spans_lookback => |k| blk: {
+                        const lb_full = job.lookback orelse &.{};
+                        const lb_tail = lb_full[k..];
+                        parser.reset();
+                        const span = parser_mod.feedSpanning(&parser, lb_tail, job.data, true) catch {
+                            parser.reset();
+                            break :blk job.data.len;
+                        };
+                        switch (span) {
+                            .done => |d| {
+                                const stitched = aa.alloc(u8, lb_tail.len + d.consumed_data) catch {
+                                    parser.reset();
+                                    break :blk job.data.len;
+                                };
+                                @memcpy(stitched[0..lb_tail.len], lb_tail);
+                                @memcpy(stitched[lb_tail.len..], job.data[0..d.consumed_data]);
+                                const outcome = process_value(
+                                    stitched,
+                                    d.tape,
+                                    &opt_it,
+                                    &current_query,
+                                    job.query,
+                                    ctx.allocator,
+                                    aa,
+                                    false,
+                                    job.external_bindings,
+                                );
+                                append_outcome(&records, aa, outcome);
+                                parser.reset();
+                                break :blk d.consumed_data;
+                            },
+                            .need_more, .rejected => {
+                                parser.reset();
+                                break :blk job.data.len;
+                            },
+                        }
+                    },
+                    .in_progress, .empty => job.data.len,
+                };
                 while (cursor < job.data.len) {
                     cursor += parser_mod.simd.skipWhitespace(job.data[cursor..]);
                     if (cursor >= job.data.len) break;
@@ -2200,6 +2275,40 @@ pub const Pool = struct {
             p._shared.queue.signal_done();
             return;
         };
+    }
+
+    /// Test-only: push a single hand-crafted Job onto the worker queue
+    /// with the supplied `data` and `lookback`, then close the queue.
+    /// Borrows both slices — caller must keep them alive until `deinit`.
+    /// Used by pool_test to exercise the worker stitch path before the
+    /// file feeder produces .spans_lookback chunks naturally (commit 3+).
+    pub fn submit_synthetic_chunk_for_test(
+        p: *Pool,
+        data: []const u8,
+        lookback: []const u8,
+        cq: *const query_mod.CompiledQuery,
+        style: ?types.OutputStyle,
+    ) void {
+        p._style = style;
+        p._shared.limiter.set_max(MAX_IN_FLIGHT_FACTOR * @max(1, p.threads.len));
+        _ = p._shared.limiter.acquire();
+        p._shared.queue.push(.{
+            .data = data,
+            .seq_base = 0,
+            .chunk_id = 0,
+            .query = cq,
+            .owns_data = false,
+            .allocator = p.allocator,
+            .style = style,
+            .color = null,
+            .opts = .{},
+            .raw_input = false,
+            .external_bindings = &.{},
+            .seq_range_size = 1,
+            .lookback = lookback,
+        });
+        p._shared.sequencer.set_total_chunks(1);
+        p._shared.queue.signal_done();
     }
 
     /// Return the next result in submission order (structured path).

@@ -1353,3 +1353,79 @@ test "prefilter: short-escape hole — match through \\u encoding verified end-t
         \\
     , out.data);
 }
+
+// ── Worker stitch path (synthetic Job) ──────────────────────────────────────
+//
+// These exercise the .spans_lookback branch of the worker loop. Production
+// code paths today (file feeder + structural scanner) do not produce
+// .spans_lookback Jobs — that flips when commit 3 swaps the feeder to
+// memchr-split. Until then `submit_synthetic_chunk_for_test` is the only
+// way to observe the stitch behaviour.
+
+test "worker stitch: spans_lookback emits spanning record exactly once" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    // Pretty-printed object opens in lookback, closes in data, followed by a
+    // second compact record. Lookback's last `\n` is at offset 7 → lb_start=8
+    // → tryAlignChunk returns .spans_lookback(8). Worker stitches lookback[8..]
+    // = "{\n  \"a\":" and data prefix " 1\n}" into the spanning record, then
+    // resumes at data[4..] to emit `{"b":2}`.
+    const lookback = "{\"x\":0}\n{\n  \"a\":";
+    const data = " 1\n}\n{\"b\":2}\n";
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_synthetic_chunk_for_test(data, lookback, &cq, .{ .compact = true });
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    try std.testing.expectEqualStrings(
+        \\{"a":1}
+        \\{"b":2}
+        \\
+    , out.data);
+}
+
+test "worker stitch: in_progress drops chunk gracefully" {
+    var cq = try compile(".");
+    defer cq.deinit();
+
+    // Lookback has no `\n` → no candidate boundary → tryAlignChunk returns
+    // .in_progress. Worker posts an empty ChunkResult (no records emitted)
+    // but must still close the sequencer slot so the pool drains cleanly.
+    const lookback = "  \"a\":";
+    const data = " 1\n}\n{\"b\":2}\n";
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_synthetic_chunk_for_test(data, lookback, &cq, .{ .compact = true });
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    try std.testing.expectEqualStrings("", out.data);
+}
+
+test "worker stitch: spans_lookback structured path emits spanning record" {
+    var cq = try compile(".a");
+    defer cq.deinit();
+
+    const lookback = "{\"x\":0}\n{\n  \"a\":";
+    const data = " 42\n}\n{\"a\":7}\n";
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_synthetic_chunk_for_test(data, lookback, &cq, null);
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 2), vals.len);
+    try std.testing.expectEqual(@as(i64, 42), vals[0].int);
+    try std.testing.expectEqual(@as(i64, 7), vals[1].int);
+}

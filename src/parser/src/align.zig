@@ -15,18 +15,29 @@
 //!     `AlignResult` with the confirmed boundary index, `in_progress`
 //!     when the lookback budget was exhausted, or `empty` for
 //!     whitespace-only input.
+//!   - `feedSpanning(parser, lookback, data, is_eof)` — drives a parser
+//!     across the lookback/data join to emit the single record that
+//!     straddles the boundary. Returns the bytes of `data` consumed by
+//!     that record so the worker can continue its normal feed loop.
 
 const std = @import("std");
 const simd = @import("simd.zig");
 const parser_mod = @import("parser.zig");
 
 const Parser = parser_mod.Parser;
+const Tape = parser_mod.Tape;
 const FeedResult = parser_mod.FeedResult;
+const ZqError = parser_mod.ZqError;
 
 pub const LOOKBACK_BYTES: usize = 4 * 1024;
 
 pub const AlignResult = union(enum) {
     aligned_at: usize,
+    /// Chunk's first record starts inside lookback at the given offset and
+    /// continues into `data`. Worker must feed `lookback[spans_lookback..]`
+    /// then `data` to a single parser instance; records that complete
+    /// before crossing into `data` were already emitted by the prior chunk.
+    spans_lookback: usize,
     in_progress,
     empty,
 };
@@ -79,28 +90,16 @@ pub fn tryAlignChunk(
             lookback[lookback.len - LOOKBACK_BYTES ..]
         else
             lookback;
+        const lb_offset = lookback.len - lookback_used.len;
 
         var lb_search_end: usize = lookback_used.len;
         while (lb_search_end > 0) {
             const nl_lb = std.mem.lastIndexOfScalar(u8, lookback_used[0..lb_search_end], '\n') orelse break;
             switch (probeAcrossLookback(lookback_used, nl_lb + 1, data)) {
-                .confirmed_in_data => |consumed_in_data| {
-                    if (consumed_in_data <= hint_start) {
-                        if (findValueStart(data, consumed_in_data)) |start_abs| {
-                            return .{ .aligned_at = start_abs };
-                        }
-                        return .{ .aligned_at = consumed_in_data };
-                    }
-                    if (hint_start == 0) {
-                        if (findValueStart(data, consumed_in_data)) |start_abs| {
-                            return .{ .aligned_at = start_abs };
-                        }
-                        return .{ .aligned_at = consumed_in_data };
-                    }
-                    // Spanning value extends past hint_start. The value started
-                    // in the lookback (before data[0]), so hint_start is mid-record.
-                    // The previous chunk-owner covers it; we have nothing to align to.
-                },
+                // Spanning case: a record starts at `nl_lb + 1` in lookback and
+                // continues into data. Worker re-drives the parser across the
+                // join — see `feedSpanning`.
+                .confirmed_in_data => return .{ .spans_lookback = lb_offset + nl_lb + 1 },
                 .confirmed_in_lookback => {
                     if (findValueStart(data, 0)) |start_abs| {
                         if (hint_start == 0 or start_abs <= hint_start) return .{ .aligned_at = start_abs };
@@ -114,6 +113,52 @@ pub fn tryAlignChunk(
 
     if (findValueStart(data, 0) == null and !hasNonWhitespace(lookback)) return .empty;
     return .in_progress;
+}
+
+/// Outcome of `feedSpanning`.
+pub const SpanResult = union(enum) {
+    /// The spanning record completed; tape borrows parser-owned memory and
+    /// is valid until the next `parser.reset()` or `parser.deinit()`.
+    /// `consumed_data` bytes of `data` were used for the record (the bytes
+    /// from `lookback` that preceded them are excluded — they were already
+    /// emitted by the prior chunk's worker).
+    done: struct { tape: Tape, consumed_data: usize },
+    /// Spanning record extends past `data`. Caller has nothing to emit.
+    need_more,
+    /// Parser rejected the input — boundary was not actually structural.
+    rejected,
+};
+
+/// Drive the parser across the lookback/data join to emit a record that
+/// starts in `lookback_tail` and continues into `data`. Caller must pass a
+/// freshly-`reset()` parser. On success, the returned `consumed_data` is
+/// the offset within `data` where the spanning record ended; the caller
+/// resumes its normal per-record loop on `data[consumed_data..]` (after
+/// `parser.reset()`).
+pub fn feedSpanning(
+    parser: *Parser,
+    lookback_tail: []const u8,
+    data: []const u8,
+    is_eof: bool,
+) error{OutOfMemory}!SpanResult {
+    if (lookback_tail.len > 0) {
+        const r1 = parser.feed(lookback_tail, false) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .rejected,
+        };
+        switch (r1) {
+            .done => return .rejected, // K mis-chosen: the record completed in lookback.
+            .need_more => {},
+        }
+    }
+    const r2 = parser.feed(data, is_eof) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .rejected,
+    };
+    return switch (r2) {
+        .done => |d| .{ .done = .{ .tape = d.tape, .consumed_data = d.consumed } },
+        .need_more => .need_more,
+    };
 }
 
 const ProbeResult = union(enum) {
