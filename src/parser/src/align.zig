@@ -44,8 +44,7 @@ pub fn tryAlignChunk(
     hint_start: usize,
     lookback: []const u8,
 ) AlignResult {
-    // Empty lookback at offset 0 = first chunk of input by definition.
-    if (hint_start == 0 and lookback.len == 0) return .{ .aligned_at = 0 };
+    if (hint_start == 0) return .{ .aligned_at = 0 };
 
     if (hint_start > data.len) {
         return if (findValueStart(data, 0) == null) .empty else .in_progress;
@@ -91,19 +90,13 @@ pub fn tryAlignChunk(
                         }
                         return .{ .aligned_at = consumed_in_data };
                     }
-                    if (hint_start == 0) {
-                        if (findValueStart(data, consumed_in_data)) |start_abs| {
-                            return .{ .aligned_at = start_abs };
-                        }
-                        return .{ .aligned_at = consumed_in_data };
-                    }
                     // Spanning value extends past hint_start. The value started
                     // in the lookback (before data[0]), so hint_start is mid-record.
                     // The previous chunk-owner covers it; we have nothing to align to.
                 },
                 .confirmed_in_lookback => {
                     if (findValueStart(data, 0)) |start_abs| {
-                        if (hint_start == 0 or start_abs <= hint_start) return .{ .aligned_at = start_abs };
+                        if (start_abs <= hint_start) return .{ .aligned_at = start_abs };
                     }
                 },
                 .need_more, .rejected => {},
@@ -155,31 +148,17 @@ fn probeAcrossLookback(lookback: []const u8, lb_start: usize, data: []const u8) 
     var p = Parser.init(std.heap.page_allocator) catch return .rejected;
     defer p.deinit();
 
-    if (lb_start < lookback.len) {
-        const r1 = p.feed(lookback[lb_start..], false) catch return .rejected;
-        switch (r1) {
-            .done => return .confirmed_in_lookback,
-            .need_more => {},
-        }
-
-        const r2 = p.feed(data, false) catch return .rejected;
-        return switch (r2) {
-            .done => |d| {
-                if (!trailingLooksTopLevel(data, d.consumed)) return .rejected;
-                return .{ .confirmed_in_data = d.consumed };
-            },
-            .need_more => .need_more,
-        };
+    const r1 = p.feed(lookback[lb_start..], false) catch return .rejected;
+    switch (r1) {
+        .done => return .confirmed_in_lookback,
+        .need_more => {},
     }
 
-    // Candidate `\n` is the last byte of lookback: nothing to feed before
-    // data. Parser sees data fresh — if it parses cleanly the `\n` was a
-    // real value terminator and data[0] is a fresh value boundary.
-    const r = p.feed(data, false) catch return .rejected;
-    return switch (r) {
+    const r2 = p.feed(data, false) catch return .rejected;
+    return switch (r2) {
         .done => |d| {
             if (!trailingLooksTopLevel(data, d.consumed)) return .rejected;
-            return .confirmed_in_lookback;
+            return .{ .confirmed_in_data = d.consumed };
         },
         .need_more => .need_more,
     };

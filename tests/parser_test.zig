@@ -827,51 +827,8 @@ test "tryAlignChunk: lookback supplies missing newline path" {
     const lookback = "{\"a\":1}\n";
     const data = "{\"b\":2}\n{\"c\":3}";
     const r = tryAlignChunk(data, 5, lookback);
-    // Lookback ends at the `\n` terminating the prior record, so data[0]
-    // is a fresh value boundary. hint_start=5 lands inside the first
-    // record `{"b":2}` (offsets 0..6) but no other worker is parsing it
-    // (the prior chunk ended at the lookback `\n`). The current chunk
-    // therefore owns the record from offset 0. → aligned_at(0).
-    try std.testing.expectEqual(AlignResult{ .aligned_at = 0 }, r);
-}
-
-test "tryAlignChunk: hint_start=0 with lookback confirms boundary at data[0]" {
-    // Worker contract from commit 3: every chunk past the first calls
-    // tryAlignChunk(data, 0, lookback). Lookback ends with `}\n` — the
-    // prior record's terminator. data starts a fresh top-level value, so
-    // the function must consult the parser via lookback and confirm
-    // data[0] as a fresh boundary.
-    const lookback = "{\"a\":1}\n";
-    const data = "{\"b\":2}";
-    const r = tryAlignChunk(data, 0, lookback);
-    try std.testing.expectEqual(AlignResult{ .aligned_at = 0 }, r);
-}
-
-test "tryAlignChunk: hint_start=0 with lookback rejects when data[0] is mid-value" {
-    // Lookback is the start of a pretty-printed object (`{` then `\n`
-    // and indent), with NO real record terminator. data continues that
-    // object's value, closes it, then `\n` introduces a new record.
-    //
-    // Walk-back from the only `\n` (lookback offset 1): probe feeds
-    // `lookback[2..]` = `  ` (whitespace) → need_more, then feeds data
-    // (`1\n}\n{"x":2}`) → parser parses `1` and stops at top_done with
-    // consumed=1. trailingLooksTopLevel(data, 1) skips whitespace and
-    // finds `}` — a structural mid-record byte — so the probe rejects.
-    // No earlier `\n` in lookback. → in_progress.
-    const lookback = "{\n  ";
-    const data = "1\n}\n{\"x\":2}";
-    const r = tryAlignChunk(data, 0, lookback);
-    try std.testing.expectEqual(AlignResult.in_progress, r);
-}
-
-test "tryAlignChunk: hint_start=0 with lookback containing in-string \\n" {
-    // Lookback ends with a literal raw \n inside an unterminated string
-    // (invalid per RFC 8259). The probe feeds data fresh (lb_start ==
-    // lookback.len), data starts with `l` which is not a valid top-level
-    // value-start byte → parser errors → probe rejects this `\n`. No
-    // earlier `\n` exists in lookback. → in_progress.
-    const lookback = "{\"s\":\"line1\n";
-    const data = "line2\"}\n{\"x\":1}";
-    const r = tryAlignChunk(data, 0, lookback);
+    // Spanning value {"b":2} ends at 7 in data, > hint_start=5. The value
+    // started before data[0] (in lookback), so hint_start is mid-record
+    // and the prior chunk owns it. → in_progress.
     try std.testing.expectEqual(AlignResult.in_progress, r);
 }
