@@ -531,6 +531,27 @@ pub fn build(b: *std.Build) void {
     if (shim_build_step) |step| fuzz_regex_tests.step.dependOn(&step.step);
     fuzz_regex_step.dependOn(&b.addRunArtifact(fuzz_regex_tests).step);
 
+    // ── Differential fuzz against full jq surface (NOT in test_step) ──────
+    // Generalized cousin of fuzz_regex. Generates random JSON + random jq
+    // filters, shells both to jq and the built zq binary, byte-diffs stdout.
+    // Skip-compares known divergences at the production where they're
+    // generated. Run with `zig build fuzz-diff` (ZQ_FUZZ_ITERS=50000 soak).
+    const fuzz_diff_step = b.step("fuzz-diff", "Differential fuzz of full jq surface against jq");
+    const fuzz_diff_options = b.addOptions();
+    fuzz_diff_options.addOptionPath("zq_path", exe.getEmittedBin());
+
+    const fuzz_diff_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_diff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_diff_mod.addOptions("build_options", fuzz_diff_options);
+
+    const fuzz_diff_tests = b.addTest(.{ .root_module = fuzz_diff_mod });
+    fuzz_diff_tests.step.dependOn(&exe.step);
+    if (shim_build_step) |step| fuzz_diff_tests.step.dependOn(&step.step);
+    fuzz_diff_step.dependOn(&b.addRunArtifact(fuzz_diff_tests).step);
+
     // ── Regex bench (NOT in test_step) ────────────────────────────────────
     // Latency probe. Prints median/p99 per pattern class to stderr. Not part
     // of the default test step to keep CI runs fast. Invoke with

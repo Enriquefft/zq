@@ -23,37 +23,9 @@ const regex = @import("regex");
 const query_mod = @import("query");
 const pool_mod = @import("pool");
 const types_mod = @import("types");
+const fc = @import("fuzz_common.zig");
 
 const default_iterations: u32 = 1000;
-
-/// Portable current-PID helper. `std.os.linux.getpid()` on Linux (where this
-/// harness runs in CI), fallback to a compile-time zero on other OSes — the
-/// fuzz target gates on Linux regex support anyway, so non-Linux builds
-/// never reach the jq-compare path.
-fn currentPid() i32 {
-    if (@import("builtin").os.tag == .linux) return std.os.linux.getpid();
-    return 0;
-}
-
-/// Ensure `jq` is invocable on this machine before starting a fuzz run.
-/// Without this, a missing jq would make every `runJq` call return an error
-/// which the loop body silently swallows — the test would report 0/0
-/// iterations and pass vacuously. That regression already bit us once (M6).
-fn requireJqOnPath(alloc: std.mem.Allocator) !void {
-    var child = std.process.Child.init(
-        &.{ std.posix.getenv("ZQ_JQ") orelse "jq", "--version" },
-        alloc,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.SkipZigTest;
-    const term = child.wait() catch return error.SkipZigTest;
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.SkipZigTest,
-        else => return error.SkipZigTest,
-    }
-}
 
 const Pattern = struct {
     pat: []u8,
@@ -107,13 +79,13 @@ const Generator = struct {
             5 => {
                 // \d or \w
                 try buf.append(self.alloc, '\\');
-                const c: u8 = if (self.rng.boolean()) 'd' else 'w';
-                try buf.append(self.alloc, c);
+                const ch: u8 = if (self.rng.boolean()) 'd' else 'w';
+                try buf.append(self.alloc, ch);
             },
             6 => {
                 // anchor
-                const c: u8 = if (self.rng.boolean()) '^' else '$';
-                try buf.append(self.alloc, c);
+                const ch: u8 = if (self.rng.boolean()) '^' else '$';
+                try buf.append(self.alloc, ch);
             },
             else => try buf.append(self.alloc, self.genChar()),
         }
@@ -144,82 +116,9 @@ const Generator = struct {
     }
 };
 
-fn jsonEscapeInto(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(alloc, '"');
-    for (s) |b| {
-        switch (b) {
-            '"' => try buf.appendSlice(alloc, "\\\""),
-            '\\' => try buf.appendSlice(alloc, "\\\\"),
-            '\n' => try buf.appendSlice(alloc, "\\n"),
-            '\r' => try buf.appendSlice(alloc, "\\r"),
-            '\t' => try buf.appendSlice(alloc, "\\t"),
-            0...8, 11, 12, 14...31 => {
-                var tmp: [8]u8 = undefined;
-                const enc = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}) catch unreachable;
-                try buf.appendSlice(alloc, enc);
-            },
-            else => try buf.append(alloc, b),
-        }
-    }
-    try buf.append(alloc, '"');
-}
-
-/// Run `jq -c <filter>` with `input` on stdin. Returns stdout trimmed of the
-/// trailing newline. Uses `/tmp` for a scratch file to avoid wrestling with
-/// pipe-write semantics that changed between Zig versions — fuzz harness is
-/// slow-path code, correctness first.
-///
-/// The scratch path embeds the current PID so concurrent `zig build fuzz-regex`
-/// runs (or parallel test steps) don't stomp on each other's inputs. Without
-/// this, two processes racing on `/tmp/zq_fuzz_regex_input.json` could see
-/// each other's data and emit spurious "divergences".
-fn runJq(alloc: std.mem.Allocator, filter: []const u8, input: []const u8) ![]u8 {
-    // Write `input` to a per-process temp file. PID suffix keeps concurrent
-    // fuzz runs from colliding.
-    var path_buf: [64]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(
-        &path_buf,
-        "/tmp/zq_fuzz_regex_input_{d}.json",
-        .{currentPid()},
-    );
-    {
-        var f = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer f.close();
-        var buf: [4096]u8 = undefined;
-        var w = f.writer(&buf);
-        try w.interface.writeAll(input);
-        try w.interface.flush();
-    }
-
-    var child = std.process.Child.init(
-        &.{ std.posix.getenv("ZQ_JQ") orelse "jq", "-c", filter, tmp_path },
-        alloc,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-
-    var out = std.ArrayList(u8){};
-    defer out.deinit(alloc);
-    if (child.stdout) |stdout| {
-        // readToEndAlloc via File API — 1 KB cap matches the fuzz input size.
-        const bytes = try stdout.readToEndAlloc(alloc, 64 * 1024);
-        defer alloc.free(bytes);
-        try out.appendSlice(alloc, bytes);
-    }
-    _ = try child.wait();
-    // Drop the trailing newline before handing the buffer back. Re-dupe so
-    // the caller gets an allocation whose length matches what `free` expects.
-    const slice = try out.toOwnedSlice(alloc);
-    defer alloc.free(slice);
-    const trim: usize = if (slice.len > 0 and slice[slice.len - 1] == '\n') 1 else 0;
-    return try alloc.dupe(u8, slice[0 .. slice.len - trim]);
-}
-
 test "regex fuzz: small grammar 100 iters" {
     if (!regex.enabled) return error.SkipZigTest;
-    try requireJqOnPath(std.testing.allocator);
+    try fc.requireJqOnPath(std.testing.allocator);
     // 100 inside `zig build test`; 1000+ via ZQ_FUZZ_ITERS override. Keep the
     // default low so the main test step stays fast — the larger soak is what
     // `zig build fuzz-regex` is for.
@@ -263,14 +162,14 @@ test "regex fuzz: small grammar 100 iters" {
         var filter_buf = std.ArrayList(u8){};
         defer filter_buf.deinit(std.testing.allocator);
         try filter_buf.appendSlice(std.testing.allocator, "test(");
-        try jsonEscapeInto(&filter_buf, std.testing.allocator, p.pat);
+        try fc.jsonEscapeInto(&filter_buf, std.testing.allocator, p.pat);
         try filter_buf.append(std.testing.allocator, ')');
 
         var input_buf = std.ArrayList(u8){};
         defer input_buf.deinit(std.testing.allocator);
-        try jsonEscapeInto(&input_buf, std.testing.allocator, hay_buf.items);
+        try fc.jsonEscapeInto(&input_buf, std.testing.allocator, hay_buf.items);
 
-        const jq_out = runJq(std.testing.allocator, filter_buf.items, input_buf.items) catch continue;
+        const jq_out = fc.runJq(std.testing.allocator, filter_buf.items, input_buf.items, "regex") catch continue;
         defer std.testing.allocator.free(jq_out);
 
         // Empty output = jq rejected the pattern (onig compile error). Skip —
@@ -416,7 +315,7 @@ fn genRecord(
     errdefer buf.deinit(alloc);
 
     try buf.append(alloc, '{');
-    try jsonEscapeInto(&buf, alloc, field);
+    try fc.jsonEscapeInto(&buf, alloc, field);
     try buf.append(alloc, ':');
 
     // Value is a string that either contains the literal (in some encoding)
@@ -436,12 +335,12 @@ fn genRecord(
                     try hay.append(alloc, pool[gen.rng.uintLessThan(usize, pool.len)]);
                 }
                 if (std.mem.indexOf(u8, hay.items, literal) == null) {
-                    try jsonEscapeInto(&buf, alloc, hay.items);
+                    try fc.jsonEscapeInto(&buf, alloc, hay.items);
                     break;
                 }
             } else {
                 // Worst-case fallback: just emit a fixed non-matching string.
-                try jsonEscapeInto(&buf, alloc, "XXXXXX");
+                try fc.jsonEscapeInto(&buf, alloc, "XXXXXX");
             }
         },
         else => {
@@ -463,7 +362,7 @@ fn genRecord(
 
 test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
     if (!regex.enabled) return error.SkipZigTest;
-    try requireJqOnPath(std.testing.allocator);
+    try fc.requireJqOnPath(std.testing.allocator);
 
     const iter_env = std.posix.getenv("ZQ_FUZZ_ITERS");
     const n: u32 = if (iter_env) |s|
@@ -490,7 +389,7 @@ test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
         var q_buf = std.ArrayList(u8){};
         defer q_buf.deinit(std.testing.allocator);
         try q_buf.appendSlice(std.testing.allocator, "select(.k | test(");
-        try jsonEscapeInto(&q_buf, std.testing.allocator, lit);
+        try fc.jsonEscapeInto(&q_buf, std.testing.allocator, lit);
         try q_buf.append(std.testing.allocator, ')');
         try q_buf.append(std.testing.allocator, ')');
 
@@ -519,7 +418,7 @@ test "prefilter fuzz: with-prefilter == without-prefilter == jq" {
         defer std.testing.allocator.free(out_no);
 
         // Shell to jq for ground truth.
-        const jq_out_raw = runJq(std.testing.allocator, q_buf.items, record_buf.items) catch continue;
+        const jq_out_raw = fc.runJq(std.testing.allocator, q_buf.items, record_buf.items, "regex") catch continue;
         defer std.testing.allocator.free(jq_out_raw);
 
         // Normalize jq output: append trailing newline if there's any content
