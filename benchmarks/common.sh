@@ -16,7 +16,7 @@ source "$BENCHMARK_DIR/progress.sh"
 # Quick mode reduces statistical rigor for faster iteration
 if [ "${ZQ_QUICK:-0}" = "1" ]; then
     HYPERFINE_WARMUP=1
-    HYPERFINE_RUNS=3
+    HYPERFINE_RUNS=5
     HYPERFINE_RUNS_COLD=10
     MEMORY_RUNS=1
 else
