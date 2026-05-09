@@ -1538,6 +1538,9 @@ fn flushPartialToBatch(
 const FileFeedCtx = struct {
     data: []const u8,
     n_chunks: usize,
+    /// Worker count clamped at `@max(1, p.threads.len)`. Drives the upper
+    /// bound on parallel scan regions in `chooseRegionCount`.
+    n_workers: usize,
     query: *const query_mod.CompiledQuery,
     queue: *JobQueue,
     sequencer: *Sequencer,
@@ -1550,54 +1553,85 @@ const FileFeedCtx = struct {
     external_bindings: []const query_mod.ExternalVarBinding,
 };
 
+/// Pick the number of regions for the one-shot parallel structural scan.
+/// Caps at the worker count (no point spawning more scan threads than
+/// can run concurrently) and at file_size / MIN_REGION_BYTES (below that
+/// per-region overhead dominates the scan).
+fn chooseRegionCount(file_size: usize, n_workers: usize) usize {
+    const MIN_REGION_BYTES: usize = 256 * 1024;
+    const workers = @max(1, n_workers); // clamp for n_threads=0 inline path
+    const by_size = @max(1, file_size / MIN_REGION_BYTES);
+    return @max(1, @min(workers, by_size));
+}
+
 fn file_feeder_fn(ctx: FileFeedCtx) void {
     const data = ctx.data;
     const file_size = data.len;
-    var chunk_start: usize = 0;
     var chunk_id: u64 = 0;
 
-    // Persistent JSON-structural scanner state walks the file once
-    // sequentially. Each chunk_end is a depth-0/outside-string newline,
-    // so multi-line pretty-printed values are never split across workers.
-    // Scanner only reads — workers still MADV_DONTNEED their chunks on
-    // post(), preserving the bounded-RSS invariant.
-    var scanner = parser_mod.boundary.ScannerState{};
-    var scan_cursor: usize = 0;
+    // Phase 1: one-shot parallel structural scan. `scanRegions` divides
+    // the file into N regions, scans each under both string-state
+    // variants in parallel, and `stitch` resolves the absolute depth-0
+    // newline offsets serially. Replaces the prior single-threaded
+    // boundary walk that left workers idle on the hot path.
+    const n_regions = chooseRegionCount(file_size, ctx.n_workers);
+    const regions = parser_mod.parallel_scan.scanRegions(
+        data,
+        n_regions,
+        ctx.allocator,
+    ) catch {
+        ctx.sequencer.set_total_chunks(0);
+        ctx.queue.signal_done();
+        return;
+    };
 
-    for (0..ctx.n_chunks) |i| {
-        // Once a previous chunk has consumed past EOF (record boundary
-        // landed at file_size for a no-trailing-newline final value), no
-        // remaining chunks are reachable.
-        if (chunk_start >= file_size) break;
+    var boundaries: std.ArrayList(usize) = .{};
+    defer boundaries.deinit(ctx.allocator);
+    parser_mod.parallel_scan.stitch(regions, &boundaries, ctx.allocator) catch {
+        parser_mod.parallel_scan.freeRegions(ctx.allocator, regions);
+        ctx.sequencer.set_total_chunks(0);
+        ctx.queue.signal_done();
+        return;
+    };
+    // Free the per-region arenas (the candidate lists — by far the
+    // largest transient cost) before entering the dispatch loop.
+    parser_mod.parallel_scan.freeRegions(ctx.allocator, regions);
 
-        const ideal_end_raw = if (i + 1 == ctx.n_chunks)
-            file_size
-        else
-            (i + 1) * file_size / ctx.n_chunks;
-        // A previous chunk's `findNextRecordEnd` can advance past the next
-        // ideal split. Clamp so each chunk strictly follows the prior one.
-        const ideal_end = @max(ideal_end_raw, chunk_start);
+    // Phase 2: walk the boundary list and aggregate consecutive records
+    // into chunks ~`ideal_chunk` bytes wide. Each chunk_end is a
+    // boundary offset + 1 (newline byte INCLUDED in chunk — matches the
+    // prior `findNextRecordEnd` contract that pool/cli tests depend on).
+    const ideal_chunk: usize = if (ctx.n_chunks > 0)
+        @max(1, file_size / ctx.n_chunks)
+    else
+        file_size;
+    var chunk_start: usize = 0;
+    var bi: usize = 0;
 
-        // Catch scanner up to ideal_end without recording boundaries.
-        if (ideal_end > scan_cursor) {
-            parser_mod.boundary.advanceState(&scanner, data[scan_cursor..ideal_end]);
-            scan_cursor = ideal_end;
+    while (chunk_start < file_size) {
+        const target = chunk_start + ideal_chunk;
+        // Tail fallback: if no remaining boundary satisfies `target`,
+        // the chunk runs to EOF. Handles the no-trailing-newline case
+        // (tests/pool_test.zig:157) where the final value has no `\n`.
+        var chunk_end: usize = file_size;
+        while (bi < boundaries.items.len) : (bi += 1) {
+            if (boundaries.items[bi] + 1 >= target) {
+                chunk_end = boundaries.items[bi] + 1;
+                bi += 1;
+                break;
+            }
         }
 
-        const chunk_end: usize = if (ideal_end >= file_size)
-            file_size
-        else
-            parser_mod.boundary.findNextRecordEnd(&scanner, data, ideal_end, file_size);
-        scan_cursor = chunk_end;
-
-        const chunk_origin = chunk_start;
         const chunk = data[chunk_start..chunk_end];
+        const chunk_origin = chunk_start;
         chunk_start = chunk_end;
 
         if (chunk.len == 0) continue;
         if (!ctx.raw_input and !hasNonEmptyLine(chunk)) continue;
 
-        // Block until a slot is available.  Returns false on shutdown (deinit).
+        // Block until a slot is available. Returns false on shutdown
+        // (deinit). Acquired INSIDE the dispatch loop so workers can
+        // process chunk K while we walk the boundary list to chunk K+M.
         if (!ctx.limiter.acquire()) break;
 
         const lookback_start = if (chunk_origin > parser_mod.LOOKBACK_BYTES)
@@ -2116,6 +2150,7 @@ pub const Pool = struct {
         ctx_ptr.* = .{
             .data = p._mmap.?.data,
             .n_chunks = n_chunks,
+            .n_workers = n_threads,
             .query = cq,
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
