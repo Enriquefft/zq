@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const simd = @import("simd.zig");
+const parallel_scan = @import("parallel_scan.zig");
 
 pub const ScannerState = struct {
     depth: u32 = 0,
@@ -75,6 +76,83 @@ pub fn feedBytes(
             },
             '\n' => {
                 if (state.depth == 0) try out_boundaries.append(allocator, base_offset + i);
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+}
+
+/// Parallel-scan variant of `feedBytes`. Differs in two ways from the
+/// serial form:
+///
+/// 1. Tracks a *signed* `local_depth` rather than `state.depth`. The
+///    parallel scanner runs over a chunk that may begin mid-container,
+///    so the running depth is relative — it can go negative when this
+///    region closes more containers than it opens. `state.depth` is
+///    ignored on this path; only `state.in_string` and
+///    `state.escape_pending` are read/written.
+///
+/// 2. Records *every* outside-string `\n` (with `escape_pending=false`)
+///    as a candidate, regardless of `local_depth`. The stitch step
+///    later filters candidates by `accum_depth + cand.depth_at_offset
+///    == 0` once the prior region's depth_delta is known.
+///
+/// `data` is the region's bytes; offsets in `out_candidates` are
+/// region-local (caller adds `region.base` during stitching).
+pub fn feedBytesParallel(
+    state: *ScannerState,
+    local_depth: *i32,
+    data: []const u8,
+    out_candidates: *std.ArrayList(parallel_scan.Candidate),
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    var i: usize = 0;
+    while (i < data.len) {
+        // In-string fast path: bulk-skip safe ASCII content.
+        if (state.in_string and !state.escape_pending) {
+            const safe = simd.scanStringBody(data[i..]);
+            i += safe;
+            if (i >= data.len) return;
+        }
+        // Out-of-string fast path: bulk-skip non-structural bytes.
+        if (!state.in_string) {
+            const boring = simd.scanStructural(data[i..]);
+            i += boring;
+            if (i >= data.len) return;
+        }
+
+        const b = data[i];
+        if (state.in_string) {
+            if (state.escape_pending) {
+                state.escape_pending = false;
+            } else if (b == '\\') {
+                state.escape_pending = true;
+            } else if (b == '"') {
+                state.in_string = false;
+            }
+            i += 1;
+        } else switch (b) {
+            '"' => {
+                state.in_string = true;
+                i += 1;
+            },
+            '{', '[' => {
+                local_depth.* += 1;
+                i += 1;
+            },
+            '}', ']' => {
+                local_depth.* -= 1;
+                i += 1;
+            },
+            '\n' => {
+                // Record every outside-string newline as a candidate;
+                // depth-0 filtering happens during stitch once the
+                // prior region's depth_delta is folded in.
+                try out_candidates.append(allocator, .{
+                    .local_offset = @intCast(i),
+                    .depth_at_offset = local_depth.*,
+                });
                 i += 1;
             },
             else => i += 1,

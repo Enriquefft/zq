@@ -355,6 +355,19 @@ pub fn build(b: *std.Build) void {
     const parser_tests = b.addTest(.{ .root_module = parser_test_mod });
     test_step.dependOn(&b.addRunArtifact(parser_tests).step);
 
+    // Parallel-scan property test (1000-iter random oracle vs. serial).
+    // Pulls only `parser` — no regex, no shim dependency. Wired into the
+    // default `test` step so CI catches stitch regressions.
+    const parallel_scan_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/parallel_scan_property_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parallel_scan_test_mod.addImport("parser", parser_module);
+
+    const parallel_scan_tests = b.addTest(.{ .root_module = parallel_scan_test_mod });
+    test_step.dependOn(&b.addRunArtifact(parallel_scan_tests).step);
+
     const query_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/query_test.zig"),
         .target = target,
