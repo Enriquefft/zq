@@ -11,7 +11,5 @@ pub const simd = @import("src/simd.zig");
 
 pub const LOOKBACK_BYTES = align_impl.LOOKBACK_BYTES;
 pub const AlignResult = align_impl.AlignResult;
-pub const SpanResult = align_impl.SpanResult;
 pub const findValueStart = align_impl.findValueStart;
 pub const tryAlignChunk = align_impl.tryAlignChunk;
-pub const feedSpanning = align_impl.feedSpanning;
