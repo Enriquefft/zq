@@ -355,6 +355,16 @@ pub fn build(b: *std.Build) void {
     const parser_tests = b.addTest(.{ .root_module = parser_test_mod });
     test_step.dependOn(&b.addRunArtifact(parser_tests).step);
 
+    const boundary_simd_property_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/boundary_simd_property_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    boundary_simd_property_test_mod.addImport("parser", parser_module);
+
+    const boundary_simd_property_tests = b.addTest(.{ .root_module = boundary_simd_property_test_mod });
+    test_step.dependOn(&b.addRunArtifact(boundary_simd_property_tests).step);
+
     const query_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/query_test.zig"),
         .target = target,
