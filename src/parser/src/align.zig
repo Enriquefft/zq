@@ -142,7 +142,7 @@ fn probeFromAfterNewline(data: []const u8, start: usize) ProbeResult {
     return switch (r) {
         .done => |d| {
             const end_abs = start + d.consumed;
-            if (!trailingLooksTopLevel(data, end_abs)) return .rejected;
+            if (!trailingLooksTopLevel(data[end_abs..], "")) return .rejected;
             return .{ .confirmed = end_abs };
         },
         .need_more => .need_more,
@@ -158,14 +158,20 @@ fn probeAcrossLookback(lookback: []const u8, lb_start: usize, data: []const u8) 
     if (lb_start < lookback.len) {
         const r1 = p.feed(lookback[lb_start..], false) catch return .rejected;
         switch (r1) {
-            .done => return .confirmed_in_lookback,
+            // Tail of lookback after the parsed value, then data, must not
+            // begin with a structural mid-record byte — otherwise the value
+            // we parsed was a key/element of an enclosing structure.
+            .done => |d| {
+                if (!trailingLooksTopLevel(lookback[lb_start + d.consumed ..], data)) return .rejected;
+                return .confirmed_in_lookback;
+            },
             .need_more => {},
         }
 
         const r2 = p.feed(data, false) catch return .rejected;
         return switch (r2) {
             .done => |d| {
-                if (!trailingLooksTopLevel(data, d.consumed)) return .rejected;
+                if (!trailingLooksTopLevel(data[d.consumed..], "")) return .rejected;
                 return .{ .confirmed_in_data = d.consumed };
             },
             .need_more => .need_more,
@@ -178,21 +184,26 @@ fn probeAcrossLookback(lookback: []const u8, lb_start: usize, data: []const u8) 
     const r = p.feed(data, false) catch return .rejected;
     return switch (r) {
         .done => |d| {
-            if (!trailingLooksTopLevel(data, d.consumed)) return .rejected;
+            if (!trailingLooksTopLevel(data[d.consumed..], "")) return .rejected;
             return .confirmed_in_lookback;
         },
         .need_more => .need_more,
     };
 }
 
-/// After the parser reports `.done` at `end`, the next non-whitespace byte
-/// must either be missing (end of input) or be a top-level value-start
+/// After the parser reports `.done`, the next non-whitespace byte across
+/// `prefix ++ rest` must either be missing or be a top-level value-start
 /// byte. If it's a structural mid-record byte (`:`, `,`, `}`, `]`), the
 /// parser was fooled by a syntactically valid mid-record fragment (e.g.
 /// the key string of an object) and the boundary is bogus.
-fn trailingLooksTopLevel(data: []const u8, end: usize) bool {
-    const next = findValueStart(data, end) orelse return true;
-    return switch (data[next]) {
+fn trailingLooksTopLevel(prefix: []const u8, rest: []const u8) bool {
+    if (findValueStart(prefix, 0)) |idx| return isTopLevelStart(prefix[idx]);
+    const idx = findValueStart(rest, 0) orelse return true;
+    return isTopLevelStart(rest[idx]);
+}
+
+fn isTopLevelStart(b: u8) bool {
+    return switch (b) {
         '{', '[', '"', '-', '0'...'9', 't', 'f', 'n', 'I', 'N' => true,
         else => false,
     };
