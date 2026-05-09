@@ -77,6 +77,13 @@ The regression checker (`check_regression.sh`) uses **ratio-based comparison**: 
 
 A regression is flagged when the ratio degrades by more than 15%.
 
+In addition, the memory scenario is gated on **peak RSS** with two independent checks:
+
+- **Absolute ceiling**: `zq_max_rss_kb / input_size_kb` must stay under 40% (≈18% headroom over the live measurement, ≈29% over the README's published 0.31× claim).
+- **Delta vs baseline**: zq peak RSS may not grow more than 25% versus the cached baseline, catching creeping memory regressions even when still under the absolute ceiling.
+
+Either gate tripping fails CI. The thresholds are hard-coded in `check_regression.sh` — there are no env-var knobs to remember.
+
 ## CI Baseline System
 
 CI does **not** use the committed `baseline.json` (that file is a developer-machine reference only). Instead, it maintains a self-tracking baseline via GitHub Actions cache:

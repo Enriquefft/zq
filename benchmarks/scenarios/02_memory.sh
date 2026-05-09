@@ -92,9 +92,16 @@ $HAVE_JQ  && run_memory_test "jq"  jq  'select(.id > 500000)' "$DATA_FILE"
 $HAVE_JAQ && run_memory_test "jaq" jaq 'select(.id > 500000)' "$DATA_FILE"
 run_memory_test "zq" "$ZQ_BIN" 'select(.id > 500000)' "$DATA_FILE"
 
+# Capture input size in KB so the regression gate can compute RSS-per-input
+# without re-statting the file on a different machine.
+INPUT_SIZE_BYTES=$(stat --format='%s' "$DATA_FILE" 2>/dev/null || stat -f '%z' "$DATA_FILE" 2>/dev/null)
+INPUT_SIZE_KB=$(( INPUT_SIZE_BYTES / 1024 ))
+
 # Write JSON export
 {
-    echo '{"results":['
+    echo '{'
+    printf '"input_size_kb":%s,\n' "$INPUT_SIZE_KB"
+    echo '"results":['
     first=true
     for label in jq jaq zq; do
         if [ -n "${WALL_CLOCK[$label]+x}" ]; then

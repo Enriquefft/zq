@@ -21,14 +21,11 @@ export ZQ_QUICK
 # Source progress utilities
 source "$BENCHMARK_DIR/progress.sh"
 
-# Regression mode skips the memory scenario: it isn't consumed by
-# check_regression.sh, so running it on every PR adds time without signal.
+# All five scenarios run in both modes. Regression mode consumes 02_memory's
+# peak-RSS reading via check_regression.sh's absolute-ceiling gate, so the
+# memory scenario is no longer optional.
 BENCH_MODE="${BENCH_MODE:-comparison}"
-if [ "$BENCH_MODE" = "regression" ]; then
-    TOTAL_SCENARIOS=4
-else
-    TOTAL_SCENARIOS=5
-fi
+TOTAL_SCENARIOS=5
 
 init_main_progress
 
@@ -132,11 +129,7 @@ run_scenario() {
 }
 
 run_scenario "Multi-core Scalability" "01_parallelism.sh" "01_parallelism.md"
-
-if [ "$BENCH_MODE" != "regression" ]; then
-    run_scenario "Memory Efficiency" "02_memory.sh" "02_memory.md"
-fi
-
+run_scenario "Memory Efficiency"      "02_memory.sh"          "02_memory.md"
 run_scenario "Startup Latency"        "03_startup_latency.sh" "03_startup_latency.md"
 run_scenario "Streaming Throughput"   "04_streaming.sh"       "04_streaming.md"
 run_scenario "Complex Query"          "05_complex_query.sh"   "05_complex_query.md"
@@ -154,6 +147,23 @@ extract_mean() {
     fi
 }
 
+# Helper: extract a numeric per-command field (e.g. max_rss_kb) from 02_memory.json
+extract_field() {
+    local json_file="$1" cmd_name="$2" field="$3"
+    if [ -f "$json_file" ]; then
+        jq -r --arg cmd "$cmd_name" --arg f "$field" \
+            '.results[] | select(.command == $cmd) | .[$f] // empty' "$json_file" 2>/dev/null
+    fi
+}
+
+# Helper: extract a top-level scalar (e.g. input_size_kb) from 02_memory.json
+extract_top() {
+    local json_file="$1" field="$2"
+    if [ -f "$json_file" ]; then
+        jq -r --arg f "$field" '.[$f] // empty' "$json_file" 2>/dev/null
+    fi
+}
+
 # Build summary JSON
 {
     cat <<HEADER
@@ -168,10 +178,17 @@ HEADER
     P_JQ=$(extract_mean "$BENCHMARK_DIR/results/01_parallelism.json" "jq")
     printf '    "parallelism": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${P_ZQ:-null}" "${P_JQ:-null}"
 
-    # Memory (uses wall clock time from our custom JSON)
-    M_ZQ=$(extract_mean "$BENCHMARK_DIR/results/02_memory.json" "zq")
-    M_JQ=$(extract_mean "$BENCHMARK_DIR/results/02_memory.json" "jq")
-    printf '    "memory": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${M_ZQ:-null}" "${M_JQ:-null}"
+    # Memory: wall-clock means + peak RSS (additive, non-breaking schema).
+    # input_size_kb is captured at measurement time so the regression gate
+    # computes RSS-per-input on the file the run actually saw.
+    M_JSON="$BENCHMARK_DIR/results/02_memory.json"
+    M_ZQ=$(extract_mean  "$M_JSON" "zq")
+    M_JQ=$(extract_mean  "$M_JSON" "jq")
+    M_ZQ_RSS=$(extract_field "$M_JSON" "zq" "max_rss_kb")
+    M_JQ_RSS=$(extract_field "$M_JSON" "jq" "max_rss_kb")
+    M_INPUT_KB=$(extract_top "$M_JSON" "input_size_kb")
+    printf '    "memory": {"zq_mean_s": %s, "jq_mean_s": %s, "zq_max_rss_kb": %s, "jq_max_rss_kb": %s, "input_size_kb": %s},\n' \
+        "${M_ZQ:-null}" "${M_JQ:-null}" "${M_ZQ_RSS:-null}" "${M_JQ_RSS:-null}" "${M_INPUT_KB:-null}"
 
     # Startup latency
     SL_ZQ=$(extract_mean "$BENCHMARK_DIR/results/03_startup_latency.json" "zq")
