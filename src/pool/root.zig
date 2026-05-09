@@ -1763,25 +1763,14 @@ const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
 const STREAM_SEQ_RANGE: u32 = 8;
 
 /// Default file-mode backpressure: max simultaneously-live ChunkResults per
-/// thread.  With 4× n_threads slots, the feeder runs ahead of the workers far
-/// enough that its sequential structural-boundary scan (NIX-001) does not
-/// starve the queue.  At 2× the feeder's per-byte scan cost serialised the
-/// pipeline: each `acquire()` blocked the next `advanceState()` call, so any
-/// scan latency translated 1:1 into worker idle time and parallelism collapsed
-/// (see NIX-001 follow-up — lever A in 7a67732 cut a third byte-pass in the
-/// worker, this lever opens producer-side overlap).
-///
-/// Peak in-flight RSS bound: `in_flight_factor × file_expanded / chunk_factor`
-/// = `4 × file_expanded / 4` = `1.0 × file_expanded` (vs `0.5×` previously).
-/// For pretty-printed output this is `6× file_size`; the `MemoryBudget`
-/// over-budget branch (`computeParams`) still drops `in_flight_factor` to `1`
-/// when that exceeds the configured budget, so constrained environments are
-/// unaffected.  Hardware-agnostic — the cap scales with `n_threads` only.
-const DEFAULT_IN_FLIGHT_FACTOR: usize = 4;
+/// thread.  With 2× n_threads slots, each worker can have one chunk being
+/// processed and one buffered in the Sequencer, keeping all cores busy while
+/// bounding RSS.
+const DEFAULT_IN_FLIGHT_FACTOR: usize = 2;
 
 /// Upper bound for in_flight_factor.  The Sequencer ring is sized for this
 /// value so that reducing in_flight_factor at runtime never exceeds capacity.
-const MAX_IN_FLIGHT_FACTOR: usize = 4;
+const MAX_IN_FLIGHT_FACTOR: usize = 2;
 
 /// Thread stack size. Workers need at most ~512 KB (parser depth 512 ×
 /// ~200 B per frame for serialize recursion); 2 MiB provides 4× safety margin.
@@ -1878,9 +1867,7 @@ pub const MemoryBudget = struct {
             chunk_factor = std.math.clamp(max_chunks, DEFAULT_CHUNK_FACTOR, 64);
         }
 
-        // Check if the default in_flight_factor still fits the budget.
-        // If not, fall back to 1 — single-slot mode bounds in-flight bytes to
-        // one chunk per worker, the minimum needed to keep cores busy.
+        // Check if in_flight_factor=2 still fits
         var in_flight: u64 = DEFAULT_IN_FLIGHT_FACTOR;
         const in_flight_bytes = (DEFAULT_IN_FLIGHT_FACTOR * n_eff * file_expanded) / (n_eff * chunk_factor);
         if (in_flight_bytes > self.budget_bytes) {
