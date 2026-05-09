@@ -259,11 +259,6 @@ const Job = struct {
     /// The submitter must arrange chunk_id assignments so that ranges from
     /// distinct Jobs do not overlap.
     seq_range_size: u32 = 1,
-    /// Bytes immediately preceding `data` in the source. File mode populates
-    /// this from the mmap (clamped at offset 0); stream mode passes empty
-    /// until commit 4. Workers feed it to `parser.tryAlignChunk` to confirm
-    /// the chunk starts on a top-level value boundary.
-    lookback: ?[]const u8 = null,
 };
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
@@ -579,11 +574,6 @@ fn worker_fn(ctx: WorkerCtx) void {
         // MADV_DONTNEED releases the physical pages immediately (Linux only),
         // bounding mmap RSS to O(in_flight × chunk_size) instead of O(file_size).
         defer if (!job.owns_data) madvise_dontneed_chunk(job.data);
-
-        // Structural scanner still upstream; tryAlignChunk acts as cross-check
-        // here. Commit 3 makes it load-bearing and deletes the duplicate.
-        const align_result = parser_mod.tryAlignChunk(job.data, 0, job.lookback orelse &.{});
-        std.debug.assert(align_result == .aligned_at and align_result.aligned_at == 0);
 
         if (job.style) |style| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
@@ -1501,7 +1491,6 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
         .raw_input = ctx.raw_input,
         .external_bindings = ctx.external_bindings,
         .seq_range_size = STREAM_SEQ_RANGE,
-        .lookback = &.{},
     });
     batch_buf.clearRetainingCapacity();
 }
@@ -1590,7 +1579,6 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             parser_mod.boundary.findNextRecordEnd(&scanner, data, ideal_end, file_size);
         scan_cursor = chunk_end;
 
-        const chunk_origin = chunk_start;
         const chunk = data[chunk_start..chunk_end];
         chunk_start = chunk_end;
 
@@ -1599,12 +1587,6 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
 
         // Block until a slot is available.  Returns false on shutdown (deinit).
         if (!ctx.limiter.acquire()) break;
-
-        const lookback_start = if (chunk_origin > parser_mod.LOOKBACK_BYTES)
-            chunk_origin - parser_mod.LOOKBACK_BYTES
-        else
-            0;
-        const lookback = data[lookback_start..chunk_origin];
 
         ctx.queue.push(.{
             .data = chunk,
@@ -1619,7 +1601,6 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .raw_input = ctx.raw_input,
             .external_bindings = ctx.external_bindings,
             .seq_range_size = 1,
-            .lookback = lookback,
         });
         chunk_id += 1;
     }
