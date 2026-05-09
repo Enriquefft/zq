@@ -44,7 +44,7 @@ jobs:
             echo "ZQ_QUICK=0"          >> "$GITHUB_ENV"
           else
             echo "HUGE_LINES=1000000"  >> "$GITHUB_ENV"
-            echo "ZQ_QUICK=1"          >> "$GITHUB_ENV"
+            echo "ZQ_QUICK=0"          >> "$GITHUB_ENV"
           fi
 
       - name: Install jq + hyperfine (always, pinned)
@@ -82,10 +82,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: benchmarks/ci-baseline.json
-          key: benchmark-baseline-v2-${{ github.ref_name }}-current
+          key: benchmark-baseline-v3-${{ github.ref_name }}-current
           restore-keys: |
-            benchmark-baseline-v2-${{ github.ref_name }}-
-            benchmark-baseline-v2-main-
+            benchmark-baseline-v3-${{ github.ref_name }}-
+            benchmark-baseline-v3-main-
 
       - name: Cache test dataset
         id: cache-data
@@ -127,7 +127,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: benchmarks/ci-baseline.json
-          key: benchmark-baseline-v2-main-${{ github.run_id }}
+          key: benchmark-baseline-v3-main-${{ github.run_id }}
 
       - uses: actions/upload-artifact@v4
         if: always()
