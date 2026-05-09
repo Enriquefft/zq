@@ -134,3 +134,58 @@ jobs:
         with:
           name: benchmark-results-${{ env.BENCH_MODE }}-${{ github.sha }}
           path: benchmarks/results/
+
+  # Throwaway instrumentation job — runs only on the two `instrument/*-timing`
+  # branches.  Builds zq, executes the parallelism scenario once with
+  # `ZQ_INSTRUMENT=1`, and uploads the resulting stderr log as an artifact.
+  # Independent of the main `benchmark` job so it cannot affect the regression
+  # gate.  Removed when the parent diagnostic task closes.
+  instrument:
+    if: github.ref == 'refs/heads/instrument/r4-timing' || github.ref == 'refs/heads/instrument/serial-timing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache test dataset
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: benchmarks/data/huge.jsonl
+          key: huge-jsonl-${{ hashFiles('benchmarks/data/huge.generator.sh') }}-1000000
+
+      - name: Build zq (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Generate test data
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        env:
+          HUGE_LINES: '1000000'
+          ZQ_QUICK: '1'
+        run: |
+          cd benchmarks/data
+          bash huge.generator.sh
+          ls -lh huge.jsonl
+
+      - name: Run instrumented .id over huge.jsonl
+        run: |
+          ZQ_INSTRUMENT=1 ./zig-out/bin/zq '.id' benchmarks/data/huge.jsonl 2>instrument.log >/dev/null
+
+      - name: Echo CSV line(s) for quick visibility
+        if: always()
+        run: |
+          echo "==== ZQ_INST_CSV (full line) ===="
+          grep '^\[ZQ_INST_CSV\]' instrument.log || echo "(no CSV line found)"
+          echo "==== sample [ZQ_INST] scan lines ===="
+          grep '^\[ZQ_INST\] scan ' instrument.log | head -10 || true
+
+      - name: Upload instrument log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrument-${{ github.ref_name }}
+          path: instrument.log

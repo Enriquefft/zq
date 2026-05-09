@@ -144,15 +144,36 @@ const ThreadCtx = struct {
     arena: *std.heap.ArenaAllocator,
     result: *DualResult,
     err: ?anyerror,
+    /// Throwaway instrumentation only: region index for the per-region
+    /// `[ZQ_INST] scan region=...` stderr line emitted when ZQ_INSTRUMENT=1.
+    region_idx: usize = 0,
 };
 
+fn instEnabled() bool {
+    return std.posix.getenv("ZQ_INSTRUMENT") != null;
+}
+
+fn emitScanRegionTiming(idx: usize, start_ns: i64, end_ns: i64) void {
+    if (!instEnabled()) return;
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "[ZQ_INST] scan region={d} start_ns={d} end_ns={d}\n", .{
+        idx, start_ns, end_ns,
+    }) catch return;
+    std.fs.File.stderr().writeAll(msg) catch {};
+}
+
 fn workerEntry(ctx: *ThreadCtx) void {
+    const t_start: i64 = @truncate(std.time.nanoTimestamp());
     const arena_alloc = ctx.arena.allocator();
     const r = scanRegionDual(ctx.data, arena_alloc) catch |e| {
         ctx.err = e;
+        const t_end: i64 = @truncate(std.time.nanoTimestamp());
+        emitScanRegionTiming(ctx.region_idx, t_start, t_end);
         return;
     };
     ctx.result.* = r;
+    const t_end: i64 = @truncate(std.time.nanoTimestamp());
+    emitScanRegionTiming(ctx.region_idx, t_start, t_end);
 }
 
 /// Scan `data` in parallel across (up to) `n_regions` worker threads.
@@ -233,7 +254,10 @@ pub fn scanRegions(
     // Serial path: skip thread spawn entirely. Used for n_regions==1
     // and for the small-input fallback.
     if (actual == 1) {
+        const t_start: i64 = @truncate(std.time.nanoTimestamp());
         const r = scanRegionDual(slices[0], arenas[0].allocator()) catch return error.OutOfMemory;
+        const t_end: i64 = @truncate(std.time.nanoTimestamp());
+        emitScanRegionTiming(0, t_start, t_end);
         regions[0] = .{
             .base = bases[0],
             .data = slices[0],
@@ -265,6 +289,7 @@ pub fn scanRegions(
                 .arena = arenas[k],
                 .result = &results[k],
                 .err = null,
+                .region_idx = k,
             };
         }
     }
@@ -290,7 +315,10 @@ pub fn scanRegions(
         // Run the un-spawned tail (and any whose result is uninitialised) serially.
         var k: usize = spawned;
         while (k < actual) : (k += 1) {
+            const t_start: i64 = @truncate(std.time.nanoTimestamp());
             const r = try scanRegionDual(slices[k], arenas[k].allocator());
+            const t_end: i64 = @truncate(std.time.nanoTimestamp());
+            emitScanRegionTiming(k, t_start, t_end);
             results[k] = r;
         }
     }

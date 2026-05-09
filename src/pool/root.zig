@@ -532,6 +532,12 @@ const WorkerCtx = struct {
     active_stream_jobs: *std.atomic.Value(u64),
     io_done: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
+    /// Instrumentation pointers (see SharedCtx).  Inert when ZQ_INSTRUMENT
+    /// is unset because nothing reads them.
+    inst_first_worker_ts: *std.atomic.Value(i64),
+    inst_all_workers_ts: *std.atomic.Value(i64),
+    inst_workers_started: *std.atomic.Value(u32),
+    inst_n_workers: u32,
 };
 
 /// Pin `Sequencer.total_chunks` iff (a) the IO thread has finished pushing
@@ -568,7 +574,26 @@ fn worker_fn(ctx: WorkerCtx) void {
     var current_query: ?*const query_mod.CompiledQuery = null;
     defer if (opt_it) |*it| it.deinit();
 
+    // Instrumentation: per-thread "has pulled at least one job" flag.
+    // Captured exactly once per worker thread on its first dequeued job —
+    // used by the feeder to compute t_first_worker_busy / t_all_workers_busy
+    // when ZQ_INSTRUMENT=1.  Reads/writes are atomic and contention-free
+    // after first hit, so overhead off-the-hot-path is one branch per loop.
+    var has_started: bool = false;
+
     while (ctx.queue.pop()) |job| {
+        if (!has_started) {
+            has_started = true;
+            const now: i64 = @truncate(std.time.nanoTimestamp());
+            // First worker globally to pull a job: CAS 0 -> now.
+            _ = ctx.inst_first_worker_ts.cmpxchgStrong(0, now, .acq_rel, .monotonic);
+            // Count this thread; if it tipped the counter to N, capture
+            // the all-workers-busy timestamp.
+            const prev = ctx.inst_workers_started.fetchAdd(1, .acq_rel);
+            if (prev + 1 >= ctx.inst_n_workers) {
+                _ = ctx.inst_all_workers_ts.cmpxchgStrong(0, now, .acq_rel, .monotonic);
+            }
+        }
         defer if (job.owns_data) job.allocator.free(job.data);
         // INVARIANT: job.data must not be accessed after sequencer.post().
         // Serialized path: output bytes are in the arena, not in job.data.
@@ -1551,6 +1576,9 @@ const FileFeedCtx = struct {
     opts: output_mod.SerializeOpts,
     raw_input: bool,
     external_bindings: []const query_mod.ExternalVarBinding,
+    /// Instrumentation pointers (read-only for the feeder; populated by workers).
+    inst_first_worker_ts: *std.atomic.Value(i64),
+    inst_all_workers_ts: *std.atomic.Value(i64),
 };
 
 /// Pick the number of regions for the one-shot parallel structural scan.
@@ -1565,6 +1593,13 @@ fn chooseRegionCount(file_size: usize, n_workers: usize) usize {
 }
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
+    const t_feeder_start: i64 = @truncate(std.time.nanoTimestamp());
+    const rss_feeder_start: u64 = rssKb();
+    var t_first_dispatch: i64 = 0;
+    var t_last_dispatch: i64 = 0;
+    var rss_dispatch_start: u64 = 0;
+    var rss_dispatch_end: u64 = 0;
+
     const data = ctx.data;
     const file_size = data.len;
     var chunk_id: u64 = 0;
@@ -1575,6 +1610,7 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
     // newline offsets serially. Replaces the prior single-threaded
     // boundary walk that left workers idle on the hot path.
     const n_regions = chooseRegionCount(file_size, ctx.n_workers);
+    const t_scan_start: i64 = @truncate(std.time.nanoTimestamp());
     const regions = parser_mod.parallel_scan.scanRegions(
         data,
         n_regions,
@@ -1584,9 +1620,12 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
         ctx.queue.signal_done();
         return;
     };
+    const t_scan_end: i64 = @truncate(std.time.nanoTimestamp());
+    const rss_scan_end: u64 = rssKb();
 
     var boundaries: std.ArrayList(usize) = .{};
     defer boundaries.deinit(ctx.allocator);
+    const t_stitch_start: i64 = @truncate(std.time.nanoTimestamp());
     parser_mod.parallel_scan.stitch(regions, &boundaries, ctx.allocator) catch {
         parser_mod.parallel_scan.freeRegions(ctx.allocator, regions);
         ctx.sequencer.set_total_chunks(0);
@@ -1596,6 +1635,8 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
     // Free the per-region arenas (the candidate lists — by far the
     // largest transient cost) before entering the dispatch loop.
     parser_mod.parallel_scan.freeRegions(ctx.allocator, regions);
+    const t_stitch_end: i64 = @truncate(std.time.nanoTimestamp());
+    const rss_stitch_end: u64 = rssKb();
 
     // Phase 2: walk the boundary list and aggregate consecutive records
     // into chunks ~`ideal_chunk` bytes wide. Each chunk_end is a
@@ -1640,6 +1681,11 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             0;
         const lookback = data[lookback_start..chunk_origin];
 
+        if (t_first_dispatch == 0) {
+            t_first_dispatch = @truncate(std.time.nanoTimestamp());
+            rss_dispatch_start = rssKb();
+        }
+
         ctx.queue.push(.{
             .data = chunk,
             .seq_base = chunk_id,
@@ -1655,13 +1701,121 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
             .seq_range_size = 1,
             .lookback = lookback,
         });
+        t_last_dispatch = @truncate(std.time.nanoTimestamp());
         chunk_id += 1;
     }
+    rss_dispatch_end = rssKb();
 
     // Always inform the Sequencer of the final total and stop workers,
     // even when we exit early due to shutdown.
     ctx.sequencer.set_total_chunks(chunk_id);
     ctx.queue.signal_done();
+
+    const t_feeder_end: i64 = @truncate(std.time.nanoTimestamp());
+    const rss_feeder_end: u64 = rssKb();
+    const row = InstCsvRow{
+        .branch = "R4",
+        .t_feeder_start = t_feeder_start,
+        .t_scan_start = t_scan_start,
+        .t_scan_end = t_scan_end,
+        .t_stitch_start = t_stitch_start,
+        .t_stitch_end = t_stitch_end,
+        .t_first_dispatch = t_first_dispatch,
+        .t_last_dispatch = t_last_dispatch,
+        .t_first_worker_busy = ctx.inst_first_worker_ts.load(.acquire),
+        .t_all_workers_busy = ctx.inst_all_workers_ts.load(.acquire),
+        .t_feeder_end = t_feeder_end,
+        .rss_feeder_start = rss_feeder_start,
+        .rss_scan_end = rss_scan_end,
+        .rss_stitch_end = rss_stitch_end,
+        .rss_dispatch_start = rss_dispatch_start,
+        .rss_dispatch_end = rss_dispatch_end,
+        .rss_feeder_end = rss_feeder_end,
+    };
+    emitInstCsv(&row);
+}
+
+// ── Instrumentation helpers (gated on ZQ_INSTRUMENT env var) ─────────────────
+//
+// All wall-clock timestamps are captured as i128 nanoseconds from
+// `std.time.nanoTimestamp()`.  RSS is read from `/proc/self/status`
+// (Linux-only path; returns 0 elsewhere) — this throwaway tooling targets
+// the CI runners only.  Disabled at runtime when `ZQ_INSTRUMENT` is unset:
+// `emitInstCsv` early-returns and the per-phase capture overhead reduces
+// to a handful of nanoTimestamp calls + atomic loads (no hot-loop touches).
+
+fn instEnabled() bool {
+    return std.posix.getenv("ZQ_INSTRUMENT") != null;
+}
+
+fn rssKb() u64 {
+    if (comptime @import("builtin").os.tag != .linux) return 0;
+    const file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch return 0;
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    const n = file.readAll(&buf) catch return 0;
+    const slice = buf[0..n];
+    var line_iter = std.mem.tokenizeScalar(u8, slice, '\n');
+    while (line_iter.next()) |line| {
+        if (std.mem.startsWith(u8, line, "VmRSS:")) {
+            var tok = std.mem.tokenizeScalar(u8, line, ' ');
+            _ = tok.next(); // "VmRSS:"
+            const num_str = tok.next() orelse return 0;
+            return std.fmt.parseInt(u64, num_str, 10) catch 0;
+        }
+    }
+    return 0;
+}
+
+const InstCsvRow = struct {
+    branch: []const u8,
+    t_feeder_start: i64,
+    t_scan_start: i64,
+    t_scan_end: i64,
+    t_stitch_start: i64,
+    t_stitch_end: i64,
+    t_first_dispatch: i64,
+    t_last_dispatch: i64,
+    t_first_worker_busy: i64,
+    t_all_workers_busy: i64,
+    t_feeder_end: i64,
+    rss_feeder_start: u64,
+    rss_scan_end: u64,
+    rss_stitch_end: u64,
+    rss_dispatch_start: u64,
+    rss_dispatch_end: u64,
+    rss_feeder_end: u64,
+};
+
+fn emitInstCsv(row: *const InstCsvRow) void {
+    if (!instEnabled()) return;
+    // Split into two bufPrint calls so neither tuple becomes large enough to
+    // trip Zig 0.15.2's Debug-codegen "value larger than dst_reg" bug.
+    var buf: [1024]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &buf,
+        "[ZQ_INST_CSV] branch={s},t_feeder_start={d},t_scan_start={d},t_scan_end={d},t_stitch_start={d},t_stitch_end={d},t_first_dispatch={d},t_last_dispatch={d},",
+        .{
+            row.branch,
+            row.t_feeder_start,
+            row.t_scan_start,
+            row.t_scan_end,
+            row.t_stitch_start,
+            row.t_stitch_end,
+            row.t_first_dispatch,
+            row.t_last_dispatch,
+        },
+    ) catch return;
+    const tail = std.fmt.bufPrint(
+        buf[head.len..],
+        "t_first_worker_busy={d},t_all_workers_busy={d},t_feeder_end={d},rss_feeder_start={d},rss_scan_end={d},rss_stitch_end={d},rss_dispatch_start={d},rss_dispatch_end={d},rss_feeder_end={d}\n",
+        .{
+            row.t_first_worker_busy, row.t_all_workers_busy, row.t_feeder_end,
+            row.rss_feeder_start,    row.rss_scan_end,       row.rss_stitch_end,
+            row.rss_dispatch_start,  row.rss_dispatch_end,   row.rss_feeder_end,
+        },
+    ) catch return;
+    std.fs.File.stderr().writeAll(buf[0 .. head.len + tail.len]) catch {};
 }
 
 /// Count newline bytes using SIMD (AVX2 on x86-64, NEON on aarch64).
@@ -1731,6 +1885,15 @@ const SharedCtx = struct {
     /// collect()/collect_bytes() releases after each arena free.
     limiter: InFlightLimiter,
     allocator: std.mem.Allocator,
+    /// Instrumentation (gated on ZQ_INSTRUMENT env var; otherwise stays at 0
+    /// and is harmless).  CAS-from-zero on the first worker's first job.
+    inst_first_worker_ts: std.atomic.Value(i64),
+    /// Set when `inst_workers_started` reaches `inst_n_workers`.
+    inst_all_workers_ts: std.atomic.Value(i64),
+    /// Number of worker threads that have pulled at least one job so far.
+    inst_workers_started: std.atomic.Value(u32),
+    /// Worker count expected before `inst_all_workers_ts` is captured.
+    inst_n_workers: u32,
     /// Starts at 1 (for the Pool) + n_workers.  Each exiting thread decrements.
     /// The last to decrement frees SharedCtx.
     ref_count: std.atomic.Value(usize),
@@ -1771,6 +1934,10 @@ fn worker_thread_entry(shared: *SharedCtx) void {
         .active_stream_jobs = &shared.active_stream_jobs,
         .io_done = &shared.io_done,
         .allocator = shared.allocator,
+        .inst_first_worker_ts = &shared.inst_first_worker_ts,
+        .inst_all_workers_ts = &shared.inst_all_workers_ts,
+        .inst_workers_started = &shared.inst_workers_started,
+        .inst_n_workers = shared.inst_n_workers,
     });
     release_shared(shared, shared.allocator);
 }
@@ -2041,6 +2208,10 @@ pub const Pool = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .active_stream_jobs = std.atomic.Value(u64).init(0),
             .io_done = std.atomic.Value(bool).init(false),
+            .inst_first_worker_ts = std.atomic.Value(i64).init(0),
+            .inst_all_workers_ts = std.atomic.Value(i64).init(0),
+            .inst_workers_started = std.atomic.Value(u32).init(0),
+            .inst_n_workers = @intCast(@max(1, n_threads)),
         };
 
         const threads = try allocator.alloc(std.Thread, n_threads);
@@ -2161,6 +2332,8 @@ pub const Pool = struct {
             .opts = opts,
             .raw_input = raw_input,
             .external_bindings = external_bindings,
+            .inst_first_worker_ts = &p._shared.inst_first_worker_ts,
+            .inst_all_workers_ts = &p._shared.inst_all_workers_ts,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
