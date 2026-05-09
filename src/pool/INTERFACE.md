@@ -230,8 +230,9 @@ pub const Pool = struct {
   serialized bytes (e.g. "42\n" = 3 bytes) instead of OwnedValue structs + tape copies.
   Peak RSS: 403 MB for a 1.3 GB file with `.id` (0.31x input).
 - **Adaptive sizing is transparent.** On >=4 GB machines with files that fit in budget,
-  parameters are identical to the previous hardcoded defaults (chunk_factor=4,
-  in_flight_factor=2, stream_batch_size=256K). Only constrained environments see changes.
+  parameters are identical to the hardcoded defaults (chunk_factor=4,
+  in_flight_factor=4, stream_batch_size=256K). Only constrained environments see changes
+  (over-budget files drop in_flight_factor to 1).
 - **`job.data` must not be accessed after `sequencer.post()`.** File-mode workers call
   `madvise(MADV_DONTNEED)` on the mmap chunk immediately after posting, releasing
   physical pages from RSS. The invariant holds because: (a) the serialized path stores

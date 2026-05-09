@@ -939,7 +939,7 @@ test "computeParams: small file returns defaults" {
     const budget = MemoryBudget.explicit(8 * 1024 * 1024 * 1024); // 8 GiB
     const params = budget.computeParams(1 * 1024 * 1024, 16, .{ .compact = true }); // 1 MB file
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
-    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+    try std.testing.expectEqual(@as(usize, 4), params.in_flight_factor);
 }
 
 test "computeParams: large file increases chunk_factor" {
@@ -947,7 +947,7 @@ test "computeParams: large file increases chunk_factor" {
     const params = budget.computeParams(10 * 1024 * 1024 * 1024, 8, .{ .compact = true }); // 10 GB file
     try std.testing.expect(params.chunk_factor > 4);
     try std.testing.expect(params.chunk_factor <= 64);
-    try std.testing.expect(params.in_flight_factor <= 2);
+    try std.testing.expect(params.in_flight_factor <= 4);
 }
 
 test "computeParams: constrained budget reduces in_flight_factor" {
@@ -961,7 +961,7 @@ test "computeParams: stream mode returns defaults with adapted batch_size" {
     const budget = MemoryBudget.explicit(1024 * 1024 * 1024); // 1 GiB
     const params = budget.computeParams(0, 8, .{ .compact = true }); // stream mode
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
-    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+    try std.testing.expectEqual(@as(usize, 4), params.in_flight_factor);
     try std.testing.expect(params.stream_batch_size >= 64 * 1024);
     try std.testing.expect(params.stream_batch_size <= 256 * 1024);
 }
@@ -970,7 +970,7 @@ test "computeParams: huge budget returns defaults" {
     const budget = MemoryBudget.explicit(64 * 1024 * 1024 * 1024); // 64 GiB
     const params = budget.computeParams(1 * 1024 * 1024 * 1024, 32, .{ .compact = true }); // 1 GB file
     try std.testing.expectEqual(@as(usize, 4), params.chunk_factor);
-    try std.testing.expectEqual(@as(usize, 2), params.in_flight_factor);
+    try std.testing.expectEqual(@as(usize, 4), params.in_flight_factor);
 }
 
 test "computeParams: deterministic — same inputs same outputs" {
