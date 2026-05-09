@@ -697,3 +697,138 @@ test "simd: UTF-8 continuation bytes across feed chunks" {
         .need_more => return error.UnexpectedNeedMore,
     }
 }
+
+// ── Alignment detector ───────────────────────────────────────────────────────
+
+const findValueStart = parser.findValueStart;
+const tryAlignChunk = parser.tryAlignChunk;
+const AlignResult = parser.AlignResult;
+
+test "findValueStart: empty input returns null" {
+    try std.testing.expectEqual(@as(?usize, null), findValueStart("", 0));
+}
+
+test "findValueStart: from past end returns null" {
+    try std.testing.expectEqual(@as(?usize, null), findValueStart("xy", 5));
+}
+
+test "findValueStart: skips leading whitespace" {
+    try std.testing.expectEqual(@as(?usize, 3), findValueStart("   {}", 0));
+}
+
+test "findValueStart: from middle skips whitespace" {
+    try std.testing.expectEqual(@as(?usize, 5), findValueStart("{}\n  1", 2));
+}
+
+test "findValueStart: all whitespace returns null" {
+    try std.testing.expectEqual(@as(?usize, null), findValueStart("   \n\t  ", 0));
+}
+
+test "tryAlignChunk: aligned-at-zero" {
+    const r = tryAlignChunk("{\"a\":1}", 0, "");
+    try std.testing.expectEqual(AlignResult{ .aligned_at = 0 }, r);
+}
+
+test "tryAlignChunk: mid-record-rescue picks newline-confirmed boundary" {
+    // Layout (offsets):
+    //  0..6 : {"a":1}        7:\n
+    //  8..14: {"b":2}       15:\n
+    // 16..22: {"c":3}
+    // hint_start = 11 (mid {"b":2}). The only confirmable boundary lives at
+    // offset 15 (end of {"b":2}), but that's > hint_start. Walk back: no
+    // earlier \n. Empty lookback → in_progress (chunk owner is the prior).
+    const data = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}";
+    const r = tryAlignChunk(data, 11, "");
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
+
+test "tryAlignChunk: rescue picks next-value start when value ends before hint" {
+    // hint_start = 16 (start of {"c":3}). The \n at 15 has value_start=16
+    // == hint_start, so the value_start-equals-hint_start branch fires and
+    // we return aligned_at(16).
+    const data = "{\"a\":1}\n{\"b\":2}\n{\"c\":3}";
+    const r = tryAlignChunk(data, 16, "");
+    try std.testing.expectEqual(AlignResult{ .aligned_at = 16 }, r);
+}
+
+test "tryAlignChunk: rescue past in-string newline" {
+    // Raw \n inside a JSON string is invalid per RFC 8259 — the parser
+    // rejects any fragment fed across it, so the in-string \n at 11 cannot
+    // be used as a boundary candidate.
+    //  0..18: {"s":"line1\nline2"}    19:\n    20..26: {"x":1}
+    const data = "{\"s\":\"line1\nline2\"}\n{\"x\":1}";
+    // hint_start=22. Walk-back: \n=19 → confirmed end_abs=27 > 22 and
+    // value_start (20) != 22 → reject. \n=11 → probe rejects (parser sees
+    // raw \n → InvalidUtf8). No earlier \n. → in_progress.
+    const r = tryAlignChunk(data, 22, "");
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
+
+test "tryAlignChunk: in-string newline rescued when chunk anchored on real boundary" {
+    // Same shape; hint_start=20 lands exactly on the structural boundary.
+    // \n at 19 → value_start=20 == hint_start → aligned_at(20).
+    const data = "{\"s\":\"line1\nline2\"}\n{\"x\":1}";
+    const r = tryAlignChunk(data, 20, "");
+    try std.testing.expectEqual(AlignResult{ .aligned_at = 20 }, r);
+}
+
+test "tryAlignChunk: rescue inside multi-line pretty object" {
+    // Pretty-printed object spans three lines (offsets 0..21). Trailing
+    // \n at 22 closes the record; next record at 23..29.
+    //  0:{ 1:\n 2:sp 3:sp 4:" 5:a 6:" 7:: 8:sp 9:1 10:, 11:\n
+    // 12:sp 13:sp 14:" 15:b 16:" 17:: 18:sp 19:2 20:\n 21:} 22:\n
+    // 23:{ 24:" 25:x 26:" 27:: 28:1 29:}
+    const data = "{\n  \"a\": 1,\n  \"b\": 2\n}\n{\"x\":1}";
+    // hint_start=28 (mid {"x":1}). Walk-back: every interior \n probe fails
+    // because the parser interprets fragments like `  "b"` as a complete
+    // top-level string but the trailing-byte sanity check rejects `:`.
+    // Final result: in_progress (the record at 23..29 is owned by the prior
+    // chunk because hint_start lies inside it).
+    const r = tryAlignChunk(data, 28, "");
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
+
+test "tryAlignChunk: rescue inside multi-line pretty object hits trailing terminator" {
+    // Same shape; hint_start=23 lands AT the next record's first byte. The
+    // \n at 22 has value_start=23 == hint_start → aligned_at(23).
+    const data = "{\n  \"a\": 1,\n  \"b\": 2\n}\n{\"x\":1}";
+    const r = tryAlignChunk(data, 23, "");
+    try std.testing.expectEqual(AlignResult{ .aligned_at = 23 }, r);
+}
+
+test "tryAlignChunk: escape pending boundary" {
+    // String containing an escaped backslash (`\\`) followed by 'n' — no
+    // raw newline in the string, only the structural \n at offset 14.
+    //  0:{ 1:" 2:s 3:" 4:: 5:" 6:f 7:o 8:o 9:\ 10:\ 11:n 12:" 13:}
+    // 14:\n 15..21: {"x":1}
+    const data = "{\"s\":\"foo\\\\n\"}\n{\"x\":1}";
+    // hint_start=17 (mid {"x":1}). \n at 14 → value_start=15. confirmed
+    // end_abs=22 > 17 and value_start != 17 → reject. No earlier \n. →
+    // in_progress (chunk owner is the prior chunk).
+    const r = tryAlignChunk(data, 17, "");
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
+
+test "tryAlignChunk: in_progress when no newline and empty lookback" {
+    // No \n in data[0..hint_start], no lookback → in_progress.
+    const data = "{\"abcdefghijk\":1}";
+    const r = tryAlignChunk(data, 8, "");
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
+
+test "tryAlignChunk: empty whitespace-only input" {
+    const r = tryAlignChunk("   \n\t ", 3, "");
+    try std.testing.expectEqual(AlignResult.empty, r);
+}
+
+test "tryAlignChunk: lookback supplies missing newline path" {
+    // data has no \n in [0..hint_start]; lookback ends with a record
+    // boundary. Algorithm falls back to lookback path.
+    const lookback = "{\"a\":1}\n";
+    const data = "{\"b\":2}\n{\"c\":3}";
+    const r = tryAlignChunk(data, 5, lookback);
+    // Spanning value {"b":2} ends at 7 in data, > hint_start=5. The value
+    // started before data[0] (in lookback), so hint_start is mid-record
+    // and the prior chunk owns it. → in_progress.
+    try std.testing.expectEqual(AlignResult.in_progress, r);
+}
