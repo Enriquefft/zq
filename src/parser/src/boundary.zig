@@ -175,84 +175,6 @@ pub fn findNextRecordEnd(
     return end;
 }
 
-/// Conservative count of complete top-level values in a fully-buffered
-/// slice. Used as an `ensureTotalCapacity` upper bound for `meta_list`.
-///
-/// Counts each depth-0/outside-string `\n` as one record boundary, plus
-/// one if the slice ends mid-value (no trailing newline). Worst case is
-/// a slight over-allocation, which is fine for arena pre-sizing.
-pub fn countTopLevelValues(data: []const u8) usize {
-    var state = ScannerState{};
-    var count: usize = 0;
-    var i: usize = 0;
-    var saw_content_since_last_boundary = false;
-
-    while (i < data.len) {
-        if (state.in_string and !state.escape_pending) {
-            const safe = simd.scanStringBody(data[i..]);
-            if (safe > 0) saw_content_since_last_boundary = true;
-            i += safe;
-            if (i >= data.len) break;
-        }
-        if (!state.in_string) {
-            const boring = simd.scanStructural(data[i..]);
-            // Boring bytes outside strings can be whitespace; only count as
-            // content if any non-whitespace appeared. Conservative: bump
-            // the flag whenever we advance, since this only affects the
-            // tail-of-value count and over-counting is acceptable.
-            if (boring > 0) saw_content_since_last_boundary = true;
-            i += boring;
-            if (i >= data.len) break;
-        }
-
-        const b = data[i];
-        if (state.in_string) {
-            saw_content_since_last_boundary = true;
-            if (state.escape_pending) {
-                state.escape_pending = false;
-            } else if (b == '\\') {
-                state.escape_pending = true;
-            } else if (b == '"') {
-                state.in_string = false;
-            }
-            i += 1;
-        } else switch (b) {
-            '"' => {
-                state.in_string = true;
-                saw_content_since_last_boundary = true;
-                i += 1;
-            },
-            '{', '[' => {
-                state.depth += 1;
-                saw_content_since_last_boundary = true;
-                i += 1;
-            },
-            '}', ']' => {
-                state.depth -|= 1;
-                saw_content_since_last_boundary = true;
-                i += 1;
-            },
-            '\n' => {
-                if (state.depth == 0 and saw_content_since_last_boundary) {
-                    count += 1;
-                    saw_content_since_last_boundary = false;
-                }
-                i += 1;
-            },
-            else => {
-                if (b != ' ' and b != '\t' and b != '\r') saw_content_since_last_boundary = true;
-                i += 1;
-            },
-        }
-    }
-
-    // Tail value with no trailing newline at depth 0.
-    if (saw_content_since_last_boundary and state.depth == 0 and !state.in_string) {
-        count += 1;
-    }
-    return count;
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -344,18 +266,6 @@ test "scanAll: unterminated string at EOF terminates without hang" {
     defer testing.allocator.free(bnds);
     // Still in_string at EOF → the \n was inside a string → no boundaries.
     try testing.expectEqual(@as(usize, 0), bnds.len);
-}
-
-test "countTopLevelValues: matches scanAll count plus tail value" {
-    // 3 newline-terminated values: count = 3.
-    try testing.expectEqual(@as(usize, 3), countTopLevelValues("1\n2\n3\n"));
-    // 3 values, last with no trailing newline: count = 3.
-    try testing.expectEqual(@as(usize, 3), countTopLevelValues("1\n2\n3"));
-    // Pretty single value: count = 1.
-    try testing.expectEqual(@as(usize, 1), countTopLevelValues("{\n  \"a\": 1\n}\n"));
-    // Empty / whitespace-only: count = 0.
-    try testing.expectEqual(@as(usize, 0), countTopLevelValues(""));
-    try testing.expectEqual(@as(usize, 0), countTopLevelValues("\n\n  \n"));
 }
 
 test "findNextRecordEnd: aligns past mid-value newline inside string" {

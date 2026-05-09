@@ -608,20 +608,26 @@ fn worker_fn(ctx: WorkerCtx) void {
             };
             state.aa = state.arena.allocator();
 
-            // Count records first so meta_list can be exactly pre-allocated.
-            // This prevents interleaving: meta_list is allocated FIRST (exact,
-            // never grows), then chunk_buf is allocated SECOND.  Because
-            // chunk_buf is always the arena's last allocation, it can resize
-            // in-place when output exceeds input size (e.g. pretty format) —
-            // no leaked copies from ArrayList doubling.
+            // Count records first so meta_list can be pre-sized. This
+            // prevents interleaving: meta_list is allocated FIRST (won't
+            // grow in the common case), then chunk_buf is allocated SECOND.
+            // Because chunk_buf is always the arena's last allocation, it
+            // can resize in-place when output exceeds input size (e.g.
+            // pretty format) — no leaked copies from ArrayList doubling.
+            //
+            // SIMD-popcount of '\n' is a cheap upper bound on record count:
+            // the feeder structurally aligns chunk boundaries, so every
+            // complete top-level value within `job.data` is terminated by
+            // a '\n'. Multi-line pretty values cause a slight over-estimate,
+            // which is fine for an `ensureTotalCapacity` hint. NIX-001
+            // briefly used a full structural state-machine walk here as a
+            // third byte-pass over every chunk; that cost is the regression
+            // this restoration removes.
             const record_count = blk: {
-                if (job.raw_input) {
-                    var count = countNewlines(job.data);
-                    // Account for a final line without trailing newline.
-                    if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
-                    break :blk count;
-                }
-                break :blk parser_mod.boundary.countTopLevelValues(job.data);
+                var count = countNewlines(job.data);
+                // Account for a final value without trailing newline.
+                if (job.data.len > 0 and job.data[job.data.len - 1] != '\n') count += 1;
+                break :blk count;
             };
             state.meta_list.ensureTotalCapacity(state.aa, record_count) catch {};
             // Pretty-printed compounds expand ~6× input size; compact emits
