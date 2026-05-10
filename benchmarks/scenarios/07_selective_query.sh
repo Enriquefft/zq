@@ -53,21 +53,28 @@ DISPLAY_FILE=$(display_filename "$DATA_FILE")
 FILE_SIZE=$(file_size_display "$DATA_FILE")
 LINE_COUNT=$(wc -l < "$DATA_FILE")
 
+# Threshold derived from LINE_COUNT for ~25% selectivity. The deterministic
+# generator emits ids uniformly in 1..LINE_COUNT, so any threshold expressed
+# as a fraction of LINE_COUNT lands the same selectivity regardless of
+# HUGE_LINES (regression: 1M; comparison: 15M).
+THRESHOLD=$(( LINE_COUNT * 3 / 4 ))
+
 # Pure-scalar selective predicate the harvester recognizes — yields a
 # `ProjectionPlan { predicate: { op: .gt, ... } }` in the default
-# build. The threshold is chosen so that ~25% of records pass; the
-# other ~75% are dropped at the parser boundary in the default build,
-# but reach the VM in the no-plan build. This shapes the attribution
-# delta clearly without being so selective that the work is dominated
-# by output formatting.
-QUERY='.[] | select(.id > 11250000) | .id'
+# build. ~25% of records pass; the other ~75% are dropped at the parser
+# boundary in the default build, but reach the VM in the no-plan build.
+# This shapes the attribution delta clearly without being so selective
+# that the work is dominated by output formatting.
+#
+# huge.jsonl is a record stream of objects (one JSON object per line),
+# not a single array. jq/zq apply the filter to each record directly —
+# no `.[]` prefix.
+QUERY="select(.id > $THRESHOLD) | .id"
 
-# Identity-stream variant for the verification step. zq's `.[]`
-# emits scalars, but jq with the same query also iterates a single
-# record-stream. EXPECTED_PASSED is recomputed from awk over the data
-# file because the deterministic huge generator's id distribution is
-# uniform 1..LINE_COUNT.
-EXPECTED_PASSED=$(awk -F'"id":' 'NR > 0 { split($2, a, ","); if (a[1] + 0 > 11250000) c++ } END { print c }' "$DATA_FILE")
+# EXPECTED_PASSED computed by awk over the data file. `c=0` initialized
+# in BEGIN so an all-fail input still prints 0 (not empty), which would
+# break verify_correctness's integer comparison.
+EXPECTED_PASSED=$(awk -F'"id":' -v t="$THRESHOLD" 'BEGIN { c = 0 } NR > 0 { split($2, a, ","); if (a[1] + 0 > t) c++ } END { print c }' "$DATA_FILE")
 
 echo "# Scenario 7: Selective Query (Predicate Pushdown Attribution)" > "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
