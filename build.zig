@@ -9,6 +9,15 @@ pub fn build(b: *std.Build) void {
     const ver = b.option([]const u8, "version", "Version string") orelse version;
     const regex_enabled = b.option(bool, "regex", "Enable regex builtins (requires rustc+cargo)") orelse true;
     const lsp_enabled = b.option(bool, "lsp", "Enable LSP server (--lsp flag). Disable to shrink CLI binary.") orelse true;
+    // `-Dno-plan=true` makes the projection-plan harvester unconditionally
+    // return `null`, so `CompiledQuery.projection_plan` is always absent
+    // and the parser stays on the no-plan code path. Used by the
+    // selective-query bench scenario to attribute the speedup cleanly to
+    // the projection / predicate pushdown work. Default `false`: the
+    // harvester runs and the parser routes plan-aware records through
+    // `feedPlanned`. Single source of truth — only `compiler/harvest.zig`
+    // (or its `projection_plan` harvester wrappers) consults this flag.
+    const no_plan = b.option(bool, "no-plan", "Disable projection plan harvester (for benchmark attribution)") orelse false;
     // `-Dprofile=true` compiles in the body of every `microbench/hooks.zig`
     // `markPhase` call site. Default is `false`: hooks expand to no-ops at
     // comptime and the production binary is byte-identical to a no-hooks
@@ -25,6 +34,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "regex_enabled", regex_enabled);
     options.addOption(bool, "lsp_enabled", lsp_enabled);
     options.addOption(bool, "profile_enabled", profile_enabled);
+    options.addOption(bool, "no_plan", no_plan);
     // One concrete options module, imported everywhere via addImport. Using
     // `addOptions(...)` on each consumer module would create *separate*
     // modules backed by the same generated source file — that collides when
@@ -128,6 +138,20 @@ pub fn build(b: *std.Build) void {
     });
     io_module.addImport("error", error_module);
 
+    // Projection plan + predicate types — produced by the compiler's
+    // harvester (`src/compiler/harvest.zig`), consumed by the parser
+    // (`src/parser/src/parser.zig` via `feedPlanned`). Defined as its
+    // own module so both the parser and compiler can `@import` the
+    // same file without forcing a parser→compiler dependency edge
+    // (which would create a cycle since compiler→… eventually wires
+    // back through query→… ). Single source of truth for the type
+    // definitions.
+    const projection_plan_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/projection_plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const parser_module = b.createModule(.{
         .root_source_file = b.path("src/parser/root.zig"),
         .target = target,
@@ -135,6 +159,8 @@ pub fn build(b: *std.Build) void {
     });
     parser_module.addImport("error", error_module);
     parser_module.addImport("types", types_module);
+    parser_module.addImport("projection_plan", projection_plan_module);
+    parser_module.addImport("build_options", build_options_module);
 
     const lexer_module = b.createModule(.{
         .root_source_file = b.path("src/lexer/root.zig"),
@@ -192,6 +218,8 @@ pub fn build(b: *std.Build) void {
     compiler_module.addImport("regex", regex_module);
     compiler_module.addImport("prefilter", prefilter_module);
     compiler_module.addImport("module_resolver", module_resolver_module);
+    compiler_module.addImport("projection_plan", projection_plan_module);
+    compiler_module.addImport("build_options", build_options_module);
 
     // VM (runtime executor) — consumes the bytecode produced by the
     // compiler and produces `ResultIterator`. Phase 2R cutover: relocated
@@ -224,6 +252,7 @@ pub fn build(b: *std.Build) void {
     query_module.addImport("ast", ast_module);
     query_module.addImport("prefilter", prefilter_module);
     query_module.addImport("compiler", compiler_module);
+    query_module.addImport("projection_plan", projection_plan_module);
     // The regex module already carries the shim as an object file and links
     // libc/libunwind. The query module picks those up transitively via
     // `addImport`, so no extra link options are needed here. Avoid adding
@@ -364,6 +393,25 @@ pub fn build(b: *std.Build) void {
 
     const boundary_simd_property_tests = b.addTest(.{ .root_module = boundary_simd_property_test_mod });
     test_step.dependOn(&b.addRunArtifact(boundary_simd_property_tests).step);
+
+    // Projection-plan + pure-predicate-pushdown property test (Commit 1).
+    // Exercises the in-process Pool against jq subprocess on randomly
+    // generated `select(.id OP N) | <projection>` queries × random JSONL
+    // at thread counts {1, 2, 4, 8}. Includes a deterministic bleed-
+    // through stress that walks every (op, literal, projection) shape
+    // the harvester accepts.
+    const projection_property_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/projection_property_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    projection_property_test_mod.addImport("pool", pool_module);
+    projection_property_test_mod.addImport("query", query_module);
+    projection_property_test_mod.addImport("types", types_module);
+
+    const projection_property_tests = b.addTest(.{ .root_module = projection_property_test_mod });
+    if (shim_build_step) |step| projection_property_tests.step.dependOn(&step.step);
+    test_step.dependOn(&b.addRunArtifact(projection_property_tests).step);
 
     const query_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/query_test.zig"),

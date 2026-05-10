@@ -11,6 +11,13 @@ set -o pipefail
 CURRENT="$1"
 BASELINE="$2"
 THRESHOLD=15
+# Narrow-records is the load-bearing no-plan parse-loop guard: any
+# regression of zq/jq ratio > 2% on the `.id` extraction workload
+# indicates the plan-aware code path's coexistence in the same
+# translation unit perturbed the no-plan body's machine code in a
+# user-visible way (replaces the prior byte-identity-via-objdump
+# invariant — see Commit 1's commit message §β for rationale).
+NARROW_THRESHOLD=2
 
 # Peak-RSS gate (zq only). Two checks fire independently; either tripping
 # fails CI.
@@ -55,11 +62,13 @@ echo ""
 FAILED=0
 
 # Compare zq/jq ratio against baseline ratio
-# Usage: check_scenario "scenario_name" "zq_key" "jq_key"
+# Usage: check_scenario "scenario_name" "zq_key" "jq_key" [override_threshold]
+# When override_threshold is omitted, the global $THRESHOLD applies.
 check_scenario() {
     local name="$1"
     local zq_key="$2"
     local jq_key="$3"
+    local thresh="${4:-$THRESHOLD}"
 
     local cur_zq cur_jq base_zq base_jq
     cur_zq=$(jq -r "$zq_key" "$CURRENT" 2>/dev/null)
@@ -76,7 +85,7 @@ check_scenario() {
     done
 
     local result
-    result=$(awk -v cz="$cur_zq" -v cj="$cur_jq" -v bz="$base_zq" -v bj="$base_jq" -v thresh="$THRESHOLD" '
+    result=$(awk -v cz="$cur_zq" -v cj="$cur_jq" -v bz="$base_zq" -v bj="$base_jq" -v thresh="$thresh" '
     BEGIN {
         if (cj > 0 && bj > 0) {
             cur_ratio = cz / cj
@@ -102,10 +111,10 @@ check_scenario() {
     fi
 
     if [ "$status" = "REGRESSION" ]; then
-        echo "REGRESSION: $name — ratio ${cur_ratio} vs baseline ${base_ratio} (${change}% worse)"
+        echo "REGRESSION: $name — ratio ${cur_ratio} vs baseline ${base_ratio} (${change}% worse, threshold ${thresh}%)"
         FAILED=1
     else
-        echo "OK: $name — ratio ${cur_ratio} vs baseline ${base_ratio} (${change}% change)"
+        echo "OK: $name — ratio ${cur_ratio} vs baseline ${base_ratio} (${change}% change, threshold ${thresh}%)"
     fi
 }
 
@@ -164,7 +173,9 @@ check_rss() {
     fi
 }
 
-echo "Benchmark Regression Check (ratio-based, threshold: ${THRESHOLD}%)"
+echo "Benchmark Regression Check (ratio-based)"
+echo "  • Default threshold: ${THRESHOLD}%"
+echo "  • Narrow-records threshold: ${NARROW_THRESHOLD}% (no-plan parse-loop guard)"
 echo "==================================================================="
 echo ""
 
@@ -172,7 +183,33 @@ check_scenario "parallelism"     ".scenarios.parallelism.zq_mean_s"     ".scenar
 check_scenario "streaming"       ".scenarios.streaming.zq_mean_s"       ".scenarios.streaming.jq_mean_s"
 check_scenario "startup_latency" ".scenarios.startup_latency.zq_mean_s" ".scenarios.startup_latency.jq_mean_s"
 check_scenario "complex_query"   ".scenarios.complex_query.zq_mean_s"   ".scenarios.complex_query.jq_mean_s"
+# Narrow-records uses a tighter 2% threshold — this is the no-plan
+# parse-loop guard.
+check_scenario "narrow_records"  ".scenarios.narrow_records.zq_mean_s"  ".scenarios.narrow_records.jq_mean_s" "$NARROW_THRESHOLD"
+# Selective-query uses the production zq_default mean against jq.
+# The default→no-plan attribution ratio is informational (logged below
+# the gate, not enforced) since it depends on dataset-specific
+# selectivity that the regression baseline doesn't fix.
+check_scenario "selective_query" ".scenarios.selective_query.zq_default_mean_s" ".scenarios.selective_query.jq_mean_s"
 check_rss
+
+# Selective-query attribution: log the speedup of the default
+# (predicate-pushed) build over the no-plan attribution build. Not
+# gated — informational only.
+log_selective_attribution() {
+    local sq_default sq_noplan
+    sq_default=$(jq -r '.scenarios.selective_query.zq_default_mean_s // empty' "$CURRENT" 2>/dev/null)
+    sq_noplan=$(jq -r '.scenarios.selective_query.zq_noplan_mean_s // empty' "$CURRENT" 2>/dev/null)
+    if [ -z "$sq_default" ] || [ "$sq_default" = "null" ] || \
+       [ -z "$sq_noplan" ] || [ "$sq_noplan" = "null" ]; then
+        echo "INFO: selective_attribution — no-plan attribution missing"
+        return
+    fi
+    local ratio
+    ratio=$(awk -v d="$sq_default" -v n="$sq_noplan" 'BEGIN { if (d > 0) printf "%.2fx", n / d }')
+    echo "INFO: selective_attribution — predicate pushdown gives ${ratio} speedup vs -Dno-plan=true"
+}
+log_selective_attribution
 
 echo ""
 

@@ -556,6 +556,14 @@ fn worker_fn(ctx: WorkerCtx) void {
     };
     defer parser.deinit();
 
+    // Plan-aware side-table, lazily allocated on the first record whose
+    // CompiledQuery carries a `projection_plan`. Held outside `Parser` so
+    // the no-plan code path stays byte-identical to master (Zig auto-
+    // reorders struct fields by alignment, so any field added to the
+    // parser shifts every offset). Reset on every top-level value.
+    var opt_plan_state: ?parser_mod.PlanState = null;
+    defer if (opt_plan_state) |*ps| ps.deinit();
+
     // Persistent ResultIterator: initialised once on the first record, then
     // reset() on every subsequent record — zero alloc/free cycles after the first.
     // Uses ctx.allocator (GPA) so its eval stack survives across chunks.
@@ -711,7 +719,26 @@ fn worker_fn(ctx: WorkerCtx) void {
                     if (cursor >= job.data.len) break;
 
                     const value_start = cursor;
-                    const result = parser.feed(job.data[cursor..], true) catch |e| {
+                    // Plan-aware dispatch: if the CompiledQuery carries a
+                    // projection_plan, route through `feedPlanned` so the
+                    // pure-scalar predicate can drop records before the VM
+                    // sees them. The no-plan branch calls `feed` directly so
+                    // its machine code stays byte-identical to master.
+                    const result = blk: {
+                        if (job.query.projection_plan) |*plan| {
+                            if (opt_plan_state == null) {
+                                opt_plan_state = parser_mod.PlanState.init(ctx.allocator) catch {
+                                    // OOM on plan-state alloc: fall back to
+                                    // plain feed for this chunk; correctness
+                                    // is preserved (predicate just won't
+                                    // short-circuit). Future chunks retry.
+                                    break :blk parser.feed(job.data[cursor..], true);
+                                };
+                            }
+                            break :blk parser.feedPlanned(plan, &opt_plan_state.?, job.data[cursor..], true);
+                        }
+                        break :blk parser.feed(job.data[cursor..], true);
+                    } catch |e| {
                         const append_err = struct {
                             fn call(s: *SerializeJobState, code: u16) void {
                                 const meta = RecordMeta{
@@ -756,6 +783,15 @@ fn worker_fn(ctx: WorkerCtx) void {
                             state.meta_list.append(state.aa, meta) catch {};
                             parser.reset();
                             break;
+                        },
+                        .dropped => |d| {
+                            // Predicate rejected this record: tape and
+                            // string-buf were rolled back inside the parser.
+                            // Skip ProcessOne entirely — no output for this
+                            // record. Advance and continue with the next.
+                            const advance = if (d.consumed == 0) job.data.len - value_start else d.consumed;
+                            parser.reset();
+                            cursor = value_start + advance;
                         },
                     }
                 }
@@ -815,7 +851,18 @@ fn worker_fn(ctx: WorkerCtx) void {
                     if (cursor >= job.data.len) break;
 
                     const value_start = cursor;
-                    const result = parser.feed(job.data[cursor..], true) catch |e| {
+                    // Plan-aware dispatch (mirror of the serialized path).
+                    const result = blk: {
+                        if (job.query.projection_plan) |*plan| {
+                            if (opt_plan_state == null) {
+                                opt_plan_state = parser_mod.PlanState.init(ctx.allocator) catch {
+                                    break :blk parser.feed(job.data[cursor..], true);
+                                };
+                            }
+                            break :blk parser.feedPlanned(plan, &opt_plan_state.?, job.data[cursor..], true);
+                        }
+                        break :blk parser.feed(job.data[cursor..], true);
+                    } catch |e| {
                         append_outcome(&records, aa, .{ .err = @as(ZqError, @errorCast(e)) });
                         parser.reset();
                         const skip = std.mem.indexOfScalar(u8, job.data[cursor..], '\n') orelse (job.data.len - cursor);
@@ -846,6 +893,12 @@ fn worker_fn(ctx: WorkerCtx) void {
                             append_outcome(&records, aa, .{ .err = error.UnexpectedEof });
                             parser.reset();
                             break;
+                        },
+                        .dropped => |d| {
+                            // Predicate rejected: skip this record entirely.
+                            const advance = if (d.consumed == 0) job.data.len - value_start else d.consumed;
+                            parser.reset();
+                            cursor = value_start + advance;
                         },
                     }
                 }

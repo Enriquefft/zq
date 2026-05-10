@@ -33,6 +33,8 @@ test "JSONTestSuite: y_* files parse successfully" {
                 std.debug.print("FAIL: y_* file returned need_more: {s}\n", .{entry.name});
                 return error.UnexpectedNeedMore;
             },
+            // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+            .dropped => unreachable,
         }
         count += 1;
     }

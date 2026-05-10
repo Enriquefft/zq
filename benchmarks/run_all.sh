@@ -21,11 +21,15 @@ export ZQ_QUICK
 # Source progress utilities
 source "$BENCHMARK_DIR/progress.sh"
 
-# All five scenarios run in both modes. Regression mode consumes 02_memory's
-# peak-RSS reading via check_regression.sh's absolute-ceiling gate, so the
-# memory scenario is no longer optional.
+# All seven scenarios run in both modes. Regression mode consumes
+# 02_memory's peak-RSS reading via check_regression.sh's absolute-
+# ceiling gate, so the memory scenario is no longer optional. The
+# narrow-records scenario (06) is the no-plan parse-loop guard
+# replacing the prior byte-identity-via-objdump invariant; the
+# selective-query scenario (07) attributes predicate-pushdown speedup
+# by running zq twice (default build + `-Dno-plan=true`).
 BENCH_MODE="${BENCH_MODE:-comparison}"
-TOTAL_SCENARIOS=5
+TOTAL_SCENARIOS=7
 
 init_main_progress
 
@@ -128,11 +132,13 @@ run_scenario() {
     } >> "$SUMMARY_FILE"
 }
 
-run_scenario "Multi-core Scalability" "01_parallelism.sh" "01_parallelism.md"
-run_scenario "Memory Efficiency"      "02_memory.sh"          "02_memory.md"
-run_scenario "Startup Latency"        "03_startup_latency.sh" "03_startup_latency.md"
-run_scenario "Streaming Throughput"   "04_streaming.sh"       "04_streaming.md"
-run_scenario "Complex Query"          "05_complex_query.sh"   "05_complex_query.md"
+run_scenario "Multi-core Scalability" "01_parallelism.sh"      "01_parallelism.md"
+run_scenario "Memory Efficiency"      "02_memory.sh"           "02_memory.md"
+run_scenario "Startup Latency"        "03_startup_latency.sh"  "03_startup_latency.md"
+run_scenario "Streaming Throughput"   "04_streaming.sh"        "04_streaming.md"
+run_scenario "Complex Query"          "05_complex_query.sh"    "05_complex_query.md"
+run_scenario "Narrow Records"         "06_narrow_records.sh"   "06_narrow_records.md"
+run_scenario "Selective Query"        "07_selective_query.sh"  "07_selective_query.md"
 
 echo "" >&2
 
@@ -203,7 +209,28 @@ HEADER
     # Complex query
     CQ_ZQ=$(extract_mean "$BENCHMARK_DIR/results/05_complex_query.json" "zq")
     CQ_JQ=$(extract_mean "$BENCHMARK_DIR/results/05_complex_query.json" "jq")
-    printf '    "complex_query": {"zq_mean_s": %s, "jq_mean_s": %s}\n' "${CQ_ZQ:-null}" "${CQ_JQ:-null}"
+    printf '    "complex_query": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${CQ_ZQ:-null}" "${CQ_JQ:-null}"
+
+    # Narrow records — no-plan parse-loop guard. The CI regression gate
+    # treats this scenario's zq/jq ratio as the load-bearing invariant
+    # for the no-plan path (replacing the prior byte-identity-via-
+    # objdump invariant — see commit message for rationale).
+    NR_ZQ=$(extract_mean "$BENCHMARK_DIR/results/06_narrow_records.json" "zq")
+    NR_JQ=$(extract_mean "$BENCHMARK_DIR/results/06_narrow_records.json" "jq")
+    printf '    "narrow_records": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${NR_ZQ:-null}" "${NR_JQ:-null}"
+
+    # Selective query — predicate-pushdown attribution. Two zq numbers
+    # are emitted: `zq_default_mean_s` (production binary, predicate
+    # pushed into `feedPlanned`) and `zq_noplan_mean_s` (-Dno-plan=true
+    # binary, predicate evaluated by the VM). Both compared against jq
+    # for orientation, but the load-bearing number is the
+    # default→no-plan ratio: the speedup attributable to the C1
+    # predicate-pushdown work.
+    SQ_ZQD=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-default")
+    SQ_ZQN=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-noplan")
+    SQ_JQ=$(extract_mean  "$BENCHMARK_DIR/results/07_selective_query.json" "jq")
+    printf '    "selective_query": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s}\n' \
+        "${SQ_ZQD:-null}" "${SQ_ZQN:-null}" "${SQ_JQ:-null}"
 
     echo '  }'
     echo '}'
@@ -223,13 +250,15 @@ cat >> "$SUMMARY_FILE" << EOF
 
 ## Test Scenarios
 
-This benchmark suite includes five test scenarios:
+This benchmark suite includes seven test scenarios:
 
 1. **Multi-core Scalability**: Throughput on large-scale batch processing
 2. **Memory Efficiency**: Resource footprint during streaming operations
 3. **Startup Latency**: Process initialization overhead
 4. **Streaming Throughput**: Pipe-based stdin processing performance
 5. **Complex Query**: Real-world transformation with multiple operators
+6. **Narrow Records**: No-plan parse-loop throughput guard (≤2% regression vs jq baseline)
+7. **Selective Query**: Predicate-pushdown attribution (default vs `-Dno-plan=true` build)
 
 ---
 
@@ -248,6 +277,8 @@ echo "    02_memory.md           — Memory Efficiency" >&2
 echo "    03_startup_latency.md  — Startup Latency" >&2
 echo "    04_streaming.md        — Streaming Throughput" >&2
 echo "    05_complex_query.md    — Complex Query" >&2
+echo "    06_narrow_records.md   — Narrow Records (no-plan guard)" >&2
+echo "    07_selective_query.md  — Selective Query (pushdown attribution)" >&2
 echo "" >&2
 echo "  Full Summary: $SUMMARY_FILE" >&2
 echo "" >&2

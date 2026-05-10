@@ -236,6 +236,29 @@ pub fn compile(
         error.OutOfMemory => {},
     }
 
+    // Stage 6: harvest projection plan + optional pure-scalar predicate
+    // (C1 of the per-core ceiling roadmap). Runs after fuse so chained
+    // `.a | .b | .c` projections appear as a single `load_path` node;
+    // both shapes are accepted by the harvester. On any rejection or
+    // OOM we leave `projection_plan = null` and the parser stays on
+    // the no-plan code path.
+    //
+    // Predicate harvest is attempted first because a `select(...)`
+    // root rejects the plain projection harvester. If the predicate
+    // shape doesn't match, we fall through to projection harvest.
+    if (harvest_mod.harvestPredicate(allocator, &fused)) |maybe_plan| {
+        if (maybe_plan) |pp| compiled.projection_plan = pp;
+    } else |err| switch (err) {
+        error.OutOfMemory => {},
+    }
+    if (compiled.projection_plan == null) {
+        if (harvest_mod.harvestProjectionPlan(allocator, &fused)) |maybe_plan| {
+            if (maybe_plan) |pp| compiled.projection_plan = pp;
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
+    }
+
     compiled_consumed = true;
     return .{ .ok = compiled };
 }

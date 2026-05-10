@@ -4,12 +4,17 @@ const types = @import("types");
 const vm = @import("vm");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
+const projection_plan_mod = @import("projection_plan");
 // Phase 2R cutover: the new compiler at `src/compiler/` is the only
 // backend. The pre-cutover backend dispatcher and build flag are gone;
 // `compile()` is a thin wrapper over `new_compiler.compile`.
 const new_compiler = @import("compiler");
 
 pub const PrefilterSet = prefilter_mod.PrefilterSet;
+/// Re-exported so pool / parser-driver call sites can speak the type
+/// name without re-importing the compiler-side projection_plan module.
+/// Single source of truth lives in `src/compiler/projection_plan.zig`.
+pub const ProjectionPlan = projection_plan_mod.ProjectionPlan;
 
 pub const ZqError = err_mod.ZqError;
 pub const Tape = types.Tape;
@@ -73,6 +78,15 @@ pub const CompiledQuery = struct {
     /// `null` otherwise. The parallel chunk worker consults this before
     /// parsing each record.
     prefilter: ?prefilter_mod.PrefilterSet,
+    /// Static projection plan + optional pure-scalar predicate harvested
+    /// from the IR after lower+fuse. When present, the pool worker calls
+    /// `parser.feedPlanned(plan, ...)` instead of `parser.feed(...)` —
+    /// the parser then skips out-of-projection JSON values scalarly and
+    /// drops top-level records that fail the predicate via tape /
+    /// string-buf snapshot rollback. `null` when the filter shape does
+    /// not qualify (any non-pure op in the projection chain or an
+    /// unsupported predicate idiom). C1 of the per-core ceiling roadmap.
+    projection_plan: ?ProjectionPlan,
 
     /// Compile `src` into bytecode. Returns a CompileResult union:
     /// `.ok` on success, `.err` with source location on compile error.
@@ -115,6 +129,7 @@ pub const CompiledQuery = struct {
                 .opts = opts,
                 .regex_pool = compiled.regex_pool,
                 .prefilter = compiled.prefilter,
+                .projection_plan = compiled.projection_plan,
             } },
             .err => |ce| return .{ .err = ce },
         }
@@ -128,6 +143,7 @@ pub const CompiledQuery = struct {
         q.allocator.free(q.external_var_ids);
         q.regex_pool.deinit();
         if (q.prefilter) |*p| p.deinit();
+        if (q.projection_plan) |*pp| pp.deinit();
         if (q.function_table.len > 0) {
             for (q.function_table) |def| {
                 if (def.write_set.len > 0) q.allocator.free(def.write_set);

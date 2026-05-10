@@ -266,6 +266,8 @@ pub fn main() !u8 {
                             printErr("\n");
                             return EXIT_USAGE;
                         },
+                        // `.dropped` only from `feedPlanned`; this is plain `feed`.
+                        .dropped => unreachable,
                     };
                     const entry = tape.entries[0];
                     switch (entry.tag) {
@@ -393,6 +395,8 @@ pub fn main() !u8 {
                             printErr("\n");
                             return EXIT_USAGE;
                         },
+                        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+                        .dropped => unreachable,
                     };
                     // Copy parsed value into argjson_rt
                     argjson_rt.copyFrom(tape, allocator) catch {
@@ -474,6 +478,8 @@ pub fn main() !u8 {
                                 _ = argjson_rt.appendEntry(allocator, .{ .tag = .null_val, .payload = .{ .none = {} } }) catch {};
                                 continue;
                             },
+                            // `.dropped` only from `feedPlanned`; this is plain `feed`.
+                            .dropped => unreachable,
                         };
                         argjson_rt.copyFrom(tape, allocator) catch {
                             printErr("zq: out of memory\n");
@@ -846,6 +852,8 @@ fn collectJsonValues(
                         had_errors.* = true;
                         parser.reset();
                     },
+                    // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+                    .dropped => unreachable,
                 }
             }
             break;
@@ -894,6 +902,8 @@ fn collectJsonValues(
                 if (view.is_eof) break;
                 _ = try src.refill();
             },
+            // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+            .dropped => unreachable,
         }
     }
 }
@@ -992,6 +1002,8 @@ fn processNullInput(
     const tape = switch (result) {
         .done => |d| d.tape,
         .need_more => return .none,
+        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+        .dropped => unreachable,
     };
 
     var opt_it: ?query_mod.ResultIterator = null;
@@ -1190,6 +1202,8 @@ fn describeStream(
                     .need_more => {
                         parser.reset();
                     },
+                    // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+                    .dropped => unreachable,
                 }
             }
             break;
@@ -1236,6 +1250,8 @@ fn describeStream(
                 if (view.is_eof) break;
                 _ = try src.refill();
             },
+            // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+            .dropped => unreachable,
         }
     }
 }
@@ -1391,6 +1407,8 @@ fn loadSlurpfile(
                 printErr("\n");
                 return error.UsageError;
             },
+            // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+            .dropped => unreachable,
         }
     }
 

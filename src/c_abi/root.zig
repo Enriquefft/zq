@@ -400,6 +400,8 @@ pub export fn zq_execute(
             setError(handle, ERR_PARSE, "unexpected_eof", null);
             return ERR_PARSE;
         },
+        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+        .dropped => unreachable,
     };
 
     // Execute the compiled query against the tape.

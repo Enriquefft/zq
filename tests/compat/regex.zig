@@ -43,6 +43,8 @@ fn runFilterStrict(filter: []const u8, input_json: []const u8) ![][]const u8 {
     const tape = switch (try p.feed(input_json, true)) {
         .done => |d| d.tape,
         .need_more => return error.ParseIncomplete,
+        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
+        .dropped => unreachable,
     };
 
     const result = try query_mod.CompiledQuery.compile(filter, .{}, h.alloc);
