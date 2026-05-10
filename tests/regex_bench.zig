@@ -118,8 +118,6 @@ test "regex bench: prefilter skips parse for non-matching records" {
     const first_tape = switch (first_fr) {
         .done => |d| d.tape,
         .need_more => unreachable,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     };
     var it = try cq.execute(first_tape, &.{}, alloc);
     defer it.deinit();

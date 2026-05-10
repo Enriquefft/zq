@@ -2,73 +2,9 @@ const std = @import("std");
 const types = @import("types");
 const err_mod = @import("error");
 const simd = @import("simd.zig");
-const projection_plan_mod = @import("projection_plan");
 
 pub const ZqError = err_mod.ZqError;
 pub const Tape = types.Tape;
-pub const ProjectionPlan = projection_plan_mod.ProjectionPlan;
-
-/// Per-parser side-table of plan navigation state. Held *outside* the
-/// `Parser` struct so the no-plan parse path's struct layout stays
-/// byte-identical to the pre-Commit-1 `Parser` (Zig's auto field
-/// reordering shifts every field's offset whenever a new field is
-/// appended, regardless of position in source). The pool worker that
-/// owns the `Parser` allocates one of these alongside the parser when
-/// `CompiledQuery.projection_plan != null` and threads it through
-/// `feedPlanned` per call.
-///
-/// Lifetime: caller-owned. Reset (zero state) on every top-level value
-/// reset; deinit drops the heap-allocated `plan_stack` slice.
-pub const PlanState = struct {
-    /// Active plan-node index. Matched by `feedGeneric` against
-    /// `plan.root` at the start of each top-level value.
-    plan_cursor: u32,
-    /// Per-depth saved plan cursor — pushed on container-open, popped
-    /// on container-close. Sized to the parser's `DEPTH_LIMIT` so it
-    /// never re-allocates during a single parse.
-    plan_stack: []u32,
-    /// Snapshot of `tape_buf.items.len` at the start of the current
-    /// top-level value. Used to roll the tape back when a plan-aware
-    /// predicate rejects the value.
-    top_value_tape_start: usize,
-    /// Snapshot of `string_buf.items.len` at the start of the current
-    /// top-level value. Mirrors `top_value_tape_start` so string
-    /// interns allocated inside a dropped record can be reclaimed.
-    top_value_string_start: usize,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!PlanState {
-        const stack = try allocator.alloc(u32, DEPTH_LIMIT);
-        @memset(stack, 0);
-        return .{
-            .plan_cursor = 0,
-            .plan_stack = stack,
-            .top_value_tape_start = 0,
-            .top_value_string_start = 0,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(s: *PlanState) void {
-        s.allocator.free(s.plan_stack);
-    }
-
-    pub fn reset(s: *PlanState) void {
-        s.plan_cursor = 0;
-        s.top_value_tape_start = 0;
-        s.top_value_string_start = 0;
-    }
-};
-
-/// Bundled plan context passed into `feedGeneric` when the caller
-/// has a projection plan. Kept as a small struct (two pointers) so
-/// `feedPlanned` can pass a single value into the comptime-specialized
-/// generic — the `PlanT` type parameter then carries the layout, and
-/// `void` selects the no-plan specialization.
-const PlanCtx = struct {
-    plan: *const ProjectionPlan,
-    state: *PlanState,
-};
 
 /// The outcome of a single `feed()` call.
 pub const FeedResult = union(enum) {
@@ -79,14 +15,6 @@ pub const FeedResult = union(enum) {
     done: struct { tape: Tape, consumed: usize },
     /// Valid so far but incomplete; call `feed()` again with the next chunk.
     need_more,
-    /// A complete top-level JSON value was parsed but rejected by the
-    /// pure-scalar select() predicate threaded in via `feedPlanned`.
-    /// The parser has rolled the tape and string-buf back to the
-    /// snapshot taken at the start of the value, so `tape` is empty
-    /// and the caller may continue feeding the next record. Only the
-    /// `feedPlanned` path can return this variant — `feed` (no plan)
-    /// never produces it.
-    dropped: struct { consumed: usize },
 };
 
 const DEPTH_LIMIT: u32 = 512;
@@ -225,218 +153,54 @@ pub const Parser = struct {
         p.kw_pos = 0;
     }
 
-    /// Plan-agnostic feed entry point. Trampoline over
-    /// `feedGeneric(void, {}, ...)` — the comptime `PlanT == void`
-    /// specialization elides every plan-aware code path before LLVM
-    /// sees the body. `void` is zero-sized: the `plan_ctx` parameter
-    /// generates no stack slot, no register, no machine code.
-    ///
-    /// Note on byte-identity vs master: `feed`'s emitted body is NOT
-    /// byte-identical to master's pre-Commit-1 `feed`. Master inlined
-    /// `processEof`, `autoClose`, `finalizeNumber`, and `makeTape`
-    /// directly into `feed` (single-callsite inlining heuristic).
-    /// Once `feedPlanned` exists in the same translation unit, those
-    /// helpers have two callers and LLVM keeps them as out-of-line
-    /// functions. The hot loop machine code is structurally
-    /// equivalent (same SIMD, same dispatch); the cold tail is
-    /// shared via call instead of inlined. The runtime invariant
-    /// guarding this — narrow-records throughput within 2% of master —
-    /// is enforced by the bench regression CI gate, not by
-    /// instruction-level identity.
     pub fn feed(
         p: *Parser,
         input: []const u8,
         is_eof: bool,
     ) (ZqError || error{OutOfMemory})!FeedResult {
-        return p.feedGeneric(void, {}, input, is_eof);
-    }
-
-    /// Plan-aware feed entry point. Drives the same byte dispatch
-    /// loop as `feed` and, on every top-level-value completion,
-    /// evaluates the harvested pure-scalar predicate (when the plan
-    /// carries one). When the predicate is false, the tape and
-    /// string-buf are rolled back to the snapshot taken at the start
-    /// of the value and the parser returns `FeedResult.dropped` —
-    /// downstream stages (VM dispatch, output serialization) never
-    /// see the dropped record.
-    ///
-    /// Trampoline over `feedGeneric(PlanCtx, .{...}, ...)`. The
-    /// generic carries a single source of truth for the byte dispatch
-    /// loop; both `feed` and `feedPlanned` resolve to specializations
-    /// of the same body via comptime type-erasure (`PlanT == void`
-    /// vs `PlanT == PlanCtx`).
-    pub fn feedPlanned(
-        p: *Parser,
-        plan: *const ProjectionPlan,
-        plan_state: *PlanState,
-        input: []const u8,
-        is_eof: bool,
-    ) (ZqError || error{OutOfMemory})!FeedResult {
-        const ctx: PlanCtx = .{ .plan = plan, .state = plan_state };
-        return p.feedGeneric(PlanCtx, ctx, input, is_eof);
-    }
-
-    /// Comptime-specialized parse loop. `PlanT == void` selects the
-    /// no-plan code path (used by `feed`); `PlanT == PlanCtx` selects
-    /// the plan-aware path (used by `feedPlanned`).
-    ///
-    /// Comptime-erasure rationale: the parameter is a comptime *type*
-    /// (`PlanT`), not a comptime *value*. `void` is zero-sized, so
-    /// the `plan_ctx` parameter occupies neither stack nor register
-    /// in the no-plan specialization. `if (PlanT == void)` is a
-    /// comptime-known branch that the compiler eliminates before
-    /// code-gen, so the two specializations have entirely separate
-    /// IR and the no-plan body never sees plan-aware locals.
-    ///
-    /// Single source of truth for the byte dispatch loop: both
-    /// specializations share the same source body verbatim, gated
-    /// only at the boundaries (snapshot init, top-of-record
-    /// finalization, EOF handling). The differential property test in
-    /// `tests/projection_property_test.zig` asserts both
-    /// specializations produce byte-identical output relative to jq,
-    /// catching any divergence between the two paths.
-    fn feedGeneric(
-        p: *Parser,
-        comptime PlanT: type,
-        plan_ctx: PlanT,
-        input: []const u8,
-        is_eof: bool,
-    ) (ZqError || error{OutOfMemory})!FeedResult {
-        // Two physically separate bodies, gated by a comptime-known
-        // type comparison. Zig folds `if (PlanT == void)` at semantic-
-        // analysis time and only the chosen arm is lowered to IR; the
-        // other arm's locals never enter LLVM's frame layout, which
-        // is the difference between this shape and the prior nested-
-        // `if (PlanT != void)` per-step shape (where dead-arm locals
-        // still allocated stack slots).
-        if (PlanT == void) {
-            var i: usize = 0;
-            // Strip a UTF-8 BOM (U+FEFF → 0xEF 0xBB 0xBF) that appears at
-            // the very beginning of a JSON stream.  jq silently discards
-            // BOM-prefixed input (jq test L48); we mirror that behaviour.
-            // Only strip once — when the tape is still empty (first feed
-            // call for this value).
-            if (p.tape_buf.items.len == 0 and p.stack.items.len == 0 and
-                p.state == .want_value and
-                i + 3 <= input.len and
-                input[i] == 0xEF and input[i + 1] == 0xBB and input[i + 2] == 0xBF)
-            {
-                i += 3;
-            }
-            while (i < input.len) {
-                // ── SIMD fast paths ──────────────────────────────
-                switch (p.state) {
-                    .in_string => {
-                        if (p.utf8_pending == 0 and p.unicode_surrogate == 0) {
-                            const safe = simd.scanStringBody(input[i..]);
-                            if (safe > 0) {
-                                try p.string_buf.appendSlice(p.allocator, input[i..][0..safe]);
-                                i += safe;
-                                continue;
-                            }
-                        }
-                    },
-                    .want_value, .want_key, .want_colon, .after_value => {
-                        const skip = simd.skipWhitespace(input[i..]);
-                        i += skip;
-                        if (i >= input.len) break;
-                    },
-                    else => {},
-                }
-                // ── Scalar fallback ──────────────────────────────
-                try p.processByte(input[i]);
-                i += 1;
-                if (p.state == .top_done) {
-                    return .{ .done = .{ .tape = p.makeTape(), .consumed = i } };
-                }
-            }
-            if (is_eof) return p.processEof();
-            return .need_more;
-        } else {
-            // Plan-aware initialization: snapshot tape + string-buf
-            // cursors at the start of every top-level value so a
-            // failing predicate can roll the buffers back. Done only
-            // when the parser is fresh (no buffered tape entries / no
-            // open container). When the call resumes mid-value (the
-            // prior call returned `need_more`), the existing snapshot
-            // is preserved.
-            if (p.tape_buf.items.len == 0 and p.stack.items.len == 0 and
-                p.state == .want_value)
-            {
-                plan_ctx.state.top_value_tape_start = p.tape_buf.items.len;
-                plan_ctx.state.top_value_string_start = p.string_buf.items.len;
-                plan_ctx.state.plan_cursor = plan_ctx.plan.root;
-            }
-            var i: usize = 0;
-            if (p.tape_buf.items.len == 0 and p.stack.items.len == 0 and
-                p.state == .want_value and
-                i + 3 <= input.len and
-                input[i] == 0xEF and input[i + 1] == 0xBB and input[i + 2] == 0xBF)
-            {
-                i += 3;
-            }
-            while (i < input.len) {
-                switch (p.state) {
-                    .in_string => {
-                        if (p.utf8_pending == 0 and p.unicode_surrogate == 0) {
-                            const safe = simd.scanStringBody(input[i..]);
-                            if (safe > 0) {
-                                try p.string_buf.appendSlice(p.allocator, input[i..][0..safe]);
-                                i += safe;
-                                continue;
-                            }
-                        }
-                    },
-                    .want_value, .want_key, .want_colon, .after_value => {
-                        const skip = simd.skipWhitespace(input[i..]);
-                        i += skip;
-                        if (i >= input.len) break;
-                    },
-                    else => {},
-                }
-                try p.processByte(input[i]);
-                i += 1;
-                if (p.state == .top_done) {
-                    return finalizePlannedRecord(p, plan_ctx.plan, plan_ctx.state, i);
-                }
-            }
-            if (is_eof) {
-                const eof_result = try p.processEof();
-                switch (eof_result) {
-                    .done => |d| return finalizePlannedRecord(p, plan_ctx.plan, plan_ctx.state, d.consumed),
-                    .need_more => return .need_more,
-                    .dropped => unreachable,
-                }
-            }
-            return .need_more;
+        var i: usize = 0;
+        // Strip a UTF-8 BOM (U+FEFF → 0xEF 0xBB 0xBF) that appears at the
+        // very beginning of a JSON stream.  jq silently discards BOM-prefixed
+        // input (jq test L48); we mirror that behaviour.  Only strip once —
+        // when the tape is still empty (first feed call for this value).
+        if (p.tape_buf.items.len == 0 and p.stack.items.len == 0 and
+            p.state == .want_value and
+            i + 3 <= input.len and
+            input[i] == 0xEF and input[i + 1] == 0xBB and input[i + 2] == 0xBF)
+        {
+            i += 3;
         }
-    }
+        while (i < input.len) {
+            // ── SIMD fast paths ──────────────────────────────
+            switch (p.state) {
+                .in_string => {
+                    // Only safe when not mid-UTF8 sequence or surrogate pair.
+                    if (p.utf8_pending == 0 and p.unicode_surrogate == 0) {
+                        const safe = simd.scanStringBody(input[i..]);
+                        if (safe > 0) {
+                            try p.string_buf.appendSlice(p.allocator, input[i..][0..safe]);
+                            i += safe;
+                            continue;
+                        }
+                    }
+                },
+                .want_value, .want_key, .want_colon, .after_value => {
+                    const skip = simd.skipWhitespace(input[i..]);
+                    i += skip;
+                    if (i >= input.len) break;
+                },
+                else => {},
+            }
 
-    /// Apply predicate evaluation + tape/string-buf rollback at the
-    /// boundary of a finalized top-level value. Returns the
-    /// appropriate `FeedResult` variant — `.done` if the predicate
-    /// passes (or no predicate exists), `.dropped` otherwise.
-    fn finalizePlannedRecord(
-        p: *Parser,
-        plan: *const ProjectionPlan,
-        plan_state: *PlanState,
-        consumed: usize,
-    ) FeedResult {
-        if (plan.predicate) |pred| {
-            const tape_window_start = plan_state.top_value_tape_start;
-            const passed = evalPredicate(
-                p.tape_buf.items[tape_window_start..],
-                p.string_buf.items,
-                plan,
-                pred,
-            );
-            if (!passed) {
-                p.tape_buf.shrinkRetainingCapacity(plan_state.top_value_tape_start);
-                p.string_buf.shrinkRetainingCapacity(plan_state.top_value_string_start);
-                return .{ .dropped = .{ .consumed = consumed } };
+            // ── Scalar fallback ──────────────────────────────
+            try p.processByte(input[i]);
+            i += 1;
+            if (p.state == .top_done) {
+                return .{ .done = .{ .tape = p.makeTape(), .consumed = i } };
             }
         }
-        return .{ .done = .{ .tape = p.makeTape(), .consumed = consumed } };
+        if (is_eof) return p.processEof();
+        return .need_more;
     }
 
     // ── Byte dispatch ─────────────────────────────────────────────────────
@@ -1052,234 +816,3 @@ pub const Parser = struct {
         };
     }
 };
-
-// ── Plan-aware helpers ─────────────────────────────────────────────────────────
-
-/// Walk the per-record tape window to find the terminal field
-/// referenced by `plan.predicate.?.field_path_node`, then compare the
-/// field's value against `pred.literal` using `pred.op`. Returns
-/// `true` when the predicate passes (record stays) and `false` when
-/// it fails (record dropped).
-///
-/// The walk uses the plan's static path: starting from `plan.root`,
-/// follow the `object_key` chain to the terminal node. Each step
-/// performs a sequential scan over the surrounding object's
-/// key/value pairs and recurses into the matched child. Out-of-plan
-/// fields are skipped via tape `payload.skip` indices (set by
-/// `closeContainer` when each container ends).
-///
-/// On structural mismatch (wrong type at any path step, missing
-/// field, etc.) the predicate evaluates to `false` for `eq`/`lt`/`le`/
-/// `gt`/`ge` (jq's coercion rules: comparing a missing field returns
-/// `null < everything-else`, but the harvester only emits comparisons
-/// that map cleanly to the available tape entries — we mirror that by
-/// dropping on mismatch). For `ne`, the same rule yields `true`.
-///
-/// `has_key` is evaluated as a tape lookup: at the terminal, the
-/// current tape index must point to an `object_start`; the predicate
-/// passes iff the literal key exists in that object. No latch is
-/// required — the tape already records every key the parser emitted.
-fn evalPredicate(
-    tape_window: []const types.Tape.Entry,
-    string_buf: []const u8,
-    plan: *const projection_plan_mod.ProjectionPlan,
-    pred: projection_plan_mod.Predicate,
-) bool {
-    if (tape_window.len == 0) return false;
-    const root_entry = tape_window[0];
-
-    // Non-object top-level value with an object-key predicate path:
-    // the path can't resolve. For top-level `select(has("k"))` plans
-    // (whose plan root is itself a `terminal`) the value can be any
-    // type — the has_key check evaluates against the value directly.
-    const root_node = plan.nodes[plan.root];
-    if (root_node.kind != .terminal and root_entry.tag != .object_start) {
-        return predicateFalseValue(pred);
-    }
-
-    // Walk from plan.root following object_key chains until terminal.
-    var current_node_idx: u32 = plan.root;
-    var current_tape_idx: u32 = 0; // index into tape_window
-    while (true) {
-        const node = plan.nodes[current_node_idx];
-        switch (node.kind) {
-            .object_key => {
-                if (current_tape_idx >= tape_window.len) return predicateFalseValue(pred);
-                const obj_entry = tape_window[current_tape_idx];
-                if (obj_entry.tag != .object_start) return predicateFalseValue(pred);
-                const want_key = plan.keyBytes(node);
-                const found_value_idx = findObjectKey(tape_window, string_buf, current_tape_idx, want_key) orelse {
-                    return predicateFalseValue(pred);
-                };
-                const children = plan.childIndices(node);
-                if (children.len == 0) return predicateFalseValue(pred);
-                current_node_idx = children[0];
-                current_tape_idx = found_value_idx;
-            },
-            .terminal => {
-                if (current_tape_idx >= tape_window.len) return predicateFalseValue(pred);
-                if (pred.op == .has_key) {
-                    // The terminal value must be an object; the literal
-                    // (a string) is the key whose presence is tested.
-                    const value_entry = tape_window[current_tape_idx];
-                    if (value_entry.tag != .object_start) return predicateFalseValue(pred);
-                    const key_bytes = switch (pred.literal) {
-                        .string => |s| plan.string_buf[s.offset .. s.offset + s.len],
-                        else => return predicateFalseValue(pred),
-                    };
-                    return findObjectKey(tape_window, string_buf, current_tape_idx, key_bytes) != null;
-                }
-                return compareTapeValue(tape_window[current_tape_idx], string_buf, plan, pred);
-            },
-            // Array index / iterate not supported by the predicate
-            // harvester today — drop conservatively.
-            else => return predicateFalseValue(pred),
-        }
-    }
-}
-
-/// Locate the value of a given key inside an object that starts at
-/// `obj_start` (where `tape_window[obj_start].tag == .object_start`).
-/// Returns the tape index of the matched value entry, or `null` when
-/// the key is absent. Out-of-match entries are skipped via the
-/// container's `payload.skip` indices stored on `*_start` entries.
-fn findObjectKey(
-    tape_window: []const types.Tape.Entry,
-    string_buf: []const u8,
-    obj_start: u32,
-    want_key: []const u8,
-) ?u32 {
-    var i: u32 = obj_start + 1;
-    const end = tape_window[obj_start].payload.skip;
-    while (i < end and i < tape_window.len) {
-        const e = tape_window[i];
-        if (e.tag == .object_end) return null;
-        if (e.tag != .key) return null; // malformed
-        const key_ref = e.payload.string;
-        const key_bytes = string_buf[key_ref.offset .. key_ref.offset + key_ref.len];
-        const value_idx = i + 1;
-        if (std.mem.eql(u8, key_bytes, want_key)) {
-            return value_idx;
-        }
-        // Advance past the value: containers carry a `skip`; scalars
-        // are exactly one entry.
-        const v = tape_window[value_idx];
-        switch (v.tag) {
-            .object_start, .array_start => {
-                // skip points one past the matching *_end (relative to
-                // the full tape, but our window starts at obj_start of
-                // the top-level object — still valid because skip is
-                // tape-absolute: tape_window aliases parser.tape_buf
-                // starting at the top-level object's first entry).
-                i = v.payload.skip;
-            },
-            else => i = value_idx + 1,
-        }
-    }
-    return null;
-}
-
-/// Compare a single tape entry against the predicate literal under
-/// the harvested operator. jq numeric semantics (everything is f64)
-/// apply for numeric ops; string equality is exact byte-equality on
-/// the decoded UTF-8 form; bool / null / float compare directly.
-fn compareTapeValue(
-    entry: types.Tape.Entry,
-    string_buf: []const u8,
-    plan: *const projection_plan_mod.ProjectionPlan,
-    pred: projection_plan_mod.Predicate,
-) bool {
-    // `has_key` is handled in `evalPredicate` (tape lookup at the
-    // terminal object), not here. Reaching `compareTapeValue` with
-    // `op == .has_key` would mean the harvester emitted a comparison
-    // predicate against a `has_key` op — the harvester never does that.
-    std.debug.assert(pred.op != .has_key);
-    const op = pred.op;
-    return switch (pred.literal) {
-        .null_ => switch (op) {
-            .eq => entry.tag == .null_val,
-            .ne => entry.tag != .null_val,
-            else => false,
-        },
-        .bool_ => |b| switch (entry.tag) {
-            .true_val => switch (op) {
-                .eq => b == true,
-                .ne => b == false,
-                else => false,
-            },
-            .false_val => switch (op) {
-                .eq => b == false,
-                .ne => b == true,
-                else => false,
-            },
-            else => predicateFalseValue(pred),
-        },
-        .int => |n| compareNumeric(entry, @as(f64, @floatFromInt(n)), op),
-        .float => |f| compareNumeric(entry, f, op),
-        .string => |s| switch (entry.tag) {
-            .string => switch (op) {
-                .eq, .ne => blk: {
-                    const want = plan.string_buf[s.offset .. s.offset + s.len];
-                    const got_ref = entry.payload.string;
-                    const got = string_buf[got_ref.offset .. got_ref.offset + got_ref.len];
-                    const eql = std.mem.eql(u8, want, got);
-                    break :blk if (op == .eq) eql else !eql;
-                },
-                else => false, // ordering on strings not harvested
-            },
-            else => predicateFalseValue(pred),
-        },
-    };
-}
-
-fn compareNumeric(entry: types.Tape.Entry, want: f64, op: projection_plan_mod.PredicateOp) bool {
-    std.debug.assert(op != .has_key);
-    const got: f64 = switch (entry.tag) {
-        .int => @as(f64, @floatFromInt(entry.payload.int)),
-        .float => entry.payload.float,
-        else => return op == .ne, // type mismatch: false for ==, true for !=
-    };
-    return switch (op) {
-        .eq => got == want,
-        .ne => got != want,
-        .lt => got < want,
-        .le => got <= want,
-        .gt => got > want,
-        .ge => got >= want,
-        .has_key => unreachable,
-    };
-}
-
-/// Outcome when the predicate's path can't be resolved against the
-/// current top-level value (missing field, type mismatch at a path
-/// step, non-object root for an object-key plan, etc.).
-///
-/// jq treats missing-key access as `null`, which propagates through
-/// comparison operators as: `null == lit` → false (for any non-null
-/// `lit`), `null != lit` → true (likewise), `null < lit` / `null > lit`
-/// follow jq's null-orders-first ordering, which depends on the
-/// literal — those edge cases aren't currently emitted by the
-/// harvester (it only accepts `<path> CMP <load_const>` with a
-/// matching scalar type), so the conservative rule below is safe:
-/// drop the record on any unresolvable path *unless* the operator is
-/// `ne`, where missing ≠ literal is logically true.
-///
-/// This is the final word on the result — the pool worker sees
-/// `.dropped` and emits no record, so the VM never runs against a
-/// dropped value. Earlier comments referenced a "VM re-run" fallback
-/// that does not exist.
-fn predicateFalseValue(pred: projection_plan_mod.Predicate) bool {
-    return pred.op == .ne;
-}
-
-// Note on projection skipping: a scalar JSON-value skipper (Component E
-// per the original C1 plan) was removed pre-merge. The current commit
-// implements predicate-only pushdown — records that fail a harvested
-// pure-scalar `select(...)` predicate are dropped at the parser
-// boundary via `finalizePlannedRecord`. Projection skipping (dropping
-// out-of-plan subtrees byte-wise without tape emission) is deferred to
-// a follow-up commit; introducing it requires intrusive changes to the
-// per-byte dispatch state-machine and is being staged separately to
-// keep this commit's blast radius bounded. The `ProjectionPlan` shape
-// is already future-proofed for both (its node tree is the
-// single-source representation either pass would consume).

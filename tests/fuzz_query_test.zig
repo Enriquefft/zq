@@ -26,8 +26,6 @@ fn parseTape(allocator: std.mem.Allocator, json: []const u8) !struct { parser: P
             p.deinit();
             return error.UnexpectedNeedMore;
         },
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 

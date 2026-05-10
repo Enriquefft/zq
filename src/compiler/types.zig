@@ -11,7 +11,6 @@ const types_mod = @import("types");
 const err_mod = @import("error");
 const regex_mod = @import("regex");
 const prefilter_mod = @import("prefilter");
-const projection_plan_mod = @import("projection_plan");
 
 /// Caller-owned compiled bytecode + auxiliary tables. Produced by
 /// `src/compiler/root.zig:compile`. The lifetime contract: every
@@ -29,11 +28,6 @@ pub const Compiled = struct {
     source_map: []u32,
     regex_pool: regex_mod.RegexPool,
     prefilter: ?prefilter_mod.PrefilterSet,
-    /// Static projection plan + optional pure-scalar predicate harvested
-    /// from the IR. `null` when the filter shape doesn't qualify (any
-    /// non-pure op in the projection chain, or any unsupported predicate
-    /// shape). Consumed by `parser.feedPlanned` in the pool worker.
-    projection_plan: ?projection_plan_mod.ProjectionPlan,
 
     pub fn deinit(c: *Compiled, alloc: std.mem.Allocator) void {
         alloc.free(c.instructions);
@@ -42,7 +36,6 @@ pub const Compiled = struct {
         alloc.free(c.external_var_ids);
         c.regex_pool.deinit();
         if (c.prefilter) |*p| p.deinit();
-        if (c.projection_plan) |*pp| pp.deinit();
         // `function_table` is owned by emit (one entry per fn_id), with a
         // per-entry `write_set` slice. Frees a no-op for empty cat-9 case
         // since the literal `&.{}` slice is static.

@@ -16,8 +16,6 @@ fn inferSchema(inputs: []const []const u8, max_depth: u32) !describe.SchemaInfer
         const tape = switch (result) {
             .done => |d| d.tape,
             .need_more => return error.ParseIncomplete,
-            // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-            .dropped => unreachable,
         };
         try inferrer.feedTape(tape);
         parser.reset();

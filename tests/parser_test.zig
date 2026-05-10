@@ -14,8 +14,6 @@ fn parseAll(p: *Parser, input: []const u8) !Tape {
     switch (result) {
         .done => |d| return d.tape,
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -280,8 +278,6 @@ test "streaming: need_more then done" {
             try std.testing.expectEqual(@as(i64, 1), tape.entries[2].payload.int);
         },
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -293,8 +289,6 @@ test "streaming: number split across chunks" {
     switch (r) {
         .done => |d| try std.testing.expectEqual(@as(i64, 1234), d.tape.entries[0].payload.int),
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -310,8 +304,6 @@ test "streaming: string split across chunks" {
             try std.testing.expectEqualStrings("hello", s);
         },
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -527,8 +519,6 @@ test "depth limit: 512 levels accepted" {
     switch (result) {
         .done => {},
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -669,8 +659,6 @@ test "simd: cross-chunk string scanning" {
             try std.testing.expectEqualStrings("A" ** 34 ++ "B" ** 34, s);
         },
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }
 
@@ -707,7 +695,5 @@ test "simd: UTF-8 continuation bytes across feed chunks" {
             try std.testing.expectEqualStrings("abc\xE2\x82\xAC", s);
         },
         .need_more => return error.UnexpectedNeedMore,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     }
 }

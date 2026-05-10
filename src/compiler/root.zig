@@ -151,40 +151,10 @@ pub fn compile(
         try extra_roots.append(allocator, entry.body_ir_root);
     }
     const fuse_result = try fuse_mod.fuse(lowered, extra_roots.items);
-    var fused = fuse_result.ir;
+    const fused = fuse_result.ir;
     for (lowerer.function_table.items) |*entry| {
         if (entry.body_ir_root == lower_mod.BODY_IR_NOT_LOWERED) continue;
         entry.body_ir_root = fuse_result.index_map[entry.body_ir_root];
-    }
-
-    // Stage 3.5: harvest projection plan + optional pure-scalar
-    // predicate (C1 of the per-core ceiling roadmap). MUST run before
-    // emit because `harvestPredicate` rewrites the IR root in-place
-    // when the predicate-pushdown shape matches: the parser will drop
-    // failing records via `feedPlanned`, so the VM's bytecode for kept
-    // records collapses to the body's identity-projection. Running this
-    // after emit would leave the original `select(...)` body lowered
-    // into bytecode, producing a double-eval of the predicate on every
-    // kept record. The strip is a single in-place node overwrite — no
-    // allocation, no resize — so on harvest-OOM the IR is unmodified
-    // and the parser stays no-plan.
-    //
-    // Predicate harvest is attempted first because a `select(...)`
-    // root rejects the plain projection harvester. If the predicate
-    // shape doesn't match, we fall through to projection harvest.
-    var staged_plan: ?harvest_mod.ProjectionPlan = null;
-    errdefer if (staged_plan) |*pp| pp.deinit();
-    if (harvest_mod.harvestPredicate(allocator, &fused)) |maybe_plan| {
-        if (maybe_plan) |pp| staged_plan = pp;
-    } else |err| switch (err) {
-        error.OutOfMemory => {},
-    }
-    if (staged_plan == null) {
-        if (harvest_mod.harvestProjectionPlan(allocator, &fused)) |maybe_plan| {
-            if (maybe_plan) |pp| staged_plan = pp;
-        } else |err| switch (err) {
-            error.OutOfMemory => {},
-        }
     }
 
     // Stage 4: emit IR → bytecode. The emitter copies bytes the VM
@@ -197,11 +167,6 @@ pub fn compile(
     // `function_table` snapshot threads through to emit so cat-9
     // `call_user` IR nodes can resolve to body_ir_root + canonical
     // var_ids without re-traversing the AST.
-    //
-    // The IR walked here is the post-strip IR if the predicate
-    // harvester accepted the shape — emit lowers identity / projection
-    // body, and the now-orphaned `select`-body sub-tree is dropped
-    // when the IR arena dies.
     const pool = lowerer.takeRegexPool();
     var pool_consumed = false;
     errdefer if (!pool_consumed) {
@@ -220,29 +185,11 @@ pub fn compile(
     var compiled_consumed = false;
     defer if (!compiled_consumed) compiled.deinit(allocator);
 
-    // Transfer the staged projection plan into `compiled`. Ownership
-    // moves; clear the local so the errdefer above doesn't double-free
-    // if a later step fails (the plan now lives in `compiled` and is
-    // freed by `compiled.deinit`).
-    if (staged_plan) |pp| {
-        compiled.projection_plan = pp;
-        staged_plan = null;
-    }
-
     // Stage 5: harvest prefilter literals from IR (Phase 18).
     // Read-only IR walk; no mutations. The IR is still valid because
     // `arena` hasn't been freed yet (the defer above runs on return).
     // On OOM or harvest failure, we simply skip the prefilter — the
     // filter still runs correctly without it.
-    //
-    // Note: the regex prefilter harvester walks from the IR root,
-    // which after a successful predicate-strip is `Op.identity` — that
-    // arm of `harvestFromIr` returns immediately (no select root), so
-    // no work duplication and no spurious prefilters land. The two
-    // harvesters are mutually exclusive on a given query: predicate
-    // pushdown applies to scalar comparisons / `has()`, regex
-    // prefilter applies to `select(... | test|scan(...))`. Composing
-    // them is deferred (#4 from the original commit's deferred list).
     const prefilter = @import("prefilter");
     var literal_groups: std.ArrayList(harvest_mod.LiteralGroup) = .{};
     // The harvest output owns per-literal []u8 dupes plus the outer slice.

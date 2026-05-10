@@ -23,14 +23,10 @@ source "$BENCHMARK_DIR/progress.sh"
 
 # All eight scenarios run in both modes. Regression mode consumes
 # 02_memory's peak-RSS reading via check_regression.sh's absolute-
-# ceiling gate, so the memory scenario is no longer optional. The
-# narrow-records scenario (06) is the no-plan parse-loop guard
-# replacing the prior byte-identity-via-objdump invariant; the
-# selective-query scenario (07) attributes predicate-pushdown speedup
-# on narrow records (~80B/line) by running zq twice (default build +
-# `-Dno-plan=true`); scenario (08) repeats that attribution on wide
-# records (~1KB/line, ~50 fields) where the per-record VM body
-# dominates and the pushdown speedup compounds.
+# ceiling gate, so the memory scenario is no longer optional.
+# Scenarios 06/07/08 are workload-coverage benchmarks: narrow-record
+# `.id` extraction (06), narrow-record selective filter (07), and
+# wide-record selective filter (08). Each runs a single zq build vs jq.
 BENCH_MODE="${BENCH_MODE:-comparison}"
 TOTAL_SCENARIOS=8
 
@@ -215,37 +211,20 @@ HEADER
     CQ_JQ=$(extract_mean "$BENCHMARK_DIR/results/05_complex_query.json" "jq")
     printf '    "complex_query": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${CQ_ZQ:-null}" "${CQ_JQ:-null}"
 
-    # Narrow records — no-plan parse-loop guard. The CI regression gate
-    # treats this scenario's zq/jq ratio as the load-bearing invariant
-    # for the no-plan path (replacing the prior byte-identity-via-
-    # objdump invariant — see commit message for rationale).
+    # Narrow records — `.id` extraction on huge.jsonl, workload coverage.
     NR_ZQ=$(extract_mean "$BENCHMARK_DIR/results/06_narrow_records.json" "zq")
     NR_JQ=$(extract_mean "$BENCHMARK_DIR/results/06_narrow_records.json" "jq")
     printf '    "narrow_records": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${NR_ZQ:-null}" "${NR_JQ:-null}"
 
-    # Selective query — predicate-pushdown attribution. Two zq numbers
-    # are emitted: `zq_default_mean_s` (production binary, predicate
-    # pushed into `feedPlanned`) and `zq_noplan_mean_s` (-Dno-plan=true
-    # binary, predicate evaluated by the VM). Both compared against jq
-    # for orientation, but the load-bearing number is the
-    # default→no-plan ratio: the speedup attributable to the C1
-    # predicate-pushdown work.
-    SQ_ZQD=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-default")
-    SQ_ZQN=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-noplan")
-    SQ_JQ=$(extract_mean  "$BENCHMARK_DIR/results/07_selective_query.json" "jq")
-    printf '    "selective_query": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s},\n' \
-        "${SQ_ZQD:-null}" "${SQ_ZQN:-null}" "${SQ_JQ:-null}"
+    # Selective query — narrow records (~80B/line), workload coverage.
+    SQ_ZQ=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq")
+    SQ_JQ=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "jq")
+    printf '    "selective_query": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${SQ_ZQ:-null}" "${SQ_JQ:-null}"
 
-    # Selective wide — same shape as scenario 7 but on huge_wide.jsonl
-    # (~50-field, ~1KB-per-line records). Same three runners; the load-
-    # bearing number is the default→no-plan ratio on records where the
-    # per-record VM body dominates (informational only, surfaced via
-    # `wide_selective_attribution` in check_regression.sh).
-    SW_ZQD=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "zq-default")
-    SW_ZQN=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "zq-noplan")
-    SW_JQ=$(extract_mean  "$BENCHMARK_DIR/results/08_selective_wide.json" "jq")
-    printf '    "selective_wide": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s}\n' \
-        "${SW_ZQD:-null}" "${SW_ZQN:-null}" "${SW_JQ:-null}"
+    # Selective wide — wide records (~50 fields, ~1KB/line), workload coverage.
+    SW_ZQ=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "zq")
+    SW_JQ=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "jq")
+    printf '    "selective_wide": {"zq_mean_s": %s, "jq_mean_s": %s}\n' "${SW_ZQ:-null}" "${SW_JQ:-null}"
 
     echo '  }'
     echo '}'
@@ -272,9 +251,9 @@ This benchmark suite includes eight test scenarios:
 3. **Startup Latency**: Process initialization overhead
 4. **Streaming Throughput**: Pipe-based stdin processing performance
 5. **Complex Query**: Real-world transformation with multiple operators
-6. **Narrow Records**: No-plan parse-loop throughput guard (≤2% regression vs jq baseline)
-7. **Selective Query**: Predicate-pushdown attribution on narrow records (default vs \`-Dno-plan=true\` build)
-8. **Selective Wide**: Predicate-pushdown attribution on wide records (~50 fields, ~1KB/line)
+6. **Narrow Records**: \`.id\` extraction on ~80B/line records (workload coverage)
+7. **Selective Query**: \`select(.id > N) | .id\` on ~80B/line records (workload coverage)
+8. **Selective Wide**: \`select(.id > N)\` on ~1KB/line, ~50-field records (workload coverage)
 
 ---
 
@@ -293,9 +272,9 @@ echo "    02_memory.md           — Memory Efficiency" >&2
 echo "    03_startup_latency.md  — Startup Latency" >&2
 echo "    04_streaming.md        — Streaming Throughput" >&2
 echo "    05_complex_query.md    — Complex Query" >&2
-echo "    06_narrow_records.md   — Narrow Records (no-plan guard)" >&2
-echo "    07_selective_query.md  — Selective Query (pushdown attribution, narrow)" >&2
-echo "    08_selective_wide.md   — Selective Query (pushdown attribution, wide)" >&2
+echo "    06_narrow_records.md   — Narrow Records" >&2
+echo "    07_selective_query.md  — Selective Query (narrow records)" >&2
+echo "    08_selective_wide.md   — Selective Query (wide records)" >&2
 echo "" >&2
 echo "  Full Summary: $SUMMARY_FILE" >&2
 echo "" >&2

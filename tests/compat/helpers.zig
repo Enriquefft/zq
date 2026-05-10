@@ -287,8 +287,6 @@ pub fn expectJsonEqual(expected_json: []const u8, actual_json: []const u8) !void
             std.debug.print("\nexpectJsonEqual: expected JSON incomplete: {s}\n", .{expected_json});
             return error.TestExpectedEqual;
         },
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     };
     const exp_val = entryToValue(&tape_exp, 0);
 
@@ -303,8 +301,6 @@ pub fn expectJsonEqual(expected_json: []const u8, actual_json: []const u8) !void
             std.debug.print("\nexpectJsonEqual: actual JSON incomplete: {s}\n", .{actual_json});
             return error.TestExpectedEqual;
         },
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     };
     const act_val = entryToValue(&tape_act, 0);
 
@@ -325,8 +321,6 @@ pub fn runFilter(filter: []const u8, input_json: []const u8) ![][]const u8 {
     const tape = switch (try p.feed(input_json, true)) {
         .done => |d| d.tape,
         .need_more => return error.ParseIncomplete,
-        // `.dropped` only flows from `feedPlanned`; this is plain `feed`.
-        .dropped => unreachable,
     };
 
     const result = try CompiledQuery.compile(filter, .{

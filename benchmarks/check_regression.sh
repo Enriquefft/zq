@@ -11,13 +11,6 @@ set -o pipefail
 CURRENT="$1"
 BASELINE="$2"
 THRESHOLD=15
-# Narrow-records is the load-bearing no-plan parse-loop guard: any
-# regression of zq/jq ratio > 2% on the `.id` extraction workload
-# indicates the plan-aware code path's coexistence in the same
-# translation unit perturbed the no-plan body's machine code in a
-# user-visible way (replaces the prior byte-identity-via-objdump
-# invariant — see Commit 1's commit message §β for rationale).
-NARROW_THRESHOLD=2
 
 # Peak-RSS gate (zq only). Two checks fire independently; either tripping
 # fails CI.
@@ -62,13 +55,12 @@ echo ""
 FAILED=0
 
 # Compare zq/jq ratio against baseline ratio
-# Usage: check_scenario "scenario_name" "zq_key" "jq_key" [override_threshold]
-# When override_threshold is omitted, the global $THRESHOLD applies.
+# Usage: check_scenario "scenario_name" "zq_key" "jq_key"
 check_scenario() {
     local name="$1"
     local zq_key="$2"
     local jq_key="$3"
-    local thresh="${4:-$THRESHOLD}"
+    local thresh="$THRESHOLD"
 
     local cur_zq cur_jq base_zq base_jq
     cur_zq=$(jq -r "$zq_key" "$CURRENT" 2>/dev/null)
@@ -175,7 +167,6 @@ check_rss() {
 
 echo "Benchmark Regression Check (ratio-based)"
 echo "  • Default threshold: ${THRESHOLD}%"
-echo "  • Narrow-records threshold: ${NARROW_THRESHOLD}% (no-plan parse-loop guard)"
 echo "==================================================================="
 echo ""
 
@@ -183,38 +174,10 @@ check_scenario "parallelism"     ".scenarios.parallelism.zq_mean_s"     ".scenar
 check_scenario "streaming"       ".scenarios.streaming.zq_mean_s"       ".scenarios.streaming.jq_mean_s"
 check_scenario "startup_latency" ".scenarios.startup_latency.zq_mean_s" ".scenarios.startup_latency.jq_mean_s"
 check_scenario "complex_query"   ".scenarios.complex_query.zq_mean_s"   ".scenarios.complex_query.jq_mean_s"
-# Narrow-records uses a tighter 2% threshold — this is the no-plan
-# parse-loop guard.
-check_scenario "narrow_records"  ".scenarios.narrow_records.zq_mean_s"  ".scenarios.narrow_records.jq_mean_s" "$NARROW_THRESHOLD"
-# Selective-query uses the production zq_default mean against jq.
-# The default→no-plan attribution ratio is informational (logged below
-# the gate, not enforced) since it depends on dataset-specific
-# selectivity that the regression baseline doesn't fix.
-check_scenario "selective_query" ".scenarios.selective_query.zq_default_mean_s" ".scenarios.selective_query.jq_mean_s"
+check_scenario "narrow_records"  ".scenarios.narrow_records.zq_mean_s"  ".scenarios.narrow_records.jq_mean_s"
+check_scenario "selective_query" ".scenarios.selective_query.zq_mean_s" ".scenarios.selective_query.jq_mean_s"
+check_scenario "selective_wide"  ".scenarios.selective_wide.zq_mean_s"  ".scenarios.selective_wide.jq_mean_s"
 check_rss
-
-# Selective-query attribution: log the speedup of the default
-# (predicate-pushed) build over the no-plan attribution build. Not
-# gated — informational only. Two flavors: narrow (scenario 7,
-# huge.jsonl, ~80B/line) and wide (scenario 8, huge_wide.jsonl,
-# ~1KB/line, ~50 fields). Wide attribution is the load-bearing
-# number on workloads where the per-record VM body dominates.
-log_attribution() {
-    local label="$1" path="$2"
-    local d n
-    d=$(jq -r "${path}.zq_default_mean_s // empty" "$CURRENT" 2>/dev/null)
-    n=$(jq -r "${path}.zq_noplan_mean_s // empty" "$CURRENT" 2>/dev/null)
-    if [ -z "$d" ] || [ "$d" = "null" ] || \
-       [ -z "$n" ] || [ "$n" = "null" ]; then
-        echo "INFO: ${label} — no-plan attribution missing"
-        return
-    fi
-    local ratio
-    ratio=$(awk -v d="$d" -v n="$n" 'BEGIN { if (d > 0) printf "%.2fx", n / d }')
-    echo "INFO: ${label} — predicate pushdown gives ${ratio} speedup vs -Dno-plan=true"
-}
-log_attribution "selective_attribution"      ".scenarios.selective_query"
-log_attribution "wide_selective_attribution" ".scenarios.selective_wide"
 
 echo ""
 

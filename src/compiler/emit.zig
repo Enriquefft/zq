@@ -271,7 +271,6 @@ pub fn emit(
         .source_map = src_map_slice,
         .regex_pool = regex_pool,
         .prefilter = null,
-        .projection_plan = null,
     };
 }
 

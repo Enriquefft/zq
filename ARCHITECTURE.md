@@ -425,3 +425,7 @@ Initial (all chunks live):        2998 MB
 + madvise(MADV_DONTNEED):          396 MB  (-45%, 1277 MB file, .id → 0.31x input)
                           Total:          -87%
 ```
+
+## Considered and rejected
+
+- Predicate pushdown evaluated and rejected (2026-05-09): see `research/09-pushdown-doesnt-transfer.md` on the `research` branch.

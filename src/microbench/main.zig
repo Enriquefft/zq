@@ -172,9 +172,6 @@ fn measureParse(rig: *Rig, samples: []u64) !void {
         switch (fr) {
             .done => {},
             .need_more => return error.IncompleteRecord,
-            // `.dropped` only flows from `feedPlanned`; `feed()` callers
-            // (microbench rig) never see it.
-            .dropped => unreachable,
         }
         rig.parser.reset();
     }
@@ -191,8 +188,6 @@ fn measureLookup(rig: *Rig, samples: []u64) !void {
         const tape = switch (fr) {
             .done => |d| d.tape,
             .need_more => return error.IncompleteRecord,
-            // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-            .dropped => unreachable,
         };
         timer.reset();
         var it = try rig.cq.execute(tape, &.{}, rig.allocator);
@@ -211,8 +206,6 @@ fn measurePredicate(rig: *Rig, samples: []u64) !void {
     const first_tape = switch (first_fr) {
         .done => |d| d.tape,
         .need_more => return error.IncompleteRecord,
-        // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-        .dropped => unreachable,
     };
     var it = try rig.cq.execute(first_tape, &.{}, rig.allocator);
     defer it.deinit();
@@ -226,8 +219,6 @@ fn measurePredicate(rig: *Rig, samples: []u64) !void {
         const tape = switch (fr) {
             .done => |d| d.tape,
             .need_more => return error.IncompleteRecord,
-            // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-            .dropped => unreachable,
         };
         it.reset(tape, &.{});
         timer.reset();
@@ -248,8 +239,6 @@ fn measureSerialize(rig: *Rig, samples: []u64, style: types.OutputStyle) !void {
     const tape = switch (fr) {
         .done => |d| d.tape,
         .need_more => return error.IncompleteRecord,
-        // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-        .dropped => unreachable,
     };
     var it = try rig.cq.execute(tape, &.{}, rig.allocator);
     defer it.deinit();
@@ -279,8 +268,6 @@ fn measureCoord(rig: *Rig, samples: []u64, style: types.OutputStyle) !void {
     const first_tape = switch (first_fr) {
         .done => |d| d.tape,
         .need_more => return error.IncompleteRecord,
-        // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-        .dropped => unreachable,
     };
     var it = try rig.cq.execute(first_tape, &.{}, rig.allocator);
     defer it.deinit();
@@ -299,8 +286,6 @@ fn measureCoord(rig: *Rig, samples: []u64, style: types.OutputStyle) !void {
         const tape = switch (fr) {
             .done => |d| d.tape,
             .need_more => return error.IncompleteRecord,
-            // `.dropped` only flows from `feedPlanned`; this rig calls `feed()`.
-            .dropped => unreachable,
         };
         it.reset(tape, &.{});
         while (try it.next()) |v| {
