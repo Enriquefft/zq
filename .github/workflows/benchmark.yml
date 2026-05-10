@@ -40,11 +40,17 @@ jobs:
       - name: Configure mode-dependent env
         run: |
           if [ "$BENCH_MODE" = "comparison" ]; then
-            echo "HUGE_LINES=15000000" >> "$GITHUB_ENV"
-            echo "ZQ_QUICK=0"          >> "$GITHUB_ENV"
+            echo "HUGE_LINES=15000000"     >> "$GITHUB_ENV"
+            # Wide records are ~12x larger per line than narrow records
+            # (~960B vs ~80B), so HUGE_WIDE_LINES is scaled down to keep
+            # the on-disk dataset size in the same ballpark as the narrow
+            # one (~1.4 GB).
+            echo "HUGE_WIDE_LINES=1500000" >> "$GITHUB_ENV"
+            echo "ZQ_QUICK=0"              >> "$GITHUB_ENV"
           else
-            echo "HUGE_LINES=1000000"  >> "$GITHUB_ENV"
-            echo "ZQ_QUICK=0"          >> "$GITHUB_ENV"
+            echo "HUGE_LINES=1000000"      >> "$GITHUB_ENV"
+            echo "HUGE_WIDE_LINES=100000"  >> "$GITHUB_ENV"
+            echo "ZQ_QUICK=0"              >> "$GITHUB_ENV"
           fi
 
       - name: Install jq + hyperfine (always, pinned)
@@ -94,6 +100,13 @@ jobs:
           path: benchmarks/data/huge.jsonl
           key: huge-jsonl-${{ hashFiles('benchmarks/data/huge.generator.sh') }}-${{ env.HUGE_LINES }}
 
+      - name: Cache wide test dataset
+        id: cache-data-wide
+        uses: actions/cache@v4
+        with:
+          path: benchmarks/data/huge_wide.jsonl
+          key: huge-wide-jsonl-${{ hashFiles('benchmarks/data/huge_wide.generator.sh') }}-${{ env.HUGE_WIDE_LINES }}
+
       - name: Build zq
         run: zig build -Doptimize=ReleaseFast
 
@@ -103,6 +116,13 @@ jobs:
           cd benchmarks/data
           bash huge.generator.sh
           ls -lh huge.jsonl
+
+      - name: Generate wide test data
+        if: steps.cache-data-wide.outputs.cache-hit != 'true'
+        run: |
+          cd benchmarks/data
+          bash huge_wide.generator.sh
+          ls -lh huge_wide.jsonl
 
       - name: Run benchmarks
         run: |

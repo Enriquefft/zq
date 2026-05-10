@@ -195,21 +195,26 @@ check_rss
 
 # Selective-query attribution: log the speedup of the default
 # (predicate-pushed) build over the no-plan attribution build. Not
-# gated — informational only.
-log_selective_attribution() {
-    local sq_default sq_noplan
-    sq_default=$(jq -r '.scenarios.selective_query.zq_default_mean_s // empty' "$CURRENT" 2>/dev/null)
-    sq_noplan=$(jq -r '.scenarios.selective_query.zq_noplan_mean_s // empty' "$CURRENT" 2>/dev/null)
-    if [ -z "$sq_default" ] || [ "$sq_default" = "null" ] || \
-       [ -z "$sq_noplan" ] || [ "$sq_noplan" = "null" ]; then
-        echo "INFO: selective_attribution — no-plan attribution missing"
+# gated — informational only. Two flavors: narrow (scenario 7,
+# huge.jsonl, ~80B/line) and wide (scenario 8, huge_wide.jsonl,
+# ~1KB/line, ~50 fields). Wide attribution is the load-bearing
+# number on workloads where the per-record VM body dominates.
+log_attribution() {
+    local label="$1" path="$2"
+    local d n
+    d=$(jq -r "${path}.zq_default_mean_s // empty" "$CURRENT" 2>/dev/null)
+    n=$(jq -r "${path}.zq_noplan_mean_s // empty" "$CURRENT" 2>/dev/null)
+    if [ -z "$d" ] || [ "$d" = "null" ] || \
+       [ -z "$n" ] || [ "$n" = "null" ]; then
+        echo "INFO: ${label} — no-plan attribution missing"
         return
     fi
     local ratio
-    ratio=$(awk -v d="$sq_default" -v n="$sq_noplan" 'BEGIN { if (d > 0) printf "%.2fx", n / d }')
-    echo "INFO: selective_attribution — predicate pushdown gives ${ratio} speedup vs -Dno-plan=true"
+    ratio=$(awk -v d="$d" -v n="$n" 'BEGIN { if (d > 0) printf "%.2fx", n / d }')
+    echo "INFO: ${label} — predicate pushdown gives ${ratio} speedup vs -Dno-plan=true"
 }
-log_selective_attribution
+log_attribution "selective_attribution"      ".scenarios.selective_query"
+log_attribution "wide_selective_attribution" ".scenarios.selective_wide"
 
 echo ""
 

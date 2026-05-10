@@ -570,12 +570,23 @@ pub fn harvestProjectionPlan(
 ///   2. `has(<load_const string-literal>)`
 ///
 /// On success, returns a `ProjectionPlan` whose `predicate` field is
-/// populated. On any rejection (composite predicates, impure pipes,
-/// nested selects), returns null and the caller falls back to running
-/// the predicate via the VM as before.
+/// populated AND mutates `ir_obj` in place to strip the now-redundant
+/// `select(...)` root: the parser will drop failing records before they
+/// reach the VM, and `select`'s job (return the input value verbatim
+/// on success) is the identity-projection. Stripping the `select` node
+/// down to identity removes the double-eval the original landing left
+/// in place — the VM no longer re-runs the predicate body on every
+/// kept record.
+///
+/// On any rejection (composite predicates, impure pipes, nested
+/// selects, OOM), returns null and the IR is left UNMODIFIED — the
+/// parser stays on the no-plan code path. The strip is the only IR
+/// mutation in this whole module; it is a single in-place node
+/// overwrite (no allocation, no resize), so the rewrite is atomic
+/// with respect to OOM.
 pub fn harvestPredicate(
     alloc: std.mem.Allocator,
-    ir_obj: *const ir.IR,
+    ir_obj: *ir.IR,
 ) error{OutOfMemory}!?ProjectionPlan {
     if (build_options.no_plan) return null;
     if (ir_obj.nodes.items.len == 0) return null;
@@ -599,12 +610,14 @@ pub fn harvestPredicate(
     // a single pipe — `select(.a == 1)` lowers either as `cmp(...)`
     // directly or as `pipe(., cmp(...))` depending on AST shape).
     if (body.op == .cmp) {
-        return try buildPredicatePlan(
+        const plan = (try buildPredicatePlan(
             alloc,
             ir_obj,
             null, // no leading projection chain
             body,
-        );
+        )) orelse return null;
+        stripSelectRoot(ir_obj, root_idx);
+        return plan;
     }
 
     if (body.op == .pipe) {
@@ -617,17 +630,21 @@ pub fn harvestPredicate(
         const right_idx = body.children[1];
         const right = ir_obj.nodes.items[right_idx];
         if (right.op == .cmp) {
-            return try buildPredicatePlan(
+            const plan = (try buildPredicatePlan(
                 alloc,
                 ir_obj,
                 left_idx,
                 right,
-            );
+            )) orelse return null;
+            stripSelectRoot(ir_obj, root_idx);
+            return plan;
         }
         if (right.op == .call_builtin) {
             const name = getBuiltinName(ir_obj, right) orelse return null;
             if (std.mem.eql(u8, name, "has")) {
-                return try buildHasPredicatePlan(alloc, ir_obj, left_idx, right);
+                const plan = (try buildHasPredicatePlan(alloc, ir_obj, left_idx, right)) orelse return null;
+                stripSelectRoot(ir_obj, root_idx);
+                return plan;
             }
         }
         return null;
@@ -636,12 +653,41 @@ pub fn harvestPredicate(
     if (body.op == .call_builtin) {
         const name = getBuiltinName(ir_obj, body) orelse return null;
         if (std.mem.eql(u8, name, "has")) {
-            return try buildHasPredicatePlan(alloc, ir_obj, null, body);
+            const plan = (try buildHasPredicatePlan(alloc, ir_obj, null, body)) orelse return null;
+            stripSelectRoot(ir_obj, root_idx);
+            return plan;
         }
         return null;
     }
 
     return null;
+}
+
+/// Replace the `select(<body>)` root with an `identity` node. `select`
+/// returns the input value verbatim on success (jq semantics — verified
+/// against `select(.a | .b == 5)` returning the full input, not `.a`).
+/// Once the parser drops failing records via `feedPlanned`, the kept
+/// records flow into the VM with the predicate already gated upstream;
+/// the VM's job is just to emit the input value, which is exactly what
+/// `Op.identity` lowers to (a single `push_current` instruction).
+///
+/// Single in-place overwrite — emit walks from
+/// `ir_obj.nodes.items[len-1]`, so making that slot an identity node
+/// is sufficient. The original `select` body and its sub-nodes remain
+/// reachable in the node array but unreferenced; they are dropped when
+/// the IR arena dies after compile() completes. No reallocation: the
+/// rewrite is OOM-atomic by construction.
+///
+/// Source span is preserved from the original `select` node so
+/// diagnostics referring to the root still highlight the user's source
+/// text rather than synthesized whitespace.
+fn stripSelectRoot(ir_obj: *ir.IR, root_idx: u32) void {
+    const orig = ir_obj.nodes.items[root_idx];
+    ir_obj.nodes.items[root_idx] = .{
+        .op = .identity,
+        .src_start = orig.src_start,
+        .src_len = orig.src_len,
+    };
 }
 
 /// Build a projection plan whose root represents the projection chain

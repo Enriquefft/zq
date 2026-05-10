@@ -21,15 +21,18 @@ export ZQ_QUICK
 # Source progress utilities
 source "$BENCHMARK_DIR/progress.sh"
 
-# All seven scenarios run in both modes. Regression mode consumes
+# All eight scenarios run in both modes. Regression mode consumes
 # 02_memory's peak-RSS reading via check_regression.sh's absolute-
 # ceiling gate, so the memory scenario is no longer optional. The
 # narrow-records scenario (06) is the no-plan parse-loop guard
 # replacing the prior byte-identity-via-objdump invariant; the
 # selective-query scenario (07) attributes predicate-pushdown speedup
-# by running zq twice (default build + `-Dno-plan=true`).
+# on narrow records (~80B/line) by running zq twice (default build +
+# `-Dno-plan=true`); scenario (08) repeats that attribution on wide
+# records (~1KB/line, ~50 fields) where the per-record VM body
+# dominates and the pushdown speedup compounds.
 BENCH_MODE="${BENCH_MODE:-comparison}"
-TOTAL_SCENARIOS=7
+TOTAL_SCENARIOS=8
 
 init_main_progress
 
@@ -89,7 +92,7 @@ cat > "$SUMMARY_FILE" << EOF
 
 **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
-This report summarizes benchmark results comparing zq against jq across 5 key scenarios.
+This report summarizes benchmark results comparing zq against jq across 8 key scenarios.
 
 ---
 
@@ -139,6 +142,7 @@ run_scenario "Streaming Throughput"   "04_streaming.sh"        "04_streaming.md"
 run_scenario "Complex Query"          "05_complex_query.sh"    "05_complex_query.md"
 run_scenario "Narrow Records"         "06_narrow_records.sh"   "06_narrow_records.md"
 run_scenario "Selective Query"        "07_selective_query.sh"  "07_selective_query.md"
+run_scenario "Selective Wide"         "08_selective_wide.sh"   "08_selective_wide.md"
 
 echo "" >&2
 
@@ -229,8 +233,19 @@ HEADER
     SQ_ZQD=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-default")
     SQ_ZQN=$(extract_mean "$BENCHMARK_DIR/results/07_selective_query.json" "zq-noplan")
     SQ_JQ=$(extract_mean  "$BENCHMARK_DIR/results/07_selective_query.json" "jq")
-    printf '    "selective_query": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s}\n' \
+    printf '    "selective_query": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s},\n' \
         "${SQ_ZQD:-null}" "${SQ_ZQN:-null}" "${SQ_JQ:-null}"
+
+    # Selective wide — same shape as scenario 7 but on huge_wide.jsonl
+    # (~50-field, ~1KB-per-line records). Same three runners; the load-
+    # bearing number is the default→no-plan ratio on records where the
+    # per-record VM body dominates (informational only, surfaced via
+    # `wide_selective_attribution` in check_regression.sh).
+    SW_ZQD=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "zq-default")
+    SW_ZQN=$(extract_mean "$BENCHMARK_DIR/results/08_selective_wide.json" "zq-noplan")
+    SW_JQ=$(extract_mean  "$BENCHMARK_DIR/results/08_selective_wide.json" "jq")
+    printf '    "selective_wide": {"zq_default_mean_s": %s, "zq_noplan_mean_s": %s, "jq_mean_s": %s}\n' \
+        "${SW_ZQD:-null}" "${SW_ZQN:-null}" "${SW_JQ:-null}"
 
     echo '  }'
     echo '}'
@@ -250,7 +265,7 @@ cat >> "$SUMMARY_FILE" << EOF
 
 ## Test Scenarios
 
-This benchmark suite includes seven test scenarios:
+This benchmark suite includes eight test scenarios:
 
 1. **Multi-core Scalability**: Throughput on large-scale batch processing
 2. **Memory Efficiency**: Resource footprint during streaming operations
@@ -258,7 +273,8 @@ This benchmark suite includes seven test scenarios:
 4. **Streaming Throughput**: Pipe-based stdin processing performance
 5. **Complex Query**: Real-world transformation with multiple operators
 6. **Narrow Records**: No-plan parse-loop throughput guard (≤2% regression vs jq baseline)
-7. **Selective Query**: Predicate-pushdown attribution (default vs `-Dno-plan=true` build)
+7. **Selective Query**: Predicate-pushdown attribution on narrow records (default vs \`-Dno-plan=true\` build)
+8. **Selective Wide**: Predicate-pushdown attribution on wide records (~50 fields, ~1KB/line)
 
 ---
 
@@ -278,7 +294,8 @@ echo "    03_startup_latency.md  — Startup Latency" >&2
 echo "    04_streaming.md        — Streaming Throughput" >&2
 echo "    05_complex_query.md    — Complex Query" >&2
 echo "    06_narrow_records.md   — Narrow Records (no-plan guard)" >&2
-echo "    07_selective_query.md  — Selective Query (pushdown attribution)" >&2
+echo "    07_selective_query.md  — Selective Query (pushdown attribution, narrow)" >&2
+echo "    08_selective_wide.md   — Selective Query (pushdown attribution, wide)" >&2
 echo "" >&2
 echo "  Full Summary: $SUMMARY_FILE" >&2
 echo "" >&2

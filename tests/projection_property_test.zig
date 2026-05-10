@@ -68,6 +68,103 @@ const THREADS = [_]usize{ 1, 2, 4, 8 };
 // are query-correctness bugs not memory-pressure spills.
 const TEST_BUDGET = MemoryBudget.explicit(1024 * 1024 * 1024);
 
+// ── Select-rooted predicate-strip coverage (Task A invariant) ─────────────────
+//
+// The harvester accepts FOUR exact `select(...)`-rooted shapes (see
+// `harvest.zig::harvestPredicate`):
+//
+//   B1. `select(<path> CMP <literal>)`              body=cmp
+//   B2. `select(<leading-path> | <subpath> CMP <literal>)` body=pipe→cmp
+//   B3. `select(has(<key-literal>))`                 body=call_builtin
+//   B4. `select(<leading-path> | has(<key-literal>))` body=pipe→has
+//
+// For every accepted shape, the IR strip transform replaces the root
+// `select(...)` with `Op.identity`. The VM then runs identity on records
+// the parser kept; failing records were dropped at the parser boundary.
+// The byte-eq invariant against jq is the load-bearing assertion: a
+// missed strip would cause the VM to re-evaluate the predicate body and
+// (on the cmp branches) emit `true`/`false` instead of the input, while
+// a wrong strip would emit the input even on records that fail.
+//
+// The existing pipe-rooted test below DOES NOT exercise the strip — its
+// root is `pipe(select(...), <projection>)`, which the harvester rejects
+// because the root is not `call_builtin("select")`. The new test below
+// drives all four select-rooted shapes through the same Pool harness.
+
+const SELECT_PROJECTIONS_FIRST = [_][]const u8{ ".", ".a", ".a.b" };
+// `has(K)` keys that may or may not be present in the generated records.
+const HAS_KEYS = [_][]const u8{ "id", "name", "missing" };
+
+/// Generate a JSONL stream of records suitable for select-rooted shapes:
+///   { "id": N, "name": "...", "a": { "b": N2 } }
+/// `id` is uniform over [0, ID_RANGE); `a.b` is independent and uniform
+/// over the same range so `select(.a | .b OP N)` partitions non-trivially.
+/// Some records omit the `name` field (drawn 1-in-3) so `has("name")`
+/// produces both branches in the same input.
+fn genSelectJsonl(rng: std.Random, alloc: std.mem.Allocator) ![]u8 {
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(alloc);
+
+    const n = rng.intRangeAtMost(u32, MIN_RECORDS, MAX_RECORDS);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const id = rng.uintLessThan(u32, ID_RANGE);
+        const ab = rng.uintLessThan(u32, ID_RANGE);
+        const include_name = rng.uintLessThan(u32, 3) != 0;
+        if (include_name) {
+            const name = KEY_DICT[rng.uintLessThan(usize, KEY_DICT.len)];
+            try buf.writer(alloc).print(
+                "{{\"id\":{d},\"name\":\"{s}\",\"a\":{{\"b\":{d}}}}}\n",
+                .{ id, name, ab },
+            );
+        } else {
+            try buf.writer(alloc).print(
+                "{{\"id\":{d},\"a\":{{\"b\":{d}}}}}\n",
+                .{ id, ab },
+            );
+        }
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Emit one of the four select-rooted shapes the harvester accepts.
+/// `branch` cycles 0..3 to guarantee every branch is exercised across
+/// iterations even at small iteration counts.
+fn genSelectQuery(
+    rng: std.Random,
+    alloc: std.mem.Allocator,
+    branch: u32,
+) ![]u8 {
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(alloc);
+    switch (branch % 4) {
+        // B1: select(<path> CMP <lit>) — no leading pipe.
+        0 => {
+            const op = OPS[rng.uintLessThan(usize, OPS.len)];
+            const lit = LITERALS[rng.uintLessThan(usize, LITERALS.len)];
+            try buf.writer(alloc).print("select(.id {s} {d})", .{ op, lit });
+        },
+        // B2: select(<leading-path> | <subpath> CMP <lit>).
+        1 => {
+            const op = OPS[rng.uintLessThan(usize, OPS.len)];
+            const lit = LITERALS[rng.uintLessThan(usize, LITERALS.len)];
+            try buf.writer(alloc).print("select(.a | .b {s} {d})", .{ op, lit });
+        },
+        // B3: select(has("k")) — top-level has.
+        2 => {
+            const k = HAS_KEYS[rng.uintLessThan(usize, HAS_KEYS.len)];
+            try buf.writer(alloc).print("select(has(\"{s}\"))", .{k});
+        },
+        // B4: select(<leading-path> | has("k")) — has on subpath.
+        3 => {
+            const k = HAS_KEYS[rng.uintLessThan(usize, HAS_KEYS.len)];
+            try buf.writer(alloc).print("select(.a | has(\"{s}\"))", .{k});
+        },
+        else => unreachable,
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
 // ── Generators ────────────────────────────────────────────────────────────────
 //
 // Two complementary generators sit behind the harness:
@@ -456,4 +553,82 @@ test "projection property: bleed-through stress matches jq across thread counts"
 
     // 6 ops × 6 literals × 3 projections × 4 thread counts = 432 cases.
     try std.testing.expectEqual(@as(u32, 6 * 6 * 3 * 4), checked);
+}
+
+// ── Test entry: select-rooted predicate strip × all four harvest branches ────
+//
+// Drives the IR strip transform: each query has `select(...)` at the
+// IR root, which `harvestPredicate` recognizes and rewrites to
+// `Op.identity`. The byte-eq invariant against jq catches:
+//   - bad strip (VM emits `true`/`false` instead of the input)
+//   - missed strip (VM re-evaluates the predicate body, doubling work
+//     but still correct — caught by the non-pushed comparator path)
+//   - wrong predicate decoding (drops a record jq keeps, or vice versa)
+//
+// The branch dispatch cycles 0..3 to guarantee every accepted shape
+// gets coverage even at small `ZQ_PROJ_ITERS`. At the default 200
+// iterations each branch sees 50 random query/input pairs, multiplied
+// by the four-thread sweep for 800 cases per branch.
+test "projection property: select-rooted predicate strip matches jq across thread counts" {
+    const alloc = std.testing.allocator;
+    try fc.requireJqOnPath(alloc);
+
+    const n: u32 = parseIters();
+    const seed: u64 = parseSeed() ^ 0x5e1ec7;
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+
+    var checked: u32 = 0;
+    var iter: u32 = 0;
+    while (iter < n) : (iter += 1) {
+        const filter = try genSelectQuery(rng, alloc, iter);
+        defer alloc.free(filter);
+        const input = try genSelectJsonl(rng, alloc);
+        defer alloc.free(input);
+
+        var jq = try fc.runJqStdin(alloc, filter, input);
+        defer jq.deinit(alloc);
+        if (jq.exit_code != 0) {
+            std.debug.print(
+                "jq rejected harness-generated select filter at seed={d} iter={d}: filter={s}\n",
+                .{ seed, iter, filter },
+            );
+            return error.GeneratorEmittedInvalidFilter;
+        }
+
+        var cq = try compileQuery(filter);
+        defer cq.deinit();
+
+        for (THREADS) |nt| {
+            const zq_out = try runZqPool(alloc, &cq, input, nt);
+            defer alloc.free(zq_out);
+
+            var label_buf: [64]u8 = undefined;
+            const label = try std.fmt.bufPrint(
+                &label_buf,
+                "select-strip branch={d} threads={d}",
+                .{ iter % 4, nt },
+            );
+
+            if (try diffOrNull(alloc, label, jq.stdout, zq_out)) |diag| {
+                defer alloc.free(diag);
+                std.debug.print(
+                    \\select-strip property FAIL at seed={d} iter={d}
+                    \\  filter: {s}
+                    \\  input ({d} bytes): {s}
+                    \\  diff: {s}
+                    \\  reproduce: ZQ_PROJ_SEED={d} ZQ_PROJ_ITERS={d}
+                    \\
+                ,
+                    .{ seed, iter, filter, input.len, input, diag, seed, iter + 1 },
+                );
+                return error.ProjectionDivergence;
+            }
+            checked += 1;
+        }
+    }
+
+    // Every iteration runs all four thread counts.
+    try std.testing.expectEqual(@as(u32, n) * @as(u32, THREADS.len), checked);
 }
