@@ -4370,6 +4370,315 @@ test "builtin: add(f) with multi-yield generator argument" {
     try std.testing.expectEqual(@as(i64, 3), vals.items[0].int);
 }
 
+// ── in/1 — dual of has/1 ──────────────────────────────────────────────────────
+
+test "builtin: in/1 string key hit on object" {
+    var vals = try runFilterStr("in({\"foo\":1,\"bar\":2})", "foo");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 string key miss on object" {
+    var vals = try runFilterStr("in({\"foo\":1})", "baz");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 int index in array bounds" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 1);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 int index out of bounds" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 5);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 negative int index is false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, -1);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 fractional float index (1.5) truncates to 1 → true" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = 1.5 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 TypeError on string key against array" {
+    var q = try compile("in([1,2,3])");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, "foo");
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+test "builtin: in/1 TypeError on int key against object" {
+    var q = try compile("in({\"foo\":1})");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 0);
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+test "builtin: in/1 TypeError when argument is not container" {
+    var q = try compile("in(42)");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = stringTape(&entries, "x");
+
+    var it = try q.execute(t, &.{}, alloc);
+    defer it.deinit();
+    try std.testing.expectError(error.TypeError, it.next());
+}
+
+test "builtin: in/1 empty object is always miss" {
+    var vals = try runFilterStr("in({})", "anything");
+    defer vals.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 empty array is always miss" {
+    var q = try compile("in([])");
+    defer q.deinit();
+    var entries: [1]Entry = undefined;
+    const t = intTape(&entries, 0);
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 integer-valued float (1.0) → true" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = 1.0 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.items.len);
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 float just below upper bound (2.9 → idx 2) → true" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = 2.9 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 float at length boundary (3.0) → false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = 3.0 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 small negative float (-0.5) truncates to 0 → true" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = -0.5 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 negative float ≤ -1 → false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = -1.0 } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 NaN index → false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = std.math.nan(f64) } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 +infinity index → false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = std.math.inf(f64) } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: in/1 -infinity index → false" {
+    var q = try compile("in([0,1,2])");
+    defer q.deinit();
+    const entries = [_]Entry{.{ .tag = .float, .payload = .{ .float = -std.math.inf(f64) } }};
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+// ── has/1 — float-index correctness (jq parity) ──────────────────────────────
+//
+// jq accepts integer-valued floats as array indices and truncates fractional
+// floats toward zero before bounds-checking. NaN and ±Inf are rejected.
+// These tests lock the corrected behavior in builtinHas.
+
+test "builtin: has/1 integer-valued float (1.0) on array → true" {
+    var q = try compile("has(1.0)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 0 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: has/1 fractional float (1.5) truncates to 1 → true" {
+    var q = try compile("has(1.5)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 0 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: has/1 small negative float (-0.5) → true" {
+    var q = try compile("has(-0.5)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 0 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(true, vals.items[0].bool_val);
+}
+
+test "builtin: has/1 float at length boundary (3.0) → false" {
+    var q = try compile("has(3.0)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 0 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
+test "builtin: has/1 +infinity → false" {
+    var q = try compile("has(infinite)");
+    defer q.deinit();
+    const entries = [_]Entry{
+        .{ .tag = .array_start, .payload = .{ .skip = 5 } },
+        .{ .tag = .int, .payload = .{ .int = 0 } },
+        .{ .tag = .int, .payload = .{ .int = 1 } },
+        .{ .tag = .int, .payload = .{ .int = 2 } },
+        .{ .tag = .array_end, .payload = .{ .none = {} } },
+    };
+    const t = tape(&entries, "");
+
+    var vals = try collectAll(&q, t);
+    defer vals.deinit();
+    try std.testing.expectEqual(false, vals.items[0].bool_val);
+}
+
 test "path(f): path(paths) on nested object yields descent paths" {
     var results = std.ArrayList([]const u8){};
     defer {

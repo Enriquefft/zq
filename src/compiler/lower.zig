@@ -2426,6 +2426,7 @@ fn isValueArg1Builtin(name: []const u8) bool {
         std.mem.eql(u8, name, "bsearch") or
         std.mem.eql(u8, name, "flatten") or
         std.mem.eql(u8, name, "has") or
+        std.mem.eql(u8, name, "in") or
         std.mem.eql(u8, name, "contains") or
         std.mem.eql(u8, name, "inside");
 }

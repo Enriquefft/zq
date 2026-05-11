@@ -3465,6 +3465,7 @@ fn nameToBuiltinId(name: []const u8, arity: usize) ?types_mod.BuiltinId {
         if (std.mem.eql(u8, name, "strflocaltime")) return .strflocaltime_;
         if (std.mem.eql(u8, name, "flatten")) return .flatten_n;
         if (std.mem.eql(u8, name, "has")) return .has;
+        if (std.mem.eql(u8, name, "in")) return .in_;
         if (std.mem.eql(u8, name, "contains")) return .contains;
         if (std.mem.eql(u8, name, "inside")) return .inside;
         // Cat-16 — `index/rindex/indices` 1-arity. Mirrors legacy

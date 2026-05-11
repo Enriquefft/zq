@@ -5143,22 +5143,23 @@ pub const ResultIterator = struct {
                 return .{ .bool_val = false };
             },
             .array => |span| {
-                const idx = switch (key_sv) {
-                    .int => |i| i,
-                    // jq: has(nan) / has(float) on array returns false — not a valid index.
-                    .float => return .{ .bool_val = false },
+                switch (key_sv) {
+                    .int => |i| {
+                        if (i < 0) return .{ .bool_val = false };
+                        const len = arrayLength(span.tape, span);
+                        if (i > std.math.maxInt(u32)) return .{ .bool_val = false };
+                        return .{ .bool_val = @as(u32, @intCast(i)) < len };
+                    },
+                    .float => |f| return .{ .bool_val = floatIndexInBounds(f, arrayLength(span.tape, span)) },
                     else => return error.TypeError,
-                };
-                if (idx < 0) return .{ .bool_val = false };
-                const len = arrayLength(span.tape, span);
-                return .{ .bool_val = @as(u32, @intCast(idx)) < len };
+                }
             },
             else => return error.TypeError,
         }
     }
 
     fn builtinIn(it: *ResultIterator) ZqError!?StackValue {
-        // Current value is the key; top of if_stack (put there by save_input before compile_in) is the object.
+        // Dual of builtinHas: input is the key, popped arg is the container.
         const obj_sv = try it.popValue();
         const key_sv = try valueToStackValue(it.current);
         switch (obj_sv) {
@@ -5181,13 +5182,16 @@ pub const ResultIterator = struct {
                     return .{ .bool_val = false };
                 },
                 .array => |span| {
-                    const idx = switch (key_sv) {
-                        .int => |i| i,
+                    switch (key_sv) {
+                        .int => |i| {
+                            if (i < 0) return .{ .bool_val = false };
+                            const len = arrayLength(span.tape, span);
+                            if (i > std.math.maxInt(u32)) return .{ .bool_val = false };
+                            return .{ .bool_val = @as(u32, @intCast(i)) < len };
+                        },
+                        .float => |f| return .{ .bool_val = floatIndexInBounds(f, arrayLength(span.tape, span)) },
                         else => return error.TypeError,
-                    };
-                    if (idx < 0) return .{ .bool_val = false };
-                    const len = arrayLength(span.tape, span);
-                    return .{ .bool_val = @as(u32, @intCast(idx)) < len };
+                    }
                 },
                 else => return error.TypeError,
             },
@@ -13376,6 +13380,22 @@ fn arrayLength(tape: *const Tape, span: Value.TapeSpan) u32 {
         len += 1;
     }
     return len;
+}
+
+/// jq float-as-array-index semantics for `has/1` and `in/1`:
+///   NaN / ±Inf       → false
+///   −1 < f < 0       → index 0 (trunc toward zero); valid iff len > 0
+///   f ≤ −1           → false
+///   f ≥ 0            → valid iff f < len (float-domain compare avoids
+///                      i64 overflow for huge floats; for non-negative f,
+///                      trunc(f) < len ⇔ f < len since len is integral).
+fn floatIndexInBounds(f: f64, len: u32) bool {
+    if (std.math.isNan(f) or std.math.isInf(f)) return false;
+    if (f < 0) {
+        if (f <= -1.0) return false;
+        return len > 0;
+    }
+    return f < @as(f64, @floatFromInt(len));
 }
 
 fn lookupIndex(tape: *const Tape, span: Value.TapeSpan, idx: u32) ?Value {
