@@ -1,7 +1,8 @@
 version: 2
 updates:
-  # Workflow actions: pinned by SHA. Dependabot rewrites the SHA + trailing
-  # `# v<N>` comment so security/feature updates land without manual scraping.
+  # Workflow actions: pinned by major-version tag (e.g. `@v5`). Dependabot
+  # rewrites the tag on major bumps and forwards security advisories within
+  # the current major as no-op alerts so we can react manually if needed.
   - package-ecosystem: github-actions
     directory: /
     schedule:

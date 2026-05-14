@@ -199,8 +199,8 @@ jobs:
           bash docker/publish.sh "$VERSION" artifacts
 
   smoke-install:
-    name: Smoke test installer (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Smoke test installer (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     needs: [release]
     if: "!contains(github.ref_name, '-')"
     permissions:
@@ -209,21 +209,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            shell: bash
-            script: install.sh
-            bin: zq
-            install_dir: ~/.local/bin
-          - os: macos-latest
-            shell: bash
-            script: install.sh
-            bin: zq
-            install_dir: ~/.local/bin
-          - os: windows-latest
-            shell: pwsh
-            script: install.ps1
-            bin: zq.exe
-            install_dir: $env:LOCALAPPDATA\zq
+          - { runner: ubuntu-latest,  shell: bash, script: install.sh,  bin: zq,     install_dir: ~/.local/bin }
+          - { runner: macos-latest,   shell: bash, script: install.sh,  bin: zq,     install_dir: ~/.local/bin }
+          - { runner: windows-latest, shell: pwsh, script: install.ps1, bin: zq.exe, install_dir: '$env:LOCALAPPDATA\zq' }
     steps:
       # Allow up to ~60s for the freshly created release to propagate to the
       # GitHub releases CDN. install scripts hit /releases/download/<tag>/...
@@ -239,9 +227,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${GITHUB_REF_NAME}/${{ matrix.script }}" \
             | sh -s -- --version "$VERSION"
-          # install.sh appends $HOME/.local/bin to PATH via shell rc; in CI we
-          # prepend it directly so the verify step resolves zq.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # install.sh appends ${{ matrix.install_dir }} to PATH via shell rc;
+          # in CI we prepend it directly so the verify step resolves the binary.
+          # `eval` resolves the leading `~` to $HOME.
+          eval "echo ${{ matrix.install_dir }}" >> "$GITHUB_PATH"
 
       - name: Run installer (Windows)
         if: matrix.shell == 'pwsh'
@@ -252,24 +241,26 @@ jobs:
           $ScriptBlock = [scriptblock]::Create((Invoke-RestMethod -Uri $ScriptUrl))
           & $ScriptBlock -Version $VERSION
           # install.ps1 updates user PATH via SetEnvironmentVariable; that
-          # change is not visible to the current process. Prepend manually.
-          "$env:LOCALAPPDATA\zq" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # change is not visible to the current process. Append manually.
+          # Use Add-Content (no BOM, no encoding ambiguity across PS5/PS7).
+          $InstallDir = "${{ matrix.install_dir }}"
+          Add-Content -Path $env:GITHUB_PATH -Value $ExecutionContext.InvokeCommand.ExpandString($InstallDir)
 
       - name: Verify binary (Unix)
         if: matrix.shell == 'bash'
         run: |
           set -euo pipefail
-          which zq
-          zq --version
-          echo '{"a":[1,2,3]}' | zq '.a | map(. * 2)'
+          command -v ${{ matrix.bin }}
+          ${{ matrix.bin }} --version
+          echo '{"a":[1,2,3]}' | ${{ matrix.bin }} '.a | map(. * 2)'
 
       - name: Verify binary (Windows)
         if: matrix.shell == 'pwsh'
         shell: pwsh
         run: |
-          (Get-Command zq.exe).Source
-          zq.exe --version
-          '{"a":[1,2,3]}' | zq.exe '.a | map(. * 2)'
+          (Get-Command ${{ matrix.bin }}).Source
+          ${{ matrix.bin }} --version
+          '{"a":[1,2,3]}' | ${{ matrix.bin }} '.a | map(. * 2)'
 
   aur:
     name: Update AUR
