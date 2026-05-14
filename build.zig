@@ -777,6 +777,10 @@ fn rustTripleFromTarget(t: std.Target) ?[]const u8 {
         },
         .windows => switch (arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
+            // ARM64 Windows: only the LLVM-MinGW `gnullvm` triple is
+            // installable via rustup AND links under zig cc (the msvc
+            // variant requires the MSVC linker, not Zig).
+            .aarch64 => "aarch64-pc-windows-gnullvm",
             else => null,
         },
         .freebsd => switch (arch) {

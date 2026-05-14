@@ -22,6 +22,21 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     exit 1
 }
 
+# Detect CPU architecture. PROCESSOR_ARCHITECTURE reflects the host CPU when
+# PowerShell itself runs 64-bit; on WoW64 (32-bit shell on ARM64), prefer
+# PROCESSOR_ARCHITEW6432 if present.
+$arch = $env:PROCESSOR_ARCHITEW6432
+if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+
+switch ($arch) {
+    "AMD64" { $ArchSlug = "amd64" }
+    "ARM64" { $ArchSlug = "arm64" }
+    default {
+        Write-Error "unsupported CPU architecture: $arch (zq ships windows-amd64 and windows-arm64)"
+        exit 1
+    }
+}
+
 # ── Resolve version ──────────────────────────────────────────────────────────
 
 if (-not $Version) {
@@ -47,7 +62,7 @@ if (-not (Test-Path $InstallDir)) {
 
 # ── Download & verify ─────────────────────────────────────────────────────────
 
-$Archive = "zq-$Version-windows-amd64.zip"
+$Archive = "zq-$Version-windows-$ArchSlug.zip"
 $DownloadUrl = "$BaseUrl/download/v$Version/$Archive"
 $ChecksumsUrl = "$BaseUrl/download/v$Version/checksums-sha256.txt"
 
@@ -58,7 +73,7 @@ try {
     $ArchivePath = Join-Path $TmpDir $Archive
     $ChecksumsPath = Join-Path $TmpDir "checksums-sha256.txt"
 
-    Write-Host "  > downloading zq v$Version for windows/amd64..." -ForegroundColor Blue
+    Write-Host "  > downloading zq v$Version for windows/$ArchSlug..." -ForegroundColor Blue
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchivePath -UseBasicParsing
     Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath -UseBasicParsing
 

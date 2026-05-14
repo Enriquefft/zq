@@ -41,6 +41,7 @@
           targets.x86_64-apple-darwin.stable.rust-std
           targets.aarch64-apple-darwin.stable.rust-std
           targets.x86_64-pc-windows-gnu.stable.rust-std
+          targets.aarch64-pc-windows-gnullvm.stable.rust-std
           targets.x86_64-unknown-freebsd.stable.rust-std
         ];
 

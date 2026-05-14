@@ -1,0 +1,41 @@
+# Default: text files use LF on checkout. Auto-detect text vs binary.
+* text=auto eol=lf
+
+# Windows-native scripts: must have CRLF so they parse in PowerShell/cmd.exe
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Unix-native scripts: must have LF (shebangs break on CRLF)
+*.sh    text eol=lf
+
+# Source: LF everywhere
+*.zig   text eol=lf
+*.zon   text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.nix   text eol=lf
+
+# Binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.tar   binary
+*.gz    binary
+
+# Exclude from `git archive` (source-tarball releases)
+.github/        export-ignore
+.claude/        export-ignore
+benchmarks/data export-ignore
+zig-out/        export-ignore
+.zig-cache/     export-ignore
+result          export-ignore

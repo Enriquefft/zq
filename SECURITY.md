@@ -42,3 +42,28 @@ The following are out of scope:
 - Confirmed vulnerabilities will be fixed before public disclosure.
 - Credit will be given to reporters in the release notes unless they request otherwise.
 - CVEs will be requested for issues with significant impact.
+
+## Verifying release artifacts
+
+Every release ships three layers of integrity proof:
+
+1. **SHA-256 checksums** — `checksums-sha256.txt` lists hashes for every
+   binary archive. Verify with `sha256sum -c checksums-sha256.txt`.
+2. **SLSA build provenance** — every archive is attested via
+   [GitHub Artifact Attestations][gh-attest] using sigstore-backed OIDC
+   signatures. The attestation proves the binary was produced by
+   `.github/workflows/release.yml` from a specific commit in this repo.
+
+   ```
+   gh attestation verify zq-<version>-<os>-<arch>.<ext> \
+     --repo Enriquefft/zq
+   ```
+
+   This requires the [GitHub CLI][gh-cli]. No PGP keys, no trust-on-first-use.
+3. **Software Bill of Materials (SBOM)** — `zq-sbom.cyclonedx.json`
+   enumerates every direct and transitive dependency in CycloneDX 1.6
+   format. Feed it into Grype, Trivy, or Dependency-Track to scan for
+   known CVEs.
+
+[gh-attest]: https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
+[gh-cli]: https://cli.github.com/

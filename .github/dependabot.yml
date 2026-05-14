@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # Workflow actions: pinned by SHA. Dependabot rewrites the SHA + trailing
+  # `# v<N>` comment so security/feature updates land without manual scraping.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: ci
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+
+  # Cargo: the Rust regex shim at third_party/zq-regex-shim is the only
+  # cargo workspace in the repo. Group minor+patch; major lands separately.
+  - package-ecosystem: cargo
+    directory: /third_party/zq-regex-shim
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
+      include: scope
+    labels:
+      - dependencies
+      - rust

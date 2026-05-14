@@ -10,16 +10,40 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   format:
-    name: Format
-    runs-on: ubuntu-latest
+    name: Format (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
       - run: zig fmt --check src/ tests/
+
+  lint-scripts:
+    name: Lint installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck install.sh
+        run: shellcheck install.sh
+      - name: PSScriptAnalyzer install.ps1
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $issues = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning,Error
+          if ($issues) {
+            $issues | Format-Table -AutoSize
+            exit 1
+          }
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
@@ -33,6 +57,9 @@ jobs:
             optimize: Debug
           - os: macos
             runner: macos-latest
+            optimize: Debug
+          - os: windows
+            runner: windows-latest
             optimize: Debug
           # Guards BUG-001: mixing extern union inside a non-extern struct
           # only mis-compiles under LLVM TBAA DCE at -O2/-O3. Debug skips it.
@@ -64,6 +91,8 @@ jobs:
             rust-target: aarch64-apple-darwin
           - target: x86_64-windows
             rust-target: x86_64-pc-windows-gnu
+          - target: aarch64-windows
+            rust-target: aarch64-pc-windows-gnullvm
           - target: x86_64-freebsd
             rust-target: x86_64-unknown-freebsd
     steps:

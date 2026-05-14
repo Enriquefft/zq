@@ -16,6 +16,7 @@ declare -A PLATFORM_MAP=(
   ["darwin-x64"]="macos-amd64.tar.gz:zq"
   ["darwin-arm64"]="macos-arm64.tar.gz:zq"
   ["win32-x64"]="windows-amd64.zip:zq.exe"
+  ["win32-arm64"]="windows-arm64.zip:zq.exe"
   ["freebsd-x64"]="freebsd-amd64.tar.gz:zq"
 )
 
