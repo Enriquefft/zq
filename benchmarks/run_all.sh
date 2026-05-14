@@ -201,9 +201,13 @@ HEADER
     SL_JQ=$(extract_mean "$BENCHMARK_DIR/results/03_startup_latency.json" "jq")
     printf '    "startup_latency": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${SL_ZQ:-null}" "${SL_JQ:-null}"
 
-    # Streaming
-    ST_ZQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "zq")
-    ST_JQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "jq")
+    # Streaming — 04_streaming runs zq in three modes (file-arg, < redirect,
+    # cat | pipe) plus competitors in pipe mode. The summary tracks the pipe
+    # row: file-arg/redirect both route through the mmap dispatch already
+    # covered by 06_narrow_records, but the pipe path is the only sensor for
+    # the stream IO thread, InputSlotPool, and per-worker InFlightLimiter.
+    ST_ZQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "zq (cat | pipe)")
+    ST_JQ=$(extract_mean "$BENCHMARK_DIR/results/04_streaming.json" "jq (cat | pipe)")
     printf '    "streaming": {"zq_mean_s": %s, "jq_mean_s": %s},\n' "${ST_ZQ:-null}" "${ST_JQ:-null}"
 
     # Complex query
