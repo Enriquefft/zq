@@ -62,6 +62,9 @@ const Config = struct {
     /// chunks, but each `BytesResult` (stdin/file pool) and each per-value
     /// emit (null-input / slurp) is followed by an explicit flush.
     unbuffered: bool = false,
+    /// -t / --threads N or ZQ_THREADS: explicit worker count override.
+    /// null means "auto-detect via std.Thread.getCpuCount()".
+    threads: ?usize = null,
 
     // Owned allocations to free on cleanup.
     _owned_positional_strs: [][]u8 = &.{},
@@ -620,7 +623,7 @@ pub fn main() !u8 {
         };
         defer src.deinit();
 
-        const n_threads = std.Thread.getCpuCount() catch 4;
+        const n_threads = resolveThreads(config.threads);
         const budget = pool_mod.MemoryBudget.detect();
         var pool = pool_mod.Pool.init(n_threads, budget, allocator) catch |e| {
             printErr("zq: ");
@@ -656,6 +659,7 @@ pub fn main() !u8 {
             last_output = types.lastOutputFold(last_output, result.last_output);
         }
     } else {
+        const n_threads_files = resolveThreads(config.threads);
         for (config.files) |path| {
             const file = openFile(path) catch {
                 printErr("zq: could not open ");
@@ -667,7 +671,7 @@ pub fn main() !u8 {
 
             var diag = QueryDiag{};
             defer diag.deinit(allocator);
-            const file_last = processFile(file, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, &diag) catch |e| {
+            const file_last = processFile(file, &cq, &writer, style, color, serialize_opts, ext_bindings, allocator, config.raw_input, config.unbuffered, n_threads_files, &diag) catch |e| {
                 const kind = err_mod.kindFromZqError(@errorCast(e));
                 const src_offset = if (diag.last_ip < cq.source_map.len) cq.source_map[diag.last_ip] else 0;
                 err_mod.formatDiagnostic(stderr_writer, filter_src, kind, src_offset, 0, null, diag.user_error_msg, allocator, diag_format);
@@ -695,7 +699,8 @@ pub fn main() !u8 {
 }
 
 /// Process a regular file in parallel using the worker Pool.
-/// Uses all available CPU cores. Results are delivered in submission order.
+/// `n_threads` is resolved by the caller via `resolveThreads(config.threads)`
+/// so the precedence (CLI flag > env > getCpuCount) lives in one place.
 fn processFile(
     file: std.fs.File,
     cq: *const query_mod.CompiledQuery,
@@ -707,9 +712,9 @@ fn processFile(
     allocator: std.mem.Allocator,
     raw_input: bool,
     unbuffered: bool,
+    n_threads: usize,
     diag: *QueryDiag,
 ) !types.LastOutput {
-    const n_threads = std.Thread.getCpuCount() catch 4;
     const budget = pool_mod.MemoryBudget.detect();
     var pool = try pool_mod.Pool.init(n_threads, budget, allocator);
     defer pool.deinit();
@@ -1302,6 +1307,46 @@ fn hasNoColor() bool {
     }
 }
 
+/// Advance `i` past the `--threads`/`-t` argument value and return the parsed
+/// thread count. Single source of truth for the diagnostic message and the
+/// `>= 1` constraint; both callers (short-flag `-t` arm and long-flag
+/// `--threads` arm in `parseArgs`) route through this.
+fn parseThreadsArg(args: []const []const u8, i: *usize) error{UsageError}!usize {
+    i.* += 1;
+    const bad: error{UsageError} = blk: {
+        if (i.* >= args.len) break :blk error.UsageError;
+        const n = std.fmt.parseInt(usize, args[i.*], 10) catch break :blk error.UsageError;
+        if (n < 1) break :blk error.UsageError;
+        return n;
+    };
+    printErr("zq: --threads: must be a positive integer\n");
+    return bad;
+}
+
+/// Resolve the worker-thread count for parallel execution.
+/// Precedence (first non-null wins): explicit CLI flag (`-t` / `--threads`),
+/// `ZQ_THREADS` env var, `std.Thread.getCpuCount()`, fallback `4`.
+///
+/// On Windows, `ZQ_THREADS` is skipped (std.posix.getenv is POSIX-only);
+/// precedence collapses to CLI flag → getCpuCount → 4.
+///
+/// Asymmetry: the CLI flag errors out on malformed input (handled at parse
+/// time), but a malformed `ZQ_THREADS` falls back silently. The env var is an
+/// environmental hint; the CLI flag is user-asserted intent.
+fn resolveThreads(config_threads: ?usize) usize {
+    if (config_threads) |n| return n;
+    if (comptime @import("builtin").os.tag != .windows) {
+        if (std.posix.getenv("ZQ_THREADS")) |s| {
+            if (s.len > 0) {
+                if (std.fmt.parseInt(usize, s, 10)) |n| {
+                    if (n >= 1) return n;
+                } else |_| {}
+            }
+        }
+    }
+    return std.Thread.getCpuCount() catch 4;
+}
+
 fn openFile(path: []const u8) !std.fs.File {
     return std.fs.cwd().openFile(path, .{}) catch return error.IoError;
 }
@@ -1489,6 +1534,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     'C' => config.color = .on,
                     'M' => config.color = .off,
                     'R' => config.raw_input = true,
+                    't' => {
+                        config.threads = try parseThreadsArg(args, &i);
+                        break; // -t consumes rest of flag group
+                    },
                     'f' => {
                         i += 1;
                         if (i >= args.len) {
@@ -1644,6 +1693,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 printErr("zq: --depth: invalid number\n");
                 return error.UsageError;
             };
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            config.threads = try parseThreadsArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             std.process.exit(EXIT_OK);
@@ -1806,6 +1857,7 @@ fn printUsage() void {
         \\  --jsonargs            Remaining args are JSON values
         \\  --json-errors         Output errors as JSON on stderr
         \\  --unbuffered          Flush output after every emitted value
+        \\  -t, --threads N       Worker thread count (default: detected CPU count, env: ZQ_THREADS)
     ++ (if (@import("lsp").enabled)
         "\n  --lsp                 Start Language Server Protocol server on stdin/stdout"
     else

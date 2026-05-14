@@ -915,3 +915,218 @@ test "stdin dispatch parity: pretty-printed multi-line records" {
     try std.testing.expectEqual(@as(u8, 0), r_redir.exit_code);
     try std.testing.expectEqualStrings(r_file.stdout, r_redir.stdout);
 }
+
+// ── -t / --threads / ZQ_THREADS ─────────────────────────────────────────────
+//
+// Resolution order: CLI flag > ZQ_THREADS env > getCpuCount() > 4.
+// CLI flag errors out on malformed input (positive integer required);
+// env var falls back silently if absent or malformed.
+
+/// Run `zq` with an explicit environment map (otherwise identical to runZq).
+fn runZqWithEnv(
+    alloc: std.mem.Allocator,
+    extra_args: []const []const u8,
+    stdin_input: ?[]const u8,
+    env_map: *const std.process.EnvMap,
+) !RunResult {
+    var argv = std.ArrayList([]const u8){};
+    defer argv.deinit(alloc);
+    try argv.append(alloc, zq_path);
+    for (extra_args) |a| try argv.append(alloc, a);
+
+    var child = std.process.Child.init(argv.items, alloc);
+    child.stdin_behavior = if (stdin_input != null) .Pipe else .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.env_map = env_map;
+    try child.spawn();
+
+    if (stdin_input) |input| {
+        if (child.stdin) |stdin| {
+            stdin.writeAll(input) catch {};
+            stdin.close();
+            child.stdin = null;
+        }
+    }
+
+    var stdout_buf = std.ArrayList(u8){};
+    defer stdout_buf.deinit(alloc);
+    var stderr_buf = std.ArrayList(u8){};
+    defer stderr_buf.deinit(alloc);
+
+    if (child.stdout) |stdout| {
+        const bytes = try stdout.readToEndAlloc(alloc, 16 * 1024 * 1024);
+        defer alloc.free(bytes);
+        try stdout_buf.appendSlice(alloc, bytes);
+    }
+    if (child.stderr) |stderr| {
+        const bytes = try stderr.readToEndAlloc(alloc, 1 * 1024 * 1024);
+        defer alloc.free(bytes);
+        try stderr_buf.appendSlice(alloc, bytes);
+    }
+
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| c,
+        else => 255,
+    };
+
+    return .{
+        .stdout = try stdout_buf.toOwnedSlice(alloc),
+        .stderr = try stderr_buf.toOwnedSlice(alloc),
+        .exit_code = code,
+    };
+}
+
+test "--threads: -t 1 runs filter end-to-end" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-t", "1", "-c", "." }, "{\"a\":1}\n{\"a\":2}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n{\"a\":2}\n", r.stdout);
+}
+
+test "--threads: --threads 4 runs filter end-to-end" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "--threads", "4", "-c", "." }, "{\"a\":1}\n{\"a\":2}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n{\"a\":2}\n", r.stdout);
+}
+
+test "--threads: -t 0 is rejected as usage error" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-t", "0", "." }, "{}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "must be a positive integer") != null);
+}
+
+test "--threads: --threads 0 is rejected as usage error" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "--threads", "0", "." }, "{}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "must be a positive integer") != null);
+}
+
+test "--threads: -t abc is rejected as usage error" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-t", "abc", "." }, "{}");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 2), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "must be a positive integer") != null);
+}
+
+test "--threads: ZQ_THREADS=2 with no flag runs successfully" {
+    const alloc = std.testing.allocator;
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("ZQ_THREADS", "2");
+
+    var r = try runZqWithEnv(alloc, &.{ "-c", "." }, "{\"a\":1}\n", &env);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+test "--threads: CLI flag overrides ZQ_THREADS env (provable via crash trick)" {
+    const alloc = std.testing.allocator;
+
+    // First, prove the env-alone path actually fails for this value. If a
+    // future Pool.init learns to clamp the worker count, this guard catches
+    // the change so the precedence assertion below stays honest.
+    {
+        var env_alone = try std.process.getEnvMap(alloc);
+        defer env_alone.deinit();
+        try env_alone.put("ZQ_THREADS", "999999999");
+        var r_alone = try runZqWithEnv(alloc, &.{ "-c", "." }, "{\"a\":1}\n", &env_alone);
+        defer r_alone.deinit(alloc);
+        try std.testing.expect(r_alone.exit_code != 0);
+    }
+
+    // Now: same hostile env, but with `-t 1`. If the CLI flag did not win,
+    // the env value would crash the pool. Successful run proves env was ignored.
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("ZQ_THREADS", "999999999");
+
+    var r = try runZqWithEnv(alloc, &.{ "-t", "1", "-c", "." }, "{\"a\":1}\n", &env);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+test "--threads: malformed ZQ_THREADS falls back silently" {
+    const alloc = std.testing.allocator;
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("ZQ_THREADS", "garbage");
+
+    var r = try runZqWithEnv(alloc, &.{ "-c", "." }, "{\"a\":1}\n", &env);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+test "--threads: empty ZQ_THREADS falls back silently" {
+    const alloc = std.testing.allocator;
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("ZQ_THREADS", "");
+
+    var r = try runZqWithEnv(alloc, &.{ "-c", "." }, "{\"a\":1}\n", &env);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+test "--threads: ZQ_THREADS=0 falls back silently (not >= 1)" {
+    const alloc = std.testing.allocator;
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    try env.put("ZQ_THREADS", "0");
+
+    // 0 fails the >= 1 check inside resolveThreads → falls through to
+    // getCpuCount(). Run must succeed.
+    var r = try runZqWithEnv(alloc, &.{ "-c", "." }, "{\"a\":1}\n", &env);
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
+
+// Short-flag combinator: `-t` is a value-consuming flag, so its position in
+// the group matters. These tests pin the current ordering semantics.
+
+test "--threads: -rt 4 enables raw output AND parses threads (chars before 't' apply)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-rt", "4", "." }, "\"hello\"\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // raw_strings=true: string emitted without quotes.
+    try std.testing.expectEqualStrings("hello\n", r.stdout);
+}
+
+test "--threads: -tr 4 swallows trailing 'r' (the `break` after -t skips it)" {
+    const alloc = std.testing.allocator;
+    var r = try runZq(alloc, &.{ "-tr", "4", "." }, "\"hello\"\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // raw_strings stays false: string is emitted with quotes. This is the
+    // intentional consequence of `-t` consuming the rest of the flag group.
+    // If a future change drops the `break`, this test will flip and force
+    // a documented decision.
+    try std.testing.expectEqualStrings("\"hello\"\n", r.stdout);
+}
+
+test "--threads: -t 5 -t 3 succeeds (duplicate flag, last-write-wins by inspection)" {
+    const alloc = std.testing.allocator;
+    // No-crash assertion. The effective value (3) is not observable from
+    // outside, but the unconditional assignment in parseThreadsArg's caller
+    // means later occurrences overwrite earlier ones — confirmed by code
+    // inspection at src/main.zig (`config.threads = try parseThreadsArg(...)`).
+    var r = try runZq(alloc, &.{ "-t", "5", "-t", "3", "-c", "." }, "{\"a\":1}\n");
+    defer r.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expectEqualStrings("{\"a\":1}\n", r.stdout);
+}
