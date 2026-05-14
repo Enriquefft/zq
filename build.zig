@@ -46,9 +46,17 @@ pub fn build(b: *std.Build) void {
     // plain `cargo build` to avoid the zigbuild wrapper's startup overhead.
     const rust_triple_opt = rustTripleFromTarget(target.result);
     const is_host = target.query.isNative();
+    // Windows hosts default to the MSVC ABI for `cargo build`, which emits
+    // `zq_regex_shim.lib` (no `lib` prefix, `.lib` extension) instead of the
+    // GNU/Unix `libzq_regex_shim.a` we link against everywhere else. Force
+    // the cross path on Windows so we always link the mingw archive — the
+    // host runs cargo-zigbuild with --target=x86_64-pc-windows-gnu, matching
+    // what the cross-compile job already produces.
+    const force_cross_on_host = target.result.os.tag == .windows;
+    const use_cross_invocation = !is_host or force_cross_on_host;
     const shim_archive_path: []const u8 = if (shim_archive_opt) |p|
         p
-    else if (!is_host and rust_triple_opt != null)
+    else if (use_cross_invocation and rust_triple_opt != null)
         b.fmt("third_party/zq-regex-shim/target/{s}/release/libzq_regex_shim.a", .{rust_triple_opt.?})
     else
         "third_party/zq-regex-shim/target/release/libzq_regex_shim.a";
@@ -61,7 +69,7 @@ pub fn build(b: *std.Build) void {
         b.path(shim_archive_path);
 
     const shim_build_step: ?*std.Build.Step.Run = if (regex_enabled and shim_archive_opt == null) blk: {
-        const cmd = if (!is_host) cross: {
+        const cmd = if (use_cross_invocation) cross: {
             const triple = rust_triple_opt orelse {
                 std.debug.panic(
                     "regex shim cross-compile requires a known rust triple; zig target {s}-{s}-{s} is unmapped. Either add a mapping in build.zig or pass -Dregex=false.",
@@ -340,6 +348,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     io_test_mod.addImport("io", io_module);
+    // `std.posix.pipe()` resolves to an `extern "c" fn pipe` declaration on
+    // Windows (POSIX emulation via the MSVC CRT). Zig 0.15.x requires libc
+    // to be linked explicitly when any module reaches such a decl. The
+    // pipe-using sites are test-only, so linking libc on every host is a
+    // no-op cost not worth gating on `target.result.os.tag == .windows`.
+    io_test_mod.link_libc = true;
 
     const io_tests = b.addTest(.{ .root_module = io_test_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
@@ -400,6 +414,8 @@ pub fn build(b: *std.Build) void {
     });
     output_test_mod.addImport("output", output_module);
     output_test_mod.addImport("types", types_module);
+    // See `io_test_mod.link_libc` — same `std.posix.pipe()` decl.
+    output_test_mod.link_libc = true;
 
     const output_tests = b.addTest(.{ .root_module = output_test_mod });
     test_step.dependOn(&b.addRunArtifact(output_tests).step);
@@ -414,6 +430,8 @@ pub fn build(b: *std.Build) void {
     pool_test_mod.addImport("types", types_module);
     pool_test_mod.addImport("io", io_module);
     pool_test_mod.addImport("regex", regex_module);
+    // See `io_test_mod.link_libc` — same `std.posix.pipe()` decl.
+    pool_test_mod.link_libc = true;
 
     const pool_tests = b.addTest(.{ .root_module = pool_test_mod });
     if (shim_build_step) |step| pool_tests.step.dependOn(&step.step);

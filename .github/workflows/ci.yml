@@ -74,6 +74,15 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+      # Windows host cargo defaults to the MSVC ABI, which emits an archive
+      # with a different name (`zq_regex_shim.lib`) than we link against
+      # everywhere else (`libzq_regex_shim.a`). build.zig forces the cross
+      # path on Windows hosts and invokes cargo-zigbuild with the gnu triple,
+      # so the test job needs the same toolchain as the cross-compile job.
+      - if: matrix.os == 'windows'
+        uses: ./.github/actions/setup-rust-cross
+        with:
+          rust-target: x86_64-pc-windows-gnu
       - run: zig build test -Doptimize=${{ matrix.optimize }}
 
   cross-compile:
