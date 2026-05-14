@@ -37,4 +37,4 @@ awk -v lines="$LINES" 'BEGIN {
             printf "{\"id\":%d,\"name\":\"n%d\",\"data\":\"d%d\",\"status\":\"ok\",\"tags\":[\"t%d\",\"t%d\"]}\n", i, i % 1000, i, i % 20, (i+1) % 20
         }
     }
-}' > huge.jsonl
+}' > "$(dirname "$0")/huge.jsonl"
