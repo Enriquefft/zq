@@ -1458,23 +1458,31 @@ test "readCgroupFile: nonexistent path returns null" {
 }
 
 test "readCgroupFile: numeric value parsed correctly" {
-    // Write a temp file with a numeric value
-    const path = "/tmp/_zq_cgroup_test";
-    const f = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    // `readCgroupFile` is parser logic over `openFileAbsolute`; it works on
+    // any absolute path. cgroup files don't exist on Windows, but `/tmp`
+    // doesn't either (NT namespace → `OBJECT_PATH_NOT_FOUND`). Stage the
+    // fixture under a per-test tmpDir on every platform and resolve to its
+    // absolute path so the call sees what production sees.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("cgroup", .{ .truncate = true });
     try f.writeAll("536870912\n");
     f.close();
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("cgroup", &path_buf);
 
     const result = pool_mod.readCgroupFile(path);
     try std.testing.expectEqual(@as(?u64, 536870912), result);
 }
 
 test "readCgroupFile: max string returns null" {
-    const path = "/tmp/_zq_cgroup_test_max";
-    const f = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("cgroup", .{ .truncate = true });
     try f.writeAll("max\n");
     f.close();
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("cgroup", &path_buf);
 
     const result = pool_mod.readCgroupFile(path);
     try std.testing.expectEqual(@as(?u64, null), result);
