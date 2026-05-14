@@ -1032,6 +1032,19 @@ test "--threads: ZQ_THREADS=2 with no flag runs successfully" {
 }
 
 test "--threads: CLI flag overrides ZQ_THREADS env (provable via crash trick)" {
+    // The "crash trick" relies on `Pool.init(999999999, …)` failing because
+    // the OS can't actually spawn that many threads. Linux/macOS surface
+    // that as a non-zero exit immediately (POSIX `pthread_create` returns
+    // EAGAIN; the test runner reports the non-zero status). Windows reaches
+    // the same outcome via a different path — large `CreateThread` counts
+    // either succeed up to a much higher ceiling or fail with a system
+    // error our crash handler swallows differently, so the env-alone
+    // baseline doesn't fail and the precedence assertion no longer holds
+    // shape. Other tests in this file (`--threads: -t 1 wins over
+    // ZQ_THREADS=…`, the ZQ_THREADS-fallback cases) cover precedence on
+    // every platform; this one is POSIX-only by construction.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const alloc = std.testing.allocator;
 
     // First, prove the env-alone path actually fails for this value. If a

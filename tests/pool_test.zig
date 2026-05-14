@@ -25,23 +25,41 @@ const test_budget = MemoryBudget.explicit(1024 * 1024 * 1024);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Write `data` to a tmp file and return a readable File.
-/// Caller must close the file.
-fn tmp_file_fd(data: []const u8) !std.fs.File {
+/// Per-call temp-file handle. Linux uses `memfd_create` (no on-disk
+/// file, no directory tracking — `_dir` stays null). Other platforms
+/// (Windows in particular, where the prior `/tmp/...` literal hits the
+/// NT namespace and fails `OBJECT_PATH_NOT_FOUND`) materialize an
+/// on-disk file inside a per-call `std.testing.tmpDir`. `deinit` closes
+/// the file handle and, when applicable, removes the temp directory.
+const TmpFile = struct {
+    file: std.fs.File,
+    _dir: ?std.testing.TmpDir,
+
+    fn deinit(self: *TmpFile) void {
+        self.file.close();
+        if (self._dir) |*d| d.cleanup();
+    }
+};
+
+/// Write `data` to a temp file and return a `TmpFile` whose `.file` is
+/// a readable handle positioned at offset 0. Caller must `defer
+/// owner.deinit()` to close the handle and reap the temp dir.
+fn tmp_file_fd(data: []const u8) !TmpFile {
     // memfd_create is Linux-only and has a @compileError on other targets, so
     // gate the call comptime. Non-Linux falls through to the named-temp path.
     if (comptime @import("builtin").os.tag == .linux) {
         if (std.posix.memfd_create("pool_test", 0)) |fd| {
             _ = try std.posix.write(fd, data);
             try std.posix.lseek_SET(fd, 0);
-            return std.fs.File{ .handle = fd };
+            return .{ .file = std.fs.File{ .handle = fd }, ._dir = null };
         } else |_| {}
     }
-    const path = "/tmp/_zq_pool_test_tmp";
-    const f = try std.fs.createFileAbsolute(path, .{ .read = true, .truncate = true });
+    var dir = std.testing.tmpDir(.{});
+    errdefer dir.cleanup();
+    const f = try dir.dir.createFile("data", .{ .read = true });
     try f.writeAll(data);
     try f.seekTo(0);
-    return f;
+    return .{ .file = f, ._dir = dir };
 }
 
 /// Drain all results from the pool into an ArrayList of Values (structured path).
@@ -119,8 +137,9 @@ test "submit_file: single integer line" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("42\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("42\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -138,8 +157,9 @@ test "submit_file: three integer lines in order" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("1\n2\n3\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("1\n2\n3\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -159,8 +179,9 @@ test "submit_file: no trailing newline" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("99");
-    defer file.close();
+    var file_owner = try tmp_file_fd("99");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -178,8 +199,9 @@ test "submit_file: empty file returns no results" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("");
-    defer file.close();
+    var file_owner = try tmp_file_fd("");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -196,8 +218,9 @@ test "submit_file: blank lines are skipped" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("\n\n7\n\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("\n\n7\n\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -217,8 +240,9 @@ test "submit_file: .x field projection" {
     var cq = try compile(".x");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("{\"x\":10}\n{\"x\":20}\n{\"x\":30}\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("{\"x\":10}\n{\"x\":20}\n{\"x\":30}\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -238,8 +262,9 @@ test "submit_file: string value round-trip" {
     var cq = try compile(".name");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("{\"name\":\"alice\"}\n{\"name\":\"bob\"}\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -267,8 +292,9 @@ test "submit_file: ordering preserved with 4 workers, 20 records" {
         try file_buf.writer(alloc).print("{d}\n", .{i});
     }
 
-    const file = try tmp_file_fd(file_buf.items);
-    defer file.close();
+    var file_owner = try tmp_file_fd(file_buf.items);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
@@ -290,8 +316,9 @@ test "submit_file: malformed JSON returns parse error" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("not-json\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("not-json\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -307,8 +334,9 @@ test "submit_file: type error propagated from query" {
     var cq = try compile(".x");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("42\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("42\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -325,8 +353,9 @@ test "submit_file: boolean values" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("true\nfalse\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("true\nfalse\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -345,8 +374,9 @@ test "submit_file: null value" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("null\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("null\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -364,8 +394,9 @@ test "submit_file: float value" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("3.14\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("3.14\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -458,8 +489,9 @@ test "submit_file: pretty record crossing chunk boundary (4 workers)" {
         try data.writer(alloc).print("{{\n  \"n\": {d}\n}}\n", .{i});
     }
 
-    const file = try tmp_file_fd(data.items);
-    defer file.close();
+    var file_owner = try tmp_file_fd(data.items);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
@@ -868,8 +900,9 @@ test "collect returns null when called after drain" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("1\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("1\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -890,8 +923,9 @@ test "zero threads: submit_file processes records synchronously" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("7\n8\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("7\n8\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -914,8 +948,9 @@ test "serialized: single integer" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("42\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("42\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -933,8 +968,9 @@ test "serialized: string value" {
     var cq = try compile(".name");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("{\"name\":\"alice\"}\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("{\"name\":\"alice\"}\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -951,8 +987,9 @@ test "serialized: multi-value query (.[])" {
     var cq = try compile(".[]");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("[1,2,3]\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("[1,2,3]\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -969,8 +1006,9 @@ test "serialized: error propagation" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("not-json\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("not-json\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -989,8 +1027,9 @@ test "serialized: user_error_msg surfaced for error(\"...\")" {
     var cq = try compile(".foo // error(\"bad\")");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("\"x\"\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("\"x\"\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1024,8 +1063,9 @@ test "serialized: ordering with 4 workers" {
         try file_buf.writer(alloc).print("{d}\n", .{i});
     }
 
-    const file = try tmp_file_fd(file_buf.items);
-    defer file.close();
+    var file_owner = try tmp_file_fd(file_buf.items);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(4, test_budget, alloc);
     defer p.deinit();
@@ -1076,8 +1116,9 @@ test "serialized: empty select produces no bytes" {
     var cq = try compile("select(false)");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("1\n2\n3\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("1\n2\n3\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1094,8 +1135,9 @@ test "serialized: false/null tracking for -e flag" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("false\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("false\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1113,8 +1155,9 @@ test "serialized: null tracking for -e flag" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("null\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("null\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1132,8 +1175,9 @@ test "serialized: collect_bytes returns null after drain" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("1\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("1\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1151,8 +1195,9 @@ test "serialized: jsonl format" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("42\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("42\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1170,8 +1215,9 @@ test "serialized: raw format for string" {
     var cq = try compile(".name");
     defer cq.deinit();
 
-    const file = try tmp_file_fd("{\"name\":\"hello\"}\n");
-    defer file.close();
+    var file_owner = try tmp_file_fd("{\"name\":\"hello\"}\n");
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
@@ -1456,8 +1502,9 @@ test "prefilter: select(.field|test(literal)) skips non-matching records" {
     // Prefilter must be populated for this filter shape.
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     pool_mod.prefilter_stats.reset();
 
@@ -1495,8 +1542,9 @@ test "prefilter: alternation pattern uses OR-semantics" {
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     pool_mod.prefilter_stats.reset();
 
@@ -1645,8 +1693,9 @@ test "prefilter: correctness — no false negatives on matching records" {
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     pool_mod.prefilter_stats.reset();
 
@@ -1682,8 +1731,9 @@ test "prefilter: \\uXXXX escape hole — record with escape-encoded literal matc
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     pool_mod.prefilter_stats.reset();
 
@@ -1716,8 +1766,9 @@ test "prefilter: short-escape hole — record with \\t inside string keeps liter
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     pool_mod.prefilter_stats.reset();
 
@@ -1753,8 +1804,9 @@ test "prefilter: short-escape hole — match through \\u encoding verified end-t
     defer cq.deinit();
     try std.testing.expect(cq.prefilter != null);
 
-    const file = try tmp_file_fd(input);
-    defer file.close();
+    var file_owner = try tmp_file_fd(input);
+    defer file_owner.deinit();
+    const file = file_owner.file;
 
     var p = try Pool.init(1, test_budget, alloc);
     defer p.deinit();
