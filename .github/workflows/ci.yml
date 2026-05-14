@@ -40,9 +40,17 @@ jobs:
         run: shellcheck --severity=warning install.sh
       - name: PSScriptAnalyzer install.ps1
         shell: pwsh
+        # `PSAvoidUsingWriteHost` is a false positive on interactive
+        # installers — `Write-Host` is the correct tool for colored
+        # progress output that is not pipeline data. `PSUseBOMForUnicode
+        # EncodedFile` only fires on decorative non-ASCII glyphs inside
+        # comments (no functional impact); PS7 reads UTF-8 fine without
+        # a BOM. Both rules are well-known noise for installer scripts.
         run: |
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
-          $issues = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning,Error
+          $issues = Invoke-ScriptAnalyzer -Path install.ps1 `
+            -Severity Warning,Error `
+            -ExcludeRule PSAvoidUsingWriteHost,PSUseBOMForUnicodeEncodedFile
           if ($issues) {
             $issues | Format-Table -AutoSize
             exit 1
