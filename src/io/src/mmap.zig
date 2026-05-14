@@ -65,6 +65,19 @@ pub const MappedFile = struct {
                 file.handle,
                 0,
             );
+            // POSIX hint: workers walk the mapping sequentially, so the kernel
+            // can prefetch aggressively and reclaim already-read pages.
+            // Composes with the per-chunk MADV_DONTNEED issued by the worker
+            // pool after each chunk completes. Best-effort: failure is ignored
+            // (madvise is purely advisory and never affects correctness).
+            // Supported on Linux/macOS/BSD; skip Solaris-derived posix_madvise
+            // surfaces zig does not yet expose.
+            switch (builtin.os.tag) {
+                .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+                    std.posix.madvise(data.ptr, data.len, std.posix.MADV.SEQUENTIAL) catch {};
+                },
+                else => {},
+            }
             return .{ .data = data, ._win_mapping = {} };
         }
     }

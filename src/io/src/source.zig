@@ -63,4 +63,27 @@ pub const Source = struct {
             .ring => |*r| r.refill(),
         };
     }
+
+    /// If backed by mmap, returns the full mapped slice (independent of the
+    /// peek/consume cursor). Returns null for streaming (ring) sources.
+    /// Used by callers that want to feed the entire mapping into a
+    /// parallel-chunked processor instead of the streaming IO thread.
+    pub fn mappedSlice(s: *const Source) ?[]const u8 {
+        return switch (s.backend) {
+            .mmap => |m| m.mapped.data,
+            .ring => null,
+        };
+    }
+
+    /// If backed by a streaming ring buffer, returns the underlying file
+    /// handle so callers can read directly from the fd (bypassing the ring's
+    /// internal buffer). Returns null for mmap sources.
+    /// Used by the stream IO thread to read into pool-managed input slots
+    /// without an intermediate ring → batch_buf copy.
+    pub fn streamFile(s: *const Source) ?std.fs.File {
+        return switch (s.backend) {
+            .mmap => null,
+            .ring => |r| r.file,
+        };
+    }
 };

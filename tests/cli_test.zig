@@ -795,3 +795,123 @@ test "-e absent: empty output is still EXIT_OK (0)" {
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
 }
+
+// ── stdin dispatch parity (Phase 1: submit_source) ──────────────────────────
+//
+// Regression guard for the source-backend-aware dispatch that routes a
+// regular-file stdin (e.g. `zq … < f.json`) through the same mmap-backed
+// parallel chunker as `zq f.json`, instead of the streaming IO thread.
+// All three invocations — file arg, shell `<` redirect, and `cat | zq` pipe —
+// must produce byte-identical stdout for the same query.
+
+/// Run a shell pipeline (`/bin/sh -c …`) and capture stdout/stderr/exit code.
+fn runShell(alloc: std.mem.Allocator, script: []const u8) !RunResult {
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", script }, alloc);
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    var stdout_buf = std.ArrayList(u8){};
+    defer stdout_buf.deinit(alloc);
+    var stderr_buf = std.ArrayList(u8){};
+    defer stderr_buf.deinit(alloc);
+
+    if (child.stdout) |stdout| {
+        const bytes = try stdout.readToEndAlloc(alloc, 64 * 1024 * 1024);
+        defer alloc.free(bytes);
+        try stdout_buf.appendSlice(alloc, bytes);
+    }
+    if (child.stderr) |stderr| {
+        const bytes = try stderr.readToEndAlloc(alloc, 1 * 1024 * 1024);
+        defer alloc.free(bytes);
+        try stderr_buf.appendSlice(alloc, bytes);
+    }
+
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| c,
+        else => 255,
+    };
+
+    return .{
+        .stdout = try stdout_buf.toOwnedSlice(alloc),
+        .stderr = try stderr_buf.toOwnedSlice(alloc),
+        .exit_code = code,
+    };
+}
+
+test "stdin dispatch parity: file arg, < redirect, and cat | pipe agree" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [128]u8 = undefined;
+    const path = try tmpPath(&path_buf, "dispatch.jsonl");
+    defer deleteTmp(path);
+
+    var contents = std.ArrayList(u8){};
+    defer contents.deinit(alloc);
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        try contents.writer(alloc).print("{{\"id\":{d},\"v\":\"x\"}}\n", .{i});
+    }
+    try writeTmp(path, contents.items);
+
+    var r_file = try runZq(alloc, &.{ ".id", path }, null);
+    defer r_file.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r_file.exit_code);
+
+    var script_redir_buf: [256]u8 = undefined;
+    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, path });
+    var r_redir = try runShell(alloc, script_redir);
+    defer r_redir.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r_redir.exit_code);
+
+    var script_pipe_buf: [256]u8 = undefined;
+    const script_pipe = try std.fmt.bufPrint(&script_pipe_buf, "cat {s} | {s} '.id'", .{ path, zq_path });
+    var r_pipe = try runShell(alloc, script_pipe);
+    defer r_pipe.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r_pipe.exit_code);
+
+    try std.testing.expectEqualStrings(r_file.stdout, r_redir.stdout);
+    try std.testing.expectEqualStrings(r_file.stdout, r_pipe.stdout);
+}
+
+test "stdin dispatch parity: pretty-printed multi-line records" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [128]u8 = undefined;
+    const path = try tmpPath(&path_buf, "pretty.json");
+    defer deleteTmp(path);
+
+    var contents = std.ArrayList(u8){};
+    defer contents.deinit(alloc);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        try contents.writer(alloc).print(
+            \\{{
+            \\  "id": {d},
+            \\  "nested": {{
+            \\    "v": "x"
+            \\  }}
+            \\}}
+            \\
+        , .{i});
+    }
+    try writeTmp(path, contents.items);
+
+    var r_file = try runZq(alloc, &.{ ".id", path }, null);
+    defer r_file.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), r_file.exit_code);
+
+    var script_redir_buf: [256]u8 = undefined;
+    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, path });
+    var r_redir = try runShell(alloc, script_redir);
+    defer r_redir.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u8, 0), r_redir.exit_code);
+    try std.testing.expectEqualStrings(r_file.stdout, r_redir.stdout);
+}

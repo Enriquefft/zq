@@ -629,7 +629,11 @@ pub fn main() !u8 {
         };
         defer pool.deinit();
 
-        pool.submit_stream(&src, &cq, style, color, serialize_opts, config.raw_input, ext_bindings);
+        pool.submit_source(&src, &cq, style, color, serialize_opts, config.raw_input, ext_bindings) catch |e| {
+            printErr("zq: ");
+            printZqErr(e);
+            return EXIT_USAGE;
+        };
 
         while (true) {
             const maybe = pool.collect_bytes() catch |e| {

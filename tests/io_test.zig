@@ -57,6 +57,37 @@ test "mmap: consume advances cursor; is_eof set when all bytes consumed" {
     try std.testing.expect(done.is_eof);
 }
 
+test "mmap: mappedSlice returns full content" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const content = "ABCDEFGHIJ";
+    const file = try tmpFileWithContent(tmp.dir, "mapslice.json", content);
+    defer file.close();
+
+    var src = try Source.init(file, alloc);
+    defer src.deinit();
+
+    const slice = src.mappedSlice() orelse return error.TestExpectedMmap;
+    try std.testing.expectEqualSlices(u8, content, slice);
+
+    // Cursor advance must not change mappedSlice() — it always spans the file.
+    src.consume(5);
+    try std.testing.expectEqualSlices(u8, content, src.mappedSlice().?);
+}
+
+test "ring: mappedSlice returns null for streaming source" {
+    const alloc = std.testing.allocator;
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[1]);
+
+    var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
+    defer src.deinit();
+
+    try std.testing.expect(src.mappedSlice() == null);
+}
+
 test "mmap: refill always returns false" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
