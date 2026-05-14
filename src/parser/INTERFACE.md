@@ -105,6 +105,38 @@ pub const Parser = struct {
 | `DepthLimitExceeded`   | Structural nesting exceeds 512 levels (`{` / `[` stack overflow).                                 |
 | `error{OutOfMemory}`   | Internal tape or string buffer could not grow (extremely large input).                             |
 
+### Submodules (re-exports)
+
+The parser root re-exports two submodules that the file-feeding pool consumes
+directly. They are part of the public API; production callers outside the
+parser package must go through `parser.boundary` / `parser.simd`.
+
+#### `parser.boundary` — record-boundary scanner
+
+JSONL boundary scanner driven by the same simdjson stage-1 SIMD pipeline as
+`Parser.feed`. Used by the pool's file feeder to split a memory-mapped JSONL
+file into chunk-aligned record boundaries before dispatching chunks to
+worker `Parser` instances.
+
+| Symbol                 | Role                                                                                                                         |
+|------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| `ScannerState`         | Carry-state across SIMD chunks: `depth`, `in_string`, `escape_pending`. Default-initializable; one instance per scan sweep.  |
+| `feedBytes`            | Append the absolute offsets of every depth-0/outside-string `\n` in `data` to `out_boundaries`. Owns the `allocator` for growth. |
+| `advanceState`         | State-only sweep over `data` (no boundaries recorded). Used to bring the scanner up to a chunk midpoint before searching forward. |
+| `findNextRecordEnd`    | Starting from `from`, return the position one past the next depth-0/outside-string `\n` in `data[from..end]`. Mutates `state` to reflect bytes consumed up to and including the boundary newline. |
+| `feedBytesReference`   | **Tests-only oracle.** Scalar reference implementation of `feedBytes`; the SIMD `feedBytes` is property-tested against this. Production callers must not use it. |
+
+#### `parser.simd` — SIMD scanning primitives
+
+Building blocks shared by `Parser.feed` and the boundary scanner. Each
+primitive returns a `usize` count of bytes the caller may safely advance.
+
+| Function           | Role                                                                                                          |
+|--------------------|---------------------------------------------------------------------------------------------------------------|
+| `scanStringBody`   | Inside a JSON string, skip safe ASCII content up to the next `"` / `\\` / control byte.                       |
+| `scanStructural`   | Outside a string, skip non-structural bytes up to the next `"` / `{` / `}` / `[` / `]` / structural delimiter. |
+| `skipWhitespace`   | Skip JSON whitespace (`0x20`, `0x09`, `0x0A`, `0x0D`).                                                        |
+
 ---
 
 ## Dependencies

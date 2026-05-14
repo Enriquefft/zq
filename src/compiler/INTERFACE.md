@@ -109,13 +109,22 @@ pub const CompileResult = ctypes.CompileResult;
 /// these in the root scope at var ids `0..N-1` so cat-4 `$external_var`
 /// references resolve to the same operand index every run.
 pub const ExternalVarDecl = ctypes.ExternalVarDecl;
+
+/// Module-system options threaded into `compile()`. Together,
+/// `module_search_path` (the fixture-root chain) and the optional
+/// `current_file_dir` feed the resolver's lookup. Callers that don't use
+/// the module system pass `.{}`.
+pub const ModuleOpts = struct {
+    module_search_path: []const []const u8 = &.{},
+    current_file_dir: ?[]const u8 = null,
+};
 ```
 
 ### Functions
 
 | Function          | Signature                                                                                                  | Description                                                                              |
 |-------------------|------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
-| `compile`         | `[]const u8, []const ExternalVarDecl, std.mem.Allocator → error{OutOfMemory}!CompileResult`               | Compile a filter source string. Always returns a `CompileResult`; only OOM bubbles up.   |
+| `compile`         | `[]const u8, []const ExternalVarDecl, ModuleOpts, std.mem.Allocator → error{OutOfMemory}!CompileResult`   | Compile a filter source string. Always returns a `CompileResult`; only OOM bubbles up.   |
 | `lowerNode`       | `*Lowerer, *const ast.Node → error{OutOfMemory, LowerDiagnostic}!void`                                     | Lower one AST node; recursive entry. `.err` carried via `lowerer.compile_err`.           |
 | `fuse`            | `IR → error{OutOfMemory}!FuseResult`                                                                       | IR → IR rewrite pass. Result carries `index_map` for re-pointing aux tables.             |
 | `dump` / `dumpIR` / `dumpIRSubtree` | (see `ir.zig`)                                                                              | Snapshot-test helpers; not used at runtime.                                              |
