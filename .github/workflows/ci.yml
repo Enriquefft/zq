@@ -33,8 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # Match the PSScriptAnalyzer filter below: warnings + errors only.
+      # Info/style findings (e.g. SC2016 on intentional `$PATH` literals in
+      # rc-snippet `printf`s) are not actionable lint failures.
       - name: ShellCheck install.sh
-        run: shellcheck install.sh
+        run: shellcheck --severity=warning install.sh
       - name: PSScriptAnalyzer install.ps1
         shell: pwsh
         run: |
