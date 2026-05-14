@@ -560,7 +560,7 @@ test "submit_stream: no trailing newline" {
 // partial-publish boundary, (3) slot recycling when the input volume exceeds
 // the total pool residency, (4) multi-slot tail-carry for records larger than
 // one slot, (5) clean cuts when a record terminator lands on a slot boundary,
-// and (6) graceful exit when a single record exceeds K_MAX_CARRY × slot_size.
+// and (6) graceful exit when a single record exceeds one slot (hard cap = slot_size).
 
 /// Background thread that drains a pipe writer asynchronously. Required
 /// because writes >PIPE_BUF block until the reader empties the pipe.
@@ -1297,6 +1297,112 @@ test "computeParams: pretty format uses higher expansion" {
     const pretty = budget.computeParams(2 * 1024 * 1024 * 1024, 8, .{});
     // Pretty has 6x expansion vs compact's 2x, so it should need more chunks
     try std.testing.expect(pretty.chunk_factor >= compact.chunk_factor);
+}
+
+// Pins the hardware-adaptive sizing rule: every tunable scales from
+// MemoryBudget, no hardcoded hardware assumption. Three tiers cover the
+// expected deployment range; the floor tier covers minimum-resource
+// containers. If any of these expectations changes, the change must be
+// deliberate — adjust the test in the same commit as the sizing change.
+test "computeParams: three-tier hardware sizing (stream mode, compact)" {
+    // Tier 1 — small constrained container (e.g., 1 GiB cgroup → 512 MiB budget).
+    {
+        const budget = MemoryBudget.explicit(512 * 1024 * 1024);
+        const p = budget.computeParams(0, 1, .{ .compact = true });
+        try std.testing.expectEqual(@as(usize, 256 * 1024), p.stream_batch_size);
+        try std.testing.expectEqual(@as(usize, 512 * 1024), p.stream_slot_size);
+        // floor = n+2 = 3, ceiling = n+32 = 33, ideal = 512MiB/(4*512KiB) = 256 → 33.
+        try std.testing.expectEqual(@as(usize, 33), p.stream_input_slots);
+        // Total slot residency stays a small fraction of budget.
+        const residency = p.stream_slot_size * p.stream_input_slots;
+        try std.testing.expect(residency <= budget.budget_bytes / 4);
+    }
+
+    // Tier 2 — typical 16-core / 32 GiB box (→ 16 GiB budget).
+    {
+        const budget = MemoryBudget.explicit(16 * 1024 * 1024 * 1024);
+        const p = budget.computeParams(0, 16, .{ .compact = true });
+        try std.testing.expectEqual(@as(usize, 256 * 1024), p.stream_batch_size);
+        try std.testing.expectEqual(@as(usize, 512 * 1024), p.stream_slot_size);
+        // floor = 18, ceiling = 48, ideal = 16GiB/(4*512KiB) = 8192 → 48.
+        try std.testing.expectEqual(@as(usize, 48), p.stream_input_slots);
+        const residency = p.stream_slot_size * p.stream_input_slots;
+        try std.testing.expect(residency <= budget.budget_bytes / 4);
+    }
+
+    // Tier 3 — fat 64-core / 512 GiB server (→ 256 GiB budget).
+    {
+        const budget = MemoryBudget.explicit(256 * 1024 * 1024 * 1024);
+        const p = budget.computeParams(0, 64, .{ .compact = true });
+        try std.testing.expectEqual(@as(usize, 256 * 1024), p.stream_batch_size);
+        try std.testing.expectEqual(@as(usize, 512 * 1024), p.stream_slot_size);
+        // floor = 66, ceiling = 96, ideal = 256GiB/(4*512KiB) = 131072 → 96.
+        try std.testing.expectEqual(@as(usize, 96), p.stream_input_slots);
+        const residency = p.stream_slot_size * p.stream_input_slots;
+        try std.testing.expect(residency <= budget.budget_bytes / 4);
+    }
+}
+
+test "computeParams: minimum-resource floor (sub-MB budget)" {
+    // Hostile minimum: 128 KiB budget, 1 thread. Batch hits MIN_STREAM_BATCH;
+    // slot count clamps to floor. Verifies the floor invariant so a malformed
+    // cgroup limit doesn't degenerate to zero slots.
+    const budget = MemoryBudget.explicit(128 * 1024);
+    const p = budget.computeParams(0, 1, .{ .compact = true });
+    try std.testing.expectEqual(@as(usize, 64 * 1024), p.stream_batch_size);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), p.stream_slot_size);
+    // floor = n+2 = 3.
+    try std.testing.expectEqual(@as(usize, 3), p.stream_input_slots);
+}
+
+test "computeParams: slot count monotonic in thread count" {
+    // For a fixed budget, more threads → ≥ as many slots (floor = n+2 rises).
+    // Prevents future regressions where slot count accidentally caps below
+    // n_workers (which would starve every worker permanently).
+    const budget = MemoryBudget.explicit(8 * 1024 * 1024 * 1024);
+    const p1 = budget.computeParams(0, 1, .{ .compact = true });
+    const p16 = budget.computeParams(0, 16, .{ .compact = true });
+    const p64 = budget.computeParams(0, 64, .{ .compact = true });
+    try std.testing.expect(p1.stream_input_slots <= p16.stream_input_slots);
+    try std.testing.expect(p16.stream_input_slots <= p64.stream_input_slots);
+    // And always at least n_workers + 2 (per-worker + IO thread + queue tail).
+    try std.testing.expect(p1.stream_input_slots >= 1 + 2);
+    try std.testing.expect(p16.stream_input_slots >= 16 + 2);
+    try std.testing.expect(p64.stream_input_slots >= 64 + 2);
+}
+
+test "computeParams: in_flight_factor never exceeds MAX_IN_FLIGHT_FACTOR" {
+    // The Sequencer ring is sized for MAX_IN_FLIGHT_FACTOR; the runtime
+    // value must never exceed it across the parameter space.
+    const max: usize = 2;
+    const budgets = [_]u64{
+        128 * 1024,               256 * 1024 * 1024, 8 * 1024 * 1024 * 1024,
+        128 * 1024 * 1024 * 1024,
+    };
+    const threads = [_]usize{ 1, 4, 16, 64 };
+    const sizes = [_]u64{ 0, 1024 * 1024, 10 * 1024 * 1024 * 1024 };
+    for (budgets) |b| for (threads) |t| for (sizes) |s| {
+        const budget = MemoryBudget.explicit(b);
+        const p = budget.computeParams(s, t, .{ .compact = true });
+        try std.testing.expect(p.in_flight_factor <= max);
+        try std.testing.expect(p.in_flight_factor >= 1);
+    };
+}
+
+test "computeParams: stream_slot_size == 2 × stream_batch_size invariant" {
+    // The slot-size doubling is the publish-threshold + tail-headroom contract
+    // that the IO thread relies on. Pin it across the parameter space so a
+    // future tweak to one without the other is caught immediately.
+    const budgets = [_]u64{
+        512 * 1024,              256 * 1024 * 1024,        2 * 1024 * 1024 * 1024,
+        16 * 1024 * 1024 * 1024, 256 * 1024 * 1024 * 1024,
+    };
+    const threads = [_]usize{ 1, 8, 32 };
+    for (budgets) |b| for (threads) |t| {
+        const budget = MemoryBudget.explicit(b);
+        const p = budget.computeParams(0, t, .{ .compact = true });
+        try std.testing.expectEqual(p.stream_batch_size *| 2, p.stream_slot_size);
+    };
 }
 
 test "readCgroupFile: nonexistent path returns null" {

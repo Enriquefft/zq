@@ -162,6 +162,28 @@ pub const Pool = struct {
         external_bindings: []const query.ExternalVarBinding,
     ) void;
 
+    /// Dispatch a `Source` to the optimal path based on its backend.
+    ///
+    /// - `.mmap`-backed sources (regular-file stdin, e.g. `zq < f.json`) route
+    ///   through the file/mmap path — workers walk the mapping directly with
+    ///   no IO-thread copy.
+    /// - `.ring`-backed sources (true pipes, sockets) route through
+    ///   `submit_stream`'s slot-pool path.
+    ///
+    /// This is the canonical entrypoint for stdin in `main.zig`. Callers must
+    /// keep `src` alive until `Pool.deinit` returns (the pool borrows the
+    /// mmap slice in the mmap path).
+    pub fn submit_source(
+        p:                 *Pool,
+        src:               *io.Source,
+        cq:                *const query.CompiledQuery,
+        style:             ?types.OutputStyle,
+        color:             ?*const output.Color,
+        opts:              output.SerializeOpts,
+        raw_input:         bool,
+        external_bindings: []const query.ExternalVarBinding,
+    ) ZqError!void;
+
     /// Return the next result in submission order (structured path).
     pub fn collect(p: *Pool) ZqError!?Result;
 
@@ -182,6 +204,7 @@ pub const Pool = struct {
 | `Pool.deinit`         | `*Pool → void`                                                                   | Stop all workers, join threads, free memory.                                            |
 | `Pool.submit_file`    | `*Pool, File, *const CompiledQuery, ?OutputStyle, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → ZqError!void` | Read file, split into adaptive chunks, enqueue for parallel processing. |
 | `Pool.submit_stream`  | `*Pool, *Source, *const CompiledQuery, ?OutputStyle, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → void`      | Attach stream; IO thread reads lines and feeds workers in pipeline mode. |
+| `Pool.submit_source`  | `*Pool, *Source, *const CompiledQuery, ?OutputStyle, ?*const Color, SerializeOpts, bool, []const ExternalVarBinding → ZqError!void` | Dispatch a Source to the optimal path: `.mmap` → file path, `.ring` → stream path. Canonical entrypoint for stdin. |
 | `Pool.collect`        | `*Pool → ZqError!?Result`                                                        | Return next in-order result; null when exhausted; error on per-record failure.          |
 | `Pool.collect_bytes`  | `*Pool → ZqError!?BytesResult`                                                   | Return next in-order pre-serialized bytes; null when exhausted; skips empty records.    |
 | `record_meta_size_for_test` | `usize` (comptime constant)                                                | `@sizeOf(RecordMeta)` — exported so the regression test in `tests/pool_test.zig` can pin the layout. Any new per-record field changes this value and fails the test intentionally. |
@@ -316,14 +339,27 @@ and exits cleanly; downstream sees a clean EOF. With `stream_batch_size` in
 records are well under 1 KiB; pretty-printed top-level values exceeding the
 cap are not a supported stream-mode workload.
 
-**Hardware sizing.** All knobs derive from `MemoryBudget.computeParams`:
+**Hardware sizing.** All knobs derive from `MemoryBudget.computeParams`
+(stream mode, compact output). Pinned in
+`tests/pool_test.zig` → "computeParams: three-tier hardware sizing":
 
-| Tier (RAM / CPUs / budget)        | batch_size | slot_size | slot_count | slot residency |
-|-----------------------------------|------------|-----------|------------|----------------|
-| Constrained: 1 GB / 1 core / 256 MB | 64 KiB   | 128 KiB   | 3          | 384 KiB        |
-| Workstation: 32 GB / 16 cores / 16 GB | 256 KiB | 512 KiB | 48         | 24 MiB         |
-| Server: 512 GB / 64 cores / 256 GB    | 256 KiB | 512 KiB | 96         | 48 MiB         |
+| Tier (RAM / CPUs / budget)            | batch_size | slot_size | slot_count | slot residency |
+|---------------------------------------|------------|-----------|------------|----------------|
+| Minimum-floor: 128 KiB / 1 core       | 64 KiB     | 128 KiB   | 3          | 384 KiB        |
+| Constrained: 1 GiB / 1 core / 512 MiB | 256 KiB    | 512 KiB   | 33         | 16.5 MiB       |
+| Workstation: 32 GiB / 16 cores / 16 GiB | 256 KiB  | 512 KiB   | 48         | 24 MiB         |
+| Server: 512 GiB / 64 cores / 256 GiB  | 256 KiB    | 512 KiB   | 96         | 48 MiB         |
 
-Floor (`n_threads + 2`) keeps single-core systems usable; ceiling (`n_threads + 32`)
-prevents over-allocation on large-CPU systems where producers can't fill more
-slots than consumers can drain.
+`batch_size = clamp(budget / (n_threads × 2 × format_expansion),
+MIN_STREAM_BATCH=64 KiB, MAX_STREAM_BATCH=256 KiB)`. The MIN_STREAM_BATCH
+floor only engages on truly tiny budgets (a 1-core compact workload requires
+budget < ~256 KiB to hit it); MAX_STREAM_BATCH ceils every realistic
+deployment to 256 KiB.
+
+`slot_count = clamp(budget / (4 × slot_size), n_threads + 2, n_threads + 32)`.
+Floor (`n_threads + 2`) keeps single-core systems usable (per-worker + IO
+thread + queue tail); ceiling (`n_threads + 32`) prevents over-allocation on
+large-CPU systems where producers can't fill more slots than consumers can
+drain. The `n_threads + 32` ceiling dominates the result on every realistic
+budget (≥ ~16 MiB on a 64-thread box), so total slot residency stays under
+~50 MiB everywhere.

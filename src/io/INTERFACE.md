@@ -33,6 +33,17 @@ pub const Source = struct {
     /// Only syscall site. Returns true if new data was read, false on clean EOF or backpressure.
     /// std.posix.read handles EINTR internally; all other read failures return error.IoError.
     pub fn refill(s: *Source) ZqError!bool;
+
+    /// For mmap-backed sources, returns the full mapped slice (cursor-independent).
+    /// Returns null for ring-backed sources. Consumed by `pool.submit_source` to
+    /// route shell-redirect-from-file (`zq < f.json`) through the zero-copy file
+    /// path instead of paying the stream IO thread + copy cost.
+    pub fn mappedSlice(s: *const Source) ?[]const u8;
+
+    /// For ring-backed sources, returns the underlying `std.fs.File` so the
+    /// stream IO thread can `read()` directly into pool-managed input slots.
+    /// Returns null for mmap-backed sources.
+    pub fn streamFile(s: *const Source) ?std.fs.File;
 };
 
 /// mmap-backed view over a regular file. Re-exported from `src/io/root.zig`
@@ -49,6 +60,8 @@ pub const MappedFile = @import("src/mmap.zig").MappedFile;
 | `Source.peek` | `*Source → ZqError!SliceView` | Zero-copy view; no syscalls |
 | `Source.consume` | `*Source, usize → void` | Advances cursor; pointer arithmetic only |
 | `Source.refill` | `*Source → ZqError!bool` | Only syscall point; false on clean EOF/backpressure, error.IoError on failure |
+| `Source.mappedSlice` | `*const Source → ?[]const u8` | Full mmap slice if `.mmap`-backed; null for ring. Drives the pool's mmap-vs-stream dispatch in `submit_source` |
+| `Source.streamFile` | `*const Source → ?std.fs.File` | Underlying fd if `.ring`-backed; null for mmap. Used by the stream IO thread to read directly into input slots |
 
 ### Errors
 | ZqError | When |

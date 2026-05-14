@@ -70,10 +70,15 @@ pub const MappedFile = struct {
             // Composes with the per-chunk MADV_DONTNEED issued by the worker
             // pool after each chunk completes. Best-effort: failure is ignored
             // (madvise is purely advisory and never affects correctness).
-            // Supported on Linux/macOS/BSD; skip Solaris-derived posix_madvise
-            // surfaces zig does not yet expose.
+            //
+            // Gate matches the targets where `std.posix.MADV.SEQUENTIAL` is a
+            // real integer constant in Zig 0.15's stdlib (`std/c.zig:1522`):
+            // linux, macos+ios/tvos/watchos/visionos, freebsd, dragonfly,
+            // solaris/illumos, serenity. NetBSD/OpenBSD/AIX/etc. fall through
+            // to `else => void` in the stdlib MADV switch — referencing the
+            // field there is a compile error, not a runtime fallback.
             switch (builtin.os.tag) {
-                .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+                .linux, .macos, .freebsd, .dragonfly => {
                     std.posix.madvise(data.ptr, data.len, std.posix.MADV.SEQUENTIAL) catch {};
                 },
                 else => {},

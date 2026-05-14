@@ -797,7 +797,11 @@ fn try_pin_total_chunks(
 fn worker_fn(ctx: WorkerCtx) void {
     // One parser per worker, reused across all chunks via reset().
     var parser = parser_mod.Parser.init(ctx.allocator) catch {
-        while (ctx.queue.pop()) |job| if (job.owns_data) job.allocator.free(job.data);
+        // Drain the queue so the IO thread / file feeder unblock and Pool.deinit's
+        // slot-pool free_count assertion holds. Use releaseJobData (not just
+        // `if (owns_data)`) so slot-backed jobs return their slot to the pool
+        // alongside heap-owned jobs.
+        while (ctx.queue.pop()) |job| releaseJobData(job);
         return;
     };
     defer parser.deinit();
@@ -1967,49 +1971,70 @@ fn release_shared(shared: *SharedCtx, allocator: std.mem.Allocator) void {
 
 // ── Pool ──────────────────────────────────────────────────────────────────────
 
-/// Stream-mode queue capacity.  The IO thread blocks on push() when full,
-/// providing natural backpressure for streaming workloads.
+// ── Pool constants — classification ───────────────────────────────────────────
+//
+// Each constant below is labelled either HARDWARE-INVARIANT (purpose is to
+// bound a structural or correctness property; sizing does NOT vary across
+// CPU/RAM tiers) or HARDWARE-DERIVED (the constant is the default/floor/ceiling
+// for a value `MemoryBudget.computeParams` adapts per-invocation).
+//
+// Cross-tier sizing matrix is in `src/pool/INTERFACE.md`.
+
+/// HARDWARE-INVARIANT.  Job-count cap on the shared queue; bounds the number
+/// of in-flight `Job` records (small structs), not bytes.  Stream mode bounds
+/// input *bytes* separately via `InputSlotPool` sized by `stream_input_slots`
+/// (see `computeStreamInputSlots`); the two are peer backpressure mechanisms.
+/// The IO thread / file feeder blocks on push() when full, providing natural
+/// backpressure regardless of available RAM.
 const QUEUE_CAP: usize = 256;
 
-/// Default chunks per thread — more chunks than threads allows the OS scheduler
-/// to balance load when records have uneven parse/query cost.
+/// HARDWARE-DERIVED (default).  Default chunks per thread when budget allows
+/// (file mode).  `computeParams` shrinks this on tight budgets so that
+/// `n_threads × chunk_factor × chunk_bytes` stays within budget.  More chunks
+/// than threads lets the scheduler balance uneven parse/query cost.
 const DEFAULT_CHUNK_FACTOR: usize = 4;
 
-/// Default stream-mode batch size in bytes.  The IO thread accumulates complete
-/// lines until this threshold is reached, then pushes the batch as a single Job.
-/// At ~300 B/record this yields ~850 records/batch, reducing millions of jobs
-/// to a few thousand — same order of magnitude as file mode's chunk count.
+/// HARDWARE-DERIVED (ceiling).  Default stream-mode batch size; clamped down
+/// by `computeParams` toward MIN_STREAM_BATCH on tight budgets.  At ~300 B/record
+/// this yields ~850 records/batch, reducing millions of jobs to a few thousand —
+/// same order of magnitude as file mode's chunk count.
 const DEFAULT_STREAM_BATCH_SIZE: usize = 256 * 1024; // 256 KiB
 
-/// Stream-mode partial-flush threshold (per Job).  When a single record's
-/// iterator emits more than this many bytes into the chunk buffer, the worker
-/// publishes a partial ChunkResult and starts a fresh arena.  This bounds
-/// per-Job memory and unblocks downstream consumers for infinite generators
-/// (e.g. `repeat(.+1)` piped through `head`).  See bugs.md #143.
+/// HARDWARE-INVARIANT.  Stream-mode partial-flush threshold (per Job).  Governs
+/// partial-publish *granularity*, not memory: when a single record's iterator
+/// emits more than this many bytes into the chunk buffer, the worker publishes
+/// a partial ChunkResult and starts a fresh arena.  This unblocks downstream
+/// consumers for infinite generators (e.g. `repeat(.+1)` piped through `head`)
+/// at fixed latency regardless of available RAM.  See bugs.md #143.
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
 
-/// Stream-mode sub-id reservation per Job.  Each stream-mode Job reserves
-/// `STREAM_SEQ_RANGE` consecutive chunk-ids `[seq_base .. seq_base + N)` so
-/// the worker can publish up to N-1 partial ChunkResults plus one final
+/// HARDWARE-INVARIANT.  Stream-mode sub-id reservation per Job.  Each stream-mode
+/// Job reserves `STREAM_SEQ_RANGE` consecutive chunk-ids `[seq_base .. seq_base + N)`
+/// so the worker can publish up to N-1 partial ChunkResults plus one final
 /// `end_of_range` ChunkResult.  Distinct Jobs are assigned non-overlapping
 /// ranges by `io_thread_fn`.  Ranges that finish before exhausting their
 /// allotment leave trailing slots empty; the Sequencer skips them when it
-/// observes `end_of_range = true` on the last published chunk.
+/// observes `end_of_range = true` on the last published chunk.  N=8 is the
+/// max partial-flushes per Job before forced wraparound; this is a correctness
+/// envelope, unrelated to hardware sizing.
 const STREAM_SEQ_RANGE: u32 = 8;
 
-/// Default file-mode backpressure: max simultaneously-live ChunkResults per
-/// thread.  With 2× n_threads slots, each worker can have one chunk being
-/// processed and one buffered in the Sequencer, keeping all cores busy while
-/// bounding RSS.
+/// HARDWARE-DERIVED (default).  File-mode backpressure: max simultaneously-live
+/// ChunkResults per thread.  With 2× n_threads slots, each worker can have one
+/// chunk being processed and one buffered in the Sequencer, keeping all cores
+/// busy while bounding RSS.  `computeParams` lowers this on tight budgets.
 const DEFAULT_IN_FLIGHT_FACTOR: usize = 2;
 
-/// Upper bound for in_flight_factor.  The Sequencer ring is sized for this
-/// value so that reducing in_flight_factor at runtime never exceeds capacity.
+/// HARDWARE-INVARIANT (ceiling).  Upper bound for in_flight_factor; the
+/// Sequencer ring is sized for this value so that any computed factor at
+/// runtime fits without reallocation.  Raising this requires growing the
+/// Sequencer's `pending` slab capacity in `Sequencer.init`.
 const MAX_IN_FLIGHT_FACTOR: usize = 2;
 
-/// Thread stack size. Workers need at most ~512 KB (parser depth 512 ×
-/// ~200 B per frame for serialize recursion); 2 MiB provides 4× safety margin.
-/// Default Zig stack is 16 MiB; with 16 threads that wastes ~224 MiB.
+/// HARDWARE-INVARIANT.  Thread stack size determined by parser depth, not by
+/// available RAM: workers need at most ~512 KB (parser depth 512 × ~200 B per
+/// frame for serialize recursion); 2 MiB provides 4× safety margin.  Default
+/// Zig stack is 16 MiB; with 16 threads that wastes ~224 MiB.
 const THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 // ── MemoryBudget — adaptive chunk sizing ──────────────────────────────────────
@@ -2148,10 +2173,16 @@ pub const MemoryBudget = struct {
     }
 
     /// Derive the stream-mode input-slot count from budget and slot size.
-    /// Total residency = slot_count × slot_size; we target 25% of the budget
-    /// → slot_count = budget / (4 × slot_size). Bounded so single-core systems
-    /// retain a workable minimum and many-core systems don't waste memory on
-    /// slots no producer can fill in time.
+    /// Total residency = slot_count × slot_size. The ideal value targets
+    /// `budget / (4 × slot_size)` (i.e. a quarter of the memory budget held
+    /// in input slots), but the `n_threads + 32` ceiling clamps it well
+    /// below that on real hardware — on a 256 GiB / 64-thread budget the
+    /// ceiling pins at 96 slots × 512 KiB = 48 MiB, ~0.04% of budget.
+    /// The ceiling exists because workers cannot drain slots faster than
+    /// one-per-thread-tick, so additional slots beyond that are unfillable
+    /// memory. The `n_threads + 2` floor (per-worker + IO thread + queue
+    /// tail) is what guarantees forward progress on minimum-resource
+    /// containers; both bounds are deliberate.
     fn computeStreamInputSlots(budget_bytes: u64, slot_size: u64, n_threads: u64) usize {
         const floor: u64 = n_threads + 2;
         const ceiling: u64 = n_threads + 32;

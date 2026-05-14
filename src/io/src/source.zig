@@ -78,8 +78,9 @@ pub const Source = struct {
     /// If backed by a streaming ring buffer, returns the underlying file
     /// handle so callers can read directly from the fd (bypassing the ring's
     /// internal buffer). Returns null for mmap sources.
-    /// Used by the stream IO thread to read into pool-managed input slots
-    /// without an intermediate ring → batch_buf copy.
+    /// Used by the stream IO thread to read directly into pool-managed input
+    /// slots (`InputSlotPool` in `src/pool/root.zig`), eliminating the
+    /// previous ring buffer → intermediate-batch → heap-dupe copy path.
     pub fn streamFile(s: *const Source) ?std.fs.File {
         return switch (s.backend) {
             .mmap => null,
