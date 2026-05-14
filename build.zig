@@ -322,6 +322,14 @@ pub fn build(b: *std.Build) void {
     // ── Tests ─────────────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run all tests");
 
+    // Cross-platform anonymous pipe helper. mingw-w64 does not export the
+    // POSIX `pipe` symbol that `std.posix.pipe()` resolves to (only the
+    // 3-arg MS `_pipe`), so test modules that need a pipe go through this
+    // shim which routes Windows through `std.os.windows.CreatePipe`.
+    const portable_pipe_module = b.createModule(.{
+        .root_source_file = b.path("tests/portable_pipe.zig"),
+    });
+
     const error_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/error_test.zig"),
         .target = target,
@@ -348,12 +356,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     io_test_mod.addImport("io", io_module);
-    // `std.posix.pipe()` resolves to an `extern "c" fn pipe` declaration on
-    // Windows (POSIX emulation via the MSVC CRT). Zig 0.15.x requires libc
-    // to be linked explicitly when any module reaches such a decl. The
-    // pipe-using sites are test-only, so linking libc on every host is a
-    // no-op cost not worth gating on `target.result.os.tag == .windows`.
-    io_test_mod.link_libc = true;
+    io_test_mod.addImport("portable_pipe", portable_pipe_module);
 
     const io_tests = b.addTest(.{ .root_module = io_test_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
@@ -414,8 +417,7 @@ pub fn build(b: *std.Build) void {
     });
     output_test_mod.addImport("output", output_module);
     output_test_mod.addImport("types", types_module);
-    // See `io_test_mod.link_libc` — same `std.posix.pipe()` decl.
-    output_test_mod.link_libc = true;
+    output_test_mod.addImport("portable_pipe", portable_pipe_module);
 
     const output_tests = b.addTest(.{ .root_module = output_test_mod });
     test_step.dependOn(&b.addRunArtifact(output_tests).step);
@@ -430,8 +432,7 @@ pub fn build(b: *std.Build) void {
     pool_test_mod.addImport("types", types_module);
     pool_test_mod.addImport("io", io_module);
     pool_test_mod.addImport("regex", regex_module);
-    // See `io_test_mod.link_libc` — same `std.posix.pipe()` decl.
-    pool_test_mod.link_libc = true;
+    pool_test_mod.addImport("portable_pipe", portable_pipe_module);
 
     const pool_tests = b.addTest(.{ .root_module = pool_test_mod });
     if (shim_build_step) |step| pool_tests.step.dependOn(&step.step);

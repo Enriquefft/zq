@@ -6,6 +6,15 @@ const RingBuffer = @import("ring.zig").RingBuffer;
 
 pub const ZqError = err.ZqError;
 
+// `GetFileType` and `FILE_TYPE_DISK` are not surfaced by Zig 0.15.2's
+// `std.os.windows.kernel32` / `std.os.windows`. Declare the minimum locally;
+// kernel32.dll is loaded in every Win32 process so no extra linkage needed.
+// The constant value is from `<fileapi.h>` (`FILE_TYPE_DISK = 0x0001`).
+const win = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetFileType(hFile: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
+    const FILE_TYPE_DISK: std.os.windows.DWORD = 0x0001;
+} else struct {};
+
 pub const SliceView = struct {
     bytes: []const u8,
     is_eof: bool,
@@ -33,7 +42,7 @@ pub const Source = struct {
         // while preserving the directory rejection from `stat.kind`.
         const is_regular_file = stat.kind == .file and
             (builtin.os.tag != .windows or
-                std.os.windows.kernel32.GetFileType(file.handle) == std.os.windows.FILE_TYPE_DISK);
+                win.GetFileType(file.handle) == win.FILE_TYPE_DISK);
 
         if (is_regular_file and size > 0) {
             const m = MmapBackend.init(file, size) catch return error.IoError;

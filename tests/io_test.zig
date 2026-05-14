@@ -1,5 +1,6 @@
 const std = @import("std");
 const io = @import("io");
+const portable_pipe = @import("portable_pipe");
 
 const Source = io.Source;
 const SliceView = io.SliceView;
@@ -79,7 +80,7 @@ test "mmap: mappedSlice returns full content" {
 
 test "ring: mappedSlice returns null for streaming source" {
     const alloc = std.testing.allocator;
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[1]);
 
     var src = try Source.init(std.fs.File{ .handle = fds[0] }, alloc);
@@ -106,7 +107,7 @@ test "mmap: refill always returns false" {
 
 test "ring: peek returns data written to pipe" {
     const alloc = std.testing.allocator;
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[1]);
 
     const written = try std.posix.write(fds[1], "hello");
@@ -123,7 +124,7 @@ test "ring: peek returns data written to pipe" {
 
 test "ring: consume + refill cycle drains pipe" {
     const alloc = std.testing.allocator;
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
 
     _ = try std.posix.write(fds[1], "abc");
     std.posix.close(fds[1]); // signal EOF
@@ -150,7 +151,7 @@ test "ring: consume + refill cycle drains pipe" {
 
 test "ring: is_eof only true when buffer drained and pipe closed" {
     const alloc = std.testing.allocator;
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
 
     _ = try std.posix.write(fds[1], "xy");
     std.posix.close(fds[1]);
@@ -170,7 +171,7 @@ test "ring: is_eof only true when buffer drained and pipe closed" {
 
 test "ring: buffer compacts on refill when start > 0" {
     const alloc = std.testing.allocator;
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
 
     _ = try std.posix.write(fds[1], "firstsecond");
 

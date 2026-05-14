@@ -91,12 +91,12 @@ jobs:
         uses: ./.github/actions/setup-rust-cross
         with:
           rust-target: x86_64-pc-windows-gnu
-      # On Windows, force the mingw target for the test build. MSVC's libc
-      # does not export `pipe()`, but several test modules call
-      # `std.posix.pipe()` (POSIX-only). The mingw-w64 CRT bundled with
-      # `x86_64-windows-gnu` provides the POSIX shim, and Zig statically
-      # links the CRT into the test exe so it runs natively on the MSVC
-      # GitHub-hosted runner with no runtime dependency.
+      # Force the mingw target on Windows so the test binary matches the
+      # release artifact (`x86_64-windows-gnu`) exactly. The Rust regex
+      # shim is built with cargo-zigbuild against the same triple — see
+      # `setup-rust-cross` above. Anonymous pipes in tests use the
+      # in-tree `tests/portable_pipe.zig` shim (`std.os.windows.CreatePipe`
+      # on Windows), so the test binary needs no libc pipe symbol.
       - if: matrix.os != 'windows'
         run: zig build test -Doptimize=${{ matrix.optimize }}
       - if: matrix.os == 'windows'
@@ -118,7 +118,7 @@ jobs:
             rust-target: x86_64-apple-darwin
           - target: aarch64-macos
             rust-target: aarch64-apple-darwin
-          - target: x86_64-windows
+          - target: x86_64-windows-gnu
             rust-target: x86_64-pc-windows-gnu
           - target: aarch64-windows
             rust-target: aarch64-pc-windows-gnullvm

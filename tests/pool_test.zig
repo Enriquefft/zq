@@ -2,7 +2,7 @@
 ///
 /// Because Pool uses real OS threads we test with n_threads = 1 and n_threads = 4
 /// to cover both the single-worker and multi-worker paths.  Stream mode is
-/// exercised via a pipe created with std.posix.pipe().
+/// exercised via a pipe created with portable_pipe.pipe().
 ///
 /// Ordering invariant: collect() must always return results in submission order.
 ///
@@ -11,6 +11,7 @@ const std = @import("std");
 const pool_mod = @import("pool");
 const query_mod = @import("query");
 const types = @import("types");
+const portable_pipe = @import("portable_pipe");
 
 const Pool = pool_mod.Pool;
 const MemoryBudget = pool_mod.MemoryBudget;
@@ -385,7 +386,7 @@ test "submit_stream: three lines via pipe" {
     defer cq.deinit();
 
     // Create a pipe; write end will be closed after writing.
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
 
@@ -417,7 +418,7 @@ test "submit_stream: empty stream returns no results" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     std.posix.close(pipe_fds[1]); // close write end immediately → EOF
 
     const io_mod = @import("io");
@@ -492,7 +493,7 @@ test "submit_stream: pretty value spanning IO refill" {
     }
     try data.appendSlice(alloc, "]\n");
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     // Write asynchronously: a single posix.write of >PIPE_BUF blocks until
     // the reader drains, so spawn a writer thread.
     const Writer = struct {
@@ -531,7 +532,7 @@ test "submit_stream: no trailing newline" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     _ = try std.posix.write(pipe_fds[1], "55");
     std.posix.close(pipe_fds[1]);
 
@@ -587,7 +588,7 @@ test "slot pool: infinite generator partial-publish does not starve IO slots" {
     var cq = try compile("repeat(.+1)");
     defer cq.deinit();
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
 
@@ -641,7 +642,7 @@ test "slot pool: partial-publish preserves output across STREAM_FLUSH_THRESHOLD"
         try data.writer(alloc).print("{{\"k\":{d}}}\n", .{i});
     }
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
 
     const io_mod = @import("io");
@@ -689,7 +690,7 @@ test "slot pool: recycled slots across high-volume input preserve ordering" {
         try data.writer(alloc).print("{{\"i\":{d}}}\n", .{i});
     }
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
 
     const io_mod = @import("io");
@@ -740,7 +741,7 @@ test "slot pool: pretty value within slot_size publishes intact" {
     }
     try data.appendSlice(alloc, "]\n");
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
 
     const io_mod = @import("io");
@@ -780,7 +781,7 @@ test "slot pool: many small records exercise tail-carry across slots" {
         try data.writer(alloc).print("{{\"n\":{d}}}\n", .{i});
     }
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
 
     const io_mod = @import("io");
@@ -834,7 +835,7 @@ test "slot pool: record exceeding slot_size exits cleanly without hang" {
 
     try std.testing.expect(data.items.len > 128 * 1024); // exceeds slot_size
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
 
     const io_mod = @import("io");
@@ -1048,7 +1049,7 @@ test "serialized stream: three lines via pipe" {
     var cq = try compile(".");
     defer cq.deinit();
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
 
@@ -1195,7 +1196,7 @@ test "serialized: infinite-generator stream-mode partial flush unblocks consumer
     var cq = try compile("repeat(.+1)");
     defer cq.deinit();
 
-    const pipe_fds = try std.posix.pipe();
+    const pipe_fds = try portable_pipe.pipe();
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
 

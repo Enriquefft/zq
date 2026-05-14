@@ -17,37 +17,35 @@ const build_options = @import("build_options");
 
 const zq_path: []const u8 = build_options.zq_path;
 
-/// Stable per-test temp-file slot. Tests run sequentially within one
-/// process — collisions between concurrent `zig build test` invocations
-/// would still be a concern, so we mix in PID + a per-call counter.
-var tmp_counter: u32 = 0;
+/// Per-test scratch file rooted in an isolated `std.testing.tmpDir`.
+/// Each instance owns a unique random sub-directory under the test
+/// runner's cache (so parallel test executables can't collide) and an
+/// absolute path to a named file inside it. The file is materialised
+/// lazily by `write`; `deinit` removes the entire tmpDir.
+const TmpFile = struct {
+    dir: std.testing.TmpDir,
+    path: []u8,
+    name: []const u8,
+    alloc: std.mem.Allocator,
 
-fn tmpPath(buf: []u8, suffix: []const u8) ![]u8 {
-    tmp_counter += 1;
-    const pid: i32 = if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0;
-    // `/tmp` is not in the Windows NT namespace — `NtCreateFile` returns
-    // OBJECT_PATH_NOT_FOUND. Use the platform's TEMP env var and fall back
-    // to a known-good directory if it's unset.
-    var env_buf: [512]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&env_buf);
-    const env_var = if (@import("builtin").os.tag == .windows) "TEMP" else "TMPDIR";
-    const fallback = if (@import("builtin").os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
-    const prefix = std.process.getEnvVarOwned(fba.allocator(), env_var) catch fallback;
-    return std.fmt.bufPrint(buf, "{s}{s}zq_cli_{d}_{d}_{s}", .{ prefix, std.fs.path.sep_str, pid, tmp_counter, suffix });
-}
+    fn init(alloc: std.mem.Allocator, name: []const u8) !TmpFile {
+        var dir = std.testing.tmpDir(.{});
+        errdefer dir.cleanup();
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_abs = try dir.dir.realpath(".", &dir_buf);
+        const path = try std.fs.path.join(alloc, &.{ dir_abs, name });
+        return .{ .dir = dir, .path = path, .name = name, .alloc = alloc };
+    }
 
-fn writeTmp(path: []const u8, contents: []const u8) !void {
-    var f = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer f.close();
-    var buf: [4096]u8 = undefined;
-    var w = f.writer(&buf);
-    try w.interface.writeAll(contents);
-    try w.interface.flush();
-}
+    fn deinit(self: *TmpFile) void {
+        self.alloc.free(self.path);
+        self.dir.cleanup();
+    }
 
-fn deleteTmp(path: []const u8) void {
-    std.fs.deleteFileAbsolute(path) catch {};
-}
+    fn write(self: *TmpFile, contents: []const u8) !void {
+        try self.dir.dir.writeFile(.{ .sub_path = self.name, .data = contents });
+    }
+};
 
 const RunResult = struct {
     stdout: []u8,
@@ -122,12 +120,11 @@ fn runZq(
 
 test "--slurpfile: single object wraps in 1-elem array" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "single.json");
-    try writeTmp(path, "{\"a\":1}");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "single.json");
+    defer tmp.deinit();
+    try tmp.write("{\"a\":1}");
 
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("[{\"a\":1}]\n", r.stdout);
@@ -135,12 +132,11 @@ test "--slurpfile: single object wraps in 1-elem array" {
 
 test "--slurpfile: NDJSON 2+ values yields array of all values" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "ndjson.json");
-    try writeTmp(path, "{\"x\":1}\n{\"x\":2}\n3\n");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "ndjson.json");
+    defer tmp.deinit();
+    try tmp.write("{\"x\":1}\n{\"x\":2}\n3\n");
 
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("[{\"x\":1},{\"x\":2},3]\n", r.stdout);
@@ -148,12 +144,11 @@ test "--slurpfile: NDJSON 2+ values yields array of all values" {
 
 test "--slurpfile: single array file wraps to nested array" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "arr.json");
-    try writeTmp(path, "[1,2,3]");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "arr.json");
+    defer tmp.deinit();
+    try tmp.write("[1,2,3]");
 
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("[[1,2,3]]\n", r.stdout);
@@ -161,7 +156,10 @@ test "--slurpfile: single array file wraps to nested array" {
 
 test "--slurpfile: missing file exits 2 with stderr message" {
     const alloc = std.testing.allocator;
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", "/tmp/zq_definitely_not_a_file_xyz.json", "--null-input", "." }, null);
+    var tmp = try TmpFile.init(alloc, "definitely_not_a_file.json");
+    defer tmp.deinit();
+    // Path is reserved but never written — exercises the file-missing error path.
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", tmp.path, "--null-input", "." }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--slurpfile") != null);
@@ -170,12 +168,11 @@ test "--slurpfile: missing file exits 2 with stderr message" {
 
 test "--slurpfile: invalid JSON exits 2 with stderr message" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "bad.json");
-    try writeTmp(path, "not json at all");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "bad.json");
+    defer tmp.deinit();
+    try tmp.write("not json at all");
 
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--slurpfile") != null);
@@ -184,12 +181,11 @@ test "--slurpfile: invalid JSON exits 2 with stderr message" {
 
 test "--slurpfile: collision with --arg, --slurpfile last wins" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "collision_a.json");
-    try writeTmp(path, "{\"k\":1}");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "collision_a.json");
+    defer tmp.deinit();
+    try tmp.write("{\"k\":1}");
 
-    var r = try runZq(alloc, &.{ "-c", "--arg", "V", "string-loses", "--slurpfile", "V", path, "--null-input", "$V" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--arg", "V", "string-loses", "--slurpfile", "V", tmp.path, "--null-input", "$V" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("[{\"k\":1}]\n", r.stdout);
@@ -197,12 +193,11 @@ test "--slurpfile: collision with --arg, --slurpfile last wins" {
 
 test "--slurpfile: collision with --arg, --arg last wins" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "collision_b.json");
-    try writeTmp(path, "{\"k\":1}");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "collision_b.json");
+    defer tmp.deinit();
+    try tmp.write("{\"k\":1}");
 
-    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "V", path, "--arg", "V", "string-wins", "--null-input", "$V" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--slurpfile", "V", tmp.path, "--arg", "V", "string-wins", "--null-input", "$V" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("\"string-wins\"\n", r.stdout);
@@ -212,12 +207,11 @@ test "--slurpfile: collision with --arg, --arg last wins" {
 
 test "--rawfile: trailing newline preserved" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "raw.txt");
-    try writeTmp(path, "hello world\n");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "raw.txt");
+    defer tmp.deinit();
+    try tmp.write("hello world\n");
 
-    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("\"hello world\\n\"\n", r.stdout);
@@ -225,12 +219,11 @@ test "--rawfile: trailing newline preserved" {
 
 test "--rawfile: empty file yields empty string" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "empty.txt");
-    try writeTmp(path, "");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "empty.txt");
+    defer tmp.deinit();
+    try tmp.write("");
 
-    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", path, "--null-input", "$X" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", tmp.path, "--null-input", "$X" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("\"\"\n", r.stdout);
@@ -238,7 +231,12 @@ test "--rawfile: empty file yields empty string" {
 
 test "--rawfile: missing file exits 2" {
     const alloc = std.testing.allocator;
-    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", "/tmp/zq_definitely_no_rawfile_xyz.txt", "--null-input", "." }, null);
+    // Use a fresh tmpDir and reference a path inside it that we never
+    // create — portable across Windows (no `/tmp` namespace) and POSIX.
+    var tmp = try TmpFile.init(alloc, "zq_definitely_no_rawfile_xyz.txt");
+    defer tmp.deinit();
+
+    var r = try runZq(alloc, &.{ "-c", "--rawfile", "X", tmp.path, "--null-input", "." }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 2), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--rawfile") != null);
@@ -247,12 +245,11 @@ test "--rawfile: missing file exits 2" {
 
 test "--rawfile: visible in $ARGS.named alongside --arg" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "args_named.txt");
-    try writeTmp(path, "raw-bytes");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "args_named.txt");
+    defer tmp.deinit();
+    try tmp.write("raw-bytes");
 
-    var r = try runZq(alloc, &.{ "-c", "--arg", "A", "alpha", "--rawfile", "B", path, "--null-input", "$ARGS.named" }, null);
+    var r = try runZq(alloc, &.{ "-c", "--arg", "A", "alpha", "--rawfile", "B", tmp.path, "--null-input", "$ARGS.named" }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("{\"A\":\"alpha\",\"B\":\"raw-bytes\"}\n", r.stdout);
@@ -274,12 +271,11 @@ test "--unbuffered: output bytes match unbuffered run for multi-value stream" {
 
 test "--unbuffered: file pool path produces correct output" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "stream.json");
-    try writeTmp(path, "1\n2\n3\n");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "stream.json");
+    defer tmp.deinit();
+    try tmp.write("1\n2\n3\n");
 
-    var r = try runZq(alloc, &.{ "-c", "--unbuffered", ".+100", path }, null);
+    var r = try runZq(alloc, &.{ "-c", "--unbuffered", ".+100", tmp.path }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("101\n102\n103\n", r.stdout);
@@ -324,12 +320,11 @@ test "NIX-001: pretty-printed array via stdin parses as one value" {
 
 test "NIX-001: pretty-printed object via file arg parses as one value" {
     const alloc = std.testing.allocator;
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "pretty.json");
-    try writeTmp(path, "{\n  \"a\": 1\n}\n");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "pretty.json");
+    defer tmp.deinit();
+    try tmp.write("{\n  \"a\": 1\n}\n");
 
-    var r = try runZq(alloc, &.{ "-c", ".a", path }, null);
+    var r = try runZq(alloc, &.{ "-c", ".a", tmp.path }, null);
     defer r.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expectEqualStrings("1\n", r.stdout);
@@ -854,9 +849,8 @@ test "stdin dispatch parity: file arg, < redirect, and cat | pipe agree" {
 
     const alloc = std.testing.allocator;
 
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "dispatch.jsonl");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "dispatch.jsonl");
+    defer tmp.deinit();
 
     var contents = std.ArrayList(u8){};
     defer contents.deinit(alloc);
@@ -864,20 +858,20 @@ test "stdin dispatch parity: file arg, < redirect, and cat | pipe agree" {
     while (i < 200) : (i += 1) {
         try contents.writer(alloc).print("{{\"id\":{d},\"v\":\"x\"}}\n", .{i});
     }
-    try writeTmp(path, contents.items);
+    try tmp.write(contents.items);
 
-    var r_file = try runZq(alloc, &.{ ".id", path }, null);
+    var r_file = try runZq(alloc, &.{ ".id", tmp.path }, null);
     defer r_file.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r_file.exit_code);
 
     var script_redir_buf: [256]u8 = undefined;
-    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, path });
+    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, tmp.path });
     var r_redir = try runShell(alloc, script_redir);
     defer r_redir.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r_redir.exit_code);
 
     var script_pipe_buf: [256]u8 = undefined;
-    const script_pipe = try std.fmt.bufPrint(&script_pipe_buf, "cat {s} | {s} '.id'", .{ path, zq_path });
+    const script_pipe = try std.fmt.bufPrint(&script_pipe_buf, "cat {s} | {s} '.id'", .{ tmp.path, zq_path });
     var r_pipe = try runShell(alloc, script_pipe);
     defer r_pipe.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r_pipe.exit_code);
@@ -891,9 +885,8 @@ test "stdin dispatch parity: pretty-printed multi-line records" {
 
     const alloc = std.testing.allocator;
 
-    var path_buf: [128]u8 = undefined;
-    const path = try tmpPath(&path_buf, "pretty.json");
-    defer deleteTmp(path);
+    var tmp = try TmpFile.init(alloc, "pretty.json");
+    defer tmp.deinit();
 
     var contents = std.ArrayList(u8){};
     defer contents.deinit(alloc);
@@ -909,14 +902,14 @@ test "stdin dispatch parity: pretty-printed multi-line records" {
             \\
         , .{i});
     }
-    try writeTmp(path, contents.items);
+    try tmp.write(contents.items);
 
-    var r_file = try runZq(alloc, &.{ ".id", path }, null);
+    var r_file = try runZq(alloc, &.{ ".id", tmp.path }, null);
     defer r_file.deinit(alloc);
     try std.testing.expectEqual(@as(u8, 0), r_file.exit_code);
 
     var script_redir_buf: [256]u8 = undefined;
-    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, path });
+    const script_redir = try std.fmt.bufPrint(&script_redir_buf, "{s} '.id' < {s}", .{ zq_path, tmp.path });
     var r_redir = try runShell(alloc, script_redir);
     defer r_redir.deinit(alloc);
 

@@ -107,15 +107,21 @@ test "fromCompileErrors: valid filter produces no diagnostics" {
 // short-circuits).
 
 test "didChange with identical text does not recompile" {
-    // `/dev/null` I/O: the server publishes diagnostics via the transport,
-    // which we discard. The message flow below never reads from stdin, so
-    // pointing `in_file` at /dev/null is safe (reads would return EOF).
-    const devnull_in = try std.fs.openFileAbsolute("/dev/null", .{});
-    defer devnull_in.close();
-    const devnull_out = try std.fs.createFileAbsolute("/dev/null", .{ .truncate = false });
-    defer devnull_out.close();
+    // Throwaway I/O sinks: the server publishes diagnostics via the
+    // transport, which we discard. The message flow below never reads
+    // from stdin. Linux/macOS have `/dev/null`; Windows has `NUL` (which
+    // `openFileAbsolute` rejects — it isn't a real absolute path). Open
+    // a regular file inside a per-test tmpDir on every platform; reads
+    // return EOF, writes accumulate harmlessly, and `cleanup()` deletes
+    // the directory.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sink_in = try tmp.dir.createFile("in", .{ .read = true });
+    defer sink_in.close();
+    const sink_out = try tmp.dir.createFile("out", .{});
+    defer sink_out.close();
 
-    var srv = lsp.Server.init(devnull_in, devnull_out, testing.allocator);
+    var srv = lsp.Server.init(sink_in, sink_out, testing.allocator);
     defer srv.deinit();
 
     // didOpen with a literal-regex filter (the exact shape F10 was about).

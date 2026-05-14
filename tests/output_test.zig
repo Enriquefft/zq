@@ -1,6 +1,7 @@
 const std = @import("std");
 const output = @import("output");
 const types = @import("types");
+const portable_pipe = @import("portable_pipe");
 
 const Writer = output.Writer;
 const Value = types.Value;
@@ -30,7 +31,7 @@ fn strRef(buf: []const u8, s: []const u8) StringRef {
 // then reads the pipe's read-end to obtain the rendered bytes as a slice.
 // The caller is responsible for freeing the returned slice.
 fn renderValue(val: Value, style: OutputStyle) ![]u8 {
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
 
     // Write side: use a Writer, flush, deinit, then close write fd.
     {
@@ -70,7 +71,7 @@ test "init/deinit: stdout writer initializes and deinits cleanly" {
 }
 
 test "is_tty: pipe fd is not a tty" {
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
 
@@ -610,7 +611,7 @@ test "compose: array with compact+raw_strings → compact" {
 // ── Multiple values written sequentially ─────────────────────────────────────
 
 test "multiple writes: compact values accumulate in buffer" {
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[0]);
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
@@ -637,7 +638,7 @@ test "multiple writes: compact body + explicit writeByte newline" {
     // The dispatch-loop newline now lives at the call site (main.zig), not
     // inside write_value. Verify the call site pattern works: write_value
     // emits the body, the caller writes its own '\n'.
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[0]);
 
     var w = try Writer.init(std.fs.File{ .handle = fds[1] }, alloc);
@@ -664,7 +665,7 @@ test "multiple writes: compact body + explicit writeByte newline" {
 // ── flush idempotency ─────────────────────────────────────────────────────────
 
 test "flush: flushing empty buffer is a no-op" {
-    const fds = try std.posix.pipe();
+    const fds = try portable_pipe.pipe();
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
 
