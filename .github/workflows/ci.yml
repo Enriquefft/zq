@@ -91,7 +91,16 @@ jobs:
         uses: ./.github/actions/setup-rust-cross
         with:
           rust-target: x86_64-pc-windows-gnu
-      - run: zig build test -Doptimize=${{ matrix.optimize }}
+      # On Windows, force the mingw target for the test build. MSVC's libc
+      # does not export `pipe()`, but several test modules call
+      # `std.posix.pipe()` (POSIX-only). The mingw-w64 CRT bundled with
+      # `x86_64-windows-gnu` provides the POSIX shim, and Zig statically
+      # links the CRT into the test exe so it runs natively on the MSVC
+      # GitHub-hosted runner with no runtime dependency.
+      - if: matrix.os != 'windows'
+        run: zig build test -Doptimize=${{ matrix.optimize }}
+      - if: matrix.os == 'windows'
+        run: zig build test -Dtarget=x86_64-windows-gnu -Doptimize=${{ matrix.optimize }}
 
   cross-compile:
     name: Build (${{ matrix.target }})

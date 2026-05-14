@@ -25,7 +25,15 @@ var tmp_counter: u32 = 0;
 fn tmpPath(buf: []u8, suffix: []const u8) ![]u8 {
     tmp_counter += 1;
     const pid: i32 = if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0;
-    return std.fmt.bufPrint(buf, "/tmp/zq_cli_{d}_{d}_{s}", .{ pid, tmp_counter, suffix });
+    // `/tmp` is not in the Windows NT namespace — `NtCreateFile` returns
+    // OBJECT_PATH_NOT_FOUND. Use the platform's TEMP env var and fall back
+    // to a known-good directory if it's unset.
+    var env_buf: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&env_buf);
+    const env_var = if (@import("builtin").os.tag == .windows) "TEMP" else "TMPDIR";
+    const fallback = if (@import("builtin").os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+    const prefix = std.process.getEnvVarOwned(fba.allocator(), env_var) catch fallback;
+    return std.fmt.bufPrint(buf, "{s}{s}zq_cli_{d}_{d}_{s}", .{ prefix, std.fs.path.sep_str, pid, tmp_counter, suffix });
 }
 
 fn writeTmp(path: []const u8, contents: []const u8) !void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const err = @import("error");
 const MmapBackend = @import("mmap.zig").MmapBackend;
 const RingBuffer = @import("ring.zig").RingBuffer;
@@ -23,7 +24,18 @@ pub const Source = struct {
         const stat = file.stat() catch return error.IoError;
         const size: usize = @intCast(stat.size);
 
-        if (stat.kind == .file and size > 0) {
+        // Windows pipes and consoles still report `stat.kind == .file`
+        // because `File.stat` only inspects FILE_ATTRIBUTE_DIRECTORY and
+        // REPARSE bits. `CreateFileMappingW` then fails on a pipe handle
+        // and the mmap path errors out. Compose with `GetFileType ==
+        // FILE_TYPE_DISK` — the authoritative "real disk file" predicate
+        // — so pipes/consoles fall through to the ring backend on Windows
+        // while preserving the directory rejection from `stat.kind`.
+        const is_regular_file = stat.kind == .file and
+            (builtin.os.tag != .windows or
+                std.os.windows.kernel32.GetFileType(file.handle) == std.os.windows.FILE_TYPE_DISK);
+
+        if (is_regular_file and size > 0) {
             const m = MmapBackend.init(file, size) catch return error.IoError;
             return .{ .backend = .{ .mmap = m } };
         } else {
