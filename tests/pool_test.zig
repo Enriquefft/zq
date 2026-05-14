@@ -552,6 +552,315 @@ test "submit_stream: no trailing newline" {
     try std.testing.expectEqual(@as(i64, 55), vals[0].int);
 }
 
+// ── Phase 2: InputSlotPool integration ────────────────────────────────────────
+//
+// These tests exercise the slot-pool/IO-thread contract end-to-end. Together
+// they cover: (1) UAF-free coexistence with output-arena partial flushes on an
+// infinite generator, (2) slot-ownership across the STREAM_FLUSH_THRESHOLD
+// partial-publish boundary, (3) slot recycling when the input volume exceeds
+// the total pool residency, (4) multi-slot tail-carry for records larger than
+// one slot, (5) clean cuts when a record terminator lands on a slot boundary,
+// and (6) graceful exit when a single record exceeds K_MAX_CARRY × slot_size.
+
+/// Background thread that drains a pipe writer asynchronously. Required
+/// because writes >PIPE_BUF block until the reader empties the pipe.
+const PipeWriter = struct {
+    fn run(fd: std.posix.fd_t, bytes: []const u8) void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = std.posix.write(fd, bytes[off..]) catch break;
+            if (n == 0) break;
+            off += n;
+        }
+        std.posix.close(fd);
+    }
+};
+
+test "slot pool: infinite generator partial-publish does not starve IO slots" {
+    // Stronger version of the C3 partial-flush test. Pre-Phase-2 the IO thread
+    // would heap-`dupe` each batch, so input lifetime was independent of the
+    // output arena. Post-Phase-2 input slots are pool-managed and released by
+    // the worker defer — partial flushes (which acquire FRESH output arenas
+    // via the InFlightLimiter) must NOT release the input slot, only the
+    // outer Job iteration may. Tying slot release to arena.deinit would
+    // starve the IO thread before the worker produced 1000 outputs.
+    var cq = try compile("repeat(.+1)");
+    defer cq.deinit();
+
+    const pipe_fds = try std.posix.pipe();
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+
+    _ = try std.posix.write(write_fd, "0\n");
+    std.posix.close(write_fd);
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = read_fd }, alloc);
+    defer src.deinit();
+    defer std.posix.close(read_fd);
+
+    var p = try Pool.init(1, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
+
+    const deadline_ns: u64 = 10 * std.time.ns_per_s;
+    const deadline_thread = try std.Thread.spawn(.{}, struct {
+        fn run(pool_ptr: *Pool, ns: u64) void {
+            std.Thread.sleep(ns);
+            pool_ptr._shared.shutdown.store(true, .release);
+        }
+    }.run, .{ &p, deadline_ns });
+    defer deadline_thread.join();
+
+    var record_count: usize = 0;
+    while (record_count < 1000) {
+        const r = (try p.collect_bytes()) orelse break;
+        var i: usize = 0;
+        while (i < r.data.len) : (i += 1) {
+            if (r.data[i] == '\n') record_count += 1;
+        }
+    }
+
+    try std.testing.expect(record_count >= 1000);
+}
+
+test "slot pool: partial-publish preserves output across STREAM_FLUSH_THRESHOLD" {
+    // ~80 KiB of records crosses STREAM_FLUSH_THRESHOLD (64 KiB) within a
+    // single Job. The worker must emit a partial ChunkResult, fetchAdd a
+    // fresh sub-id range, and KEEP the same input slot owned until the outer
+    // Job iteration exits. If the partial flush incorrectly released the
+    // slot, subsequent records in the same Job would alias freed bytes.
+    var cq = try compile(".k");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    var i: u32 = 0;
+    while (i < 5000) : (i += 1) {
+        try data.writer(alloc).print("{{\"k\":{d}}}\n", .{i});
+    }
+
+    const pipe_fds = try std.posix.pipe();
+    const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+    defer src.deinit();
+    defer std.posix.close(pipe_fds[0]);
+
+    var p = try Pool.init(2, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    t.join();
+
+    var lines: usize = 0;
+    var idx: usize = 0;
+    var current: u32 = 0;
+    while (idx < out.data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, out.data, idx, '\n') orelse break;
+        const value = try std.fmt.parseInt(u32, out.data[idx..nl], 10);
+        try std.testing.expectEqual(current, value);
+        current += 1;
+        lines += 1;
+        idx = nl + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5000), lines);
+}
+
+test "slot pool: recycled slots across high-volume input preserve ordering" {
+    // Stream enough records that total bytes far exceed (slot_count × slot_size).
+    // Every slot must be acquired-released-reacquired many times. The free-stack
+    // LIFO and the worker defer must keep the slot lifecycle race-free, and
+    // the Sequencer must still emit results in submission order.
+    var cq = try compile(".i");
+    defer cq.deinit();
+
+    const N: u32 = 200_000;
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        try data.writer(alloc).print("{{\"i\":{d}}}\n", .{i});
+    }
+
+    const pipe_fds = try std.posix.pipe();
+    const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+    defer src.deinit();
+    defer std.posix.close(pipe_fds[0]);
+
+    var p = try Pool.init(4, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    t.join();
+
+    var lines: usize = 0;
+    var idx: usize = 0;
+    var current: u32 = 0;
+    while (idx < out.data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, out.data, idx, '\n') orelse break;
+        const value = try std.fmt.parseInt(u32, out.data[idx..nl], 10);
+        try std.testing.expectEqual(current, value);
+        current += 1;
+        lines += 1;
+        idx = nl + 1;
+    }
+    try std.testing.expectEqual(@as(usize, N), lines);
+}
+
+test "slot pool: pretty value within slot_size publishes intact" {
+    // Default budget → slot_size = 2 × 256 KiB = 512 KiB. A pretty array of
+    // ~80 KiB fits inside one slot but is large enough that boundary scanner
+    // state has to persist across multiple read() calls before the depth-0
+    // closing `]\n` arrives. Exercises the "no inner depth-0 boundary
+    // discovered until end-of-record" branch.
+    var cq = try compile("length");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    try data.appendSlice(alloc, "[\n");
+    const ELEMENTS: u32 = 8000;
+    var i: u32 = 0;
+    while (i < ELEMENTS) : (i += 1) {
+        try data.writer(alloc).print("  {d}{s}\n", .{ i, if (i + 1 < ELEMENTS) "," else "" });
+    }
+    try data.appendSlice(alloc, "]\n");
+
+    const pipe_fds = try std.posix.pipe();
+    const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+    defer src.deinit();
+    defer std.posix.close(pipe_fds[0]);
+
+    var p = try Pool.init(2, test_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+    defer free_values(vals);
+
+    t.join();
+
+    try std.testing.expectEqual(@as(usize, 1), vals.len);
+    try std.testing.expectEqual(@as(i64, ELEMENTS), vals[0].int);
+}
+
+test "slot pool: many small records exercise tail-carry across slots" {
+    // Pin batch_size to the floor (64 KiB) → slot_size = 128 KiB. Stream
+    // 8192 records of ~12 bytes each (~98 KiB) so the IO thread publishes
+    // multiple slot cycles, each ending with a tail-carry of the in-flight
+    // bytes after the last depth-0 newline. Verifies ordering preservation
+    // across slot recycles.
+    const small_budget = MemoryBudget.explicit(256 * 1024);
+    var cq = try compile(".n");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    const N: u32 = 8192;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        try data.writer(alloc).print("{{\"n\":{d}}}\n", .{i});
+    }
+
+    const pipe_fds = try std.posix.pipe();
+    const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+    defer src.deinit();
+    defer std.posix.close(pipe_fds[0]);
+
+    var p = try Pool.init(2, small_budget, alloc);
+    defer p.deinit();
+
+    p.submit_stream(&src, &cq, .{ .compact = true }, null, .{}, false, &.{});
+
+    const out = try drain_bytes(&p);
+    defer alloc.free(out.data);
+
+    t.join();
+
+    var lines: usize = 0;
+    var idx: usize = 0;
+    var current: u32 = 0;
+    while (idx < out.data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, out.data, idx, '\n') orelse break;
+        const value = try std.fmt.parseInt(u32, out.data[idx..nl], 10);
+        try std.testing.expectEqual(current, value);
+        current += 1;
+        lines += 1;
+        idx = nl + 1;
+    }
+    try std.testing.expectEqual(@as(usize, N), lines);
+}
+
+test "slot pool: record exceeding slot_size exits cleanly without hang" {
+    // Pin batch_size to the floor (64 KiB) → slot_size = 128 KiB. A single
+    // pretty-printed array of ~200 KiB has no depth-0 newline before its
+    // closing `]` and so fills a slot with no publishable boundary. The IO
+    // thread must release its slot and return cleanly; no record is emitted,
+    // no OOM, no hang.
+    const small_budget = MemoryBudget.explicit(256 * 1024);
+    var cq = try compile("length");
+    defer cq.deinit();
+
+    var data = std.ArrayList(u8){};
+    defer data.deinit(alloc);
+    try data.appendSlice(alloc, "[\n");
+    const ELEMENTS: u32 = 16_000; // ≈200 KiB — exceeds 128 KiB slot
+    var i: u32 = 0;
+    while (i < ELEMENTS) : (i += 1) {
+        try data.writer(alloc).print("  {d}{s}\n", .{ i, if (i + 1 < ELEMENTS) "," else "" });
+    }
+    try data.appendSlice(alloc, "]\n");
+
+    try std.testing.expect(data.items.len > 128 * 1024); // exceeds slot_size
+
+    const pipe_fds = try std.posix.pipe();
+    const t = try std.Thread.spawn(.{}, PipeWriter.run, .{ pipe_fds[1], data.items });
+
+    const io_mod = @import("io");
+    var src = try io_mod.Source.init(std.fs.File{ .handle = pipe_fds[0] }, alloc);
+
+    var p = try Pool.init(2, small_budget, alloc);
+
+    p.submit_stream(&src, &cq, null, null, .{}, false, &.{});
+
+    const vals = try drain(&p);
+
+    // After drain returns (IO thread aborted on slot-full-with-no-boundary
+    // without publishing), the writer is still blocked on the pipe. Tear down
+    // in this order so PipeWriter.run sees EPIPE and exits cleanly:
+    //   1. close the read end → writer's next `write` returns EPIPE
+    //   2. join the writer
+    //   3. release src and pool resources
+    p.deinit();
+    src.deinit();
+    std.posix.close(pipe_fds[0]);
+    t.join();
+    free_values(vals);
+
+    try std.testing.expectEqual(@as(usize, 0), vals.len);
+}
+
 // ── Boundary: collect() returns null on re-call after drain ───────────────────
 
 test "collect returns null when called after drain" {

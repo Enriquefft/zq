@@ -99,7 +99,24 @@ pub const MemoryBudget = struct {
     pub const ChunkParams = struct {
         chunk_factor: usize,
         in_flight_factor: usize,
+        /// Publish threshold for one stream-mode input slot. The IO thread
+        /// scans this many bytes for depth-0 record boundaries before handing
+        /// the slot to a worker.
         stream_batch_size: usize,
+        /// Backing size of one stream-mode input slot, always
+        /// `2 × stream_batch_size` (publish threshold + tail headroom for
+        /// reading until the next depth-0 newline). Also the hard cap on a
+        /// single record — oversize records exit the stream cleanly.
+        /// Surfaced here as the single source of truth shared by
+        /// `submit_stream` and the slot-count derivation.
+        stream_slot_size: usize,
+        /// Stream-mode `InputSlotPool` slot count. The IO thread fills
+        /// `slot_count` preallocated `stream_slot_size`-byte buffers. Sized
+        /// so total slot residency (`slot_count × stream_slot_size`) is
+        /// ≤ 25% of the budget across hardware tiers; bounded by
+        /// `[n_threads + 2, n_threads + 32]` so single-core systems retain
+        /// a workable minimum and many-core systems don't waste memory.
+        stream_input_slots: usize,
     };
 
     /// Compute chunk parameters given file size, thread count, and output style.
@@ -239,3 +256,74 @@ pub const Pool = struct {
   calls `own_value()` to deep-copy all tape spans and strings into the arena, and
   `parser.reset()` after each record. Violating this invariant causes silent disk
   re-reads (performance regression), not data corruption. Linux-only; no-op elsewhere.
+- **`InFlightLimiter` is per-worker.** Each worker has an exclusive quota of
+  `in_flight_factor` partial-flush slots and its own condition variable; workers
+  never compete with each other for slots. `acquire(worker_id)` blocks only when
+  that worker's counter is saturated, and `release(worker_id)` signals only that
+  worker's cond. The IO thread and file feeder do not touch the limiter —
+  `JobQueue` capacity (`QUEUE_CAP`) and `InputSlotPool` already bound their
+  respective residencies. A single global counter (the previous design) is
+  unsound for ordered-consumer pipelines: the consumer drains chunks IN ORDER, so
+  a global wake-up can rouse the wrong producer and starve the worker whose chunk
+  is next-needed (classic producer-consumer deadlock with multiple producers
+  feeding one ordered consumer). The per-worker design wakes EXACTLY the producer
+  whose chunk was just drained, so cross-worker progress is independent: while
+  worker A is waiting on its quota, B/C/D continue posting against their own
+  quotas without affecting A.
+- **`ChunkResult.worker_id` is set by the producing worker.** `worker_fn` stamps
+  `ctx.worker_id` onto every `Job` it pops and propagates the id through
+  `SerializeJobState` into each `ChunkResult` (final and partial). The consumer
+  in `Pool.collect`/`collect_bytes` reads `worker_id` off the delivered chunk
+  and calls `limiter.release(worker_id)` so the correct worker wakes. Producers
+  (file feeder, stream IO thread) leave `Job.worker_id = WORKER_ID_NONE`; the
+  field is meaningful only after a worker pops the Job.
+
+---
+
+## Stream-mode `InputSlotPool`
+
+Stream mode (`submit_stream`) uses a dedicated `InputSlotPool` to hold input bytes
+without per-batch heap allocations. The pool is a peer to `InFlightLimiter`, not a
+replacement — the two govern different lifetimes:
+
+| Token              | Bounds                     | Acquired by              | Released by                                          |
+|--------------------|----------------------------|--------------------------|------------------------------------------------------|
+| `JobQueue`         | queued-Job residency       | Producer (push blocks)   | Worker (pop)                                         |
+| `InputSlotPool`    | stream input residency     | Stream IO thread         | Worker (outer Job iteration only)                    |
+| `InFlightLimiter`  | per-worker output residency| Worker (partial flush)   | Pool consumer at `arena.deinit`, keyed by `worker_id`|
+
+**Lifetime invariant.** A `Job` carries at most one ownership token (`input_slot`
+xor `owns_data`; file-mode chunks carry neither and `madvise(DONTNEED)` instead).
+The worker's three-way defer in `worker_fn` releases exactly the right one. A
+partial flush mid-Job (`STREAM_FLUSH_THRESHOLD` crossed inside an infinite
+generator like `repeat(.+1)`) acquires a FRESH output arena via the
+`InFlightLimiter` but does NOT touch the input slot — that release lives in the
+outer iteration. Tying slot release to `arena.deinit` would starve the IO thread
+on any partial-publish workload.
+
+**Slot size.** Surfaced as `ChunkParams.stream_slot_size` (= `2 ×
+stream_batch_size`), the single source of truth shared by `submit_stream` and
+the slot-count derivation. The publish threshold is `stream_batch_size`; the
+extra capacity is tail headroom so the IO thread can keep reading until the
+next depth-0 newline. After a publish, the unscanned tail bytes (since the
+last depth-0 boundary) are copied into a fresh slot's head and the published
+slot is handed to a worker.
+
+**Single-record size cap = `slot_size`.** A record larger than one slot is
+unrecoverable — the pool cannot grow a slot. The IO thread releases its slot
+and exits cleanly; downstream sees a clean EOF. With `stream_batch_size` in
+[64 KiB, 256 KiB], the effective cap is [128 KiB, 512 KiB]. Real JSONL
+records are well under 1 KiB; pretty-printed top-level values exceeding the
+cap are not a supported stream-mode workload.
+
+**Hardware sizing.** All knobs derive from `MemoryBudget.computeParams`:
+
+| Tier (RAM / CPUs / budget)        | batch_size | slot_size | slot_count | slot residency |
+|-----------------------------------|------------|-----------|------------|----------------|
+| Constrained: 1 GB / 1 core / 256 MB | 64 KiB   | 128 KiB   | 3          | 384 KiB        |
+| Workstation: 32 GB / 16 cores / 16 GB | 256 KiB | 512 KiB | 48         | 24 MiB         |
+| Server: 512 GB / 64 cores / 256 GB    | 256 KiB | 512 KiB | 96         | 48 MiB         |
+
+Floor (`n_threads + 2`) keeps single-core systems usable; ceiling (`n_threads + 32`)
+prevents over-allocation on large-CPU systems where producers can't fill more
+slots than consumers can drain.

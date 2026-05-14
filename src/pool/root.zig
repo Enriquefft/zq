@@ -13,11 +13,12 @@
 /// File mode
 /// ---------
 /// submit_file() mmap's the entire file and splits it into newline-aligned chunks.
-/// Chunk count and in-flight limit are computed adaptively from a MemoryBudget
-/// (defaults match the old hardcoded values on >=4 GB systems with typical files).
-/// A dedicated feeder thread lazily pushes chunks to the worker queue one at a time,
-/// blocking when the in-flight limit is reached.  Workers dequeue one chunk, process
-/// every record in it, and post a ChunkResult to the Sequencer.
+/// Chunk count is computed adaptively from a MemoryBudget (defaults match the old
+/// hardcoded values on >=4 GB systems with typical files). A dedicated feeder
+/// thread lazily pushes chunks to the worker queue one at a time; queue depth
+/// (`QUEUE_CAP`) bounds queue-side residency directly. Workers dequeue one chunk,
+/// process every record in it, post a ChunkResult to the Sequencer, then
+/// `madvise(MADV_DONTNEED)` the chunk's pages to bound mmap RSS.
 ///
 /// Stream mode
 /// -----------
@@ -33,13 +34,24 @@
 /// (8 bytes/record vs ~32 for the old per-record approach).
 /// collect()/collect_bytes() frees the arena atomically once the chunk is exhausted.
 ///
-/// Backpressure (file mode)
-/// ------------------------
-/// An InFlightLimiter caps the number of simultaneously live ChunkResults to
-/// in_flight_factor × n_threads (computed from the memory budget).  The feeder
-/// acquires a slot before pushing each chunk to the queue; collect()/collect_bytes()
-/// releases the slot after freeing the chunk's arena.
-/// Peak RSS is proportional to the in-flight limit, not the full file size.
+/// Backpressure
+/// ------------
+/// Three independent backpressure mechanisms govern peak RSS:
+///   • `JobQueue` capacity (`QUEUE_CAP`) bounds queued-but-unprocessed Jobs.
+///     The producer (file feeder or stream IO thread) blocks on `push` when
+///     full, so queue-side input residency is bounded directly.
+///   • `InputSlotPool` (stream mode only) bounds raw input bytes resident in
+///     pool-managed slots. Released by the worker after the Job completes.
+///   • `InFlightLimiter` is now **per-worker** and bounds partial-flush
+///     residency inside a single worker: each worker has an exclusive quota
+///     of `in_flight_factor` slots, never competing with other workers. Only
+///     the streaming serialized path can post multiple partials per Job;
+///     file mode and the structured path post exactly one ChunkResult per
+///     Job so their counters stay at 0.
+/// Per-worker quotas are a deliberate departure from a single global counter:
+/// the consumer drains chunks IN ORDER, so a global signal can wake the wrong
+/// producer and starve the worker whose chunk is next-needed (classic
+/// ordered-consumer deadlock with multiple producers).
 ///
 /// Ordering
 /// --------
@@ -50,9 +62,10 @@
 /// hot path.
 ///
 /// Capacity is sized to the maximum spread of simultaneously live chunk IDs for
-/// both modes (file: MAX_IN_FLIGHT_FACTOR×n_threads; stream: QUEUE_CAP+n_threads).
-/// The ring invariant — no two live chunks share a slot — is enforced by the
-/// InFlightLimiter (file) and JobQueue capacity (stream).
+/// both modes (file: chunk_count is fed at queue cadence; stream:
+/// (QUEUE_CAP+n_threads) × STREAM_SEQ_RANGE). The ring invariant — no two
+/// live chunks share a slot — is enforced by JobQueue capacity and (for
+/// stream partials) the per-worker InFlightLimiter quota.
 /// collect() maintains a (rec_idx, val_idx) cursor so multi-value queries (e.g.
 /// `.[]`) deliver every output value before advancing to the next record.
 const std = @import("std");
@@ -220,14 +233,24 @@ const ChunkResult = struct {
     /// Owns all memory for `payload` and every OwnedValue/serialized byte within.
     /// Call arena.deinit() once the chunk is exhausted to free everything atomically.
     arena: std.heap.ArenaAllocator,
+    /// Worker that produced this chunk. The consumer uses it to release the
+    /// correct per-worker limiter slot in `Pool.collect`/`collect_bytes` so
+    /// the right producer is signaled. Always set by the worker before
+    /// `Sequencer.post`.
+    worker_id: u32,
 };
 
 // ── Job ───────────────────────────────────────────────────────────────────────
 
 const Job = struct {
-    /// Byte range to process.
-    /// File mode: slice into Pool._mmap (not owned).
-    /// Stream mode: heap-duped line (owned when owns_data = true).
+    /// Byte range to process. Ownership is encoded out-of-band via one of:
+    ///   • File mode: slice into Pool._mmap (no per-Job token; freed via
+    ///     madvise_dontneed_chunk after publish).
+    ///   • Stream slot path: slice into an InputSlotPool slot (returned via
+    ///     `input_slot` + `input_slot_pool` after the worker is done).
+    ///   • Heap-owned (test fixtures, error-path injections): freed with
+    ///     `allocator` when `owns_data = true`.
+    /// At most one ownership token is set; see `releaseJobData`.
     data: []const u8,
     /// Sequence number of the first record in this job (first non-empty line).
     seq_base: u64,
@@ -238,7 +261,15 @@ const Job = struct {
     /// Compiled query — shared read-only across all workers.
     query: *const query_mod.CompiledQuery,
     /// When true the worker must free `data` with `allocator` after processing.
+    /// Mutually exclusive with `input_slot` — at most one ownership token is set.
     owns_data: bool,
+    /// Stream-mode input slot index when `data` is a slice into an
+    /// InputSlotPool. The worker releases the slot to `input_slot_pool` after
+    /// processing. Null for file mode and heap-owned stream jobs.
+    input_slot: ?u32 = null,
+    /// Backing pool for `input_slot`. Lives on the Pool for the duration of
+    /// the worker threads, so the pointer is stable.
+    input_slot_pool: ?*InputSlotPool = null,
     allocator: std.mem.Allocator,
     /// When non-null, workers use the serialized path: serialize values directly
     /// into byte buffers instead of copying them via own_value().
@@ -259,7 +290,26 @@ const Job = struct {
     /// The submitter must arrange chunk_id assignments so that ranges from
     /// distinct Jobs do not overlap.
     seq_range_size: u32 = 1,
+    /// Worker id stamped on Job pop. Producers (IO thread, file feeder) leave
+    /// this as `WORKER_ID_NONE`; the worker that dequeues the Job assigns its
+    /// own id so partial-flush limiter acquires / chunk releases all
+    /// reference the correct worker quota.
+    worker_id: u32 = WORKER_ID_NONE,
 };
+
+/// Release whatever ownership token a Job carries for its `data`. Exactly one
+/// of `input_slot` / `owns_data` is set; file-mode mmap chunks have neither
+/// and rely on `madvise_dontneed_chunk` (handled separately in worker_fn). The
+/// queue calls this on shutdown / drained jobs that the worker never sees, so
+/// the madvise branch is unnecessary here — those chunks just unmap with the
+/// rest of the file when Pool.deinit unmaps `_mmap`.
+fn releaseJobData(job: Job) void {
+    if (job.input_slot) |idx| {
+        if (job.input_slot_pool) |pool| pool.release(idx);
+        return;
+    }
+    if (job.owns_data) job.allocator.free(job.data);
+}
 
 // ── Thread-safe bounded MPMC job queue ────────────────────────────────────────
 
@@ -294,7 +344,7 @@ const JobQueue = struct {
         var i = q.head;
         var c = q.count;
         while (c > 0) : (c -= 1) {
-            if (q.buf[i]) |job| if (job.owns_data) job.allocator.free(job.data);
+            if (q.buf[i]) |job| releaseJobData(job);
             i = (i + 1) % q.buf.len;
         }
         q.allocator.free(q.buf);
@@ -306,12 +356,17 @@ const JobQueue = struct {
         defer q.mutex.unlock();
         while (q.count == q.buf.len and !q.shutdown) q.not_full.wait(&q.mutex);
         if (q.shutdown) {
-            if (job.owns_data) job.allocator.free(job.data);
+            releaseJobData(job);
             return;
         }
         q.buf[q.tail] = job;
         q.tail = (q.tail + 1) % q.buf.len;
         q.count += 1;
+        // One push, one wakeup. `broadcast` would wake every parked worker
+        // only to have N-1 of them lose the race for this single Job and
+        // re-park immediately — thundering-herd with no parallelism gain.
+        // Shutdown uses `broadcast` (see `signal_done`) because every
+        // worker must observe the flag.
         q.not_empty.signal();
     }
 
@@ -339,49 +394,92 @@ const JobQueue = struct {
     }
 };
 
-// ── InFlightLimiter — backpressure between feeder and collect() ───────────────
+// ── InFlightLimiter — per-worker partial-flush backpressure ───────────────────
 //
-// Caps how many ChunkResults are simultaneously alive (either being processed by
-// a worker or sitting in the Sequencer awaiting collect()).  The feeder calls
-// acquire() before enqueuing each chunk; collect() calls release() after freeing
-// the chunk's arena.  This bounds peak RSS to in_flight_factor × chunk_size ×
-// n_threads instead of the full file size.
+// Caps how many partial ChunkResults a single worker can have simultaneously
+// alive (either being processed by that worker or sitting in the Sequencer
+// awaiting collect()).  Each worker owns an exclusive quota of `max_per_worker`
+// slots and its own condition variable; workers never compete with each other
+// for slots.
+//
+// Why per-worker quotas?
+// A single global counter (the old design) signals exactly one waiter on each
+// release, but the consumer drains chunks IN ORDER.  If the next-needed chunk
+// is owned by worker A and the global signal happens to wake worker B instead,
+// B can immediately re-saturate the limiter posting a chunk that the consumer
+// can't drain past A.  A then stays parked forever — classic producer-consumer
+// deadlock when multiple producers feed an ordered consumer.
+// Per-worker quotas eliminate the cross-worker wake-up race: a release for
+// worker A's chunk signals A's specific cond, so A always makes forward
+// progress as soon as the consumer drains one of A's chunks.
+//
+// Only the streaming serialized path uses the limiter (partial flushes inside
+// a single Job that crosses `STREAM_FLUSH_THRESHOLD`).  File mode and the
+// structured path post exactly one ChunkResult per Job, so their per-worker
+// counters stay at 0 and never block.  Queue depth (`QUEUE_CAP`) provides the
+// queue-side RSS bound; the limiter exists solely to cap output-arena
+// residency for chained partials inside one in-flight Job.
 
 const InFlightLimiter = struct {
     mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
-    count: usize,
-    max: usize,
+    /// One condition per worker.  release(worker_id) signals only that
+    /// worker's cond, so the right producer wakes every time.
+    worker_conds: []std.Thread.Condition,
+    /// Live partial-flush count per worker.  counts[i] increments on
+    /// acquire(i), decrements on release(i).
+    counts: []u32,
+    max_per_worker: u32,
+    n_workers: u32,
     shutdown: bool,
+    allocator: std.mem.Allocator,
 
-    fn init(max_slots: usize) InFlightLimiter {
+    fn init(n_workers: u32, max_per_worker: u32, allocator: std.mem.Allocator) error{OutOfMemory}!InFlightLimiter {
+        const counts = try allocator.alloc(u32, n_workers);
+        errdefer allocator.free(counts);
+        @memset(counts, 0);
+
+        const conds = try allocator.alloc(std.Thread.Condition, n_workers);
+        errdefer allocator.free(conds);
+        for (conds) |*c| c.* = .{};
+
         return .{
             .mutex = .{},
-            .cond = .{},
-            .count = 0,
-            .max = max_slots,
+            .worker_conds = conds,
+            .counts = counts,
+            .max_per_worker = max_per_worker,
+            .n_workers = n_workers,
             .shutdown = false,
+            .allocator = allocator,
         };
     }
 
-    /// Block until a slot is available, then claim it.
+    fn deinit(self: *InFlightLimiter) void {
+        self.allocator.free(self.counts);
+        self.allocator.free(self.worker_conds);
+    }
+
+    /// Block until this worker's quota has a free slot, then claim it.
     /// Returns false when the limiter has been shut down; the caller must not
     /// process any more chunks.
-    fn acquire(self: *InFlightLimiter) bool {
+    fn acquire(self: *InFlightLimiter, worker_id: u32) bool {
+        std.debug.assert(worker_id < self.n_workers);
         self.mutex.lock();
         defer self.mutex.unlock();
-        while (self.count >= self.max and !self.shutdown) self.cond.wait(&self.mutex);
+        while (self.counts[worker_id] >= self.max_per_worker and !self.shutdown) {
+            self.worker_conds[worker_id].wait(&self.mutex);
+        }
         if (self.shutdown) return false;
-        self.count += 1;
+        self.counts[worker_id] += 1;
         return true;
     }
 
-    /// Release one slot and wake a waiting producer.
-    fn release(self: *InFlightLimiter) void {
+    /// Release one slot from `worker_id`'s quota and wake that specific worker.
+    fn release(self: *InFlightLimiter, worker_id: u32) void {
+        std.debug.assert(worker_id < self.n_workers);
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.count > 0) self.count -= 1;
-        self.cond.signal();
+        if (self.counts[worker_id] > 0) self.counts[worker_id] -= 1;
+        self.worker_conds[worker_id].signal();
     }
 
     /// Broadcast shutdown so all blocked acquire() calls return false immediately.
@@ -389,16 +487,159 @@ const InFlightLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.shutdown = true;
-        self.cond.broadcast();
+        for (self.worker_conds) |*c| c.broadcast();
     }
 
-    /// Update the maximum number of in-flight slots.
-    /// Called before the feeder starts, so no concurrent acquire() is active.
-    fn set_max(self: *InFlightLimiter, new_max: usize) void {
+    /// Update each worker's quota.  Called before the feeder starts, so no
+    /// concurrent acquire() is active.
+    fn set_max(self: *InFlightLimiter, new_per_worker: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.max = new_max;
-        self.cond.broadcast();
+        self.max_per_worker = new_per_worker;
+        for (self.worker_conds) |*c| c.broadcast();
+    }
+};
+
+/// Sentinel `worker_id` value: IO thread / feeder hasn't yet handed the Job to
+/// a worker.  The worker stamps its own id on pop.  Chunks delivered to the
+/// consumer always carry a real worker_id (0..n_workers).
+const WORKER_ID_NONE: u32 = std.math.maxInt(u32);
+
+// ── InputSlotPool — zero-copy input residency for stream mode ────────────────
+//
+// Bounded pool of fixed-size byte slots the stream IO thread fills directly
+// from the source fd. A worker takes ownership of a slot via its Job and
+// releases it back to the pool when the Job finishes — see worker_fn's defer
+// at the top of the loop.
+//
+// Distinct from InFlightLimiter, which bounds *output* arenas. A single Job
+// (and thus a single input slot) may correspond to many partial output
+// ChunkResults — tying input release to limiter release would deadlock
+// infinite generators (`repeat(.+1)`) once the partial-flush stream exceeded
+// the input slot count.
+//
+// Slot count derives from MemoryBudget.computeParams.stream_input_slots and
+// scales with hardware. No hardcoded slot count anywhere in the pipeline.
+//
+// Lifetime contract:
+//   • IO thread:  acquire → fill → publish (slot ownership transfers to Job).
+//   • Worker:     receive Job → process → release (in defer at loop top).
+//   • Shutdown:   signal_shutdown unblocks any acquire() blocked on a drained
+//                 pool so the IO thread exits cleanly.
+//
+// Debug builds tag each slot with an in-use bit so double-acquire or
+// double-release is caught by an assertion. ReleaseFast elides the tag.
+
+const SLOT_FREE: u8 = 0;
+const SLOT_IN_USE: u8 = 1;
+
+const InputSlotPool = struct {
+    /// Single contiguous backing buffer; slot i lives at [i*slot_size, (i+1)*slot_size).
+    backing: []u8,
+    slot_size: usize,
+    n_slots: u32,
+    mutex: std.Thread.Mutex,
+    not_empty: std.Thread.Condition,
+    /// LIFO stack of free slot indices. `free_count` is the number of valid
+    /// entries; top of stack is `free_stack[free_count - 1]`. LIFO keeps the
+    /// hottest slot in cache for the next acquire.
+    free_stack: []u32,
+    free_count: u32,
+    shutdown: bool,
+    /// Debug-only per-slot in-use tag. Only read/written under `mutex`.
+    /// Sized 0 in ReleaseFast (comptime-elided).
+    states: []u8,
+    allocator: std.mem.Allocator,
+
+    fn init(n_slots: u32, slot_size: usize, allocator: std.mem.Allocator) error{OutOfMemory}!*InputSlotPool {
+        std.debug.assert(n_slots > 0 and slot_size > 0);
+        const self = try allocator.create(InputSlotPool);
+        errdefer allocator.destroy(self);
+
+        const backing = try allocator.alloc(u8, @as(usize, n_slots) * slot_size);
+        errdefer allocator.free(backing);
+
+        const free_stack = try allocator.alloc(u32, n_slots);
+        errdefer allocator.free(free_stack);
+        // Push all indices so the IO thread acquires slot 0 first.
+        var i: u32 = 0;
+        while (i < n_slots) : (i += 1) free_stack[i] = n_slots - 1 - i;
+
+        const states_len: usize = if (@import("builtin").mode == .Debug) n_slots else 0;
+        const states = try allocator.alloc(u8, states_len);
+        errdefer allocator.free(states);
+        if (states_len > 0) @memset(states, SLOT_FREE);
+
+        self.* = .{
+            .backing = backing,
+            .slot_size = slot_size,
+            .n_slots = n_slots,
+            .mutex = .{},
+            .not_empty = .{},
+            .free_stack = free_stack,
+            .free_count = n_slots,
+            .shutdown = false,
+            .states = states,
+            .allocator = allocator,
+        };
+        return self;
+    }
+
+    fn deinit(self: *InputSlotPool) void {
+        // All acquired slots must have been released before deinit. We assert
+        // by checking free_count == n_slots; release-mode builds skip the
+        // check but still free the backing memory cleanly.
+        std.debug.assert(self.free_count == self.n_slots);
+        self.allocator.free(self.backing);
+        self.allocator.free(self.free_stack);
+        self.allocator.free(self.states);
+        const alloc = self.allocator;
+        alloc.destroy(self);
+    }
+
+    /// Acquire one free slot index, blocking when the pool is empty. Returns
+    /// null after `signal_shutdown` if no slots are available — the caller
+    /// must abort. After shutdown, freed slots are still acquirable so
+    /// drain paths can recycle them.
+    fn acquire(self: *InputSlotPool) ?u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.free_count == 0 and !self.shutdown) self.not_empty.wait(&self.mutex);
+        if (self.free_count == 0) return null;
+        self.free_count -= 1;
+        const idx = self.free_stack[self.free_count];
+        if (@import("builtin").mode == .Debug) {
+            std.debug.assert(self.states[idx] == SLOT_FREE);
+            self.states[idx] = SLOT_IN_USE;
+        }
+        return idx;
+    }
+
+    fn release(self: *InputSlotPool, idx: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(idx < self.n_slots);
+        if (@import("builtin").mode == .Debug) {
+            std.debug.assert(self.states[idx] == SLOT_IN_USE);
+            self.states[idx] = SLOT_FREE;
+        }
+        std.debug.assert(self.free_count < self.n_slots);
+        self.free_stack[self.free_count] = idx;
+        self.free_count += 1;
+        self.not_empty.signal();
+    }
+
+    fn signal_shutdown(self: *InputSlotPool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.shutdown = true;
+        self.not_empty.broadcast();
+    }
+
+    fn slot(self: *InputSlotPool, idx: u32) []u8 {
+        std.debug.assert(idx < self.n_slots);
+        const start = @as(usize, idx) * self.slot_size;
+        return self.backing[start .. start + self.slot_size];
     }
 };
 
@@ -507,6 +748,11 @@ const Sequencer = struct {
 // ── Worker thread ─────────────────────────────────────────────────────────────
 
 const WorkerCtx = struct {
+    /// Index into `Pool.threads` (0..n_threads). Identifies which per-worker
+    /// limiter quota / cond this worker owns; stamped on every Job and
+    /// ChunkResult this worker emits so `collect_bytes` releases the right
+    /// slot.
+    worker_id: u32,
     queue: *JobQueue,
     sequencer: *Sequencer,
     /// Stream-mode partial-flush backpressure: workers call `acquire` for each
@@ -563,17 +809,34 @@ fn worker_fn(ctx: WorkerCtx) void {
     var current_query: ?*const query_mod.CompiledQuery = null;
     defer if (opt_it) |*it| it.deinit();
 
-    while (ctx.queue.pop()) |job| {
-        defer if (job.owns_data) job.allocator.free(job.data);
+    while (ctx.queue.pop()) |job_raw| {
+        // Stamp the worker_id on the Job so chunks this worker posts carry
+        // it through to the consumer (which uses it to release the matching
+        // per-worker limiter slot). Producers (IO thread, file feeder) leave
+        // the field as WORKER_ID_NONE.
+        var job = job_raw;
+        job.worker_id = ctx.worker_id;
+        // Job.data ownership at end of iteration — exactly one branch fires:
+        //   • input_slot set  → stream slot, return to InputSlotPool.
+        //   • owns_data true  → heap-duped data, free with job.allocator.
+        //   • neither         → file-mode mmap chunk, madvise(DONTNEED) the
+        //                       pages so RSS stays bounded to in-flight bytes.
+        //
         // INVARIANT: job.data must not be accessed after sequencer.post().
         // Serialized path: output bytes are in the arena, not in job.data.
         // Structured path: own_value() copies all tape spans + strings into the
         // arena before post(); parser.reset() clears the tape after each record.
-        // Violating this invariant causes silent disk re-reads, not corruption.
-        //
-        // MADV_DONTNEED releases the physical pages immediately (Linux only),
-        // bounding mmap RSS to O(in_flight × chunk_size) instead of O(file_size).
-        defer if (!job.owns_data) madvise_dontneed_chunk(job.data);
+        // Violating this invariant causes silent disk re-reads (mmap) or UAF
+        // (slots), not corruption.
+        defer {
+            if (job.input_slot) |idx| {
+                if (job.input_slot_pool) |pool| pool.release(idx);
+            } else if (job.owns_data) {
+                job.allocator.free(job.data);
+            } else {
+                madvise_dontneed_chunk(job.data);
+            }
+        }
 
         if (job.style) |style| {
             // ── Serialized path: single contiguous buffer + compact metadata ──
@@ -605,6 +868,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                 // sub-ids (stream mode).  File-mode Jobs run as before with
                 // a single arena and a single post.
                 .flush_threshold = if (job.seq_range_size > 1) STREAM_FLUSH_THRESHOLD else 0,
+                .worker_id = ctx.worker_id,
             };
             state.aa = state.arena.allocator();
 
@@ -619,10 +883,7 @@ fn worker_fn(ctx: WorkerCtx) void {
             // the feeder structurally aligns chunk boundaries, so every
             // complete top-level value within `job.data` is terminated by
             // a '\n'. Multi-line pretty values cause a slight over-estimate,
-            // which is fine for an `ensureTotalCapacity` hint. NIX-001
-            // briefly used a full structural state-machine walk here as a
-            // third byte-pass over every chunk; that cost is the regression
-            // this restoration removes.
+            // which is fine for an `ensureTotalCapacity` hint.
             const record_count = blk: {
                 var count = countNewlines(job.data);
                 // Account for a final value without trailing newline.
@@ -744,9 +1005,10 @@ fn worker_fn(ctx: WorkerCtx) void {
                             cursor = value_start + advance;
                         },
                         .need_more => {
-                            // Should not occur post-NIX-001 (chunker aligns on
-                            // depth-0 boundaries). Treat defensively as a parse
-                            // error and stop processing this chunk.
+                            // Should not occur: the chunker aligns chunks on
+                            // depth-0 boundaries before handing them to the
+                            // worker. Treat defensively as a parse error and
+                            // stop processing this chunk.
                             const meta = RecordMeta{
                                 .end_offset = @intCast(state.chunk_buf.items.len),
                                 .last_output = .none,
@@ -860,6 +1122,7 @@ fn worker_fn(ctx: WorkerCtx) void {
                 .seq_range_size = job.seq_range_size,
                 .payload = .{ .structured = records_slice },
                 .arena = arena,
+                .worker_id = ctx.worker_id,
             });
 
             // Stream-mode Job accounting (structured path mirror of the
@@ -969,6 +1232,11 @@ const SerializeJobState = struct {
     seq_range_size: u32,
     sub_id: u32,
     flush_threshold: usize, // 0 disables partial flush
+    /// Worker id producing this Job — stamped on every ChunkResult posted by
+    /// `partial_flush` so the consumer can release the right per-worker
+    /// limiter slot, and used as the argument to `limiter.acquire(...)` so
+    /// partial-flush backpressure is per-worker.
+    worker_id: u32,
 };
 
 /// Publish the current accumulated chunk_buf + meta_list as a ChunkResult,
@@ -1007,15 +1275,19 @@ fn partial_flush(state: *SerializeJobState, is_final: bool) void {
         } },
         .user_error_msg = state.chunk_user_error_msg,
         .arena = state.arena,
+        .worker_id = state.worker_id,
     });
 
     if (is_final) return;
 
     // Reserve the next slot's in-flight allowance before we resume work, so
-    // the limiter properly bounds peak memory across partials within a Job.
+    // this worker's partial-flush residency stays bounded by its per-worker
+    // quota. acquire(worker_id) blocks only on this worker's own counter, so
+    // the consumer's release of a chunk from this worker wakes this exact
+    // thread (no cross-worker thundering herd, no ordered-consumer deadlock).
     // On shutdown we still allocate a fresh arena so the worker's defer loop
     // remains balanced; subsequent flushes will just observe the shutdown.
-    _ = state.limiter.acquire();
+    _ = state.limiter.acquire(state.worker_id);
 
     if (range_full) {
         // Chain into a brand-new range — the only way an unbounded generator
@@ -1270,10 +1542,16 @@ fn own_value(val: types.Value, aa: std.mem.Allocator) error{OutOfMemory}!OwnedVa
 
 const IoCtx = struct {
     src: *io_mod.Source,
+    /// Direct fd into the streaming source — bypasses the ring buffer so the
+    /// IO thread reads straight into pool-managed slots (one fewer memcpy).
+    /// Owned by `src`; do not close from the IO thread.
+    file: std.fs.File,
+    /// Preallocated input-slot pool (one slot per in-flight Job at peak).
+    /// Slots are released by workers, recycled by the IO thread.
+    input_slots: *InputSlotPool,
     query: *const query_mod.CompiledQuery,
     queue: *JobQueue,
     sequencer: *Sequencer,
-    limiter: *InFlightLimiter,
     /// Shared range allocator — the IO thread's per-Job `fetchAdd` returns the
     /// `seq_base` for that Job; workers may also `fetchAdd` mid-Job to chain
     /// new ranges when an in-progress Job exhausts its current reservation.
@@ -1295,12 +1573,16 @@ const IoCtx = struct {
     batch_size: usize,
 };
 
+// Single-record cap: `stream_slot_size` (= 2 × stream_batch_size). The slot
+// pool cannot grow a slot, so a record that does not contain a depth-0
+// boundary within one slot is unrecoverable. When fill reaches `cur.len`
+// without a boundary the IO thread releases the slot and exits cleanly
+// (downstream sees a clean EOF). On the smallest hardware tier the cap is
+// 128 KiB; on default budget it is 512 KiB. Real JSONL records are <1 KiB;
+// anything larger is hostile input.
+
 fn io_thread_fn(ctx: IoCtx) void {
-    if (ctx.raw_input) {
-        io_thread_raw_lines(ctx);
-    } else {
-        io_thread_json_boundaries(ctx);
-    }
+    io_thread_slots(ctx);
 
     // No more Jobs will be pushed.  Workers may still claim additional ranges
     // (infinite generator chaining) for in-flight Jobs, so we don't pin
@@ -1313,158 +1595,115 @@ fn io_thread_fn(ctx: IoCtx) void {
     try_pin_total_chunks(ctx.sequencer, ctx.next_seq_range_base, ctx.active_stream_jobs, ctx.io_done);
 }
 
-/// Raw-input batcher: each input line becomes one record. Identical to the
-/// pre-NIX-001 behaviour — `\n` is the only relevant byte, no JSON state.
-fn io_thread_raw_lines(ctx: IoCtx) void {
-    // partial_line: holds bytes of an incomplete line spanning RingBuffer boundaries.
-    var partial_line = std.ArrayList(u8){};
-    defer partial_line.deinit(ctx.allocator);
-
-    // batch_buf: accumulates complete newline-terminated lines until batch_size threshold.
-    var batch_buf = std.ArrayList(u8){};
-    defer batch_buf.deinit(ctx.allocator);
-
-    loop: while (true) {
-        const view = ctx.src.peek() catch break :loop;
-
-        if (view.bytes.len == 0) {
-            if (view.is_eof) {
-                // EOF: flush partial line into batch, then flush batch.
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
-                flushBatch(&batch_buf, ctx);
-                break :loop;
-            }
-            // No data available but not EOF (pipe stall): flush for latency.
-            if (batch_buf.items.len > 0 or partial_line.items.len > 0) {
-                flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
-                flushBatch(&batch_buf, ctx);
-            }
-            _ = ctx.src.refill() catch break :loop;
-            continue;
-        }
-
-        // Scan view for newlines, appending complete lines to batch_buf.
-        var consumed_offset: usize = 0;
-        var scan: usize = 0;
-        while (scan < view.bytes.len) : (scan += 1) {
-            if (view.bytes[scan] == '\n') {
-                // Complete line: partial_line (if any) + view[consumed_offset..scan] + '\n'
-                if (partial_line.items.len > 0) {
-                    partial_line.appendSlice(ctx.allocator, view.bytes[consumed_offset..scan]) catch break :loop;
-                    batch_buf.appendSlice(ctx.allocator, partial_line.items) catch break :loop;
-                    partial_line.clearRetainingCapacity();
-                } else {
-                    batch_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..scan]) catch break :loop;
-                }
-                batch_buf.append(ctx.allocator, '\n') catch break :loop;
-                consumed_offset = scan + 1;
-
-                // Flush when batch reaches threshold.
-                if (batch_buf.items.len >= ctx.batch_size) {
-                    flushBatch(&batch_buf, ctx);
-                }
-            }
-        }
-
-        // Remainder after last newline goes into partial_line.
-        if (consumed_offset < view.bytes.len) {
-            partial_line.appendSlice(ctx.allocator, view.bytes[consumed_offset..]) catch break :loop;
-        }
-        ctx.src.consume(view.bytes.len);
-
-        if (view.is_eof) {
-            flushPartialToBatch(&partial_line, &batch_buf, ctx.allocator, true) catch break :loop;
-            flushBatch(&batch_buf, ctx);
-            break :loop;
-        }
-        _ = ctx.src.refill() catch break :loop;
-    }
-}
-
-/// JSON-input batcher: persistent boundary scanner across views. Each
-/// flushed batch contains zero or more complete top-level values separated
-/// by `\n` (synthesized when the input lacks one). Records are never split
-/// across batches — the in-flight bytes accumulate in `carry` until the
-/// scanner observes a depth-0 / outside-string `\n`. The pipe-stall flush
-/// only fires when no record is in flight (carry empty + at clean state).
-fn io_thread_json_boundaries(ctx: IoCtx) void {
+/// Slot-based IO thread. Reads directly from the source fd into preallocated
+/// InputSlotPool slots; the scanner walks each slot in place and publishes
+/// complete-record runs to the worker queue without any heap copy.
+///
+/// Lifetime per slot:
+///   • acquire → fill[fd-read] → scan[boundary] → publish (worker owns it)
+///   • on cycle boundary: tail bytes (after last depth-0 newline) are copied
+///     to the next slot's head, the published slot is handed to the worker
+///   • on slot-full-without-boundary: a single record exceeds slot_size →
+///     release and exit cleanly (record is unrecoverable, no further reads)
+///   • on EOF: publish remaining partial run; worker handles records
+///     without trailing '\n' via parser.feed / indexOfScalar
+///
+/// Boundary scanner state is resumable across slots — see
+/// src/parser/src/boundary.zig:33 ScannerState. Raw-input mode skips the
+/// scanner and looks for '\n' directly.
+fn io_thread_slots(ctx: IoCtx) void {
     var scanner = parser_mod.boundary.ScannerState{};
-
-    // carry: bytes inside the currently in-flight record (no boundary observed yet).
-    var carry = std.ArrayList(u8){};
-    defer carry.deinit(ctx.allocator);
-
-    // batch_buf: accumulates complete records (each `\n`-terminated) until batch_size.
-    var batch_buf = std.ArrayList(u8){};
-    defer batch_buf.deinit(ctx.allocator);
-
-    // Reused per-iteration to avoid per-feed allocations.
     var bnds = std.ArrayList(usize){};
     defer bnds.deinit(ctx.allocator);
 
-    loop: while (true) {
-        const view = ctx.src.peek() catch break :loop;
+    var cur_idx: u32 = ctx.input_slots.acquire() orelse return;
+    var cur: []u8 = ctx.input_slots.slot(cur_idx);
+    var fill: usize = 0;
+    var scanned: usize = 0;
 
-        if (view.bytes.len == 0) {
-            if (view.is_eof) {
-                // Flush any in-flight bytes as the final record (synthetic \n).
-                if (carry.items.len > 0) {
-                    batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
-                    batch_buf.append(ctx.allocator, '\n') catch break :loop;
-                    carry.clearRetainingCapacity();
-                }
-                flushBatch(&batch_buf, ctx);
-                break :loop;
-            }
-            // Pipe stall: only flush at a clean record boundary so workers
-            // never see a chunk whose final record is truncated.
-            if (carry.items.len == 0 and scanner.depth == 0 and !scanner.in_string and batch_buf.items.len > 0) {
-                flushBatch(&batch_buf, ctx);
-            }
-            _ = ctx.src.refill() catch break :loop;
-            continue;
+    while (true) {
+        if (fill >= cur.len) {
+            // Slot full with no publishable depth-0 boundary — the in-flight
+            // record exceeds slot_size = 2 × stream_batch_size. The pool
+            // cannot grow a slot, so the record is unrecoverable. Release
+            // and exit; downstream sees a clean EOF.
+            ctx.input_slots.release(cur_idx);
+            return;
         }
 
+        const n = ctx.file.read(cur[fill..]) catch {
+            ctx.input_slots.release(cur_idx);
+            return;
+        };
+
+        if (n == 0) {
+            // EOF — publish anything pending, then exit.
+            if (fill > 0) {
+                publishSlot(ctx, cur_idx, cur[0..fill]);
+            } else {
+                ctx.input_slots.release(cur_idx);
+            }
+            return;
+        }
+
+        // Scan the freshly-read bytes for record boundaries.
         bnds.clearRetainingCapacity();
-        parser_mod.boundary.feedBytes(&scanner, view.bytes, 0, &bnds, ctx.allocator) catch break :loop;
-
-        var consumed_offset: usize = 0;
-        for (bnds.items) |off| {
-            // Drain carry first so the record bytes appear contiguous.
-            if (carry.items.len > 0) {
-                batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
-                carry.clearRetainingCapacity();
+        if (ctx.raw_input) {
+            var i: usize = scanned;
+            const end = scanned + n;
+            while (i < end) : (i += 1) {
+                if (cur[i] == '\n') bnds.append(ctx.allocator, i) catch {
+                    ctx.input_slots.release(cur_idx);
+                    return;
+                };
             }
-            batch_buf.appendSlice(ctx.allocator, view.bytes[consumed_offset..off]) catch break :loop;
-            batch_buf.append(ctx.allocator, '\n') catch break :loop;
-            consumed_offset = off + 1;
-
-            if (batch_buf.items.len >= ctx.batch_size) {
-                flushBatch(&batch_buf, ctx);
-            }
+        } else {
+            parser_mod.boundary.feedBytes(&scanner, cur[scanned .. scanned + n], scanned, &bnds, ctx.allocator) catch {
+                ctx.input_slots.release(cur_idx);
+                return;
+            };
         }
+        fill += n;
+        scanned = fill;
 
-        // Remainder belongs to an in-progress record — accumulate.
-        if (consumed_offset < view.bytes.len) {
-            carry.appendSlice(ctx.allocator, view.bytes[consumed_offset..]) catch break :loop;
-        }
-        ctx.src.consume(view.bytes.len);
+        if (bnds.items.len == 0) continue;
 
-        if (view.is_eof) {
-            if (carry.items.len > 0) {
-                batch_buf.appendSlice(ctx.allocator, carry.items) catch break :loop;
-                batch_buf.append(ctx.allocator, '\n') catch break :loop;
-                carry.clearRetainingCapacity();
-            }
-            flushBatch(&batch_buf, ctx);
-            break :loop;
+        const last_bnd = bnds.items[bnds.items.len - 1];
+        const publishable_end = last_bnd + 1;
+
+        // Hold the batch until publishable bytes reach `batch_size`, or
+        // until the slot is full (forces a publish to free the slot).
+        // slot_size > batch_size, so the first condition trips on typical
+        // workloads long before the second.
+        if (publishable_end < ctx.batch_size and fill < cur.len) continue;
+
+        const tail_len = fill - publishable_end;
+        if (tail_len > 0) {
+            // Carry the in-flight tail into a fresh slot, publish the rest.
+            const next_idx = ctx.input_slots.acquire() orelse {
+                ctx.input_slots.release(cur_idx);
+                return;
+            };
+            const next = ctx.input_slots.slot(next_idx);
+            @memcpy(next[0..tail_len], cur[publishable_end..fill]);
+            publishSlot(ctx, cur_idx, cur[0..publishable_end]);
+            cur_idx = next_idx;
+            cur = next;
+            fill = tail_len;
+            scanned = tail_len;
+        } else {
+            // Clean cut — entire slot is publishable, acquire fresh next.
+            publishSlot(ctx, cur_idx, cur[0..publishable_end]);
+            const next_idx = ctx.input_slots.acquire() orelse return;
+            cur_idx = next_idx;
+            cur = ctx.input_slots.slot(next_idx);
+            fill = 0;
+            scanned = 0;
         }
-        _ = ctx.src.refill() catch break :loop;
     }
 }
 
-/// Flush the accumulated batch as a single Job.  Acquires an in-flight slot
-/// for backpressure, dupes the buffer, and pushes to the worker queue.
+/// Hand a filled slot off to the worker queue as a single Job.
 ///
 /// Each stream-mode Job claims `STREAM_SEQ_RANGE` consecutive sub-ids by
 /// `fetchAdd`-ing on the shared `next_seq_range_base`.  Workers may also
@@ -1472,10 +1711,13 @@ fn io_thread_json_boundaries(ctx: IoCtx) void {
 /// current reservation fills (infinite generators), so the IO thread and
 /// workers share one allocation space.  The Sequencer skips unused trailing
 /// sub-ids when it observes `end_of_range`.
-fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
-    if (batch_buf.items.len == 0) return;
-    if (!ctx.limiter.acquire()) return; // shutdown
-    const data = ctx.allocator.dupe(u8, batch_buf.items) catch return;
+///
+/// Backpressure: the IO thread does NOT touch the `InFlightLimiter` —
+/// queue-side bytes are bounded by `JobQueue` capacity (`QUEUE_CAP`) and the
+/// `InputSlotPool` (one slot per in-flight Job). The limiter is reserved for
+/// worker-side partial-flush residency, accessed only by the workers
+/// themselves on a per-worker quota.
+fn publishSlot(ctx: IoCtx, slot_idx: u32, data: []const u8) void {
     const base = ctx.next_seq_range_base.fetchAdd(STREAM_SEQ_RANGE, .monotonic);
     _ = ctx.active_stream_jobs.fetchAdd(1, .monotonic);
     ctx.queue.push(.{
@@ -1483,7 +1725,9 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
         .seq_base = base,
         .chunk_id = base,
         .query = ctx.query,
-        .owns_data = true,
+        .owns_data = false,
+        .input_slot = slot_idx,
+        .input_slot_pool = ctx.input_slots,
         .allocator = ctx.allocator,
         .style = ctx.style,
         .color = ctx.color,
@@ -1492,37 +1736,15 @@ fn flushBatch(batch_buf: *std.ArrayList(u8), ctx: IoCtx) void {
         .external_bindings = ctx.external_bindings,
         .seq_range_size = STREAM_SEQ_RANGE,
     });
-    batch_buf.clearRetainingCapacity();
-}
-
-/// Append any remaining partial line (without trailing newline) to the batch
-/// buffer, so it is included in the final flush.
-fn flushPartialToBatch(
-    partial_line: *std.ArrayList(u8),
-    batch_buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    raw_input: bool,
-) error{OutOfMemory}!void {
-    const trimmed = if (raw_input)
-        stripTrailingCr(partial_line.items)
-    else
-        std.mem.trimRight(u8, partial_line.items, " \t\r");
-    // In raw_input mode, an empty partial is valid (empty string) only if there
-    // were actual bytes before trimming — an empty partial_line means no data
-    // was buffered (the previous line ended with \n), not an empty input line.
-    if (trimmed.len > 0 or (raw_input and partial_line.items.len > 0)) {
-        try batch_buf.appendSlice(allocator, trimmed);
-        try batch_buf.append(allocator, '\n');
-    }
-    partial_line.clearRetainingCapacity();
 }
 
 // ── File feeder thread ────────────────────────────────────────────────────────
 //
-// Iterates the mmap lazily: computes chunk boundaries on demand, acquires an
-// in-flight slot from the limiter (blocking when max is reached), then enqueues
-// the chunk to the worker queue.  This is the sole mechanism controlling how
-// many arenas are simultaneously live for file-mode processing.
+// Iterates the mmap lazily: computes chunk boundaries on demand, then enqueues
+// each chunk to the worker queue. Bounded queue depth (`QUEUE_CAP`) supplies
+// queue-side backpressure (`queue.push` blocks when full), so file-mode peak
+// RSS is proportional to `min(n_chunks, QUEUE_CAP + n_threads) × chunk_size`
+// rather than the full file size.
 
 const FileFeedCtx = struct {
     data: []const u8,
@@ -1530,13 +1752,15 @@ const FileFeedCtx = struct {
     query: *const query_mod.CompiledQuery,
     queue: *JobQueue,
     sequencer: *Sequencer,
-    limiter: *InFlightLimiter,
     allocator: std.mem.Allocator,
     style: ?types.OutputStyle,
     color: ?*const output_mod.Color,
     opts: output_mod.SerializeOpts,
     raw_input: bool,
     external_bindings: []const query_mod.ExternalVarBinding,
+    /// Cooperative shutdown — read once per loop so `Pool.deinit` can break
+    /// the feeder out of the chunk loop even when `queue.push` would block.
+    shutdown: *std.atomic.Value(bool),
 };
 
 fn file_feeder_fn(ctx: FileFeedCtx) void {
@@ -1558,6 +1782,10 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
         // landed at file_size for a no-trailing-newline final value), no
         // remaining chunks are reachable.
         if (chunk_start >= file_size) break;
+        // Cooperative shutdown observation. `Pool.deinit` sets this flag
+        // before draining the queue, so the feeder exits promptly when the
+        // consumer has closed mid-stream.
+        if (ctx.shutdown.load(.acquire)) break;
 
         const ideal_end_raw = if (i + 1 == ctx.n_chunks)
             file_size
@@ -1584,9 +1812,6 @@ fn file_feeder_fn(ctx: FileFeedCtx) void {
 
         if (chunk.len == 0) continue;
         if (!ctx.raw_input and !hasNonEmptyLine(chunk)) continue;
-
-        // Block until a slot is available.  Returns false on shutdown (deinit).
-        if (!ctx.limiter.acquire()) break;
 
         ctx.queue.push(.{
             .data = chunk,
@@ -1674,8 +1899,11 @@ fn madvise_dontneed_chunk(data: []const u8) void {
 const SharedCtx = struct {
     queue: JobQueue,
     sequencer: Sequencer,
-    /// Backpressure limiter for file mode.  Feeder acquires before each chunk;
-    /// collect()/collect_bytes() releases after each arena free.
+    /// Per-worker partial-flush backpressure limiter. Each worker has its
+    /// own quota; release is keyed by `ChunkResult.worker_id` so the right
+    /// producer wakes on every consumer release. The file feeder and stream
+    /// IO thread no longer touch the limiter — queue depth and
+    /// `InputSlotPool` provide their respective backpressure.
     limiter: InFlightLimiter,
     allocator: std.mem.Allocator,
     /// Starts at 1 (for the Pool) + n_workers.  Each exiting thread decrements.
@@ -1708,24 +1936,31 @@ const SharedCtx = struct {
     io_done: std.atomic.Value(bool),
 };
 
-fn worker_thread_entry(shared: *SharedCtx) void {
+const WorkerEntryArgs = struct {
+    shared: *SharedCtx,
+    worker_id: u32,
+};
+
+fn worker_thread_entry(args: WorkerEntryArgs) void {
     worker_fn(.{
-        .queue = &shared.queue,
-        .sequencer = &shared.sequencer,
-        .limiter = &shared.limiter,
-        .next_seq_range_base = &shared.next_seq_range_base,
-        .shutdown = &shared.shutdown,
-        .active_stream_jobs = &shared.active_stream_jobs,
-        .io_done = &shared.io_done,
-        .allocator = shared.allocator,
+        .worker_id = args.worker_id,
+        .queue = &args.shared.queue,
+        .sequencer = &args.shared.sequencer,
+        .limiter = &args.shared.limiter,
+        .next_seq_range_base = &args.shared.next_seq_range_base,
+        .shutdown = &args.shared.shutdown,
+        .active_stream_jobs = &args.shared.active_stream_jobs,
+        .io_done = &args.shared.io_done,
+        .allocator = args.shared.allocator,
     });
-    release_shared(shared, shared.allocator);
+    release_shared(args.shared, args.shared.allocator);
 }
 
 fn release_shared(shared: *SharedCtx, allocator: std.mem.Allocator) void {
     if (shared.ref_count.fetchSub(1, .acq_rel) == 1) {
         shared.queue.deinit();
         shared.sequencer.deinit();
+        shared.limiter.deinit();
         allocator.destroy(shared);
     }
 }
@@ -1814,7 +2049,28 @@ pub const MemoryBudget = struct {
     pub const ChunkParams = struct {
         chunk_factor: usize,
         in_flight_factor: usize,
+        /// Publish threshold for a stream-mode input slot. The IO thread
+        /// scans this many bytes for depth-0 record boundaries before
+        /// handing the slot to a worker.
         stream_batch_size: usize,
+        /// Backing capacity of one input slot. Always `2 * stream_batch_size`:
+        /// the first half is the publish-threshold window, the second half is
+        /// tail headroom so the IO thread can keep reading past the threshold
+        /// until the next depth-0 newline. Also the hard cap on a single
+        /// record (oversize records are unrecoverable; the pool cannot grow
+        /// a slot). Exposed on ChunkParams as the single source of truth for
+        /// both `submit_stream` (slot pool construction) and
+        /// `computeStreamInputSlots` (residency budgeting).
+        stream_slot_size: usize,
+        /// Stream-mode input-slot pool size: number of preallocated
+        /// `stream_slot_size`-byte slots the IO thread can fill in parallel
+        /// with workers. Sized so total slot residency
+        /// (`stream_input_slots × stream_slot_size`) stays at ~25% of the
+        /// memory budget, with a floor of `n_threads + 2` (per-worker + IO
+        /// thread + one queue tail) and a ceiling of `n_threads + 32`
+        /// (diminishing returns past that). Used only by stream mode; file
+        /// mode is bounded by `in_flight_factor`.
+        stream_input_slots: usize,
     };
 
     /// Compute chunk parameters given file size, thread count, and output style.
@@ -1834,10 +2090,14 @@ pub const MemoryBudget = struct {
                 MIN_STREAM_BATCH,
                 MAX_STREAM_BATCH,
             );
+            const slot_size = batch *| 2;
+            const slots = computeStreamInputSlots(self.budget_bytes, slot_size, n_eff);
             return .{
                 .chunk_factor = DEFAULT_CHUNK_FACTOR,
                 .in_flight_factor = DEFAULT_IN_FLIGHT_FACTOR,
                 .stream_batch_size = @intCast(batch),
+                .stream_slot_size = @intCast(slot_size),
+                .stream_input_slots = slots,
             };
         }
 
@@ -1846,10 +2106,13 @@ pub const MemoryBudget = struct {
         const file_expanded = file_size *| expansion; // saturating multiply
 
         if (file_expanded <= self.budget_bytes) {
+            const default_slot_size: u64 = @as(u64, DEFAULT_STREAM_BATCH_SIZE) * 2;
             return .{
                 .chunk_factor = DEFAULT_CHUNK_FACTOR,
                 .in_flight_factor = DEFAULT_IN_FLIGHT_FACTOR,
                 .stream_batch_size = DEFAULT_STREAM_BATCH_SIZE,
+                .stream_slot_size = @intCast(default_slot_size),
+                .stream_input_slots = computeStreamInputSlots(self.budget_bytes, default_slot_size, n_eff),
             };
         }
 
@@ -1874,11 +2137,27 @@ pub const MemoryBudget = struct {
             in_flight = 1;
         }
 
+        const default_slot_size: u64 = @as(u64, DEFAULT_STREAM_BATCH_SIZE) * 2;
         return .{
             .chunk_factor = @intCast(chunk_factor),
             .in_flight_factor = @intCast(in_flight),
             .stream_batch_size = DEFAULT_STREAM_BATCH_SIZE,
+            .stream_slot_size = @intCast(default_slot_size),
+            .stream_input_slots = computeStreamInputSlots(self.budget_bytes, default_slot_size, n_eff),
         };
+    }
+
+    /// Derive the stream-mode input-slot count from budget and slot size.
+    /// Total residency = slot_count × slot_size; we target 25% of the budget
+    /// → slot_count = budget / (4 × slot_size). Bounded so single-core systems
+    /// retain a workable minimum and many-core systems don't waste memory on
+    /// slots no producer can fill in time.
+    fn computeStreamInputSlots(budget_bytes: u64, slot_size: u64, n_threads: u64) usize {
+        const floor: u64 = n_threads + 2;
+        const ceiling: u64 = n_threads + 32;
+        const denom: u64 = @max(1, 4 *| slot_size);
+        const ideal: u64 = budget_bytes / denom;
+        return @intCast(std.math.clamp(ideal, floor, ceiling));
     }
 
     /// Estimate output expansion factor for a given style.
@@ -1928,6 +2207,12 @@ pub const Pool = struct {
     // Workers hold read-only slices into this mapping; it must outlive all threads.
     _mmap: ?io_mod.MappedFile,
 
+    // Stream-mode input-slot pool. Non-null between submit_stream() and
+    // Pool.deinit's final cleanup. Workers hold slices into individual slots;
+    // it must outlive all threads. Heap-allocated because Pool is returned by
+    // value from init() and the IO thread / workers stash the pointer.
+    _input_slots: ?*InputSlotPool,
+
     // collect() cursor — maintains position across calls so multi-value queries
     // (e.g. `.[]`) deliver every output value before advancing to the next record.
     _delivering: ?ChunkResult, // chunk currently being consumed
@@ -1957,31 +2242,49 @@ pub const Pool = struct {
         // chunk IDs across both operating modes.  Stream-mode Jobs reserve
         // `STREAM_SEQ_RANGE` sub-ids each, so the spread is multiplied by the
         // reservation size:
-        //   • File mode:   MAX_IN_FLIGHT_FACTOR × n_threads
-        //                  (upper bound for limiter, seq_range_size = 1)
+        //   • File mode:   QUEUE_CAP + n_threads
+        //                  (queued + workers; seq_range_size = 1)
         //   • Stream mode: (QUEUE_CAP + n_threads) × STREAM_SEQ_RANGE
         //                  (queue depth + workers, each holding one range)
-        // Taking the max covers both; the allocation is at most a few KB.
+        // Stream spread dominates; the allocation is at most a few KB.
         //
         // Worker-chained ranges (infinite-generator support) DO NOT widen this
-        // bound: a worker only `fetchAdd`s a fresh range AFTER successfully
-        // acquiring a limiter slot, so at any moment the total live-post count
-        // remains capped by `max_in_flight = in_flight_factor × n_threads`.
-        // Live chunk-ids stay within a window of (max_in_flight + a few range
-        // boundaries), which is far below the configured capacity.
+        // bound: a worker only `fetchAdd`s a fresh range AFTER its per-worker
+        // limiter quota has a free slot, and each worker's partial-flush
+        // residency is capped at `in_flight_factor` ChunkResults. Live
+        // chunk-ids therefore stay within a window of (in_flight_factor ×
+        // n_threads × STREAM_SEQ_RANGE) plus a small constant — comfortably
+        // below the configured capacity.
         const n_eff = @max(1, n_threads);
         const stream_spread = (QUEUE_CAP + n_eff) * STREAM_SEQ_RANGE;
-        const seq_capacity = @max(MAX_IN_FLIGHT_FACTOR * n_eff, stream_spread);
+        const file_spread = QUEUE_CAP + n_eff;
+        const seq_capacity = @max(file_spread, stream_spread);
         var sequencer = try Sequencer.init(seq_capacity, allocator);
         errdefer sequencer.deinit();
 
-        // Init limiter with upper bound; submit_file/submit_stream will set_max
-        // to the actual computed in_flight_factor before starting the feeder.
-        const max_in_flight = MAX_IN_FLIGHT_FACTOR * @max(1, n_threads);
+        // Per-worker partial-flush limiter. Each worker owns its own quota
+        // of `MAX_IN_FLIGHT_FACTOR` slots; submit_file/submit_stream may
+        // narrow the quota via `set_max` based on the memory budget. The
+        // file-mode feeder no longer touches the limiter — queue depth
+        // alone bounds queue-side residency — so the limiter exists only
+        // for stream-mode partial-flush backpressure inside a worker.
+        const n_eff_for_limiter: u32 = @intCast(@max(1, n_threads));
+        var limiter = try InFlightLimiter.init(n_eff_for_limiter, @intCast(MAX_IN_FLIGHT_FACTOR), allocator);
+        errdefer limiter.deinit();
+
+        // ref_count tracks live owners of `shared`: parent (this Pool) plus
+        // every spawned worker. Initialized to `1 + n_threads` up front; on
+        // the error path the manual errdefers below own cleanup of queue/
+        // sequencer/shared (workers that did spawn decrement their own refs
+        // on exit, but the count never reaches 0 because the parent's ref
+        // is still held — release_shared therefore won't double-free what
+        // the errdefers already freed). On the success path, Pool.deinit
+        // joins all workers (each decrements once) and then calls
+        // release_shared (decrement #N+1 → 0 → destroy).
         shared.* = .{
             .queue = queue,
             .sequencer = sequencer,
-            .limiter = InFlightLimiter.init(max_in_flight),
+            .limiter = limiter,
             .allocator = allocator,
             .ref_count = std.atomic.Value(usize).init(1 + n_threads),
             .next_seq_range_base = std.atomic.Value(u64).init(0),
@@ -1999,8 +2302,10 @@ pub const Pool = struct {
             for (threads[0..spawned]) |t| t.join();
         }
 
-        for (threads) |*t| {
-            t.* = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, worker_thread_entry, .{shared}) catch {
+        for (threads, 0..) |*t, idx| {
+            t.* = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, worker_thread_entry, .{
+                WorkerEntryArgs{ .shared = shared, .worker_id = @intCast(idx) },
+            }) catch {
                 return error.OutOfMemory;
             };
             spawned += 1;
@@ -2013,6 +2318,7 @@ pub const Pool = struct {
             ._shared = shared,
             ._budget = budget,
             ._mmap = null,
+            ._input_slots = null,
             ._delivering = null,
             ._rec_idx = 0,
             ._val_idx = 0,
@@ -2026,6 +2332,10 @@ pub const Pool = struct {
         // per-iteration check and breaks out promptly — required for
         // `t.join()` below to return when the consumer has closed mid-stream.
         p._shared.shutdown.store(true, .release);
+        // Unblock the IO thread if it is parked on input-slot acquisition
+        // (all slots in flight in workers). Signal before queue/limiter so
+        // the IO thread can promptly exit without producing more work.
+        if (p._input_slots) |sp| sp.signal_shutdown();
         // Unblock the feeder if it is stalled on limiter.acquire(), then stop
         // all workers.  Order matters: limiter shutdown first so the feeder can
         // wake up and call queue.signal_done() (or we call it below if it doesn't).
@@ -2038,12 +2348,16 @@ pub const Pool = struct {
         // catches up, which happens as soon as the queue drains.
         p._shared.sequencer.set_total_chunks(p._shared.next_seq_range_base.load(.monotonic));
         if (p.io_thread) |t| t.join();
-        // Join workers BEFORE unmapping — workers may still read mmap memory.
+        // Join workers BEFORE unmapping or freeing slot pool — workers may
+        // still read mmap memory or slot bytes up to their final defer.
         for (p.threads) |t| t.join();
         p.allocator.free(p.threads);
         release_shared(p._shared, p.allocator);
-        // Unmap only after all threads have exited.
+        // Unmap and free slot pool only after all threads have exited and the
+        // queue has drained (release_shared → JobQueue.deinit releases any
+        // remaining slots back to the pool before we destroy it).
         if (p._mmap) |*m| m.deinit();
+        if (p._input_slots) |sp| sp.deinit();
         // Free any partially-consumed chunk that collect()/collect_bytes() hadn't exhausted.
         if (p._delivering) |*cr| cr.arena.deinit();
     }
@@ -2052,10 +2366,11 @@ pub const Pool = struct {
     ///
     /// The file is memory-mapped once.  A dedicated feeder thread lazily splits
     /// the mapping into newline-aligned chunks and enqueues them one at a time,
-    /// blocking when the in-flight limit is reached.  Chunk count and in-flight
-    /// limit are computed adaptively from the memory budget.
-    /// collect()/collect_bytes() releases each slot when it frees a chunk's arena,
-    /// so peak RSS is proportional to the in-flight limit, not the full file size.
+    /// blocking on `JobQueue` capacity when the queue is full. Chunk count is
+    /// computed adaptively from the memory budget; queue depth bounds
+    /// queue-side residency. Workers `madvise(MADV_DONTNEED)` each chunk
+    /// after processing, so peak RSS is proportional to in-flight bytes, not
+    /// the full file size.
     ///
     /// When `style` is non-null, workers use the serialized path: values are
     /// serialized directly into byte buffers. Use collect_bytes() to consume.
@@ -2081,32 +2396,88 @@ pub const Pool = struct {
         }
 
         p._mmap = io_mod.MappedFile.init(file, file_size) catch return error.IoError;
+        p.start_file_feeder(p._mmap.?.data, cq, style, color, opts, raw_input, external_bindings) catch |e| {
+            p._mmap.?.deinit();
+            p._mmap = null;
+            return e;
+        };
+    }
+
+    /// Submit a Source for parallel processing, automatically picking the path
+    /// that matches the underlying backend.
+    ///
+    /// - mmap-backed Source (regular-file stdin, e.g. `zq … < file.json`):
+    ///   feeds the full mapping into the file-mode parallel chunker without
+    ///   re-mmap'ing. The Source retains ownership of the mapping, so it must
+    ///   outlive the Pool (the standard `defer src.deinit()` / `defer pool.deinit()`
+    ///   ordering — LIFO — guarantees this).
+    /// - ring-backed Source (true pipe, FIFO, socket): falls back to the
+    ///   streaming IO-thread path. Behaviour identical to calling
+    ///   `submit_stream` directly.
+    pub fn submit_source(
+        p: *Pool,
+        src: *io_mod.Source,
+        cq: *const query_mod.CompiledQuery,
+        style: ?types.OutputStyle,
+        color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
+        raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
+    ) ZqError!void {
+        if (src.mappedSlice()) |data| {
+            p._style = style;
+            if (data.len == 0) {
+                p._shared.sequencer.set_total_chunks(0);
+                p._shared.queue.signal_done();
+                return;
+            }
+            return p.start_file_feeder(data, cq, style, color, opts, raw_input, external_bindings);
+        }
+        p.submit_stream(src, cq, style, color, opts, raw_input, external_bindings);
+    }
+
+    /// Internal helper: configure adaptive sizing and spawn the file feeder
+    /// thread for an already-resolved byte slice. Caller guarantees `data`
+    /// outlives all worker threads (i.e. its backing mmap is not freed until
+    /// after `Pool.deinit` returns).
+    fn start_file_feeder(
+        p: *Pool,
+        data: []const u8,
+        cq: *const query_mod.CompiledQuery,
+        style: ?types.OutputStyle,
+        color: ?*const output_mod.Color,
+        opts: output_mod.SerializeOpts,
+        raw_input: bool,
+        external_bindings: []const query_mod.ExternalVarBinding,
+    ) ZqError!void {
+        const file_size = data.len;
         const n_threads = @max(1, p.threads.len);
         const params = p._budget.computeParams(file_size, n_threads, style);
         const n_chunks = n_threads * params.chunk_factor;
-        p._shared.limiter.set_max(params.in_flight_factor * @max(1, n_threads));
+        // `in_flight_factor` continues to drive the per-worker partial-flush
+        // quota. File mode posts exactly one ChunkResult per Job, so this
+        // quota only constrains the (rare) stream-mode worker — kept here
+        // for symmetry with submit_stream and to honour `--memory-limit`.
+        p._shared.limiter.set_max(@intCast(params.in_flight_factor));
 
         const ctx_ptr = p.allocator.create(FileFeedCtx) catch {
-            // Unmap before returning so _mmap doesn't dangle.
-            p._mmap.?.deinit();
-            p._mmap = null;
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
             return error.IoError;
         };
         ctx_ptr.* = .{
-            .data = p._mmap.?.data,
+            .data = data,
             .n_chunks = n_chunks,
             .query = cq,
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
-            .limiter = &p._shared.limiter,
             .allocator = p.allocator,
             .style = style,
             .color = color,
             .opts = opts,
             .raw_input = raw_input,
             .external_bindings = external_bindings,
+            .shutdown = &p._shared.shutdown,
         };
 
         p.io_thread = std.Thread.spawn(.{ .stack_size = THREAD_STACK_SIZE }, struct {
@@ -2117,8 +2488,6 @@ pub const Pool = struct {
             }
         }.run, .{ctx_ptr}) catch {
             p.allocator.destroy(ctx_ptr);
-            p._mmap.?.deinit();
-            p._mmap = null;
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
             return error.IoError;
@@ -2145,18 +2514,53 @@ pub const Pool = struct {
     ) void {
         p._style = style;
         const params = p._budget.computeParams(0, p.threads.len, style);
-        p._shared.limiter.set_max(params.in_flight_factor * @max(1, p.threads.len));
+        // `in_flight_factor` becomes each worker's partial-flush quota. With
+        // the default factor of 2 every worker holds at most 1 active output
+        // arena plus 1 posted-unconsumed ChunkResult before its next
+        // partial_flush blocks — exactly the historical global cap, but
+        // restricted to that worker's own chain so the ordered consumer
+        // can never starve any one producer.
+        p._shared.limiter.set_max(@intCast(params.in_flight_factor));
+
+        // submit_stream is the ring-backed path; submit_source routes mmap
+        // separately. If a caller somehow lands here with a non-streaming
+        // Source we cannot proceed — fall back to a clean empty publish.
+        const stream_file = src.streamFile() orelse {
+            p._shared.sequencer.set_total_chunks(0);
+            p._shared.queue.signal_done();
+            return;
+        };
+
+        const slot_count: u32 = @intCast(@max(@as(usize, 2), params.stream_input_slots));
+        // `stream_slot_size = 2 × stream_batch_size`; both come pre-computed
+        // from `MemoryBudget.computeParams` (single source of truth). The first
+        // `stream_batch_size` worth of bytes is the publish threshold; the
+        // remaining capacity is tail headroom so the IO thread can keep
+        // reading past the threshold until the next depth-0 newline. A single
+        // record larger than `stream_slot_size` is unrecoverable (the pool
+        // cannot grow a slot) — the IO thread exits cleanly in that case and
+        // downstream sees a clean EOF.
+        const slot_pool = InputSlotPool.init(slot_count, params.stream_slot_size, p.allocator) catch {
+            p._shared.sequencer.set_total_chunks(0);
+            p._shared.queue.signal_done();
+            return;
+        };
+        p._input_slots = slot_pool;
+
         const ctx_ptr = p.allocator.create(IoCtx) catch {
+            slot_pool.deinit();
+            p._input_slots = null;
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
             return;
         };
         ctx_ptr.* = .{
             .src = src,
+            .file = stream_file,
+            .input_slots = slot_pool,
             .query = cq,
             .queue = &p._shared.queue,
             .sequencer = &p._shared.sequencer,
-            .limiter = &p._shared.limiter,
             .next_seq_range_base = &p._shared.next_seq_range_base,
             .active_stream_jobs = &p._shared.active_stream_jobs,
             .io_done = &p._shared.io_done,
@@ -2177,6 +2581,8 @@ pub const Pool = struct {
             }
         }.run, .{ctx_ptr}) catch {
             p.allocator.destroy(ctx_ptr);
+            slot_pool.deinit();
+            p._input_slots = null;
             p._shared.sequencer.set_total_chunks(0);
             p._shared.queue.signal_done();
             return;
@@ -2210,8 +2616,9 @@ pub const Pool = struct {
                 .structured => |recs| {
                     // ── Chunk exhausted — free its arena and fetch the next ──────
                     if (p._rec_idx >= recs.len) {
+                        const wid = p._delivering.?.worker_id;
                         p._delivering.?.arena.deinit();
-                        p._shared.limiter.release();
+                        p._shared.limiter.release(wid);
                         p._delivering = null;
                         continue;
                     }
@@ -2238,8 +2645,9 @@ pub const Pool = struct {
                 },
                 .serialized => {
                     // Wrong path — free and continue to next chunk.
+                    const wid = p._delivering.?.worker_id;
                     p._delivering.?.arena.deinit();
-                    p._shared.limiter.release();
+                    p._shared.limiter.release(wid);
                     p._delivering = null;
                     continue;
                 },
@@ -2271,8 +2679,9 @@ pub const Pool = struct {
                 .serialized => |ser| {
                     // ── Chunk exhausted — free its arena and fetch the next ──────
                     if (p._rec_idx >= ser.records.len) {
+                        const wid = p._delivering.?.worker_id;
                         p._delivering.?.arena.deinit();
-                        p._shared.limiter.release();
+                        p._shared.limiter.release(wid);
                         p._delivering = null;
                         continue;
                     }
@@ -2305,8 +2714,9 @@ pub const Pool = struct {
                 },
                 .structured => {
                     // Wrong path — free and continue to next chunk.
+                    const wid = p._delivering.?.worker_id;
                     p._delivering.?.arena.deinit();
-                    p._shared.limiter.release();
+                    p._shared.limiter.release(wid);
                     p._delivering = null;
                     continue;
                 },
