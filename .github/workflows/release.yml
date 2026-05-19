@@ -74,7 +74,7 @@ jobs:
           subject-path: ${{ steps.meta.outputs.name }}.${{ matrix.ext }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.meta.outputs.name }}
           path: ${{ steps.meta.outputs.name }}.${{ matrix.ext }}
