@@ -36,7 +36,7 @@ jobs:
     env:
       BENCH_MODE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'comparison')) && 'comparison' || 'regression' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: mlugg/setup-zig@v2
         with:
