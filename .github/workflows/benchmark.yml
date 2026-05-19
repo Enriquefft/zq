@@ -154,7 +154,7 @@ jobs:
           path: benchmarks/ci-baseline.json
           key: benchmark-baseline-v4-main-${{ github.run_id }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: benchmark-results-${{ env.BENCH_MODE }}-${{ github.sha }}
