@@ -36,7 +36,7 @@ jobs:
           - { target: aarch64-windows, os: windows, arch: arm64, ext: zip,    rust-target: aarch64-pc-windows-gnullvm }
           - { target: x86_64-freebsd,  os: freebsd, arch: amd64, ext: tar.gz, rust-target: x86_64-unknown-freebsd }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
@@ -88,7 +88,7 @@ jobs:
       # Required to create the GitHub release + upload assets.
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -148,7 +148,7 @@ jobs:
       id-token: write
     environment: npm-publish
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -174,7 +174,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download Linux artifacts
         uses: actions/download-artifact@v8
@@ -270,7 +270,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Prepare PKGBUILD
         run: |
